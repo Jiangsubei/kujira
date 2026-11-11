@@ -349,7 +349,12 @@ export function toMessageMediaFields(description: MessageDescription): MessageMe
   const firstRemote = description.attachments.find(
     (item) => item.remote?.fileUuid || item.remote?.fileInfo || item.remote?.fileId
   )?.remote;
-  const firstLocal = description.attachments.find((item) => item.local?.path)?.local;
+  // 优先收敛到图片/表情包（历史记录与按需读图均以此为锚点）；纯文件/语音消息保持原有落盘路径。
+  const firstLocal =
+    description.attachments.find(
+      (item) =>
+        (item.kind === 'image' || item.kind === 'sticker') && Boolean(item.local?.path)
+    )?.local ?? description.attachments.find((item) => item.local?.path)?.local;
 
   return {
     type: description.type,

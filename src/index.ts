@@ -32,6 +32,7 @@ import type {
   MessageRecord,
   QQC2CMessageCreateEvent,
 } from './types/index.js';
+import type { AttachmentDescriptor } from './attachment/types.js';
 import { MessageDatabase } from './storage/database.js';
 import { MediaStorageManager, startMediaCleanupTask, computeFileMd5 } from './storage/media.js';
 import {
@@ -40,6 +41,7 @@ import {
   type WaitCollectedMessage,
 } from './gateway/server.js';
 import {
+  descriptorsFromForwardEntries,
   resolveInboundAttachments,
   resolveEmbeddedForwardMedia,
 } from './gateway/inbound-media.js';
@@ -594,6 +596,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
 
     // message_type=102 合并转发全量内嵌媒体裸 GET 落盘 + 结构化排版 + 本地表情库匹配
     let formatForwardContent: ((raw: string) => string) | undefined;
+    let forwardDescriptors: AttachmentDescriptor[] = [];
     if (event.message_type === QQ_INBOUND_MSG_TYPE_FORWARD && typeof event.content === 'string') {
       const resolvedFwd = await resolveEmbeddedForwardMedia(
         event.content,
@@ -605,6 +608,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
         }
       );
       formatForwardContent = () => resolvedFwd.formattedContent;
+      forwardDescriptors = descriptorsFromForwardEntries(resolvedFwd.entries);
     }
 
     const decision = await shouldWakeup(event, {
@@ -621,7 +625,10 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
 
     const content = decision.payload.content;
-    const description = describeInboundAttachments(event, descriptors);
+    const description = describeInboundAttachments(event, [
+      ...descriptors,
+      ...forwardDescriptors,
+    ]);
     const mediaFields = toMessageMediaFields(description);
 
     let savedShortId: string | undefined;

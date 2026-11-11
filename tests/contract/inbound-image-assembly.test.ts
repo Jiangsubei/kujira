@@ -20,7 +20,8 @@ import { openidToPeer } from '../../src/utils/peer.js';
  *          SQLite 写入 local_path 与 attachments JSON；
  * - ASM-2: 死链 / HTTP 403 失败时 local_path 为 null，描述符 unavailable 不泄漏 rkey query，正文与唤醒遵循选项 A 保留真实直链；
  * - ASM-3: 魔数纠偏（响应头错报 image/jpeg、文件名 .jpg 但字节为 PNG → 实际落盘 .png 且 format='png'）；
- * - ASM-4: 多图 attachments[] 并发裸 GET 下载并全部落盘记录至 attachments JSON 与正文。
+ * - ASM-4: 多图 attachments[] 并发裸 GET 下载并全部落盘记录至 attachments JSON 与正文；
+ * - ASM-5: message_type=102 合并转发内嵌媒体（视频/图片/文件）全部入库为 attachments 并保留真实 rkey URL，`local_path` 收敛到图片。
  */
 
 const nativeFetch = globalThis.fetch;
@@ -39,6 +40,12 @@ const JPEG_BYTES = Buffer.concat([
   Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
   Buffer.alloc(32, 7),
 ]);
+const MP4_BYTES = Buffer.concat([
+  Buffer.from([0x00, 0x00, 0x00, 0x18]),
+  Buffer.from('ftypisom'),
+  Buffer.alloc(16, 0x11),
+]);
+const PDF_BYTES = Buffer.from('%PDF-1.7\n%mock-forward-file\n');
 
 class FakeWs {
   static instances: FakeWs[] = [];
@@ -445,5 +452,93 @@ describe('契约测试: 入站图片落盘真实装配闭环 (Inbound Image Asse
     expect(Buffer.compare(fs.readFileSync(parsedAtts[1].local.path), JPEG_BYTES)).toBe(0);
     expect(row.content).toContain(`[图片:${parsedAtts[0].local.path}]`);
     expect(row.content).toContain(`[图片:${parsedAtts[1].local.path}]`);
+  });
+
+  it('ASM-5: message_type=102 合并转发内嵌媒体全部入库为 attachments（保留真实 rkey），local_path 收敛到图片', async () => {
+    const srv = await startHttpServer((req, res) => {
+      if (req.url?.includes('clip.mp4')) {
+        res.writeHead(200, { 'Content-Type': 'video/mp4' });
+        res.end(MP4_BYTES);
+        return;
+      }
+      if (req.url?.includes('report.pdf')) {
+        res.writeHead(200, { 'Content-Type': 'application/pdf' });
+        res.end(PDF_BYTES);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+
+    const videoUrl = `${srv.baseUrl}/media/clip.mp4?rkey=fwd_video_secret`;
+    const imageUrl = `${srv.baseUrl}/media/cat.png?rkey=fwd_img_secret`;
+    const fileUrl = `${srv.baseUrl}/media/report.pdf?rkey=fwd_file_secret`;
+    const content = [
+      '[群聊的聊天记录]',
+      '=== 消息 1 ===',
+      '[发送者] 群友A',
+      `[附件1] 类型:视频 文件名:clip.mp4 尺寸:720x1280 URL:${videoUrl}`,
+      '=== 消息 2 ===',
+      '[发送者] 群友B',
+      '看看这只猫',
+      `[附件1] 类型:图片 文件名:cat.png URL:${imageUrl}`,
+      '=== 消息 3 ===',
+      '[发送者] 群友C',
+      `[附件1] 类型:文件 文件名:report.pdf URL:${fileUrl}`,
+    ].join('\n');
+
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_FORWARD_MEDIA',
+      content,
+      timestamp: '2026-11-11T12:04:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 102,
+      message_scene: { ext: ['msg_idx=REFIDX_IN_FORWARD_MEDIA'] },
+    });
+
+    const row = await waitForDbRow('ROBOT1.0_IN_FORWARD_MEDIA');
+
+    // 合并转发主导类型保持 forward，正文为结构化对话流
+    expect(row.type).toBe('forward');
+    expect(row.content).toContain('1. 群友A: [视频:clip.mp4');
+    expect(row.content).toContain('2. 群友B: 看看这只猫 [图片:');
+    expect(row.content).toContain('3. 群友C: [文件:report.pdf 已保存:');
+    expect(row.content).not.toContain('rkey');
+    expect(row.content).not.toContain('fwd_video_secret');
+
+    // 全量内嵌媒体均入库为 attachments，目录分类正确
+    const parsedAtts = JSON.parse(row.attachments);
+    expect(parsedAtts.map((a: any) => a.kind)).toEqual(['video', 'image', 'file']);
+    expect(parsedAtts.every((a: any) => a.origin === 'inbound')).toBe(true);
+    const [videoAtt, imageAtt, fileAtt] = parsedAtts;
+    expect(
+      path.resolve(videoAtt.local.path).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'video', MOCK_PEER)
+      )
+    ).toBe(true);
+    expect(
+      path.resolve(imageAtt.local.path).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER)
+      )
+    ).toBe(true);
+    expect(
+      path.resolve(fileAtt.local.path).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'files', MOCK_PEER)
+      )
+    ).toBe(true);
+    expect(fs.existsSync(videoAtt.local.path)).toBe(true);
+    expect(fs.existsSync(imageAtt.local.path)).toBe(true);
+    expect(fs.existsSync(fileAtt.local.path)).toBe(true);
+
+    // 入库保留官方真实响应（含 rkey），仅在展示层清洗
+    expect(videoAtt.remote?.url).toBe(videoUrl);
+    expect(imageAtt.remote?.url).toBe(imageUrl);
+    expect(fileAtt.remote?.url).toBe(fileUrl);
+    expect(imageAtt.local.fingerprint).toBeTruthy();
+    expect(imageAtt.local.md5).toBeTruthy();
+
+    // local_path 收敛到图片，而不是按出现顺序取视频
+    expect(row.local_path).toBe(imageAtt.local.path);
   });
 });

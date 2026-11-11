@@ -15,7 +15,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { FaceRecord, QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
-import type { AttachmentDescriptor, AttachmentFaceMeta } from '../attachment/types.js';
+import type { AttachmentDescriptor, AttachmentFaceMeta, AttachmentKind } from '../attachment/types.js';
 import {
   classifyAttachment,
   describeAttachment,
@@ -872,6 +872,72 @@ function parseForwardResolveArgs(
     limit: Number.POSITIVE_INFINITY,
     logger: maybeLogger,
   };
+}
+
+/**
+ * 合并转发内嵌媒体落盘明细 → 统一附件描述符，供入站消息入库 `attachments`。
+ *
+ * - `remote.url` 保留官方真实响应地址（含 rkey 凭证），仅在展示层做清洗；
+ * - 仅成功落盘的 entry 带 `local`；下载失败或无 URL 的 entry 标记 `unavailable`；
+ * - 同一落盘路径（SHA-256 指纹复用命中）只保留首次出现的描述符。
+ */
+export function descriptorsFromForwardEntries(
+  entries: ReadonlyArray<EmbeddedForwardAttachmentEntry>
+): AttachmentDescriptor[] {
+  const kindByMedia: Record<ForwardMediaType, AttachmentKind> = {
+    image: 'image',
+    sticker: 'sticker',
+    video: 'video',
+    voice: 'record',
+    files: 'file',
+  };
+
+  const out: AttachmentDescriptor[] = [];
+  const seenPaths = new Set<string>();
+
+  for (const entry of entries) {
+    const localPath = entry.localPath?.trim();
+    if (localPath) {
+      if (seenPaths.has(localPath)) continue;
+      seenPaths.add(localPath);
+    }
+
+    const format = localPath
+      ? detectSavedFormat(localPath, inferExtFromFilename(entry.fileName))
+      : undefined;
+    const size =
+      typeof entry.localSize === 'number' && entry.localSize > 0 ? entry.localSize : undefined;
+
+    out.push({
+      kind: kindByMedia[entry.mediaType],
+      origin: 'inbound',
+      remote: { url: entry.rawUrl },
+      ...(entry.fileName ? { fileName: entry.fileName } : {}),
+      ...(localPath
+        ? {
+            local: {
+              path: localPath,
+              ...(format ? { format } : {}),
+              ...(size !== undefined ? { size } : {}),
+              ...(entry.md5 ? { md5: entry.md5 } : {}),
+              ...(entry.fingerprint ? { fingerprint: entry.fingerprint } : {}),
+              ...(entry.mediaType === 'video' && entry.dimensions
+                ? { dimensions: entry.dimensions }
+                : {}),
+              ...(entry.mediaType === 'video' &&
+              typeof entry.durationSec === 'number' &&
+              Number.isFinite(entry.durationSec)
+                ? { durationSec: entry.durationSec }
+                : {}),
+            },
+          }
+        : {}),
+      ...(entry.face ? { face: entry.face } : {}),
+      ...(entry.error ? { unavailable: entry.error } : {}),
+    });
+  }
+
+  return out;
 }
 
 /**
