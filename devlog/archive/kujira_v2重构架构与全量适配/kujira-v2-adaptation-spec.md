@@ -1,8 +1,8 @@
 # kujira 改造架构规范（QQ 官方 Bot API v2 · 合规 C2C 单聊）
 
-> **状态**：推进中（Batch 1 即将启动）
-> **前置实证依据**：参见 [`devlog/archive/QQ官方Bot_API实测与踩坑/`](archive/QQ官方Bot_API实测与踩坑/) 全部 5 份实测报告。严禁采信腾讯官方文档未实测条款。
-> **规范约束**：严格遵守根目录 [`AGENTS.md`](../AGENTS.md) 的隐私守卫（`privacy-guard`）、TDD、DSH Lossless JSON、禁止造假与提交前强制 `pnpm build` 红线。
+> **状态**：已归档（Batch 1–4 代码重构、打包构建与全仓 92/92 契约与单元测试均已通过，待真机实联验证）
+> **前置实证依据**：参见 [`devlog/archive/QQ官方Bot_API实测与踩坑/`](../QQ官方Bot_API实测与踩坑/) 全部 5 份实测报告。严禁采信腾讯官方文档未实测条款。
+> **规范约束**：严格遵守根目录 [`AGENTS.md`](../../AGENTS.md) 的隐私守卫（`privacy-guard`）、TDD、DSH Lossless JSON、禁止造假与提交前强制 `pnpm build` 红线。
 
 ---
 
@@ -31,7 +31,7 @@
 - **内部标准化 Hash**：
   - `computeOpenidHash16(openid)`: `crypto.createHash('sha256').update(openid).digest('hex').slice(0, 16)`（16 位小写 `[0-9a-f]{16}`）。
   - **内部 Peer**：`user_<hash16>`
-  - **DSH SessionId**：`kujira-user-<hash16>`（支持 `-r<round>-<version>[-<hash6>]` 多轮归档后缀，由 [`id-resolver.ts`](../src/gateway/session/id-resolver.ts) 解析）。
+  - **DSH SessionId**：`kujira-user-<hash16>`（支持 `-r<round>-<version>[-<hash6>]` 多轮归档后缀，由 [`id-resolver.ts`](../../src/gateway/session/id-resolver.ts) 解析）。
 - **数据库双向映射**：
   - SQLite `peer_openid_map(peer TEXT PRIMARY KEY, openid TEXT UNIQUE NOT NULL, remark TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)`。
   - 首条入站事件处理前必须先调用 `upsertPeerOpenid(peer, openid)`；所有出站接口调用前通过 `getOpenidByPeer(peer)` 反查真实 `openid`。
@@ -79,7 +79,7 @@
    - `BridgeConfigSchema` 精简为 **17 项核心单聊配置**：
      `image_ttl_days`, `markdown_enabled`, `input_notify_enabled`, `new_message_behavior`, `persona`, `behavior`, `memory_storage_dir`, `user_profile_budget_chars`, `session_memory_budget_chars`, `face_enabled`, `face_store_max`, `face_store_dir`, `face_evict_policy`, `slang_enabled`, `slang_max_entries`, `slang_evict_policy`, `slang_storage_path`。
    - **安全配置与 `admins` 全部移除**：不设黑名单、不设 `session_permission_*` / `coding_tools_*`、`admins` 鉴权一并去掉；单聊新会话默认采用 `'workspace-write'` 权限并装载 Preset 内置 Coding 工具（可通过 `/permission` 命令单会话动态切换）；斜杠命令与 `approval/request` 放行给已接入的 C2C 好友。
-   - **保留无配置的内部 [`TurnInitiatorTracker`](../src/approval/turn-initiator.ts)**：区分「真人 C2C 唤醒（`'direct'`）」与「`scheduled_task` 系统后台唤醒（`is_system: true`）」，确保后台定时任务触发需审批工具时仍维持 Fail-Closed。
+   - **保留无配置的内部 [`TurnInitiatorTracker`](../../src/approval/turn-initiator.ts)**：区分「真人 C2C 唤醒（`'direct'`）」与「`scheduled_task` 系统后台唤醒（`is_system: true`）」，确保后台定时任务触发需审批工具时仍维持 Fail-Closed。
    - 移除群夜间免打扰拦截（`isNightDnd` / `proactive_night_dnd`）。
 2. **老工具去留**：
    - 删除群聊、OneBot、跨 Agent 已清理模块，及 `group-file-resolve.ts`、`private-file.ts`；
