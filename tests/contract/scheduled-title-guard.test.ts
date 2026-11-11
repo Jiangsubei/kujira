@@ -2,10 +2,10 @@
  * tests/contract/scheduled-title-guard.test.ts
  *
  * 契约测试:
- * 1. scheduled / is_system 系统触发器绝不改写单聊标题/昵称缓存；
+ * 1. scheduled / is_system 系统触发器绝不改写会话标题，也不调用 sessionTitle.rename；
  * 2. scheduled 系统唤醒绝不擦除 OutboundStreamBridge 上已存在的真实入站被动 msg_id 锚点；
- * 3. 真实单聊消息（direct / quote）仍能用 from_name 正常更新昵称；
- * 4. 历史污染数据（plugin_kv:kujira_peer_names 中的伪系统名与已污染标题）会被清理/自愈。
+ * 3. 真实单聊消息（direct / quote）同样彻底放行 DSH 原生 AI 总结（不调用 sessionTitle.rename 锁定标题）；
+ * 4. `getSessionTitle` / `getSessionDisplayName` 只读透传 DSH 原生会话标题，无标题时返回 undefined。
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -14,28 +14,24 @@ import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { Context } from '@deepseek-ai/cordis';
 import { SessionManager } from '../../src/gateway/session.js';
-import { MessageDatabase } from '../../src/storage/database.js';
 import { OutboundStreamBridge } from '../../src/outbound/stream.js';
-import { openidToPeer, openidToSessionBaseId, extractPeerHash } from '../../src/utils/peer.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
 const OPENID = '10000000000000000000000000000001';
 const PEER = openidToPeer(OPENID);
-const HASH = extractPeerHash(PEER)!;
 const SESSION_ID = openidToSessionBaseId(OPENID);
-const NEUTRAL_TITLE = `私聊: ${HASH} #1`;
 
-describe('契约测试: 系统触发器不得污染单聊会话标题且不清除被动 msg_id 锚点', () => {
+describe('契约测试: 原生 AI 会话标题放行与系统唤醒不清除被动 msg_id 锚点', () => {
   let tmpHome: string;
-  let db: MessageDatabase | undefined;
   let sessionManager: SessionManager;
-  let currentTitle: string;
+  let currentTitle: string | undefined;
   let rename: any;
   let followup: any;
   let mockAgent: any;
 
   beforeEach(async () => {
     tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-title-guard-'));
-    currentTitle = NEUTRAL_TITLE;
+    currentTitle = '今天的工作计划';
     rename = vi.fn((_session: any, title: string) => {
       currentTitle = title;
     });
@@ -50,8 +46,6 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
 
   afterEach(async () => {
     await sessionManager?.dispose().catch(() => {});
-    db?.close();
-    db = undefined;
     await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
   });
 
@@ -65,7 +59,7 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
         }
         if (key === 'sessionTitle') {
           return {
-            get: () => ({ title: currentTitle }),
+            get: () => (currentTitle ? { title: currentTitle } : undefined),
             rename,
           };
         }
@@ -78,10 +72,10 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
         debug: vi.fn(),
       }),
     };
-    return new SessionManager(mockCtx, tmpHome, db);
+    return new SessionManager(mockCtx, tmpHome);
   }
 
-  it('契约 1: 定时任务唤醒 (trigger=scheduled) 绝不改写私聊标题，也不写入昵称缓存', async () => {
+  it('契约 1: 定时任务唤醒 (trigger=scheduled) 绝不调用 sessionTitle.rename 改写已有 AI 会话标题', async () => {
     sessionManager = createManager();
 
     await sessionManager.dispatchWakeup({
@@ -96,8 +90,8 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
     });
 
     expect(rename).not.toHaveBeenCalled();
-    expect(currentTitle).toBe(NEUTRAL_TITLE);
-    expect(sessionManager.getPeerName(PEER)).toBeUndefined();
+    expect(currentTitle).toBe('今天的工作计划');
+    expect(sessionManager.getSessionTitle(SESSION_ID)).toBe('今天的工作计划');
   });
 
   it('契约 2: 系统唤醒 (is_system / scheduled) 绝不擦除 OutboundStreamBridge 中保留的历史有效入站被动 msg_id 锚点', async () => {
@@ -107,7 +101,6 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
     });
     sessionManager.setOutboundBridge(outboundBridge);
 
-    // 1. 先通过真实入站消息建立被动回复锚点
     outboundBridge.trackInboundContext(PEER, {
       msg_id: 'ROBOT1.0_real_anchor_001',
       from_user: OPENID,
@@ -116,7 +109,6 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
     });
     expect(outboundBridge.resolvePassiveMsgId(PEER)).toBe('ROBOT1.0_real_anchor_001');
 
-    // 2. 随后触发定时任务唤醒
     await sessionManager.dispatchWakeup({
       trigger: 'scheduled',
       peer: PEER,
@@ -128,7 +120,6 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
       timestamp: Date.now(),
     });
 
-    // 3. 验证历史有效入站被动 msg_id 锚点完好保留，且当前上下文带有 is_synthetic: true
     expect(outboundBridge.resolvePassiveMsgId(PEER)).toBe('ROBOT1.0_real_anchor_001');
     const activeCtx = outboundBridge.getActiveTurnContext(PEER);
     expect((activeCtx as any)?.is_synthetic).toBe(true);
@@ -137,7 +128,8 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
     outboundBridge.dispose();
   });
 
-  it('契约 3: 真实单聊消息 (direct / quote) 仍能用 from_name 正常更新私聊标题', async () => {
+  it('契约 3: 真实单聊消息 (direct / quote) 也不再调用 sessionTitle.rename 锁定标题，交由 DSH 原生 AI 总结', async () => {
+    currentTitle = undefined;
     sessionManager = createManager();
 
     await sessionManager.dispatchWakeup({
@@ -145,35 +137,26 @@ describe('契约测试: 系统触发器不得污染单聊会话标题且不清�
       peer: PEER,
       from_user: OPENID,
       from_name: '小明',
-      content: '你好',
+      content: '你好，帮我排查构建报错',
       msg_id: 'ROBOT1.0_inbound_1',
       timestamp: Date.now(),
     });
 
-    expect(rename).toHaveBeenCalledWith(mockAgent.session, `私聊: 小明 ${HASH} #1`);
-    expect(currentTitle).toBe(`私聊: 小明 ${HASH} #1`);
-    expect(sessionManager.getPeerName(PEER)).toBe('小明');
+    expect(rename).not.toHaveBeenCalled();
+    expect(sessionManager.getSessionTitle(SESSION_ID)).toBeUndefined();
+    expect(sessionManager.getSessionDisplayName(SESSION_ID)).toBeUndefined();
+
+    // 当 DSH 原生 sessionTitle 产出 AI 总结标题后，只读方法应能立即读取
+    currentTitle = '排查构建报错问题';
+    expect(sessionManager.getSessionTitle(SESSION_ID)).toBe('排查构建报错问题');
+    expect(sessionManager.getSessionDisplayName(SESSION_ID)).toBe('排查构建报错问题');
   });
 
-  it('契约 4: 历史污染清理 —— plugin_kv:kujira_peer_names 中的「系统定时任务」加载时丢弃，已污染标题自愈为中性标题', async () => {
-    const dbPath = path.join(tmpHome, 'kujira/messages.sqlite');
-    await fsp.mkdir(path.dirname(dbPath), { recursive: true });
-    db = new MessageDatabase(dbPath);
-    db.init();
-    db.setPluginConfig(
-      'kujira_peer_names',
-      JSON.stringify({ [PEER]: '系统定时任务' })
-    );
-
-    currentTitle = `私聊: 系统定时任务 ${HASH} #1`;
+  it('契约 4: 已彻底移除 updateSessionTitle / getPeerName / setPeerName 覆盖锁定接口', () => {
     sessionManager = createManager();
-
-    expect(sessionManager.getPeerName(PEER)).toBeUndefined();
-
-    const persisted = JSON.parse(db.getPluginConfig('kujira_peer_names')!);
-    expect(persisted[PEER]).toBeUndefined();
-
-    sessionManager.updateSessionTitle(mockAgent.session, PEER, SESSION_ID);
-    expect(currentTitle).toBe(NEUTRAL_TITLE);
+    expect((sessionManager as any).updateSessionTitle).toBeUndefined();
+    expect((sessionManager as any).getPeerName).toBeUndefined();
+    expect((sessionManager as any).setPeerName).toBeUndefined();
+    expect((sessionManager as any).ensurePeerName).toBeUndefined();
   });
 });

@@ -17,8 +17,11 @@ import {
   classifyAttachment,
   describeAttachment,
   describeInboundAttachments,
+  hasFaceXmlTag,
+  inferInboundMessageType,
   resolveLocalMediaPath,
   sanitizeAttachmentFileName,
+  stripFaceXmlTags,
   toMessageMediaFields,
 } from '../../src/attachment/classify.js';
 import {
@@ -337,5 +340,116 @@ describe('契约测试: 序列化与官方 raw 事件解析 (store.ts)', () => {
 
     // 旧版 OneBot 段数组 JSON 不兼容，返回空数组
     expect(descriptorsFromRaw(JSON.stringify([{ type: 'image', data: { file: 'a.png' } }]))).toEqual([]);
+  });
+});
+
+describe('契约测试: <faceType=...> 标签剥离与表情包渲染', () => {
+  it('契约 13: hasFaceXmlTag / stripFaceXmlTags 精准匹配并剥离入站表情 XML 壳', () => {
+    const tag = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">';
+    expect(hasFaceXmlTag(tag)).toBe(true);
+    expect(hasFaceXmlTag('<faceType=6>')).toBe(true);
+    expect(hasFaceXmlTag('<faceType= 12, faceId="1">')).toBe(true);
+    expect(hasFaceXmlTag('<emoji:4>')).toBe(false);
+    expect(hasFaceXmlTag('<div>hello</div>')).toBe(false);
+    expect(hasFaceXmlTag('')).toBe(false);
+    expect(hasFaceXmlTag(undefined)).toBe(false);
+
+    expect(stripFaceXmlTags(tag)).toEqual({ text: '', hadFaceTag: true });
+    expect(stripFaceXmlTags(`  ${tag} 笑死  `)).toEqual({ text: '笑死', hadFaceTag: true });
+    expect(stripFaceXmlTags(`看看 ${tag} 这个`)).toEqual({ text: '看看 这个', hadFaceTag: true });
+    expect(stripFaceXmlTags('   ')).toEqual({ text: '   ', hadFaceTag: false });
+    expect(stripFaceXmlTags('普通文本')).toEqual({ text: '普通文本', hadFaceTag: false });
+  });
+
+  it('契约 14: <faceType=...> 仅将入站 image 描述符提升为 sticker，不影响 file/video/record', () => {
+    const faceTag = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">';
+
+    const stickerEvent = makeEvent({
+      content: faceTag,
+      attachments: [
+        {
+          content_type: 'image/jpeg',
+          filename: 'diy.jpg',
+          url: 'https://multimedia.nt.qq.com.cn/download?rkey=SECRET',
+        },
+      ],
+    });
+
+    const rawDesc = describeInboundAttachments(stickerEvent);
+    expect(rawDesc.type).toBe('sticker');
+    expect(rawDesc.attachments[0]?.kind).toBe('sticker');
+
+    const preResolved: AttachmentDescriptor[] = [
+      {
+        kind: 'image',
+        origin: 'inbound',
+        local: { path: '/dsh/kujira/downloads/image/user_1/diy.jpg', format: 'jpg' },
+      },
+    ];
+    const resolvedDesc = describeInboundAttachments(stickerEvent, preResolved);
+    expect(resolvedDesc.type).toBe('sticker');
+    expect(resolvedDesc.attachments[0]?.kind).toBe('sticker');
+    expect(inferInboundMessageType(stickerEvent, preResolved)).toBe('sticker');
+
+    // file / video / record 不受 <faceType=...> 影响
+    const fileEvent = makeEvent({
+      content: faceTag,
+      attachments: [{ content_type: 'file', filename: 'doc.pdf' }],
+    });
+    const fileDesc = describeInboundAttachments(fileEvent);
+    expect(fileDesc.type).toBe('file');
+    expect(fileDesc.attachments[0]?.kind).toBe('file');
+
+    const videoEvent = makeEvent({
+      content: faceTag,
+      attachments: [{ content_type: 'video/mp4', filename: 'v.mp4' }],
+    });
+    const videoDesc = describeInboundAttachments(videoEvent);
+    expect(videoDesc.type).toBe('video');
+    expect(videoDesc.attachments[0]?.kind).toBe('video');
+
+    const voiceEvent = makeEvent({
+      content: faceTag,
+      attachments: [{ content_type: 'voice', filename: 'v.amr' }],
+    });
+    const voiceDesc = describeInboundAttachments(voiceEvent);
+    expect(voiceDesc.type).toBe('record');
+    expect(voiceDesc.attachments[0]?.kind).toBe('record');
+  });
+
+  it('契约 15: renderSticker 严格遵循已收藏 / 未收藏本地路径 / 落盘失败 / 无路径四种格式', () => {
+    expect(
+      renderAttachment({
+        kind: 'sticker',
+        origin: 'inbound',
+        face: { id: 'face_cat', mood: '嘲讽' },
+        local: { path: '/faces/cat.png' },
+      })
+    ).toBe('[表情包: face_cat (情绪: 嘲讽) 路径: /faces/cat.png]');
+
+    expect(
+      renderAttachment({
+        kind: 'sticker',
+        origin: 'inbound',
+        summary: '[动画表情]',
+        local: { path: '/dsh/kujira/downloads/image/user_1/diy.jpg' },
+      })
+    ).toBe('[表情包:/dsh/kujira/downloads/image/user_1/diy.jpg]');
+
+    expect(
+      renderAttachment({
+        kind: 'sticker',
+        origin: 'inbound',
+        unavailable: 'download_failed',
+      })
+    ).toBe('[表情包 (入站落盘失败)]');
+
+    expect(
+      renderAttachment({
+        kind: 'sticker',
+        origin: 'inbound',
+        summary: '动画表情',
+      })
+    ).toBe('[表情包]');
   });
 });

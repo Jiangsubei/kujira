@@ -252,57 +252,104 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     }
   });
 
-  it('契约 7: /会话 命令无参列出单聊历史会话，支持序号或标题切换，无 emoji', async () => {
+  it('契约 7: /会话 命令无参列出单聊历史会话（AI 标题与回退新会话标题），支持序号、标签、AI 标题或标识切换，无 emoji', async () => {
+    const titleSvc: any = booted.ctx.get('sessionTitle') || (booted.ctx as any).sessionTitle;
+    const renameSpy = titleSvc?.rename ? vi.spyOn(titleSvc, 'rename') : null;
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
     const hash = 'a1b2c3d4e5f60003';
     const peer = `user_${hash}`;
 
-    const a1 = await sessionManager.getOrCreateAgent(peer);
-    await booted.ctx.sessions.flush(a1.session);
-    sessionManager.markSessionCleared(peer);
-    const a2 = await sessionManager.getOrCreateAgent(peer);
-    await booted.ctx.sessions.flush(a2.session);
-    sessionManager.markSessionCleared(peer);
-    const a3 = await sessionManager.getOrCreateAgent(peer);
-    await booted.ctx.sessions.flush(a3.session);
-    const s1 = a1.session;
-    const s3 = a3.session;
+    try {
+      const a1 = await sessionManager.getOrCreateAgent(peer);
+      await booted.ctx.sessions.flush(a1.session);
+      sessionManager.markSessionCleared(peer);
+      const a2 = await sessionManager.getOrCreateAgent(peer);
+      await booted.ctx.sessions.flush(a2.session);
+      sessionManager.markSessionCleared(peer);
+      const a3 = await sessionManager.getOrCreateAgent(peer);
+      await booted.ctx.sessions.flush(a3.session);
+      const s1 = a1.session;
+      const s2 = a2.session;
+      const s3 = a3.session;
 
-    sessionManager.setPeerName(peer, '阿鲸');
+      if (renameSpy) {
+        expect(renameSpy).not.toHaveBeenCalled();
+      }
+      expect(sessionManager.getSessionTitle(s1.id)).toBeUndefined();
 
-    const listRes = await handleSlashCommand('/会话', {
-      userId: peer,
-      session: s3,
-      ctx: booted.ctx,
-      sessionManager,
-    });
-    expect(listRes.handled).toBe(true);
-    expect(listRes.success).toBe(true);
-    expect(listRes.reply).toContain('历史会话列表');
-    expect(listRes.reply).toContain(`kujira-user-${hash}-3`);
-    expect(listRes.reply).toContain(`kujira-user-${hash}`);
-    expect(listRes.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
+      // 为 s1 注入原生 AI 总结标题，s2/s3 保留未命名状态以验证回退格式「新会话 #n」
+      s1.append('session/title', {
+        title: '单聊调试主题',
+        messageSeqs: [],
+        source: { kind: 'fallback' },
+      });
 
-    const resume1Res = await handleSlashCommand('/会话 1', {
-      userId: peer,
-      session: s3,
-      ctx: booted.ctx,
-      sessionManager,
-    });
-    expect(resume1Res.success).toBe(true);
-    expect(resume1Res.reply).toContain('已切换到会话：');
-    expect(resume1Res.reply).toContain(`kujira-user-${hash}`);
-    expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}`);
+      const listRes = await handleSlashCommand('/会话', {
+        userId: peer,
+        session: s3,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(listRes.handled).toBe(true);
+      expect(listRes.success).toBe(true);
+      expect(listRes.reply).toContain('历史会话列表');
+      expect(listRes.reply).toContain(`3. [当前] 新会话 #3 [kujira-user-${hash}-3]`);
+      expect(listRes.reply).toContain(`2. 新会话 #2 [kujira-user-${hash}-2]`);
+      expect(listRes.reply).toContain(`1. 单聊调试主题 (#1) [kujira-user-${hash}]`);
+      expect(listRes.reply).not.toContain('私聊:');
+      expect(listRes.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
 
-    const resumeTitleRes = await handleSlashCommand('/会话 #2', {
-      userId: peer,
-      session: s1,
-      ctx: booted.ctx,
-      sessionManager,
-    });
-    expect(resumeTitleRes.success).toBe(true);
-    expect(resumeTitleRes.reply).toContain(`kujira-user-${hash}-2`);
-    expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-2`);
+      // 1. 按序号切换
+      const resume1Res = await handleSlashCommand('/会话 1', {
+        userId: peer,
+        session: s3,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(resume1Res.success).toBe(true);
+      expect(resume1Res.reply).toContain(`已切换到会话：单聊调试主题 (#1) [kujira-user-${hash}]`);
+      expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}`);
+
+      // 2. 按版本标签切换
+      const resumeTagRes = await handleSlashCommand('/会话 #2', {
+        userId: peer,
+        session: s1,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(resumeTagRes.success).toBe(true);
+      expect(resumeTagRes.reply).toContain(`已切换到会话：新会话 #2 [kujira-user-${hash}-2]`);
+      expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-2`);
+
+      // 3. 按原生 AI 标题关键字模糊切换
+      const resumeAiTitleRes = await handleSlashCommand('/会话 调试主题', {
+        userId: peer,
+        session: s2,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(resumeAiTitleRes.success).toBe(true);
+      expect(resumeAiTitleRes.reply).toContain(`已切换到会话：单聊调试主题 (#1) [kujira-user-${hash}]`);
+      expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}`);
+
+      // 4. 按 sessionId 关键字模糊切换
+      const resumeSidRes = await handleSlashCommand(`/会话 ${hash}-3`, {
+        userId: peer,
+        session: s1,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(resumeSidRes.success).toBe(true);
+      expect(resumeSidRes.reply).toContain(`已切换到会话：新会话 #3 [kujira-user-${hash}-3]`);
+      expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-3`);
+
+      if (renameSpy) {
+        expect(renameSpy).not.toHaveBeenCalled();
+      }
+    } finally {
+      renameSpy?.mockRestore();
+      await sessionManager.dispose();
+    }
   });
 
   it('契约 8: /用量 命令测量上下文用量明细，无 emoji', async () => {
@@ -438,6 +485,7 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     const idleReply = idleRes.reply!;
     expect(idleReply).toContain('【当前会话状态】');
     expect(idleReply).toContain('网关状态：已连接 (KujiraBot (1000000001))');
+    expect(idleReply).toContain('当前会话：新会话 (#1)');
     expect(idleReply).toContain('运行状态：空闲');
     expect(idleReply).toContain('当前模型：deepseek-official / deepseek-v4-pro');
     expect(idleReply).toContain('思考等级：high');

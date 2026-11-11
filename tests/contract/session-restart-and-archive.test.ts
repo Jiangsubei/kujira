@@ -4,7 +4,12 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
-import { SessionManager, formatSessionTitle, parseSessionId } from '../../src/gateway/session.js';
+import {
+  SessionManager,
+  formatFallbackSessionTitle,
+  formatSessionVersionTag,
+  parseSessionId,
+} from '../../src/gateway/session.js';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { openidToPeer, openidToSessionBaseId, extractPeerHash } from '../../src/utils/peer.js';
 
@@ -147,19 +152,18 @@ describe('契约测试: DSH 重启后会话恢复与全归档开启新轮次 (Se
     const newSessionId = sessionManager.peerToSessionId(PEER_1);
     expect(newSessionId).toBe(`${SID_1}-r1-1`);
 
-    sessionManager.setPeerName(PEER_1, 'TestUser');
     const aNew = await sessionManager.getOrCreateAgent(PEER_1);
     expect(aNew.session.id).toBe(`${SID_1}-r1-1`);
 
-    const title = formatSessionTitle(PEER_1, aNew.session.id, 'TestUser');
-    expect(title).toBe(`私聊: TestUser ${HASH_1} #1 (1)`);
+    expect(formatSessionVersionTag(aNew.session.id)).toBe('#1 (1)');
+    expect(formatFallbackSessionTitle(aNew.session.id)).toBe('新会话 #1 (1)');
     await (booted.ctx as any).sessions.flush(aNew.session);
 
     sessionManager.markSessionCleared(PEER_1);
     const aNew2 = await sessionManager.getOrCreateAgent(PEER_1);
     expect(aNew2.session.id).toBe(`${SID_1}-r1-2`);
-    const title2 = formatSessionTitle(PEER_1, aNew2.session.id, 'TestUser');
-    expect(title2).toBe(`私聊: TestUser ${HASH_1} #2 (1)`);
+    expect(formatSessionVersionTag(aNew2.session.id)).toBe('#2 (1)');
+    expect(formatFallbackSessionTitle(aNew2.session.id)).toBe('新会话 #2 (1)');
     await (booted.ctx as any).sessions.flush(aNew2.session);
 
     await sessionManager.dispose();
@@ -180,8 +184,8 @@ describe('契约测试: DSH 重启后会话恢复与全归档开启新轮次 (Se
 
     const round2SessionId = sessionManagerRestarted.peerToSessionId(PEER_1);
     expect(round2SessionId).toBe(`${SID_1}-r2-1`);
-    const titleRound2 = formatSessionTitle(PEER_1, round2SessionId, 'TestUser');
-    expect(titleRound2).toBe(`私聊: TestUser ${HASH_1} #1 (2)`);
+    expect(formatSessionVersionTag(round2SessionId)).toBe('#1 (2)');
+    expect(formatFallbackSessionTitle(round2SessionId)).toBe('新会话 #1 (2)');
 
     await sessionManagerRestarted.dispose();
   });

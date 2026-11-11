@@ -255,6 +255,61 @@ describe('契约测试: 入站图片识别本地表情库并替换语义 (Inboun
       expect(called).toBe(0);
       expect(content).toBe('[表情包: face_pre_bound (情绪: 得意) 路径: /tmp/test.png]');
     });
+
+    it('契约 2.6: 入站含 <faceType=6,...> 壳标签时自动剥离 XML 并提升图片为表情包渲染（原事件不篡改）', () => {
+      const faceTag = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">';
+
+      // 未收藏表情包：固定输出 [表情包:<local_path>]
+      const { filePath: rawStickerPath } = createMockImageFile('uncollected-sticker-bytes', 'raw_sticker.png');
+      const uncollectedDesc: AttachmentDescriptor[] = [
+        { kind: 'image', origin: 'inbound', local: { path: rawStickerPath, format: 'png' } },
+      ];
+      const rawEvent = makeEvent({ content: faceTag });
+      const uncollectedContent = parseNormalizedContent(rawEvent, uncollectedDesc, {
+        getFaceByMd5: lookupFace,
+      });
+      expect(uncollectedContent).toBe(`[表情包:${rawStickerPath}]`);
+      expect(uncollectedDesc[0]!.kind).toBe('sticker');
+      expect(rawEvent.content).toBe(faceTag);
+
+      // 已收藏表情包（MD5 命中）：保持 [表情包: <face_id> (情绪: <mood>) 路径: <local_path>]
+      const { filePath: collectedPath, md5: collectedMd5 } = createMockImageFile(
+        'collected-sticker-bytes',
+        'collected_sticker.png'
+      );
+      registerFace({
+        id: 'face_sticker_hit',
+        file_path: '/faces/sticker_hit.png',
+        md5: collectedMd5,
+        added_at: Date.now(),
+        source: 'collect',
+        tags: ['搞笑'],
+        mood: '大笑',
+        enabled: true,
+        size: 120,
+        format: 'png',
+        use_count: 0,
+      });
+      const collectedDesc: AttachmentDescriptor[] = [
+        { kind: 'image', origin: 'inbound', local: { path: collectedPath, format: 'png', md5: collectedMd5 } },
+      ];
+      const collectedContent = parseNormalizedContent(makeEvent({ content: `${faceTag} 笑死` }), collectedDesc, {
+        getFaceByMd5: lookupFace,
+      });
+      expect(collectedContent).toBe(`笑死 [表情包: face_sticker_hit (情绪: 大笑) 路径: ${collectedPath}]`);
+      expect(collectedDesc[0]!.kind).toBe('sticker');
+
+      // 仅含 <faceType=...> 且无附件时兜底输出 '[表情]'
+      expect(parseNormalizedContent(makeEvent({ content: faceTag }), [])).toBe('[表情]');
+
+      // 落盘失败时渲染 [表情包 (入站落盘失败)]
+      const failedDesc: AttachmentDescriptor[] = [
+        { kind: 'image', origin: 'inbound', unavailable: 'download_failed' },
+      ];
+      expect(parseNormalizedContent(makeEvent({ content: faceTag }), failedDesc)).toBe(
+        '[表情包 (入站落盘失败)]'
+      );
+    });
   });
 
   describe('3. 裸 GET 落盘 + shouldWakeup 全链路表情识别契约', () => {
@@ -305,6 +360,43 @@ describe('契约测试: 入站图片识别本地表情库并替换语义 (Inboun
       expect(decision.payload?.content).toContain('[表情包: face_happy_cat (情绪: 喜悦) 路径:');
       expect(decision.payload?.content).not.toContain('FACE_RKEY');
       expect(decision.payload?.images).toEqual([descriptors[0]!.local!.path]);
+    });
+
+    it('契约 3.2: 入站 <faceType=6,...> 未收藏自定义表情包经裸 GET + shouldWakeup 归一化为 [表情包:<path>]', async () => {
+      const { buf } = createMockImageFile('diy-uncollected-sticker', 'diy.png');
+      const url = await new Promise<string>((resolve, reject) => {
+        const srv = http.createServer((_req, res) => {
+          res.writeHead(200, { 'Content-Type': 'image/png' });
+          res.end(buf);
+        });
+        srv.on('error', reject);
+        servers.push(srv);
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address() as any;
+          resolve(`http://127.0.0.1:${addr.port}/diy.png?rkey=DIY_RKEY`);
+        });
+      });
+
+      const manager = new MediaStorageManager({ dshHome: tmpDir, downloadDir: 'downloads' });
+      const peer = openidToPeer(MOCK_OPENID);
+      const faceTag = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">';
+      const event = makeEvent({
+        content: faceTag,
+        attachments: [{ content_type: 'image/png', filename: 'diy.png', size: buf.length, url }],
+      });
+
+      const descriptors = await resolveInboundAttachments(event, peer, manager);
+      const decision = await shouldWakeup(event, {
+        descriptors,
+        getFaceByMd5: lookupFace,
+        shortId: 'msg_9',
+      });
+
+      expect(decision.wakeup).toBe(true);
+      expect(decision.payload?.short_id).toBe('msg_9');
+      expect(decision.payload?.content).toBe(`[表情包:${descriptors[0]!.local!.path}]`);
+      expect(decision.payload?.content).not.toContain('<faceType');
+      expect(event.content).toBe(faceTag);
     });
   });
 });

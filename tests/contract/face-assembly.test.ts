@@ -268,9 +268,28 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
       raw: '{}',
     });
 
-    const res = await collectFaceTool.execute(
+    const savedMsg = db.getMessage('ROBOT1.0_IN_FACE_1');
+    expect(savedMsg?.short_id).toBe('msg_1');
+
+    // 传入原始长 ID 必须被校验拦截（不做长 ID 兼容）
+    const rejectedRes = await collectFaceTool.execute(
       {
         message_id: 'ROBOT1.0_IN_FACE_1',
+        tags: ['测试猫猫'],
+        mood: '搞笑',
+      },
+      {
+        agent: { session: { id: MOCK_SESSION_ID } },
+      }
+    );
+    expectLosslessJson(rejectedRes);
+    expect(rejectedRes.success).toBe(false);
+    expect(rejectedRes.error).toContain('无效的 message_id');
+
+    // 传入短 ID ('msg_1') 正常收藏落盘至 .dsh/kujira/faces
+    const res = await collectFaceTool.execute(
+      {
+        message_id: savedMsg!.short_id!,
         tags: ['测试猫猫'],
         mood: '搞笑',
       },
@@ -282,6 +301,21 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     expectLosslessJson(res);
     expect(res.success).toBe(true);
     expect(res.face_id).toBeDefined();
+
+    // 不传 message_id 时自动读取当前会话最近媒体消息并命中去重
+    const autoRes = await collectFaceTool.execute(
+      {
+        tags: ['测试猫猫'],
+        mood: '搞笑',
+      },
+      {
+        agent: { session: { id: MOCK_SESSION_ID } },
+      }
+    );
+    expectLosslessJson(autoRes);
+    expect(autoRes.success).toBe(true);
+    expect(autoRes.duplicated).toBe(true);
+    expect(autoRes.face_id).toBe(res.face_id);
 
     const faceRecord = db.getFaceById(res.face_id);
     expect(faceRecord).toBeDefined();

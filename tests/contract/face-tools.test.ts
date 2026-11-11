@@ -11,11 +11,14 @@ import * as crypto from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { OutboundStreamBridge } from '../../src/outbound/stream.js';
+import { recordOutboundSelfMessage } from '../../src/outbound/self-record.js';
 import {
   listFaces,
   sendFace,
   collectFace,
   manageFaces,
+  createSendFaceTool,
+  createCollectFaceTool,
   registerAgentTools,
 } from '../../src/tools/index.js';
 import { serializeAttachments } from '../../src/attachment/store.js';
@@ -65,13 +68,32 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
         status: 200,
         body: { file_uuid: 'face_uuid_1', file_info: 'face_file_info_1', ttl: 86400 },
       }),
-      sendC2CMessage: vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        body: {
-          id: 'ROBOT1.0_FACE_OUT_10001',
-          ext_info: { ref_idx: 'REFIDX_FACE_10001' },
-        },
+      sendC2CMessage: vi.fn(async (openid: string, payload: any, meta?: any) => {
+        const rawId = 'ROBOT1.0_FACE_OUT_10001';
+        const refIdx = 'REFIDX_FACE_10001';
+        recordOutboundSelfMessage(
+          {
+            peer: meta?.peer ?? USER_PEER,
+            openid,
+            msgId: rawId,
+            refIdx,
+            replyTo: meta?.replyTo ?? null,
+            msgType: 7,
+            text: meta?.text,
+            attachments: meta?.attachments,
+            payload,
+            time: Date.now(),
+          },
+          { db, botId: '1000000000', senderName: 'Kujira' }
+        );
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            id: rawId,
+            ext_info: { ref_idx: refIdx },
+          },
+        };
       }),
       sendC2CStreamMessage: vi.fn(),
       sendInputNotify: vi.fn(),
@@ -263,9 +285,14 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     );
 
     expect(res.success).toBe(true);
-    expect(res.message_id).toBe('ROBOT1.0_FACE_OUT_10001');
-    expect(res.ref_idx).toBe('REFIDX_FACE_10001');
+    expect(res.message_id).toBe('msg_self_1');
+    expect((res as any).ref_idx).toBeUndefined();
     assertNoUndefinedFields(res);
+
+    const sendFaceTool = createSendFaceTool();
+    expect((sendFaceTool as any).output.render({}, res)[0].text).toBe(
+      '已成功发送表情包 (ID: msg_self_1)'
+    );
 
     expect(enqueueSpy).toHaveBeenCalled();
     expect(mockGateway.uploadC2CMedia).toHaveBeenCalledWith(
@@ -341,13 +368,13 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     expect(resGroup.success).toBe(false);
   });
 
-  it('契约 4: collect_face 接收 string msg_id（及 attachments / inboundMsgIdGetter），落盘至 faceDir 并入库', async () => {
+  it('契约 4: collect_face 仅认短 message_id（及 inboundMsgIdGetter / readHistory 回退），落盘至 faceDir 并入库', async () => {
     const srcImgFile = path.join(tmpDir, 'downloaded_image.png');
     const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
     fs.writeFileSync(srcImgFile, pngBytes);
     const imgMd5 = crypto.createHash('md5').update(pngBytes).digest('hex');
 
-    db.saveMessage({
+    const imgRecord = {
       msg_id: 'ROBOT1.0_IMG_88881',
       peer: USER_PEER,
       user_id: MOCK_OPENID,
@@ -362,7 +389,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
       recalled: 0,
       self: 0,
       reply_to: null,
-      source: 'qq',
+      source: 'qq' as const,
       attachments: serializeAttachments([
         {
           kind: 'image',
@@ -370,11 +397,28 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
           local: { path: srcImgFile, format: 'png' },
         },
       ]),
-    });
+    };
+    db.saveMessage(imgRecord);
+    const shortImgId = (imgRecord as any).short_id as string;
+    expect(shortImgId).toBe('msg_1');
 
-    const res = await collectFace(
+    // 传入原始长 ROBOT1.0_... 必须拒绝
+    const resRejectLong = await collectFace(
       {
         message_id: 'ROBOT1.0_IMG_88881',
+        tags: ['猫猫'],
+        mood: '搞笑',
+      },
+      { db, peer: USER_PEER, faceDir }
+    );
+    expect(resRejectLong.success).toBe(false);
+    expect(resRejectLong.error).toContain('msg_12');
+    assertNoUndefinedFields(resRejectLong);
+
+    // 传入短消息 ID msg_1 成功收藏
+    const res = await collectFace(
+      {
+        message_id: shortImgId,
         tags: ['猫猫', '喝水'],
         mood: '搞笑',
       },
@@ -396,7 +440,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     expect(storedFace?.mood).toBe('搞笑');
     expect(fs.existsSync(storedFace!.file_path)).toBe(true);
 
-    // 验证省略 message_id 时走 inboundMsgIdGetter(peer) 获取 string msg_id
+    // 验证省略 message_id 时走 inboundMsgIdGetter(peer) 获取内部 ROBOT1.0_... 锚点或短 ID
     const resGetter = await collectFace(
       {
         tags: ['新标签'],
@@ -411,6 +455,24 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     );
     expect(resGetter.success).toBe(true);
     expect(resGetter.duplicated).toBe(true);
+
+    // 验证省略 message_id 与 inboundMsgIdGetter 时自动兜底 readHistory + getMessageByShortId
+    const resFallbackHistory = await collectFace(
+      {
+        tags: ['自动兜底'],
+        mood: '开心',
+      },
+      {
+        db,
+        peer: USER_PEER,
+        faceDir,
+      }
+    );
+    expect(resFallbackHistory.success).toBe(true);
+    expect(resFallbackHistory.duplicated).toBe(true);
+
+    const collectTool = createCollectFaceTool();
+    expect((collectTool.parameters as any)?.properties?.message_id?.description).toContain('msg_12');
   });
 
   it('契约 5: collect_face 重复偷图时显式告知已存在与既有标签', async () => {
@@ -430,7 +492,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
       format: 'png',
     });
 
-    db.saveMessage({
+    const dupRecord = {
       msg_id: 'ROBOT1.0_IMG_88882',
       peer: USER_PEER,
       user_id: MOCK_OPENID,
@@ -445,12 +507,13 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
       recalled: 0,
       self: 0,
       reply_to: null,
-      source: 'qq',
-    });
+      source: 'qq' as const,
+    };
+    db.saveMessage(dupRecord);
 
     const res = await collectFace(
       {
-        message_id: 'ROBOT1.0_IMG_88882',
+        message_id: (dupRecord as any).short_id,
         tags: ['新标签'],
         mood: '新情绪',
       },
@@ -476,7 +539,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     expect(resNoTags.success).toBe(false);
     expect(resNoTags.error).toMatch(/tags/);
 
-    db.saveMessage({
+    const txtRecord = {
       msg_id: 'ROBOT1.0_TXT_88883',
       peer: USER_PEER,
       user_id: MOCK_OPENID,
@@ -491,12 +554,13 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
       recalled: 0,
       self: 0,
       reply_to: null,
-      source: 'qq',
-    });
+      source: 'qq' as const,
+    };
+    db.saveMessage(txtRecord);
 
     const resNoImg = await collectFace(
       {
-        message_id: 'ROBOT1.0_TXT_88883',
+        message_id: (txtRecord as any).short_id,
         tags: ['标签'],
         mood: '情绪',
       },
@@ -609,7 +673,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     const newImg = path.join(tmpDir, 'new_img.png');
     fs.writeFileSync(newImg, 'new-img-data');
 
-    db.saveMessage({
+    const capRecord = {
       msg_id: 'ROBOT1.0_IMG_99901',
       peer: USER_PEER,
       user_id: MOCK_OPENID,
@@ -624,12 +688,13 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
       recalled: 0,
       self: 0,
       reply_to: null,
-      source: 'qq',
-    });
+      source: 'qq' as const,
+    };
+    db.saveMessage(capRecord);
 
     const res = await collectFace(
       {
-        message_id: 'ROBOT1.0_IMG_99901',
+        message_id: (capRecord as any).short_id,
         tags: ['新表情'],
         mood: '开心',
       },

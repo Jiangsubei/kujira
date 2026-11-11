@@ -5,7 +5,8 @@ import { promises as fsp } from 'node:fs';
 import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import {
   SessionManager,
-  formatSessionTitle,
+  formatFallbackSessionTitle,
+  formatSessionVersionTag,
   parseSessionId,
   buildSessionId,
   findSmallestAvailableVersion,
@@ -123,19 +124,22 @@ describe('契约测试: 会话编号空缺填补与短哈希防撞契约 (Sessio
     const a1 = await sessionManager.getOrCreateAgent(PEER);
     await (booted.ctx as any).sessions.flush(a1.session);
     const s1Id = a1.session.id;
-    expect(formatSessionTitle(PEER, s1Id)).toContain('#1');
+    expect(formatSessionVersionTag(s1Id)).toBe('#1');
+    expect(formatFallbackSessionTitle(s1Id)).toBe('新会话 #1');
 
     sessionManager.markSessionCleared(PEER);
     const a2 = await sessionManager.getOrCreateAgent(PEER);
     await (booted.ctx as any).sessions.flush(a2.session);
     const s2Id = a2.session.id;
-    expect(formatSessionTitle(PEER, s2Id)).toContain('#2');
+    expect(formatSessionVersionTag(s2Id)).toBe('#2');
+    expect(formatFallbackSessionTitle(s2Id)).toBe('新会话 #2');
 
     sessionManager.markSessionCleared(PEER);
     const a3 = await sessionManager.getOrCreateAgent(PEER);
     await (booted.ctx as any).sessions.flush(a3.session);
     const s3Id = a3.session.id;
-    expect(formatSessionTitle(PEER, s3Id)).toContain('#3');
+    expect(formatSessionVersionTag(s3Id)).toBe('#3');
+    expect(formatFallbackSessionTitle(s3Id)).toBe('新会话 #3');
 
     const wsRegistry = (booted.ctx as any).workspaceRegistry;
     await wsRegistry.archiveSession(s1Id);
@@ -151,7 +155,7 @@ describe('契约测试: 会话编号空缺填补与短哈希防撞契约 (Sessio
     expect(new1Parsed?.version).toBe(1);
     expect(new1Parsed?.hash).toBeDefined();
     expect(aNew1.session.id).not.toBe(s1Id);
-    expect(formatSessionTitle(PEER, aNew1.session.id)).toContain('#1');
+    expect(formatSessionVersionTag(aNew1.session.id)).toBe('#1');
 
     sessionManager.markSessionCleared(PEER);
     const aNew2 = await sessionManager.getOrCreateAgent(PEER);
@@ -160,14 +164,14 @@ describe('契约测试: 会话编号空缺填补与短哈希防撞契约 (Sessio
     expect(new2Parsed?.version).toBe(2);
     expect(new2Parsed?.hash).toBeDefined();
     expect(aNew2.session.id).not.toBe(s2Id);
-    expect(formatSessionTitle(PEER, aNew2.session.id)).toContain('#2');
+    expect(formatSessionVersionTag(aNew2.session.id)).toBe('#2');
 
     sessionManager.markSessionCleared(PEER);
     const aNew4 = await sessionManager.getOrCreateAgent(PEER);
     await (booted.ctx as any).sessions.flush(aNew4.session);
     const new4Parsed = parseSessionId(aNew4.session.id);
     expect(new4Parsed?.version).toBe(4);
-    expect(formatSessionTitle(PEER, aNew4.session.id)).toContain('#4');
+    expect(formatSessionVersionTag(aNew4.session.id)).toBe('#4');
 
     await wsRegistry.unarchiveSession(s1Id);
     expect(wsRegistry.archivedSessionIds).not.toContain(s1Id);

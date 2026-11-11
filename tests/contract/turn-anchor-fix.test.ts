@@ -14,9 +14,10 @@ import { openidToPeer } from '../../src/utils/peer.js';
  * 契约测试: 回合锚点隔离、40054005 递增重试与 40034128 主动降级修复 (Turn Anchor Fix Contract)
  *
  * 1. 合成 is_synthetic: true 上下文绝不覆盖/擦除当前活跃入站 msg_id，且 inboundMsgIdGetter 对合成回合返回 undefined；
- * 2. 出站响应 body.id (ROBOT1.0_...) 绝不进入 inbound_reply_slots，不污染被动回复锚点；
- * 3. 遇 40054005 自动递增 msg_seq 重试并持久化新 last_seq；
- * 4. 遇 40034128 标记入站锚点 invalidated=1 并自动降级无 msg_id/msg_seq 主动发送。
+ * 2. 入站唤醒消息头精简为 `[msg_<n>] [时间] 正文`（无 `[QQ私聊]`、无长 ID、无 openid），定时任务唤醒无 `[QQ私聊]` 与 `[msg_...]`；
+ * 3. 出站响应 body.id (ROBOT1.0_...) 绝不进入 inbound_reply_slots，不污染被动回复锚点，工具返回短出站 ID (`msg_self_<n>`)；
+ * 4. 遇 40054005 自动递增 msg_seq 重试并持久化新 last_seq；
+ * 5. 遇 40034128 标记入站锚点 invalidated=1 并自动降级无 msg_id/msg_seq 主动发送。
  */
 
 const nativeFetch = globalThis.fetch;
@@ -97,6 +98,12 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
   throw new Error(`等待超时: ${label}`);
 }
 
+function extractFollowupText(msg: any): string {
+  return Array.isArray(msg?.content)
+    ? msg.content.map((c: any) => c?.text || '').join('')
+    : String(msg?.content || '');
+}
+
 describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动降级 (Turn Anchor Fix)', () => {
   let tmpHome: string;
   let booted: BootedDsh;
@@ -114,7 +121,16 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     capturedFollowups = [];
     postedBodies = [];
     outSeq = 0;
-    postResponder = () => {
+    postResponder = (body) => {
+      if (body?.msg_type === 6) {
+        return {
+          status: 200,
+          body: {
+            id: 'ROBOT1.0_NOTIFY_ANCHOR',
+            timestamp: '2026-11-11T12:30:00+08:00',
+          },
+        };
+      }
       outSeq += 1;
       return {
         status: 200,
@@ -176,9 +192,6 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: true,
-      config: {
-        input_notify_enabled: false,
-      },
     });
 
     const gateway = booted.ctx.get('kujira-gateway') as KujiraGatewayClient;
@@ -220,7 +233,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     const hub = booted.ctx.get('kujira-system-event-hub') as SystemEventHub;
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
 
-    // 1. 真实入站消息激活上下文
+    // 1. 真实入站消息激活上下文（固定下发 msg_type=6 input_notify 占用 msg_seq=1）
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_ANCHOR_REAL_1',
       content: '你好助手',
@@ -229,7 +242,17 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
       message_type: 0,
       message_scene: { ext: ['msg_idx=REFIDX_ANCHOR_REAL_1'] },
     });
-    await waitUntil(() => capturedFollowups.length === 1, 3000, 'inbound 1');
+    await waitUntil(
+      () => capturedFollowups.length === 1 && postedBodies.filter((b) => b.msg_type === 6).length === 1,
+      3000,
+      'inbound 1 and input_notify'
+    );
+
+    const inboundPrompt1 = extractFollowupText(capturedFollowups[0]);
+    expect(inboundPrompt1).toMatch(/^\[msg_1\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 你好助手$/);
+    expect(inboundPrompt1).not.toContain('[QQ私聊]');
+    expect(inboundPrompt1).not.toContain('ROBOT1.0_ANCHOR_REAL_1');
+    expect(inboundPrompt1).not.toContain(MOCK_OPENID);
 
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_REAL_1');
     expect(getGlobalToolContext().inboundMsgIdGetter?.(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_REAL_1');
@@ -250,6 +273,14 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     });
     await waitUntil(() => capturedFollowups.length === 2, 3000, 'scheduled wakeup');
 
+    const scheduledPrompt = extractFollowupText(capturedFollowups[1]);
+    expect(scheduledPrompt).toContain('系统事件：[定时任务]');
+    expect(scheduledPrompt).toContain('检查锚点隔离');
+    expect(scheduledPrompt).not.toContain('[QQ私聊]');
+    expect(scheduledPrompt).not.toContain('[msg_');
+    expect(scheduledPrompt).not.toContain('[消息ID:');
+    expect(scheduledPrompt).not.toContain('SYNTHETIC_FAKE_99');
+
     // 活跃被动锚点未被合成上下文擦除或替换为 SYNTHETIC_FAKE_99
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_REAL_1');
     expect(bridge.getActiveTurnContext(MOCK_PEER)?.msg_id).toBe('ROBOT1.0_ANCHOR_REAL_1');
@@ -257,12 +288,18 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     // 工具侧 inboundMsgIdGetter 对合成回合返回 undefined 防误归属
     expect(getGlobalToolContext().inboundMsgIdGetter?.(MOCK_PEER)).toBeUndefined();
 
-    // 合成上下文下调用 send_qq_message 仍使用真实入站锚点 ROBOT1.0_ANCHOR_REAL_1
+    // 合成上下文下调用 send_qq_message 仍使用真实入站锚点 ROBOT1.0_ANCHOR_REAL_1，工具返回短 ID
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
     const res = await sendTool.execute({ text: '定时汇报' }, { agent });
     expect(res.success).toBe(true);
-    expect(postedBodies[0].msg_id).toBe('ROBOT1.0_ANCHOR_REAL_1');
+    expect(res.message_id).toBe('msg_self_1');
+    expect((res as any).ref_idx).toBeUndefined();
+
+    const textPosts = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(textPosts).toHaveLength(1);
+    expect(textPosts[0].msg_id).toBe('ROBOT1.0_ANCHOR_REAL_1');
+    expect(textPosts[0].msg_seq).toBe(2);
 
     // 3. 下一条真实入站消息恢复非合成上下文
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
@@ -272,7 +309,14 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
       author: { user_openid: MOCK_OPENID, username: 'UserA' },
       message_type: 0,
     });
-    await waitUntil(() => capturedFollowups.length === 3, 3000, 'inbound 2');
+    await waitUntil(
+      () => capturedFollowups.length === 3 && postedBodies.filter((b) => b.msg_type === 6).length === 2,
+      3000,
+      'inbound 2 and input_notify 2'
+    );
+    const inboundPrompt2 = extractFollowupText(capturedFollowups[2]);
+    expect(inboundPrompt2).toMatch(/^\[msg_2\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 收到啦$/);
+    expect(inboundPrompt2).not.toContain('[QQ私聊]');
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_REAL_2');
     expect(getGlobalToolContext().inboundMsgIdGetter?.(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_REAL_2');
 
@@ -286,7 +330,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     }
   });
 
-  it('场景 2: 出站响应 ROBOT1.0_... 绝不进入 inbound_reply_slots 且不污染被动锚点', async () => {
+  it('场景 2: 出站响应 ROBOT1.0_... 绝不进入 inbound_reply_slots 且不污染被动锚点，工具返回短出站 ID', async () => {
     const agent = await preparePeerAgent();
     const bridge = booted.ctx.get('kujira-outbound-bridge') as OutboundStreamBridge;
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
@@ -298,20 +342,28 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
       author: { user_openid: MOCK_OPENID, username: 'UserA' },
       message_type: 0,
     });
-    await waitUntil(() => capturedFollowups.length === 1, 3000, 'inbound');
+    await waitUntil(
+      () => capturedFollowups.length === 1 && postedBodies.filter((b) => b.msg_type === 6).length === 1,
+      3000,
+      'inbound and input_notify'
+    );
 
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
 
     const r1 = await sendTool.execute({ text: '第一句回复' }, { agent });
     expect(r1.success).toBe(true);
-    expect(r1.message_id).toBe('ROBOT1.0_OUT_ANCHOR_1');
+    expect(r1.message_id).toBe('msg_self_1');
+    expect((r1 as any).ref_idx).toBeUndefined();
 
     // 等待自记录落库完成
     await waitUntil(() => {
       const db = new Database(dbPath(), { readonly: true });
       try {
-        return Boolean(db.prepare('SELECT msg_id FROM messages WHERE msg_id = ?').get('ROBOT1.0_OUT_ANCHOR_1'));
+        const row = db
+          .prepare('SELECT msg_id, short_id FROM messages WHERE msg_id = ?')
+          .get('ROBOT1.0_OUT_ANCHOR_1') as any;
+        return Boolean(row && row.short_id === 'msg_self_1');
       } finally {
         db.close();
       }
@@ -321,8 +373,11 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_IN_2');
     const r2 = await sendTool.execute({ text: '第二句回复' }, { agent });
     expect(r2.success).toBe(true);
-    expect(postedBodies[1].msg_id).toBe('ROBOT1.0_ANCHOR_IN_2');
-    expect(postedBodies[1].msg_seq).toBe(2);
+    expect(r2.message_id).toBe('msg_self_2');
+
+    const textPosts = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(textPosts[1].msg_id).toBe('ROBOT1.0_ANCHOR_IN_2');
+    expect(textPosts[1].msg_seq).toBe(3);
 
     const db = new Database(dbPath(), { readonly: true });
     try {
@@ -346,10 +401,17 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
       author: { user_openid: MOCK_OPENID, username: 'UserA' },
       message_type: 0,
     });
-    await waitUntil(() => capturedFollowups.length === 1, 3000, 'inbound');
+    await waitUntil(
+      () => capturedFollowups.length === 1 && postedBodies.filter((b) => b.msg_type === 6).length === 1,
+      3000,
+      'inbound and input_notify'
+    );
 
     let attempt = 0;
     postResponder = (body) => {
+      if (body?.msg_type === 6) {
+        return { status: 200, body: { id: 'ROBOT1.0_NOTIFY_DEDUP' } };
+      }
       attempt += 1;
       if (attempt <= 2) {
         return {
@@ -357,12 +419,13 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
           body: { code: 40054005, message: `msg_seq ${body.msg_seq} duplicated` },
         };
       }
+      outSeq += 1;
       return {
         status: 200,
         body: {
-          id: 'ROBOT1.0_OUT_DEDUP_OK',
+          id: `ROBOT1.0_OUT_DEDUP_OK_${outSeq}`,
           timestamp: '2026-11-11T12:10:05+08:00',
-          ext_info: { ref_idx: 'REFIDX_OUT_DEDUP_OK' },
+          ext_info: { ref_idx: `REFIDX_OUT_DEDUP_OK_${outSeq}` },
         },
       };
     };
@@ -372,28 +435,32 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
 
     const res = await sendTool.execute({ text: '重试成功消息' }, { agent });
     expect(res.success).toBe(true);
-    expect(res.message_id).toBe('ROBOT1.0_OUT_DEDUP_OK');
+    expect(res.message_id).toBe('msg_self_1');
 
-    expect(postedBodies).toHaveLength(3);
-    expect(postedBodies.map((b) => b.msg_id)).toEqual([
+    const textPosts = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(textPosts).toHaveLength(3);
+    expect(textPosts.map((b) => b.msg_id)).toEqual([
       'ROBOT1.0_ANCHOR_DEDUP_1',
       'ROBOT1.0_ANCHOR_DEDUP_1',
       'ROBOT1.0_ANCHOR_DEDUP_1',
     ]);
-    expect(postedBodies.map((b) => b.msg_seq)).toEqual([1, 2, 3]);
+    expect(textPosts.map((b) => b.msg_seq)).toEqual([2, 3, 4]);
 
     const db = new Database(dbPath(), { readonly: true });
     try {
       const slot = db.prepare('SELECT last_seq, invalidated FROM inbound_reply_slots WHERE msg_id = ?').get('ROBOT1.0_ANCHOR_DEDUP_1') as any;
-      expect(slot.last_seq).toBe(3);
+      expect(slot.last_seq).toBe(4);
       expect(slot.invalidated).toBe(0);
     } finally {
       db.close();
     }
 
-    // 下次发送继续从 seq=4 单调递增
-    await sendTool.execute({ text: '后续消息' }, { agent });
-    expect(postedBodies[3].msg_seq).toBe(4);
+    // 下次发送继续从 seq=5 单调递增
+    const resNext = await sendTool.execute({ text: '后续消息' }, { agent });
+    expect(resNext.success).toBe(true);
+    expect(resNext.message_id).toBe('msg_self_2');
+    const allTextPosts = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(allTextPosts[3].msg_seq).toBe(5);
   });
 
   it('场景 4: 遇 40034128 失效锚点标记 invalidated=1 并自动降级无 msg_id 主动发送', async () => {
@@ -408,9 +475,19 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
       author: { user_openid: MOCK_OPENID, username: 'UserA' },
       message_type: 0,
     });
-    await waitUntil(() => capturedFollowups.length === 1, 3000, 'inbound');
+    await waitUntil(
+      () => capturedFollowups.length === 1 && postedBodies.filter((b) => b.msg_type === 6).length === 1,
+      3000,
+      'inbound and input_notify'
+    );
 
     postResponder = (body) => {
+      if (body?.msg_type === 6) {
+        return {
+          status: 200,
+          body: { id: 'ROBOT1.0_NOTIFY_EXP' },
+        };
+      }
       if (body.msg_id === 'ROBOT1.0_ANCHOR_EXP_1') {
         return {
           status: 400,
@@ -433,14 +510,15 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
 
     const res1 = await sendTool.execute({ text: '超窗降级主动发送' }, { agent });
     expect(res1.success).toBe(true);
-    expect(res1.message_id).toBe('ROBOT1.0_OUT_PROACTIVE_1');
+    expect(res1.message_id).toBe('msg_self_1');
 
     // 首请求带旧 msg_id/msg_seq 触发 40034128，紧接自动降级无 msg_id/msg_seq 主动发送
-    expect(postedBodies).toHaveLength(2);
-    expect(postedBodies[0].msg_id).toBe('ROBOT1.0_ANCHOR_EXP_1');
-    expect(postedBodies[0].msg_seq).toBe(1);
-    expect('msg_id' in postedBodies[1]).toBe(false);
-    expect('msg_seq' in postedBodies[1]).toBe(false);
+    const textPosts1 = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(textPosts1).toHaveLength(2);
+    expect(textPosts1[0].msg_id).toBe('ROBOT1.0_ANCHOR_EXP_1');
+    expect(textPosts1[0].msg_seq).toBe(2);
+    expect('msg_id' in textPosts1[1]).toBe(false);
+    expect('msg_seq' in textPosts1[1]).toBe(false);
 
     // 锚点已被标记失效
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBeUndefined();
@@ -455,9 +533,11 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     // 后续再次发送直接使用主动模式，不再尝试已失效锚点
     const res2 = await sendTool.execute({ text: '延续主动发送' }, { agent });
     expect(res2.success).toBe(true);
-    expect(postedBodies).toHaveLength(3);
-    expect('msg_id' in postedBodies[2]).toBe(false);
-    expect('msg_seq' in postedBodies[2]).toBe(false);
+    expect(res2.message_id).toBe('msg_self_2');
+    const textPosts2 = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(textPosts2).toHaveLength(3);
+    expect('msg_id' in textPosts2[2]).toBe(false);
+    expect('msg_seq' in textPosts2[2]).toBe(false);
 
     // 当新入站消息到来时恢复被动回复能力
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
@@ -467,13 +547,19 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
       author: { user_openid: MOCK_OPENID, username: 'UserA' },
       message_type: 0,
     });
-    await waitUntil(() => capturedFollowups.length === 2, 3000, 'fresh inbound');
+    await waitUntil(
+      () => capturedFollowups.length === 2 && postedBodies.filter((b) => b.msg_type === 6).length === 2,
+      3000,
+      'fresh inbound and input_notify'
+    );
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_FRESH_1');
 
     const res3 = await sendTool.execute({ text: '恢复被动回复' }, { agent });
     expect(res3.success).toBe(true);
-    expect(postedBodies).toHaveLength(4);
-    expect(postedBodies[3].msg_id).toBe('ROBOT1.0_ANCHOR_FRESH_1');
-    expect(postedBodies[3].msg_seq).toBe(1);
+    expect(res3.message_id).toBe('msg_self_3');
+    const textPosts3 = postedBodies.filter((b) => b.msg_type !== 6);
+    expect(textPosts3).toHaveLength(4);
+    expect(textPosts3[3].msg_id).toBe('ROBOT1.0_ANCHOR_FRESH_1');
+    expect(textPosts3[3].msg_seq).toBe(2);
   });
 });

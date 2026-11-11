@@ -1,14 +1,14 @@
 /**
  * tests/contract/recall-self-content.test.ts
  *
- * 契约测试: 单聊撤回内容保留策略与官方 Bot API 撤回错误语义契约
+ * 契约测试: 单聊撤回内容保留策略与仅短出站 ID (`msg_self_*`) 撤回语义契约
  *
  * 规范:
  * 1. 机器人自身消息撤回 → recalled=1，但原文必须保留（上下文压缩后可回溯）；
  * 2. 他人消息撤回 → 内容替换为「〔已撤回〕」占位；
- * 3. recall_message 必须使用 string message_id（如 ROBOT1.0_...），绝不强转为数字；
- *    撤回成功后立即标记本地记录；
- * 4. 遇 40064004（超 2 分钟硬时限）或 40061002（入站 ID 不可撤回）返回清晰可读错误。
+ * 3. `recall_message` 仅接收出站短 ID (`msg_self_<n>`)，查库换取真实 `msg_id` (`ROBOT1.0_...`) 调 DELETE 并立即标记本地记录；
+ * 4. 传入入站短 ID (`msg_<n>`) 或非短 ID（如 `ROBOT1.0_...`、`REFIDX_...`、空串）直接在本地拒绝且不发起 DELETE；
+ *    遇 40064004（超 2 分钟硬时限）返回清晰可读错误。
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -19,6 +19,7 @@ import { MessageDatabase } from '../../src/storage/database.js';
 import { recallMessage } from '../../src/tools/index.js';
 import type { MessageRecord } from '../../src/types/index.js';
 import { openidToPeer } from '../../src/utils/peer.js';
+import { formatShortMessageId } from '../../src/utils/short-id.js';
 
 const MOCK_OPENID = 'BBBBCCCCDDDDEEEEFFFF000011112222';
 const PEER = openidToPeer(MOCK_OPENID);
@@ -63,7 +64,48 @@ function record(overrides: Partial<MessageRecord>): MessageRecord {
   };
 }
 
-describe('契约测试: 单聊撤回内容保留策略与官方撤回契约', () => {
+/**
+ * 兼容 Batch 2A 合入前后的 DB 短 ID 查询辅助：
+ * - 若 DB 实例已具备 Batch 2A 的 `getMessageByShortId`，直接使用原生方法；
+ * - 否则在真实 `MessageDatabase` 之上按同协议补充内存 `short_id -> msg_id` 索引。
+ */
+function createShortIdAwareDb(db: MessageDatabase) {
+  const hasNative = typeof (db as any).getMessageByShortId === 'function';
+  const fallbackMap = new Map<string, string>();
+  const seqCounters = new Map<string, number>();
+
+  const seedMessage = (rec: MessageRecord): string => {
+    db.saveMessageIfNotExists(rec);
+    const persisted = db.getMessage(rec.msg_id);
+    if (persisted?.short_id) {
+      return persisted.short_id;
+    }
+    if (rec.short_id) {
+      fallbackMap.set(`${rec.peer}:${rec.short_id}`, rec.msg_id);
+      return rec.short_id;
+    }
+    const dirKey = `${rec.peer}:${rec.self ? 1 : 0}`;
+    const seq = (seqCounters.get(dirKey) ?? 0) + 1;
+    seqCounters.set(dirKey, seq);
+    const shortId = formatShortMessageId(Boolean(rec.self), seq);
+    fallbackMap.set(`${rec.peer}:${shortId}`, rec.msg_id);
+    return shortId;
+  };
+
+  const dbForTool: MessageDatabase = hasNative
+    ? db
+    : (Object.assign(Object.create(Object.getPrototypeOf(db)), db, {
+        getMessageByShortId(peer: string, shortId: string): MessageRecord | null {
+          const rawId = fallbackMap.get(`${peer}:${shortId}`);
+          if (!rawId) return null;
+          return db.getMessage(rawId);
+        },
+      }) as MessageDatabase);
+
+  return { dbForTool, seedMessage };
+}
+
+describe('契约测试: 单聊撤回内容保留策略与仅短 ID 撤回契约', () => {
   let tmpDir: string;
   let db: MessageDatabase;
 
@@ -99,16 +141,18 @@ describe('契约测试: 单聊撤回内容保留策略与官方撤回契约', ()
     db.saveMessage(record({ msg_id: 'ROBOT1.0_SELF_201', self: 1, content: '需要保留的原文' }));
     db.markRecalled('ROBOT1.0_SELF_201');
 
+    const stored = db.getMessage('ROBOT1.0_SELF_201')!;
     const history = db.readHistory(PEER, { self_only: true });
     expect(history.messages).toHaveLength(1);
-    expect(history.messages[0]!.msg_id).toBe('ROBOT1.0_SELF_201');
+    expect(history.messages[0]!.msg_id).toBe(stored.short_id || stored.msg_id);
     expect(history.messages[0]!.content).toBe('需要保留的原文');
     expect(history.messages[0]!.recalled).toBe(true);
   });
 
-  it('契约 3: recall_message 透传 string message_id 并立即标记本地记录（不转数字）', async () => {
+  it('契约 3: recall_message 凭出站短 ID (msg_self_*) 解析真实 msg_id 调 DELETE 并立即标库', async () => {
     const outId = 'ROBOT1.0_OUTBOUND_ABC_301';
-    db.saveMessage(record({ msg_id: outId, self: 1, content: '工具撤回的原文' }));
+    const { dbForTool, seedMessage } = createShortIdAwareDb(db);
+    const outShortId = seedMessage(record({ msg_id: outId, self: 1, content: '工具撤回的原文' }));
 
     const deleteSpy = vi.fn(async () => ({
       ok: true,
@@ -120,8 +164,8 @@ describe('契约测试: 单聊撤回内容保留策略与官方撤回契约', ()
     };
 
     const res = await recallMessage(
-      { message_id: outId },
-      { gateway, db, peer: PEER }
+      { message_id: outShortId },
+      { gateway, db: dbForTool, peer: PEER }
     );
 
     expect(res.success).toBe(true);
@@ -133,7 +177,15 @@ describe('契约测试: 单聊撤回内容保留策略与官方撤回契约', ()
     expect(msg.content).toBe('工具撤回的原文');
   });
 
-  it('契约 4: 40064004 超 2 分钟与 40061002 入站 ID 错误码返回清晰说明，非法非字符串参数拒绝', async () => {
+  it('契约 4: 40064004 超 2 分钟、入站短 ID (msg_*) 与非短 ID 本地拦截不打 DELETE', async () => {
+    const { dbForTool, seedMessage } = createShortIdAwareDb(db);
+    const oldOutShortId = seedMessage(
+      record({ msg_id: 'ROBOT1.0_OUT_OLD', self: 1, content: '超时消息' })
+    );
+    const inboundShortId = seedMessage(
+      record({ msg_id: 'ROBOT1.0_INBOUND_MSG', self: 0, content: '用户入站消息' })
+    );
+
     // 1. 40064004: 超过 2 分钟硬时限
     const gwExpired: any = {
       deleteC2CMessage: async () => ({
@@ -145,39 +197,54 @@ describe('契约测试: 单聊撤回内容保留策略与官方撤回契约', ()
       }),
     };
     const resExpired = await recallMessage(
-      { message_id: 'ROBOT1.0_OUT_OLD' },
-      { gateway: gwExpired, db, peer: PEER }
+      { message_id: oldOutShortId },
+      { gateway: gwExpired, db: dbForTool, peer: PEER }
     );
     expect(resExpired.success).toBe(false);
     expect(resExpired.error).toContain('40064004');
     expect(resExpired.error).toContain('2 分钟');
     assertNoUndefinedFields(resExpired);
 
-    // 2. 40061002: 试图撤回入站 ID
-    const gwInbound: any = {
-      deleteC2CMessage: async () => ({
-        ok: false,
-        status: 400,
-        code: 40061002,
-        message: '请求参数msgid无效',
-        body: { code: 40061002, message: '请求参数msgid无效' },
-      }),
-    };
+    // 2. 入站短 ID msg_* 本地直接拒绝，不发起 DELETE 请求
+    const deleteSpy = vi.fn(async () => ({ ok: true, status: 200, body: {} }));
+    const gwSpy: any = { deleteC2CMessage: deleteSpy };
+
     const resInbound = await recallMessage(
-      { message_id: 'ROBOT1.0_INBOUND_MSG' },
-      { gateway: gwInbound, db, peer: PEER }
+      { message_id: inboundShortId },
+      { gateway: gwSpy, db: dbForTool, peer: PEER }
     );
     expect(resInbound.success).toBe(false);
-    expect(resInbound.error).toContain('40061002');
-    expect(resInbound.error).toContain('出站消息 ID');
+    expect(resInbound.error).toContain('INBOUND_NOT_RECALLABLE');
+    expect(resInbound.error).toContain('msg_self_*');
+    expect(deleteSpy).not.toHaveBeenCalled();
     assertNoUndefinedFields(resInbound);
 
-    // 3. 空/非字符串 message_id 拒绝
+    // 3. 非短 ID（原始 ROBOT1.0_* / REFIDX_* / 空串）本地直接拒绝，不发起 DELETE 请求
+    const resRaw = await recallMessage(
+      { message_id: 'ROBOT1.0_INBOUND_MSG' },
+      { gateway: gwSpy, db: dbForTool, peer: PEER }
+    );
+    expect(resRaw.success).toBe(false);
+    expect(resRaw.error).toContain('INVALID_SHORT_ID');
+    expect(deleteSpy).not.toHaveBeenCalled();
+    assertNoUndefinedFields(resRaw);
+
     const resEmpty = await recallMessage(
       { message_id: '   ' },
-      { gateway: gwInbound, db, peer: PEER }
+      { gateway: gwSpy, db: dbForTool, peer: PEER }
     );
     expect(resEmpty.success).toBe(false);
+    expect(deleteSpy).not.toHaveBeenCalled();
     assertNoUndefinedFields(resEmpty);
+
+    // 4. 库中未命中的出站短 ID 本地拒绝，不发起 DELETE 请求
+    const resMissing = await recallMessage(
+      { message_id: 'msg_self_999' },
+      { gateway: gwSpy, db: dbForTool, peer: PEER }
+    );
+    expect(resMissing.success).toBe(false);
+    expect(resMissing.error).toContain('NOT_FOUND');
+    expect(deleteSpy).not.toHaveBeenCalled();
+    assertNoUndefinedFields(resMissing);
   });
 });

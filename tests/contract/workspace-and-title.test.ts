@@ -3,20 +3,25 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { Context } from '@deepseek-ai/cordis';
-import { SessionManager, formatSessionTitle } from '../../src/gateway/session.js';
-import { openidToPeer, openidToSessionBaseId, extractPeerHash } from '../../src/utils/peer.js';
+import {
+  SessionManager,
+  formatFallbackSessionTitle,
+  formatSessionVersionTag,
+} from '../../src/gateway/session.js';
+import { handleSessionCommand } from '../../src/commands/session/session-handler.js';
+import { handleStatusCommand } from '../../src/commands/system/status-handler.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 import type { WakeupPayload } from '../../src/types/index.js';
 
 const OPENID = '10000000000000000000000000000001';
 const PEER = openidToPeer(OPENID);
-const HASH = extractPeerHash(PEER)!;
 const SID = openidToSessionBaseId(OPENID);
 
 const OPENID_B = '10000000000000000000000000000019';
 const PEER_B = openidToPeer(OPENID_B);
 const SID_B = openidToSessionBaseId(OPENID_B);
 
-describe('Kujira 顶层工作区与单聊会话标题契约测试', () => {
+describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
   let tmpHome: string;
   let ctx: Context;
   let sessionManager: SessionManager;
@@ -24,10 +29,12 @@ describe('Kujira 顶层工作区与单聊会话标题契约测试', () => {
   let mockWorkspaceRegistry: any;
   let mockSessionTitle: any;
   let mockAgents: any;
+  let titleStore: Map<string, string>;
 
   beforeEach(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-ws-title-'));
     ctx = new Context();
+    titleStore = new Map();
     mockWorkspace = {
       path: path.resolve(tmpHome, 'workspace/kujira'),
       title: 'Kujira',
@@ -39,7 +46,10 @@ describe('Kujira 顶层工作区与单聊会话标题契约测试', () => {
     };
     mockSessionTitle = {
       rename: vi.fn(),
-      get: vi.fn(),
+      get: vi.fn((session: any) => {
+        const title = session?.id ? titleStore.get(session.id) : undefined;
+        return title ? { title } : undefined;
+      }),
     };
     mockAgents = {
       create: vi.fn().mockImplementation(async (opts: any) => {
@@ -67,35 +77,30 @@ describe('Kujira 顶层工作区与单聊会话标题契约测试', () => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  describe('1. 单聊会话标题格式化 (formatSessionTitle)', () => {
-    it('私聊带用户昵称 - 初始版本 #1', () => {
-      const title = formatSessionTitle(PEER, SID, 'TestUser');
-      expect(title).toBe(`私聊: TestUser ${HASH} #1`);
+  describe('1. 会话轮次标签与默认回退标题 (formatSessionVersionTag / formatFallbackSessionTitle)', () => {
+    it('初始版本 - #1 / 新会话 #1', () => {
+      expect(formatSessionVersionTag(SID)).toBe('#1');
+      expect(formatFallbackSessionTitle(SID)).toBe('新会话 #1');
     });
 
-    it('私聊无用户昵称 - 初始版本 #1', () => {
-      const title = formatSessionTitle(PEER, SID);
-      expect(title).toBe(`私聊: ${HASH} #1`);
+    it('带版本号 - /新建 后新会话 #3 / 新会话 #3', () => {
+      expect(formatSessionVersionTag(`${SID}-3`)).toBe('#3');
+      expect(formatFallbackSessionTitle(`${SID}-3`)).toBe('新会话 #3');
     });
 
-    it('私聊带版本号 - /clear 后新会话 #3', () => {
-      const title = formatSessionTitle(PEER, `${SID}-3`, 'TestUser');
-      expect(title).toBe(`私聊: TestUser ${HASH} #3`);
+    it('多轮归档后 - 新轮次 1 初始版本 #1 (1) / 新会话 #1 (1)', () => {
+      expect(formatSessionVersionTag(`${SID}-r1-1`)).toBe('#1 (1)');
+      expect(formatFallbackSessionTitle(`${SID}-r1-1`)).toBe('新会话 #1 (1)');
     });
 
-    it('多轮归档后 - 新轮次 1 初始版本 #1 (1)', () => {
-      const title = formatSessionTitle(PEER, `${SID}-r1-1`, 'TestUser');
-      expect(title).toBe(`私聊: TestUser ${HASH} #1 (1)`);
+    it('多轮归档后 - 新轮次 1 清空后版本 #2 (1) / 新会话 #2 (1)', () => {
+      expect(formatSessionVersionTag(`${SID}-r1-2`)).toBe('#2 (1)');
+      expect(formatFallbackSessionTitle(`${SID}-r1-2`)).toBe('新会话 #2 (1)');
     });
 
-    it('多轮归档后 - 新轮次 1 清空后版本 #2 (1)', () => {
-      const title = formatSessionTitle(PEER, `${SID}-r1-2`, 'TestUser');
-      expect(title).toBe(`私聊: TestUser ${HASH} #2 (1)`);
-    });
-
-    it('多轮归档后 - 新轮次 2 初始版本 #1 (2)', () => {
-      const title = formatSessionTitle(PEER, `${SID}-r2-1`, 'TestUser');
-      expect(title).toBe(`私聊: TestUser ${HASH} #1 (2)`);
+    it('多轮归档后 - 新轮次 2 初始版本 #1 (2) / 新会话 #1 (2)', () => {
+      expect(formatSessionVersionTag(`${SID}-r2-1`)).toBe('#1 (2)');
+      expect(formatFallbackSessionTitle(`${SID}-r2-1`)).toBe('新会话 #1 (2)');
     });
   });
 
@@ -116,38 +121,68 @@ describe('Kujira 顶层工作区与单聊会话标题契约测试', () => {
     });
   });
 
-  describe('3. 会话创建时标题锁定与免 LLM 自动总结覆盖', () => {
-    it('创建单聊 Agent 时正确设置并锁定私聊标题与 Kujira 工作区', async () => {
-      sessionManager.setPeerName(PEER, '小明');
+  describe('3. 会话创建与唤醒放行原生 AI 总结，/会话 与 /状态 正确展示 AI 标题', () => {
+    it('创建单聊 Agent 与 dispatchWakeup 均不再调用 sessionTitle.rename 锁定标题', async () => {
       await sessionManager.getOrCreateAgent(PEER);
 
-      expect(mockSessionTitle.rename).toHaveBeenCalledWith(
-        expect.anything(),
-        `私聊: 小明 ${HASH} #1`
-      );
+      expect(mockSessionTitle.rename).not.toHaveBeenCalled();
       expect(mockWorkspaceRegistry.create).toHaveBeenCalledWith(
         path.resolve(tmpHome, 'workspace/kujira'),
         'Kujira'
       );
       expect(mockWorkspace.attachSession).toHaveBeenCalledWith(SID);
-    });
 
-    it('dispatchWakeup 收到带有昵称的真实单聊消息 (direct) 时动态更新会话标题', async () => {
       const payload: WakeupPayload = {
         peer: PEER,
         trigger: 'direct',
         from_user: OPENID,
         from_name: '张三丰',
-        content: '你好呀',
+        content: '你好呀，帮我设计单聊架构',
         timestamp: Date.now(),
       };
 
       await sessionManager.dispatchWakeup(payload);
+      expect(mockSessionTitle.rename).not.toHaveBeenCalled();
+      expect(sessionManager.getSessionTitle(SID)).toBeUndefined();
 
-      expect(mockSessionTitle.rename).toHaveBeenCalledWith(
-        expect.anything(),
-        `私聊: 张三丰 ${HASH} #1`
-      );
+      // 模拟 DSH 原生 AI 总结产出标题
+      titleStore.set(SID, 'QQ 单聊架构设计');
+      expect(sessionManager.getSessionTitle(SID)).toBe('QQ 单聊架构设计');
+      expect(sessionManager.getSessionDisplayName(SID)).toBe('QQ 单聊架构设计');
+    });
+
+    it('/状态 与 /会话 分别展示 AI 标题、轮次标签并在无标题时回退「新会话」', async () => {
+      await sessionManager.getOrCreateAgent(PEER);
+      titleStore.set(SID, '排查 WebSocket 重连');
+
+      const statusRes = await handleStatusCommand('', {
+        userId: PEER,
+        session: { id: SID } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(statusRes.success).toBe(true);
+      expect(statusRes.reply).toContain('当前会话：排查 WebSocket 重连 (#1)');
+      expect(statusRes.reply).toContain(`会话标识：${SID} (版本: 1)`);
+
+      const listRes = await handleSessionCommand('', {
+        userId: PEER,
+        session: { id: SID } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(listRes.success).toBe(true);
+      expect(listRes.reply).toContain('排查 WebSocket 重连 (#1)');
+      expect(listRes.reply).not.toContain('私聊:');
+
+      titleStore.delete(SID);
+      const fallbackStatus = await handleStatusCommand('', {
+        userId: PEER,
+        session: { id: SID } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(fallbackStatus.reply).toContain('当前会话：新会话 (#1)');
     });
   });
 

@@ -3,7 +3,12 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { promises as fsp } from 'node:fs';
 import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
-import { SessionManager, formatSessionTitle, parseSessionId } from '../../src/gateway/session.js';
+import {
+  SessionManager,
+  formatFallbackSessionTitle,
+  formatSessionVersionTag,
+  parseSessionId,
+} from '../../src/gateway/session.js';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { openidToPeer } from '../../src/utils/peer.js';
 import type { WakeupPayload } from '../../src/types/index.js';
@@ -52,7 +57,8 @@ describe('契约测试：QQ /新建 命令版本自增与未落盘新会话消�
     const s1Id = a1.session.id;
     const parsed1 = parseSessionId(s1Id);
     expect(parsed1?.version).toBe(1);
-    expect(formatSessionTitle(PEER, s1Id)).toContain('#1');
+    expect(formatSessionVersionTag(s1Id)).toBe('#1');
+    expect(formatFallbackSessionTitle(s1Id)).toBe('新会话 #1');
 
     const clearedPeer = sessionManager.markSessionCleared(s1Id);
     expect(clearedPeer).toBe(PEER);
@@ -62,7 +68,8 @@ describe('契约测试：QQ /新建 命令版本自增与未落盘新会话消�
     const parsed2 = parseSessionId(s2Id);
     expect(parsed2?.version).toBe(2);
     expect(s2Id).not.toBe(s1Id);
-    expect(formatSessionTitle(PEER, s2Id)).toContain('#2');
+    expect(formatSessionVersionTag(s2Id)).toBe('#2');
+    expect(formatFallbackSessionTitle(s2Id)).toBe('新会话 #2');
 
     await sessionManager.dispose();
   });
@@ -96,7 +103,7 @@ describe('契约测试：QQ /新建 命令版本自增与未落盘新会话消�
     await sessionManager.dispose();
   });
 
-  it('契约 3: dispatchWakeup 端到端唤醒流下，/新建 后的消息必须锁定新会话 ID 与标题 #2，严禁回退旧会话 #1', async () => {
+  it('契约 3: dispatchWakeup 端到端唤醒流下，/新建 后的消息必须锁定新会话 ID #2 且绝不调用 sessionTitle.rename，严禁回退旧会话 #1', async () => {
     const dbPath = path.resolve(tmpHome, 'kujira/messages.sqlite');
     db = new MessageDatabase(dbPath);
     db.init();
@@ -151,10 +158,11 @@ describe('契约测试：QQ /新建 命令版本自增与未落盘新会话消�
     const parsed2 = parseSessionId(s2Id);
     expect(parsed2?.version).toBe(2);
     expect(s2Id).not.toBe(s1Id);
+    expect(formatSessionVersionTag(s2Id)).toBe('#2');
+    expect(formatFallbackSessionTitle(s2Id)).toBe('新会话 #2');
 
-    const lastRenameTitle = renameCalls[renameCalls.length - 1];
-    expect(lastRenameTitle).toContain('#2');
-    expect(lastRenameTitle).not.toContain('#1');
+    // 不再通过 sessionTitle.rename 锁定 "私聊: ..." 标题，完全放行原生 AI 总结
+    expect(renameCalls).toHaveLength(0);
 
     const p3: WakeupPayload = {
       peer: PEER,

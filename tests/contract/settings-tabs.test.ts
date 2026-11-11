@@ -108,7 +108,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(html).toMatch(/id="kujira-tabpanel-slang"[^>]*hidden/);
     });
 
-    it('Tab 1 包含 2 个只写凭据框（不回显明文）与 4 个对话/媒体配置项', () => {
+    it('Tab 1 包含 2 个只写凭据框（不回显明文）与 2 个对话/媒体配置项，不再暴露已固化的 markdown_enabled / input_notify_enabled 开关', () => {
       const credStatus: CredentialStatusSummary = {
         appId: { configured: true, source: 'file', writable: true },
         appSecret: { configured: false, writable: true },
@@ -135,24 +135,20 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).toMatch(/id="kujira-cred-app-secret"[^>]*value=""/);
       expect(connectionHtml).toContain('未配置');
 
-      // 3. markdown_enabled
-      expect(connectionHtml).toContain('id="kujira-markdown-enabled"');
-      expect(connectionHtml).toContain('markdown_enabled');
-
-      // 4. input_notify_enabled
-      expect(connectionHtml).toContain('id="kujira-input-notify-enabled"');
-      expect(connectionHtml).toContain('input_notify_enabled');
-
-      // 5. new_message_behavior
+      // 3. new_message_behavior
       expect(connectionHtml).toContain('id="kujira-new-message-behavior"');
       expect(connectionHtml).toContain('value="steer"');
       expect(connectionHtml).toContain('value="queue"');
 
-      // 6. image_ttl_days
+      // 4. image_ttl_days
       expect(connectionHtml).toContain('id="kujira-image-ttl"');
       expect(connectionHtml).toContain('image_ttl_days');
 
-      // 7. 已移除的旧字段不存在
+      // 5. 已固化为默认开启而移除的开关与历史字段不存在
+      expect(connectionHtml).not.toContain('kujira-markdown-enabled');
+      expect(connectionHtml).not.toContain('markdown_enabled');
+      expect(connectionHtml).not.toContain('kujira-input-notify-enabled');
+      expect(connectionHtml).not.toContain('input_notify_enabled');
       expect(connectionHtml).not.toContain('ws_port');
       expect(connectionHtml).not.toContain('ws_token');
       expect(connectionHtml).not.toContain('bot_qq');
@@ -221,7 +217,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
 
       renderCard({
         initialConfig: {
-          markdown_enabled: true,
+          new_message_behavior: 'steer',
           image_ttl_days: 7,
         },
         credentialsStatus: {
@@ -258,7 +254,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
     it('在 Tab 1 与 Tab 2/Tab 3 跨 Tab 修改时草稿保留且未保存标识持续生效', () => {
       renderCard({
         initialConfig: {
-          markdown_enabled: true,
+          new_message_behavior: 'steer',
           image_ttl_days: 7,
           persona: '默认人格',
         },
@@ -266,13 +262,13 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
 
       expect(controller.isDirty).toBe(false);
 
-      controller.handleFieldChange('markdown_enabled', false);
+      controller.handleFieldChange('new_message_behavior', 'queue');
       expect(controller.isDirty).toBe(true);
-      expect(controller.model.getDraft().markdown_enabled).toBe(false);
+      expect(controller.model.getDraft().new_message_behavior).toBe('queue');
 
       controller.setActiveTab('persona');
       expect(controller.isDirty).toBe(true);
-      expect(controller.model.getDraft().markdown_enabled).toBe(false);
+      expect(controller.model.getDraft().new_message_behavior).toBe('queue');
 
       controller.handleFieldChange('persona', '单聊助手');
       expect(controller.model.getDraft().persona).toBe('单聊助手');
@@ -282,7 +278,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
 
       controller.setActiveTab('connection');
       const finalDraft = controller.model.getDraft();
-      expect(finalDraft.markdown_enabled).toBe(false);
+      expect(finalDraft.new_message_behavior).toBe('queue');
       expect(finalDraft.persona).toBe('单聊助手');
       expect(finalDraft.user_profile_budget_chars).toBe(3000);
       expect(controller.isDirty).toBe(true);
@@ -294,15 +290,14 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       renderCard({
         revision: 5,
         initialConfig: {
-          markdown_enabled: true,
-          input_notify_enabled: true,
+          image_ttl_days: 7,
           new_message_behavior: 'steer',
           persona: '旧人设',
           user_profile_budget_chars: 2200,
         },
       });
 
-      controller.handleFieldChange('markdown_enabled', false);
+      controller.handleFieldChange('image_ttl_days', 14);
       controller.handleFieldChange('new_message_behavior', 'queue');
       controller.handleFieldChange('persona', '新人设');
       controller.handleFieldChange('user_profile_budget_chars', 2300);
@@ -315,7 +310,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(mockSaveSettings).toHaveBeenCalledTimes(1);
       const [savedDraft, options] = mockSaveSettings.mock.calls[0];
       expect(options).toEqual({ expectedRevision: 5 });
-      expect(savedDraft.markdown_enabled).toBe(false);
+      expect(savedDraft.image_ttl_days).toBe(14);
       expect(savedDraft.new_message_behavior).toBe('queue');
       expect(savedDraft.persona).toBe('新人设');
       expect(savedDraft.user_profile_budget_chars).toBe(2300);
@@ -348,13 +343,13 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
     it('点击「放弃修改」时，跨 Tab 修改与只写凭据草稿全部撤回', () => {
       renderCard({
         initialConfig: {
-          markdown_enabled: true,
+          new_message_behavior: 'steer',
           image_ttl_days: 7,
           persona: '原始人格',
         },
       });
 
-      controller.handleFieldChange('markdown_enabled', false);
+      controller.handleFieldChange('new_message_behavior', 'queue');
       controller.handleFieldChange('image_ttl_days', 30);
       controller.handleFieldChange('persona', '修改后的人格');
       controller.handleAppIdChange('1000000099');
@@ -365,7 +360,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       controller.handleDiscard();
 
       const draft = controller.model.getDraft();
-      expect(draft.markdown_enabled).toBe(true);
+      expect(draft.new_message_behavior).toBe('steer');
       expect(draft.image_ttl_days).toBe(7);
       expect(draft.persona).toBe('原始人格');
       expect(controller.appIdInput).toBe('');
@@ -377,21 +372,21 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       renderCard({
         baseDefaults: DEFAULT_BASE_CONFIG,
         initialConfig: {
-          markdown_enabled: DEFAULT_BASE_CONFIG.markdown_enabled,
+          new_message_behavior: DEFAULT_BASE_CONFIG.new_message_behavior,
           image_ttl_days: DEFAULT_BASE_CONFIG.image_ttl_days,
         },
       });
 
-      controller.handleFieldChange('markdown_enabled', false);
+      controller.handleFieldChange('new_message_behavior', 'queue');
       controller.handleFieldChange('image_ttl_days', 30);
 
-      expect(controller.model.isOverridden('markdown_enabled')).toBe(true);
+      expect(controller.model.isOverridden('new_message_behavior')).toBe(true);
       expect(controller.model.isOverridden('image_ttl_days')).toBe(true);
 
-      controller.handleResetField('markdown_enabled');
+      controller.handleResetField('new_message_behavior');
 
-      expect(controller.model.getDraft().markdown_enabled).toBe(DEFAULT_BASE_CONFIG.markdown_enabled);
-      expect(controller.model.isOverridden('markdown_enabled')).toBe(false);
+      expect(controller.model.getDraft().new_message_behavior).toBe(DEFAULT_BASE_CONFIG.new_message_behavior);
+      expect(controller.model.isOverridden('new_message_behavior')).toBe(false);
 
       expect(controller.model.getDraft().image_ttl_days).toBe(30);
       expect(controller.model.isOverridden('image_ttl_days')).toBe(true);

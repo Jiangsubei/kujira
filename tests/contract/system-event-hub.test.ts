@@ -18,7 +18,7 @@ import type { WakeupPayload } from '../../src/types/index.js';
 const PEER_USER = 'user_a1b2c3d4e5f60708';
 
 describe('契约测试: 单聊系统事件与统一唤醒中枢 (SystemEventHub)', () => {
-  it('契约 1: 定时任务提示词采用单聊骨架（含任务编号、规则、内容与置底引导，不含群聊文案）', () => {
+  it('契约 1: 定时任务提示词采用单聊骨架（含任务编号、规则、内容与置底引导，不含 [QQ私聊] 与群聊文案）', () => {
     const event: ScheduledTaskEvent = {
       kind: 'scheduled_task',
       peer: PEER_USER,
@@ -31,12 +31,24 @@ describe('契约测试: 单聊系统事件与统一唤醒中枢 (SystemEventHub)
 
     const prompt = formatSystemEventPrompt(event);
 
-    expect(prompt).toContain('系统事件：[定时任务] [任务编号: #task_999] [QQ私聊]');
+    expect(prompt).toMatch(/^系统事件：\[定时任务\] \[任务编号: #task_999\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/);
+    expect(prompt).not.toContain('[QQ私聊]');
     expect(prompt).toContain('任务规则：每天 18:00 执行');
     expect(prompt).toContain('\n\n任务内容：\n提醒用户下班并通报天气\n\n');
     expect(prompt).toContain('QQ 单聊中设定的定时任务触发');
     expect(prompt).toContain('切勿向用户透露内部 task_id 或系统事件代码等调试信息');
     expect(prompt).not.toContain('群聊');
+
+    const promptNoId = formatSystemEventPrompt({
+      kind: 'scheduled_task',
+      peer: PEER_USER,
+      taskId: '',
+      taskType: 'once',
+      prompt: '喝水提醒',
+      timestamp: 1794000000000,
+    });
+    expect(promptNoId).toMatch(/^系统事件：\[定时任务\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/);
+    expect(promptNoId).not.toContain('[QQ私聊]');
   });
 
   it('契约 2: Zero-Leak 与 Null-Initiator 铁律（from_name 与 from_user 严格为空，is_system=true）', async () => {

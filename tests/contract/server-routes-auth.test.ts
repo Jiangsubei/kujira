@@ -171,7 +171,7 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
     const queueReconcileMock = vi.fn();
     registerConfigRoute(
       mockCtx,
-      () => ({ markdown_enabled: true } as BridgePluginConfig),
+      () => ({ new_message_behavior: 'steer' } as BridgePluginConfig),
       queueReconcileMock,
       { dshHome: tmpHome, cwd: tmpHome, env: {} }
     );
@@ -183,7 +183,7 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
     expect(resGetResult.status).toBe(200);
     expect(resGetResult.body.ok).toBe(true);
 
-    const reqPost = createMockReq('POST', { markdown_enabled: false });
+    const reqPost = createMockReq('POST', { new_message_behavior: 'queue' });
     const { res: resPost, getResult: getResultPost } = createMockRes();
     await handler(reqPost, resPost);
     const resPostResult = await getResultPost();
@@ -238,7 +238,7 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
       },
     });
 
-    registerConfigRoute(mockCtx, () => ({ markdown_enabled: true } as BridgePluginConfig), async () => {}, {
+    registerConfigRoute(mockCtx, () => ({ new_message_behavior: 'steer' } as BridgePluginConfig), async () => {}, {
       dshHome: tmpHome,
       cwd: tmpHome,
       env: {},
@@ -255,19 +255,21 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
     expect(mockConnection.requestRejection).toHaveBeenCalled();
   });
 
-  describe('17 项 Schema 与可选凭据保存放行契约', () => {
-    it('Schema 兼容性: 空配置安全应用全部 17 项单聊默认值，绝不抛出解析异常或包含 ws_token/admins', () => {
+  describe('15 项 Schema 与可选凭据保存放行契约', () => {
+    it('Schema 兼容性: 空配置安全应用全部 15 项单聊默认值，绝不抛出解析异常且已剔除 markdown_enabled/input_notify_enabled/ws_token/admins', () => {
       const parsed = BridgeConfigSchema({});
       const dict = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
       const unwrap = (val: any) => (typeof val?.get === 'function' ? val.get() : val);
-      expect(Object.keys(dict)).toHaveLength(17);
+      expect(Object.keys(dict)).toHaveLength(15);
+      expect(dict.markdown_enabled).toBeUndefined();
+      expect(dict.input_notify_enabled).toBeUndefined();
       expect(dict.ws_token).toBeUndefined();
       expect(dict.admins).toBeUndefined();
-      expect(unwrap(parsed.markdown_enabled)).toBe(true);
-      expect(unwrap(parsed.input_notify_enabled)).toBe(true);
+      expect(unwrap(parsed.new_message_behavior)).toBe('steer');
+      expect(unwrap(parsed.image_ttl_days)).toBe(7);
     });
 
-    it('POST /plugins/kujira/config: 未配置凭据时仅修改普通配置项也正常放行并保存 (200 OK)', async () => {
+    it('POST /plugins/kujira/config: 未配置凭据时仅修改普通配置项也正常放行并保存 (200 OK)，同时自愈剥离遗留开关', async () => {
       let handler: any;
       const mutateMock = vi.fn().mockResolvedValue({ ok: true });
       const mockCtx: any = {
@@ -286,7 +288,12 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
         env: {},
       });
 
-      const req = createMockReq('POST', { persona: '温和助手', markdown_enabled: true });
+      const req = createMockReq('POST', {
+        persona: '温和助手',
+        image_ttl_days: 10,
+        markdown_enabled: false,
+        input_notify_enabled: true,
+      });
       const { res, getResult } = createMockRes();
 
       await handler(req, res);
@@ -295,7 +302,14 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
       expect(result.status).toBe(200);
       expect(result.body.ok).toBe(true);
       expect(result.body.credentials.ready).toBe(false);
-      expect(mutateMock).toHaveBeenCalled();
+      expect(result.body.config).toEqual({
+        persona: '温和助手',
+        image_ttl_days: 10,
+      });
+      expect(result.body.healedKeys).toEqual(['markdown_enabled', 'input_notify_enabled']);
+      expect(mutateMock).toHaveBeenCalledTimes(1);
+      const [, ops] = mutateMock.mock.calls[0];
+      expect(ops.map((op: any) => op.path[0])).toEqual(['persona', 'image_ttl_days']);
     });
   });
 

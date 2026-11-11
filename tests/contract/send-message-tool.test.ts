@@ -1,11 +1,11 @@
 /**
- * 契约测试: send_qq_message 工具装配、协议下发、UTF-8 分片与参数校验契约
+ * 契约测试: send_qq_message 工具装配、6000 字符硬拦截、固定原生 Markdown、短 ID 化与参数校验契约
  *
  * 覆盖规范清单:
  * 契约 1: 真实 DSH 服务装配下（bootDshKujira + mountPlugin: false + kujira-tools 插件与 OutboundStreamBridge）：
  *         QQ 单聊会话包含 send_qq_message；非单聊会话（WebUI / Review）安全排除；
  * 契约 2: splitMessageText 基于 UTF-8 字节安全切分算法契约（绝不从多字节码点中间切断、绝不丢字）；
- * 契约 3: send_qq_message 参数校验、Markdown 分流、reply_to 引用换取与 Lossless JSON 输出契约。
+ * 契约 3: send_qq_message 6000 字符硬拦截、固定原生 Markdown、短 ID reply_to 校验与反查、短出站 ID 返回及 Lossless JSON 输出契约。
  */
 
 import * as os from 'node:os';
@@ -16,9 +16,11 @@ import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { MediaStorageManager } from '../../src/storage/media.js';
 import { OutboundStreamBridge } from '../../src/outbound/stream.js';
+import { recordOutboundSelfMessage } from '../../src/outbound/self-record.js';
 import {
   splitMessageText,
   sendQqMessage,
+  createSendQqMessageTool,
   registerAgentTools,
   resetGlobalToolContext,
 } from '../../src/tools/index.js';
@@ -26,7 +28,7 @@ import KujiraToolsPlugin, {
   setGlobalBridgeToolsProvider,
 } from '../../src/tools/plugin.js';
 import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
-import { QQ_MSG_TYPE_MARKDOWN, QQ_MSG_TYPE_TEXT } from '../../src/constants/index.js';
+import { QQ_MSG_TYPE_MARKDOWN, QQ_SEND_MESSAGE_MAX_CHARS } from '../../src/constants/index.js';
 
 const TEST_OPENID = '0123456789ABCDEF0123456789ABCDEF';
 const TEST_PEER = openidToPeer(TEST_OPENID);
@@ -88,7 +90,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     outboundBridge = new OutboundStreamBridge(booted.ctx, {
       gateway: mockGateway,
       db,
-      getConfig: () => ({ markdown_enabled: true }),
+      getConfig: () => ({}),
     });
 
     const provider = {
@@ -99,7 +101,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
           gateway: mockGateway,
           mediaManager,
           dshHome: tmpHome,
-          config: () => ({ markdown_enabled: true }),
+          config: () => ({}),
         });
       },
     };
@@ -199,17 +201,35 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     assertNoUndefinedFields(resGroupRejected);
   });
 
-  it('1.4 send_qq_message 通过 OutboundStreamBridge 支持 Markdown 分流、reply_to 换取 ref_idx 并返回 string ID', async () => {
+  it('1.4 send_qq_message 通过 OutboundStreamBridge 固定走原生 Markdown、支持短 ID reply_to、6000 字符硬拦截与短出站 ID 返回', async () => {
     const sentPayloads: any[] = [];
+    let outSeq = 0;
     const mockGateway: any = {
-      sendC2CMessage: vi.fn(async (_openid: string, payload: any) => {
+      sendC2CMessage: vi.fn(async (openid: string, payload: any, meta?: any) => {
         sentPayloads.push(payload);
+        outSeq += 1;
+        const rawId = `ROBOT1.0_OUT_MSG_${outSeq}`;
+        const refIdx = `REFIDX_OUT_${outSeq}`;
+        recordOutboundSelfMessage(
+          {
+            peer: meta?.peer ?? TEST_PEER,
+            openid,
+            msgId: rawId,
+            refIdx,
+            replyTo: meta?.replyTo ?? null,
+            msgType: 2,
+            text: meta?.text ?? payload?.markdown?.content ?? 'outbound',
+            payload,
+            time: Date.now(),
+          },
+          { db, botId: '1000000000', senderName: 'Kujira' }
+        );
         return {
           ok: true,
           status: 200,
           body: {
-            id: 'ROBOT1.0_OUT_MSG_999',
-            ext_info: { ref_idx: 'REFIDX_OUT_999' },
+            id: rawId,
+            ext_info: { ref_idx: refIdx },
           },
         };
       }),
@@ -220,7 +240,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
       emitMessageSent: vi.fn(),
     };
 
-    db.saveMessage({
+    const inboundRec = {
       msg_id: 'ROBOT1.0_INBOUND_123',
       peer: TEST_PEER,
       user_id: TEST_OPENID,
@@ -236,18 +256,19 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
       self: 0,
       reply_to: null,
       ref_idx: 'REFIDX_INBOUND_123',
-      source: 'qq',
-    });
+      source: 'qq' as const,
+    };
+    db.saveMessage(inboundRec);
 
-    // 1. Markdown 模式（默认开启）+ 传本地库 msg_id 自动换取 REFIDX_...
+    // 1. 固定原生 Markdown + 传入短 ID reply_to 自动换取 REFIDX_... + 返回短出站 ID（无 ref_idx）
     const resMd = await sendQqMessage(
-      { text: '#标题测试\n测试回复消息', reply_to: 'ROBOT1.0_INBOUND_123' },
+      { text: '#标题测试\n测试回复消息', reply_to: inboundRec.short_id! },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
 
     expect(resMd.success).toBe(true);
-    expect(resMd.message_id).toBe('ROBOT1.0_OUT_MSG_999');
-    expect(resMd.ref_idx).toBe('REFIDX_OUT_999');
+    expect(resMd.message_id).toBe('msg_self_1');
+    expect((resMd as any).ref_idx).toBeUndefined();
     assertNoUndefinedFields(resMd);
     expect(sentPayloads[0]).toMatchObject({
       msg_type: QQ_MSG_TYPE_MARKDOWN,
@@ -255,19 +276,69 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
       message_reference: { message_id: 'REFIDX_INBOUND_123' },
     });
 
-    // 2. 纯文本模式（markdown: false）
-    const resPlain = await sendQqMessage(
-      { text: '**加粗文本**', markdown: false },
+    // 2. 非法 reply_to（REFIDX_... / ROBOT1.0_...）直接本地拒绝，不调用网关
+    const callsBeforeInvalid = mockGateway.sendC2CMessage.mock.calls.length;
+    const resBadRef = await sendQqMessage(
+      { text: '非法引用', reply_to: 'REFIDX_INBOUND_123' },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
-    expect(resPlain.success).toBe(true);
-    expect(sentPayloads[1]).toMatchObject({
-      msg_type: QQ_MSG_TYPE_TEXT,
-      content: '加粗文本',
-    });
+    expect(resBadRef.success).toBe(false);
+    expect(resBadRef.error).toContain('无效的 reply_to 短消息 ID');
+    expect(resBadRef.error).toContain('msg_12');
+    assertNoUndefinedFields(resBadRef);
+    expect(mockGateway.sendC2CMessage.mock.calls.length).toBe(callsBeforeInvalid);
+
+    // 3. 6000 字符硬拦截边界：6000 码点放行（含 4 字节 emoji 码点），6001 码点本地拦截
+    const exact6000Emoji = '🐳'.repeat(QQ_SEND_MESSAGE_MAX_CHARS);
+    expect([...exact6000Emoji].length).toBe(6000);
+    const res6000 = await sendQqMessage(
+      { text: exact6000Emoji },
+      { peer: TEST_PEER, gateway: mockGateway, db }
+    );
+    expect(res6000.success).toBe(true);
+    expect(res6000.message_id).toMatch(/^msg_self_[1-9]\d*$/);
+    assertNoUndefinedFields(res6000);
+
+    const callsBeforeOverLimit = mockGateway.sendC2CMessage.mock.calls.length;
+    const res6001Ascii = await sendQqMessage(
+      { text: 'a'.repeat(QQ_SEND_MESSAGE_MAX_CHARS + 1) },
+      { peer: TEST_PEER, gateway: mockGateway, db }
+    );
+    expect(res6001Ascii.success).toBe(false);
+    expect(res6001Ascii.error).toContain('6001');
+    expect(res6001Ascii.error).toContain('6000');
+    expect(res6001Ascii.error).toContain('拆分');
+    assertNoUndefinedFields(res6001Ascii);
+
+    const res6001Emoji = await sendQqMessage(
+      { text: '🐳'.repeat(QQ_SEND_MESSAGE_MAX_CHARS + 1) },
+      { peer: TEST_PEER, gateway: mockGateway, db }
+    );
+    expect(res6001Emoji.success).toBe(false);
+    expect(res6001Emoji.error).toContain('6001');
+    expect(mockGateway.sendC2CMessage.mock.calls.length).toBe(callsBeforeOverLimit);
+
+    // 4. 若无 DB 映射短 ID，绝不返回原始长 ROBOT1.0_...
+    const noDbGateway: any = {
+      sendC2CMessage: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        body: { id: 'ROBOT1.0_RAW_LEAK_GUARD' },
+      })),
+      sendInputNotify: vi.fn(),
+      deleteC2CMessage: vi.fn(),
+      uploadC2CMedia: vi.fn(),
+    };
+    const resNoDb = await sendQqMessage(
+      { text: '无 DB 短 ID 保护' },
+      { peer: TEST_PEER, openid: TEST_OPENID, gateway: noDbGateway }
+    );
+    expect(resNoDb.success).toBe(true);
+    expect(resNoDb.message_id).toBeUndefined();
+    assertNoUndefinedFields(resNoDb);
   });
 
-  it('1.5 send_qq_message 工具描述与参数规范：包含分段发送引导，禁止 XML/HTML 标签，且移除 at_user', async () => {
+  it('1.5 send_qq_message 工具描述与参数规范：包含分段发送与 6000 上限引导，禁止 XML/HTML 标签，移除 at_user 与 markdown', async () => {
     const ctx = booted.ctx;
     const qqWs = path.join(tmpHome, 'qq-ws-desc');
     await fsp.mkdir(qqWs, { recursive: true });
@@ -287,13 +358,24 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     expect(sendTool.description).toContain(
       '若要发送的内容较长，或包含多个不同要点、转折与独立意思，可以拆分成多条简短消息，多次调用本工具分开发送。'
     );
+    expect(sendTool.description).toContain('6000');
+    expect(sendTool.description).toContain('Markdown');
     const props = sendTool.parameters?.properties;
     expect(props?.at_user).toBeUndefined();
+    expect(props?.markdown).toBeUndefined();
     expect(props?.reply_to?.type).toBe('string');
+    expect(props?.reply_to?.description).toContain('msg_12');
     const textDesc = props?.text?.description;
     expect(typeof textDesc).toBe('string');
     expect(textDesc).toContain('直接填写展示给用户的原始文本');
     expect(textDesc).toContain('禁止附加任何 XML/HTML 标签、标签闭合符或外层包裹标记');
+
+    // 验证 output.render 仅显示短 ID（不拼 ref_idx）
+    const directTool = createSendQqMessageTool();
+    expect(
+      (directTool as any).output.render({}, { success: true, message_id: 'msg_self_8', ref_idx: 'REFIDX_NO_SHOW' })[0].text
+    ).toBe('消息已发送 (ID: msg_self_8)');
+    expect((directTool as any).output.render({}, { success: true })[0].text).toBe('消息已发送');
   });
 });
 

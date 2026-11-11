@@ -9,10 +9,25 @@ import type { KujiraGatewayClient } from '../../src/gateway/server.js';
 import { openidToPeer } from '../../src/utils/peer.js';
 import { recordOutboundSelfMessage } from '../../src/outbound/self-record.js';
 import { MessageDatabase } from '../../src/storage/database.js';
+import { renderChatHistoryText } from '../../src/tools/chat-history/read-history.js';
 
 /**
  * 契约测试: 单聊出站自记录 (onMessageSent -> recordOutboundSelfMessage) 与历史记录查询闭环
  */
+
+function expectLosslessJson(value: unknown, trail = 'root'): void {
+  if (value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach((item, idx) => expectLosslessJson(item, `${trail}[${idx}]`));
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      expect(v, `${trail}.${k} must not be undefined`).not.toBeUndefined();
+      expectLosslessJson(v, `${trail}.${k}`);
+    }
+  }
+}
 
 const nativeFetch = globalThis.fetch;
 
@@ -222,9 +237,10 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
     expect(sendTool).toBeDefined();
 
     const sendRes = await sendTool.execute({ text: '最近一小时聊了代码和工具' }, { agent });
+    expectLosslessJson(sendRes);
     expect(sendRes.success).toBe(true);
-    expect(sendRes.message_id).toBe('ROBOT1.0_OUT_SELF_1');
-    expect(sendRes.ref_idx).toBe('REFIDX_OUT_SELF_1');
+    expect(sendRes.message_id).toBe('msg_self_1');
+    expect((sendRes as any).ref_idx).toBeUndefined();
 
     await waitUntil(() => {
       const sqlite = new Database(dbPath(), { readonly: true });
@@ -238,24 +254,30 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
     const sqlite = new Database(dbPath(), { readonly: true });
     try {
       const rows = sqlite
-        .prepare('SELECT msg_id, peer, user_id, sender_name, self, ref_idx, content FROM messages ORDER BY time ASC, rowid ASC')
+        .prepare('SELECT msg_id, short_id, peer, user_id, sender_name, self, ref_idx, content, raw FROM messages ORDER BY time ASC, rowid ASC')
         .all() as any[];
       expect(rows).toHaveLength(2);
 
-      // 用户入站消息
+      // 用户入站消息（底层保留真实主键 msg_id、short_id、ref_idx、sender_name 与完整 raw JSON）
       expect(rows[0].msg_id).toBe('ROBOT1.0_IN_SELF_1');
+      expect(rows[0].short_id).toBe('msg_1');
       expect(rows[0].peer).toBe(MOCK_PEER);
+      expect(rows[0].sender_name).toBe('测试用户B');
       expect(rows[0].self).toBe(0);
       expect(rows[0].ref_idx).toBe('REFIDX_IN_SELF_1');
+      expect(JSON.parse(rows[0].raw).id).toBe('ROBOT1.0_IN_SELF_1');
 
-      // 机器人出站自记录: self=1, msg_id=ROBOT1.0_..., ref_idx=REFIDX_..., peer=MOCK_PEER
+      // 机器人出站自记录: self=1, msg_id=ROBOT1.0_..., short_id=msg_self_1, ref_idx=REFIDX_..., peer=MOCK_PEER
       expect(rows[1].msg_id).toBe('ROBOT1.0_OUT_SELF_1');
+      expect(rows[1].short_id).toBe('msg_self_1');
       expect(rows[1].peer).toBe(MOCK_PEER);
       expect(rows[1].user_id).toBe(MOCK_BOT_ID);
       expect(rows[1].sender_name).toBe('雪梨助手');
       expect(rows[1].self).toBe(1);
       expect(rows[1].ref_idx).toBe('REFIDX_OUT_SELF_1');
       expect(rows[1].content).toBe('最近一小时聊了代码和工具');
+      expect(typeof rows[1].raw).toBe('string');
+      expect(rows[1].raw.length).toBeGreaterThan(2);
 
       // msg_type=6 输入中状态提示绝不落入 messages
       expect(
@@ -273,7 +295,7 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
     }
   });
 
-  it('契约 2: 真实装配下通过 read_chat_history 查询完整单聊对话（含 self=1、msg_id 与 ref_idx）', async () => {
+  it('契约 2: 真实装配下通过 read_chat_history 查询完整单聊对话（短 msg_id/reply_to，移除 user_id/sender_name/ref_idx）', async () => {
     const agent = await preparePeerAgent();
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
 
@@ -292,25 +314,54 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
     const historyTool = toolsSvc.get('read_chat_history', agent);
     expect(historyTool).toBeDefined();
 
-    await sendTool.execute({ text: '我在呢喵' }, { agent });
+    const sendRes = await sendTool.execute({ text: '我在呢喵', reply_to: 'msg_1' }, { agent });
+    expectLosslessJson(sendRes);
+    expect(sendRes.success).toBe(true);
+    expect(sendRes.message_id).toBe('msg_self_1');
 
     const allHistory = await historyTool.execute({ order: 'asc' }, { agent });
+    expectLosslessJson(allHistory);
     expect(allHistory.total).toBe(2);
     expect(allHistory.messages).toHaveLength(2);
     expect(allHistory.messages.map((m: any) => m.content)).toEqual(['你好呀', '我在呢喵']);
 
-    const selfMsg = allHistory.messages.find((m: any) => m.msg_id === 'ROBOT1.0_OUT_SELF_1');
+    const inMsg = allHistory.messages.find((m: any) => m.msg_id === 'msg_1');
+    const selfMsg = allHistory.messages.find((m: any) => m.msg_id === 'msg_self_1');
+    expect(inMsg).toBeDefined();
+    expect(inMsg.self).toBe(false);
+    expect(inMsg.reply_to).toBeNull();
+    expect(Object.hasOwn(inMsg, 'user_id')).toBe(false);
+    expect(Object.hasOwn(inMsg, 'sender_name')).toBe(false);
+    expect(Object.hasOwn(inMsg, 'ref_idx')).toBe(false);
+
     expect(selfMsg).toBeDefined();
     expect(selfMsg.self).toBe(true);
-    expect(selfMsg.ref_idx).toBe('REFIDX_OUT_SELF_1');
+    expect(selfMsg.reply_to).toBe('msg_1');
+    expect(Object.hasOwn(selfMsg, 'user_id')).toBe(false);
+    expect(Object.hasOwn(selfMsg, 'sender_name')).toBe(false);
+    expect(Object.hasOwn(selfMsg, 'ref_idx')).toBe(false);
+
+    const rendered = renderChatHistoryText(allHistory);
+    expect(rendered).toContain('[msg_1] [');
+    expect(rendered).toContain('[msg_self_1] [');
+    expect(rendered).toContain('[回复 msg_1]');
+    expect(rendered).not.toContain('[用户]');
+    expect(rendered).not.toContain('[我]');
+    expect(rendered).not.toContain(MOCK_OPENID);
+    expect(rendered).not.toContain(MOCK_BOT_ID);
+    expect(rendered).not.toContain('ROBOT1.0_');
+    expect(rendered).not.toContain('REFIDX_');
 
     const selfOnly = await historyTool.execute({ self_only: true }, { agent });
+    expectLosslessJson(selfOnly);
     expect(selfOnly.total).toBe(1);
-    expect(selfOnly.messages[0].msg_id).toBe('ROBOT1.0_OUT_SELF_1');
+    expect(selfOnly.messages[0].msg_id).toBe('msg_self_1');
+    expect(selfOnly.messages[0].reply_to).toBe('msg_1');
 
     const excludeSelf = await historyTool.execute({ exclude_self: true }, { agent });
+    expectLosslessJson(excludeSelf);
     expect(excludeSelf.total).toBe(1);
-    expect(excludeSelf.messages[0].msg_id).toBe('ROBOT1.0_IN_SELF_2');
+    expect(excludeSelf.messages[0].msg_id).toBe('msg_1');
   });
 
   it('契约 3: recordOutboundSelfMessage 缺 msgId 或空内容时不落库，绝不写入 inbound_reply_slots', () => {
@@ -356,7 +407,10 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
         { db, botId: MOCK_BOT_ID, senderName: '雪梨助手' }
       );
       expect(saved).not.toBeNull();
+      expect(saved?.short_id).toBe('msg_self_1');
       expect(db.getMessage('ROBOT1.0_OUT_UNIT_1')?.self).toBe(1);
+      expect(db.getMessage('ROBOT1.0_OUT_UNIT_1')?.short_id).toBe('msg_self_1');
+      expect(db.getMessageByShortId(MOCK_PEER, 'msg_self_1')?.msg_id).toBe('ROBOT1.0_OUT_UNIT_1');
       expect(db.getMessageByRefIdx('REFIDX_OUT_UNIT_1')?.msg_id).toBe('ROBOT1.0_OUT_UNIT_1');
       expect(db.getLatestValidInboundSlot(MOCK_PEER)).toBeNull();
     } finally {

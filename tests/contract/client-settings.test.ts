@@ -167,6 +167,28 @@ describe('契约测试: 客户端 settings.section 侧边栏独立页面与 Kuji
       expect(html).toContain('已配置 (来源: env)');
       expect(html).toContain('已配置 (来源: file)');
       expect(html).not.toContain('NapCat');
+
+      // 保持 5 分区 Tab 结构
+      expect(html).toContain('id="kujira-tab-connection"');
+      expect(html).toContain('id="kujira-tab-persona"');
+      expect(html).toContain('id="kujira-tab-memory"');
+      expect(html).toContain('id="kujira-tab-face"');
+      expect(html).toContain('id="kujira-tab-slang"');
+
+      // AppID / AppSecret 只写保护不回显明文 + 保留核心连接配置项
+      expect(html).toContain('id="kujira-cred-app-id"');
+      expect(html).toMatch(/id="kujira-cred-app-id"[^>]*value=""/);
+      expect(html).toContain('id="kujira-cred-app-secret"');
+      expect(html).toMatch(/id="kujira-cred-app-secret"[^>]*type="password"/);
+      expect(html).toMatch(/id="kujira-cred-app-secret"[^>]*value=""/);
+      expect(html).toContain('id="kujira-new-message-behavior"');
+      expect(html).toContain('id="kujira-image-ttl"');
+
+      // 已固化为默认开启而移除的配置开关不再渲染
+      expect(html).not.toContain('kujira-markdown-enabled');
+      expect(html).not.toContain('markdown_enabled');
+      expect(html).not.toContain('kujira-input-notify-enabled');
+      expect(html).not.toContain('input_notify_enabled');
     });
   });
 });

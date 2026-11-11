@@ -101,7 +101,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
 
       expect(CONFIG_ROUTE_PATH).toBe('/plugins/kujira/config');
       expect(DEFAULT_BASE_CONFIG).toBe(CONSTANTS_BASE_CONFIG);
-      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(17);
+      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(15);
 
       registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
         dshHome: tmpHome,
@@ -200,7 +200,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
         inject: vi.fn(),
       };
 
-      // 故意混入已下线的历史键以验证 GET 清洗
+      // 故意混入已下线的历史键（含已固化开关 markdown_enabled / input_notify_enabled）以验证 GET 清洗
       const currentCfg = {
         markdown_enabled: true,
         input_notify_enabled: false,
@@ -212,7 +212,11 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
         app_id: '1000000091',
       } as unknown as BridgePluginConfig;
 
-      registerConfigRoute(mockCtx, () => currentCfg, async () => {});
+      registerConfigRoute(mockCtx, () => currentCfg, async () => {}, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
       const req = createMockReq('GET');
       const { res, getResult } = createMockRes();
@@ -232,9 +236,11 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       expect(serialized).not.toContain('1000000091');
       expect(serialized).not.toContain('super-secret-value-never-leak');
 
-      expect(result.body.config.markdown_enabled).toBe(true);
-      expect(result.body.config.input_notify_enabled).toBe(false);
+      expect(result.body.config.new_message_behavior).toBe('steer');
       expect(result.body.config.image_ttl_days).toBe(7);
+      expect(result.body.config.persona).toBe('测试人格设定');
+      expect(result.body.config.markdown_enabled).toBeUndefined();
+      expect(result.body.config.input_notify_enabled).toBeUndefined();
       expect(result.body.config.ws_port).toBeUndefined();
       expect(result.body.config.admins).toBeUndefined();
       expect(result.body.config.app_id).toBeUndefined();
@@ -261,7 +267,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
 
       registerConfigRoute(
         mockCtx,
-        () => ({ markdown_enabled: true } as BridgePluginConfig),
+        () => ({ new_message_behavior: 'steer' } as BridgePluginConfig),
         async () => {},
         { dshHome: tmpHome, cwd: tmpCwd, env: {} }
       );
@@ -281,7 +287,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
   });
 
   describe('3. POST /plugins/kujira/config 配置保存、凭据安全写入与非 schema 字段剥离', () => {
-    it('提交凭据与 17 项配置时，凭据写入 ctx.credentials 且被完全剥离出 settings 与 queueReconcile', async () => {
+    it('提交凭据与 15 项配置时，凭据写入 ctx.credentials 且被完全剥离出 settings 与 queueReconcile，遗留开关自动自愈过滤', async () => {
       let handler: any;
       const mutateMock = vi.fn().mockResolvedValue({ ok: true });
       const credStore = new Map<string, string>();
@@ -317,27 +323,32 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       };
 
       let currentCfg: BridgePluginConfig = {
-        markdown_enabled: true,
-        input_notify_enabled: true,
+        new_message_behavior: 'steer',
         image_ttl_days: 7,
       };
       const reconcileMock = vi.fn().mockImplementation(async (next) => {
         if (next) currentCfg = { ...currentCfg, ...next };
       });
 
-      registerConfigRoute(mockCtx, () => currentCfg, reconcileMock);
+      registerConfigRoute(mockCtx, () => currentCfg, reconcileMock, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
       const req = createMockReq('POST', {
-        markdown_enabled: false,
+        new_message_behavior: 'queue',
         image_ttl_days: 14,
         persona: 'Kujira 单聊助手',
         credentials: {
           app_id: '1000000055',
           app_secret: 'mock-secret-new-55',
         },
-        // 即使错误混入顶层凭据或老字段也必须被剥离
+        // 即使错误混入顶层凭据、已下线开关或老字段也必须被自愈剥离
         app_id: '1000000055',
         app_secret: 'mock-secret-new-55',
+        markdown_enabled: false,
+        input_notify_enabled: true,
         admins: ['1000000001'],
       });
       const { res, getResult } = createMockRes();
@@ -352,7 +363,12 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
         appSecret: { configured: true, source: 'file', writable: true },
         ready: true,
       });
-      expect(result.body.healedKeys).toEqual(['admins']);
+      expect(result.body.healedKeys).toEqual(['markdown_enabled', 'input_notify_enabled', 'admins']);
+      expect(result.body.config).toEqual({
+        new_message_behavior: 'queue',
+        image_ttl_days: 14,
+        persona: 'Kujira 单聊助手',
+      });
 
       // 响应中绝不回显明文凭据
       const responseText = JSON.stringify(result.body);
@@ -368,12 +384,12 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       const [ns, ops] = mutateMock.mock.calls[0];
       expect(ns).toBe(SETTINGS_NAMESPACE);
       const persistedKeys = ops.map((op: any) => op.path[0]);
-      expect(persistedKeys).toEqual(['markdown_enabled', 'image_ttl_days', 'persona']);
+      expect(persistedKeys).toEqual(['new_message_behavior', 'image_ttl_days', 'persona']);
 
       expect(reconcileMock).toHaveBeenCalledTimes(1);
       const passedToReconcile = reconcileMock.mock.calls[0][0];
       expect(passedToReconcile).toEqual({
-        markdown_enabled: false,
+        new_message_behavior: 'queue',
         image_ttl_days: 14,
         persona: 'Kujira 单聊助手',
       });
@@ -575,7 +591,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       );
     });
 
-    it('保存包含 markdown_enabled 与 persona 的配置后，后续 GET 请求能正确读取更新后的配置（防恢复默认值）', async () => {
+    it('保存包含 new_message_behavior 与 persona 的配置后，后续 GET 请求能正确读取更新后的配置（防恢复默认值）', async () => {
       let handler: any;
       let persistedSettings: Record<string, unknown> = {};
       const mutateMock = vi.fn().mockImplementation(async (_ns: string, ops: any[]) => {
@@ -588,8 +604,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       });
 
       let currentConfig: BridgePluginConfig = {
-        markdown_enabled: true,
-        input_notify_enabled: true,
+        new_message_behavior: 'steer',
         image_ttl_days: 7,
         persona: '',
       };
@@ -624,7 +639,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       });
 
       const saveReq = createMockReq('POST', {
-        markdown_enabled: false,
+        new_message_behavior: 'queue',
         image_ttl_days: 21,
         persona: '元气伙伴',
       });
@@ -635,7 +650,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       expect(saveResult.status).toBe(200);
       expect(saveResult.body.ok).toBe(true);
       expect(mutateMock).toHaveBeenCalled();
-      expect(persistedSettings.markdown_enabled).toBe(false);
+      expect(persistedSettings.new_message_behavior).toBe('queue');
       expect(persistedSettings.persona).toBe('元气伙伴');
 
       const readReq = createMockReq('GET');
@@ -645,7 +660,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
 
       expect(readResult.status).toBe(200);
       expect(readResult.body.ok).toBe(true);
-      expect(readResult.body.config.markdown_enabled).toBe(false);
+      expect(readResult.body.config.new_message_behavior).toBe('queue');
       expect(readResult.body.config.image_ttl_days).toBe(21);
       expect(readResult.body.config.persona).toBe('元气伙伴');
     });

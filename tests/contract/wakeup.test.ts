@@ -59,7 +59,7 @@ describe('契约测试: C2C 单聊基础唤醒与三索引提取', () => {
       },
     });
 
-    const decision = await shouldWakeup(event, { senderRemark: '小李' });
+    const decision = await shouldWakeup(event, { senderRemark: '小李', shortId: 'msg_12' });
 
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('direct');
@@ -69,9 +69,14 @@ describe('契约测试: C2C 单聊基础唤醒与三索引提取', () => {
     expect(decision.payload?.from_user).toBe(MOCK_OPENID);
     expect(decision.payload?.from_name).toBe('小李');
     expect(decision.payload?.msg_id).toBe('ROBOT1.0_msg_direct_101');
+    expect(decision.payload?.short_id).toBe('msg_12');
     expect(decision.payload?.ref_idx).toBe('REFIDX_inbound_self_001');
     expect(decision.payload?.content).toBe('今天深圳天气如何？');
     expect(decision.payload?.timestamp).toBe(Date.parse('2026-11-11T18:28:47+08:00'));
+
+    // 未传 shortId 时，不注入 short_id 键
+    const noShortDecision = await shouldWakeup(event, { senderRemark: '小李' });
+    expect('short_id' in noShortDecision.payload!).toBe(false);
   });
 
   it('契约 2: 自循环防护与非法 openid 拒绝唤醒', async () => {
@@ -102,6 +107,12 @@ describe('契约测试: C2C 单聊基础唤醒与三索引提取', () => {
     expect(spaceDecision.wakeup).toBe(true);
     expect(spaceDecision.trigger).toBe('direct');
     expect(spaceDecision.payload?.content).toBe('   ');
+
+    const faceOnlyEvent = makeEvent({ content: '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">' });
+    const faceOnlyDecision = await shouldWakeup(faceOnlyEvent);
+    expect(faceOnlyDecision.wakeup).toBe(true);
+    expect(faceOnlyDecision.trigger).toBe('direct');
+    expect(faceOnlyDecision.payload?.content).toBe('[表情]');
   });
 });
 
@@ -134,7 +145,9 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
         if (refIdx === 'REFIDX_target_db_001') {
           return {
             msg_id: 'ROBOT1.0_bot_out_888',
+            short_id: 'msg_self_5',
             ref_idx: 'REFIDX_target_db_001',
+            time: 1788045798000,
             user_id: 'bot',
             sender_name: '',
             self: 1,
@@ -151,13 +164,15 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
     expect(decision.trigger).toBe('quote');
     expect(decision.payload?.ref_idx).toBe('REFIDX_quote_self_001');
     expect(decision.payload?.quoted).toEqual({
-      msg_id: 'ROBOT1.0_bot_out_888',
-      ref_idx: 'REFIDX_target_db_001',
-      user_id: 'bot',
-      from_name: 'Kujira助手',
+      short_id: 'msg_self_5',
+      time: 1788045798000,
       text: '[图片:/dsh/kujira/downloads/image/user_1/cat.png]',
       images: ['/dsh/kujira/downloads/image/user_1/cat.png'],
     });
+    expect('msg_id' in decision.payload!.quoted!).toBe(false);
+    expect('ref_idx' in decision.payload!.quoted!).toBe(false);
+    expect('user_id' in decision.payload!.quoted!).toBe(false);
+    expect('from_name' in decision.payload!.quoted!).toBe(false);
     expect(decision.payload?.images).toEqual(['/dsh/kujira/downloads/image/user_1/cat.png']);
   });
 
@@ -185,12 +200,13 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
       },
     });
 
-    // TMP_ 临时索引不查本地 SQLite，直接走 msg_elements 兜底
+    // TMP_ 临时索引不查本地 SQLite，直接走 msg_elements 兜底（仅输出 { text }）
     expect(dbQueried).toBe(false);
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('quote');
-    expect(decision.payload?.quoted?.ref_idx).toBe('TMP_8d1a9f0c-1122-3344-5566-778899aabbcc');
-    expect(decision.payload?.quoted?.text).toContain('复合引用前文内容');
+    expect(decision.payload?.quoted).toEqual({
+      text: '=== 消息 1 ===\n[消息内容] 复合引用前文内容\n[消息类型] 引用消息',
+    });
 
     // REFIDX_ 存在但查库未命中时，同样回退 msg_elements
     const missedDbEvent = makeEvent({
@@ -207,7 +223,7 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
       getMessageByRefIdx: async () => null,
     });
     expect(missedDecision.trigger).toBe('quote');
-    expect(missedDecision.payload?.quoted?.text).toBe('服务端下发的原始引用内容');
+    expect(missedDecision.payload?.quoted).toEqual({ text: '服务端下发的原始引用内容' });
     expect(extractMsgElementsText(missedDbEvent)).toBe('服务端下发的原始引用内容');
   });
 
@@ -228,7 +244,6 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('quote');
     expect(decision.payload?.quoted).toEqual({
-      ref_idx: 'REFIDX_expired_004',
       text: '〔历史引用消息：内容已过期或无法获取〕',
     });
   });

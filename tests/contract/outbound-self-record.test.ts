@@ -1,17 +1,17 @@
 /**
  * tests/contract/outbound-self-record.test.ts
  *
- * 契约测试: QQ 官方 Bot 出站消息自身落库 (Outbound Self Record)
+ * 契约测试: QQ 官方 Bot 出站消息自身落库 (Outbound Self Record) 与短消息 ID (`short_id`) 同步回填
  *
  * 覆盖规范:
  * 1. 纯函数构造: 字符串 `msg_id` (`ROBOT1.0_...`)、`ref_idx` (`REFIDX_...`)、`reply_to`、`self = 1`，不含 `undefined`；
- * 2. REST 发送返回 200 并拿到字符串 `id` 与可选 `ext_info.ref_idx` 后立即写入 `messages`；
- * 3. 发送失败、缺有效字符串 `msgId`、空正文或 `msg_type=6` 输入状态绝不落库；
- * 4. 幂等入库（`saveMessageIfNotExists` 不重复、不覆盖）；
- * 5. 三 ID 严格隔离: 出站 `body.id` 绝不写入 `inbound_reply_slots`。
+ * 2. REST 发送返回 200 并拿到字符串 `id` 与可选 `ext_info.ref_idx` 后立即写入 `messages`，并获取分配好的 `short_id` (`msg_self_<n>`)；
+ * 3. `recordOutboundSelfMessage` 返回带 `short_id` 的 `record`（无论库层直接写回还是通过 `getMessage` 回查），并在 debug 日志输出 `short_id`；
+ * 4. 发送失败、缺有效字符串 `msgId`、空正文或 `msg_type=6` 输入状态绝不落库；
+ * 5. 幂等入库（`saveMessageIfNotExists` 不重复、不覆盖）与三 ID 严格隔离（出站 `body.id` 绝不写入 `inbound_reply_slots`）。
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -24,6 +24,7 @@ import {
 } from '../../src/outbound/self-record.js';
 import type { MessageRecord } from '../../src/types/index.js';
 import { openidToPeer } from '../../src/utils/peer.js';
+import { formatShortMessageId } from '../../src/utils/short-id.js';
 
 const BOT_ID = '1000000000';
 const TEST_OPENID = '00112233445566778899AABBCCDDEEFF';
@@ -40,6 +41,7 @@ function createV2TestDb(dbPath: string): {
   raw.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       msg_id TEXT PRIMARY KEY,
+      short_id TEXT,
       peer TEXT NOT NULL,
       user_id TEXT NOT NULL,
       sender_name TEXT NOT NULL,
@@ -71,18 +73,35 @@ function createV2TestDb(dbPath: string): {
 
   const insertStmt = raw.prepare(`
     INSERT OR IGNORE INTO messages (
-      msg_id, peer, user_id, sender_name, time, type, content, raw,
+      msg_id, short_id, peer, user_id, sender_name, time, type, content, raw,
       file_id, local_path, fingerprint, recalled, self, reply_to, ref_idx, source, attachments
     ) VALUES (
-      @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
+      @msg_id, @short_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
       @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @ref_idx, @source, @attachments
     )
   `);
 
+  const peerCounters = new Map<string, number>();
+
+  const getMessage = (msgId: string): MessageRecord | null => {
+    const row = raw.prepare('SELECT * FROM messages WHERE msg_id = ?').get(msgId) as any;
+    return row ?? null;
+  };
+
   const adapter: SelfRecordDb = {
+    getMessage,
     saveMessageIfNotExists(record: MessageRecord): boolean {
+      const existing = getMessage(record.msg_id);
+      if (existing) {
+        return false;
+      }
+      const dirKey = `${record.peer}:${record.self ? 1 : 0}`;
+      const nextSeq = (peerCounters.get(dirKey) ?? 0) + 1;
+      const assignedShortId = record.short_id || formatShortMessageId(Boolean(record.self), nextSeq);
+
       const result = insertStmt.run({
         msg_id: record.msg_id,
+        short_id: assignedShortId,
         peer: record.peer,
         user_id: record.user_id,
         sender_name: record.sender_name || '',
@@ -100,14 +119,19 @@ function createV2TestDb(dbPath: string): {
         source: record.source ?? 'qq',
         attachments: record.attachments ?? null,
       });
-      return result.changes > 0;
+      if (result.changes > 0) {
+        peerCounters.set(dirKey, nextSeq);
+        record.short_id = assignedShortId;
+        return true;
+      }
+      return false;
     },
   };
 
   return {
     raw,
     adapter,
-    getMessage: (msgId: string) => raw.prepare('SELECT * FROM messages WHERE msg_id = ?').get(msgId),
+    getMessage,
     listInboundSlots: () => raw.prepare('SELECT * FROM inbound_reply_slots').all(),
   };
 }
@@ -156,7 +180,7 @@ describe('契约测试: 出站消息自身记录 (纯函数 buildSelfMessageReco
         peer: TEST_PEER,
         openid: TEST_OPENID,
         msgId: 'ROBOT1.0_OUT_TEXT_002',
-        msgType: 0,
+        msgType: 2,
         text: '纯文本消息',
         time: 1793800001000,
       },
@@ -219,28 +243,32 @@ describe('契约测试: 出站消息自身记录 (纯函数 buildSelfMessageReco
   it('契约 4: 空 msgId 或空正文不产生记录', () => {
     expect(
       buildSelfMessageRecord(
-        { peer: TEST_PEER, openid: TEST_OPENID, msgId: '', msgType: 0, text: 'hello', time: 1793800004000 },
+        { peer: TEST_PEER, openid: TEST_OPENID, msgId: '', msgType: 2, text: 'hello', time: 1793800004000 },
         base
       )
     ).toBeNull();
     expect(
       buildSelfMessageRecord(
-        { peer: TEST_PEER, openid: TEST_OPENID, msgId: 'ROBOT1.0_EMPTY', msgType: 0, text: '   ', time: 1793800005000 },
+        { peer: TEST_PEER, openid: TEST_OPENID, msgId: 'ROBOT1.0_EMPTY', msgType: 2, text: '   ', time: 1793800005000 },
         base
       )
     ).toBeNull();
   });
 });
 
-describe('契约测试: KujiraGatewayClient + SQLite 出站自记录与三 ID 隔离闭环', () => {
+describe('契约测试: KujiraGatewayClient + SQLite 出站自记录、short_id 回填与三 ID 隔离闭环', () => {
   let tmpDir: string;
   let dbBundle: ReturnType<typeof createV2TestDb>;
   let sentEvents: OutboundSentEvent[];
+  let recordedRecords: MessageRecord[];
+  let debugLogs: string[];
 
   beforeEach(async () => {
     tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-self-record-'));
     dbBundle = createV2TestDb(path.join(tmpDir, 'messages.sqlite'));
     sentEvents = [];
+    recordedRecords = [];
+    debugLogs = [];
   });
 
   afterEach(async () => {
@@ -262,16 +290,20 @@ describe('契约测试: KujiraGatewayClient + SQLite 出站自记录与三 ID �
       fetchFn: fetchMock,
       onMessageSent: (event) => {
         sentEvents.push(event);
-        recordOutboundSelfMessage(event, {
+        const rec = recordOutboundSelfMessage(event, {
           db: dbBundle.adapter,
           botId: BOT_ID,
           senderName: SENDER_NAME,
+          logger: {
+            debug: (msg: string) => debugLogs.push(msg),
+          },
         });
+        if (rec) recordedRecords.push(rec);
       },
     });
   }
 
-  it('端到端 1: REST 发送成功拿到 body.id 与 ext_info.ref_idx -> 立即写入 messages，绝不写入 inbound_reply_slots', async () => {
+  it('端到端 1: REST 发送成功拿到 body.id 与 ext_info.ref_idx -> 立即写入 messages 并回填 short_id，debug 日志含 short_id，绝不写入 inbound_reply_slots', async () => {
     const client = createMockClient(async () =>
       new Response(
         JSON.stringify({
@@ -300,9 +332,12 @@ describe('契约测试: KujiraGatewayClient + SQLite 出站自记录与三 ID �
 
     expect(res.ok).toBe(true);
     expect(sentEvents).toHaveLength(1);
+    expect(recordedRecords).toHaveLength(1);
+    expect(recordedRecords[0]!.short_id).toBe('msg_self_1');
 
     const row = dbBundle.getMessage('ROBOT1.0_OUT_LIVE_001');
     expect(row).toBeDefined();
+    expect(row.short_id).toBe('msg_self_1');
     expect(row.self).toBe(1);
     expect(row.peer).toBe(TEST_PEER);
     expect(row.user_id).toBe(BOT_ID);
@@ -311,15 +346,50 @@ describe('契约测试: KujiraGatewayClient + SQLite 出站自记录与三 ID �
     expect(row.ref_idx).toBe('REFIDX_OUT_LIVE_001');
     expect(row.reply_to).toBe('ROBOT1.0_IN_PREV');
 
+    expect(debugLogs.some((line) => line.includes('short_id: msg_self_1'))).toBe(true);
+
     // 严禁把出站 body.id 写入入站槽位表
     expect(dbBundle.listInboundSlots()).toHaveLength(0);
+  });
+
+  it('端到端 1b: 若 saveMessageIfNotExists 未原地赋值 short_id（或幂等重复），通过 db.getMessage 回查补全并返回带 short_id 的 record', () => {
+    const getMessageMock = vi.fn().mockReturnValue({
+      msg_id: 'ROBOT1.0_OUT_BACKFILL_1',
+      short_id: 'msg_self_7',
+    });
+    const dbNoMutate: SelfRecordDb = {
+      saveMessageIfNotExists: () => true,
+      getMessage: getMessageMock,
+    };
+    const logs: string[] = [];
+
+    const rec = recordOutboundSelfMessage(
+      {
+        peer: TEST_PEER,
+        openid: TEST_OPENID,
+        msgId: 'ROBOT1.0_OUT_BACKFILL_1',
+        msgType: 2,
+        text: '回查补全短 ID',
+        time: 1793800009000,
+      },
+      {
+        db: dbNoMutate,
+        botId: BOT_ID,
+        senderName: SENDER_NAME,
+        logger: { debug: (m: string) => logs.push(m) },
+      }
+    );
+
+    expect(rec?.short_id).toBe('msg_self_7');
+    expect(getMessageMock).toHaveBeenCalledWith('ROBOT1.0_OUT_BACKFILL_1');
+    expect(logs[0]).toContain('short_id: msg_self_7');
   });
 
   it('端到端 2: 发送失败 (HTTP 400) 或 msg_type=6 输入状态 -> 绝不触发落库', async () => {
     const failingClient = createMockClient(async () =>
       new Response(JSON.stringify({ code: 40034024, message: '请求参数msg_id无效或越权' }), { status: 400 })
     );
-    const failRes = await failingClient.sendC2CMessage(TEST_OPENID, { msg_type: 0, content: '失败消息' });
+    const failRes = await failingClient.sendC2CMessage(TEST_OPENID, { msg_type: 2, markdown: { content: '失败消息' } });
     expect(failRes.ok).toBe(false);
     expect(sentEvents).toHaveLength(0);
 
@@ -329,22 +399,23 @@ describe('契约测试: KujiraGatewayClient + SQLite 出站自记录与三 ID �
     const notifyRes = await notifyClient.sendInputNotify(TEST_OPENID, 'ROBOT1.0_INBOUND_001', 1);
     expect(notifyRes.ok).toBe(true);
     expect(sentEvents).toHaveLength(0);
-    expect(dbBundle.getMessage('ROBOT1.0_INPUT_NOTIFY_TEMP')).toBeUndefined();
+    expect(dbBundle.getMessage('ROBOT1.0_INPUT_NOTIFY_TEMP')).toBeNull();
   });
 
-  it('端到端 3: 幂等入库 -> 相同 msg_id 重复触发不覆盖原内容', async () => {
+  it('端到端 3: 幂等入库 -> 相同 msg_id 重复触发不覆盖原内容与原 short_id', async () => {
     const client = createMockClient(async () =>
       new Response(JSON.stringify({ id: 'ROBOT1.0_OUT_DUP' }), { status: 200 })
     );
 
-    await client.sendC2CMessage(TEST_OPENID, { msg_type: 0, content: '原始消息' });
+    await client.sendC2CMessage(TEST_OPENID, { msg_type: 2, markdown: { content: '原始消息' } });
     const insertedAgain = dbBundle.adapter.saveMessageIfNotExists({
       ...buildSelfMessageRecord(
-        { peer: TEST_PEER, openid: TEST_OPENID, msgId: 'ROBOT1.0_OUT_DUP', msgType: 0, text: '被覆盖文本', time: Date.now() },
+        { peer: TEST_PEER, openid: TEST_OPENID, msgId: 'ROBOT1.0_OUT_DUP', msgType: 2, text: '被覆盖文本', time: Date.now() },
         { botId: BOT_ID, senderName: SENDER_NAME }
       )!,
     });
     expect(insertedAgain).toBe(false);
     expect(dbBundle.getMessage('ROBOT1.0_OUT_DUP').content).toBe('原始消息');
+    expect(dbBundle.getMessage('ROBOT1.0_OUT_DUP').short_id).toBe('msg_self_1');
   });
 });

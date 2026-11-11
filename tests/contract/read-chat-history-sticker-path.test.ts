@@ -6,9 +6,9 @@
  * 覆盖规范:
  * 1. 命中表情库记录：通过 attachment/render (`renderAttachments`) 与 `serializeAttachments` 标准入库，
  *    `db.readHistory` 完整保留 `local_path` 与结构化 `attachments` JSON，渲染文本为 `[表情包: face_id (情绪: mood) 路径: <local_path>]`；
- * 2. 普通表情记录：`renderAttachment` / `renderAttachments` 自动清洗嵌套方括号（如 `[动画表情]` → `动画表情`）并输出 `[表情包: 动画表情 路径: <path>]`；
- * 3. 无本地路径兜底：`renderAttachments` 仅输出脱敏占位且绝不泄漏 URL query 凭证，同时 `attachments` 保留远端元数据；
- * 4. 真实工具装配闭环：通过 `read_chat_history` `defineTool` `execute`（`kujira-user-<hash>` 会话绑定）与 `output.render` 验证 + Lossless JSON 无 `undefined`。
+ * 2. 普通表情记录：`renderAttachment` / `renderAttachments` 输出精简本地路径格式 `[表情包:<path>]`；
+ * 3. 无本地路径兜底：`renderAttachments` 仅输出脱敏占位 `[表情包]` 且绝不泄漏 URL query 凭证，同时 `attachments` 保留远端元数据；
+ * 4. 真实工具装配闭环：通过 `read_chat_history` `defineTool` `execute`（`kujira-user-<hash>` 会话绑定）与 `output.render` 验证短 ID 渲染 + Lossless JSON 无 `undefined`。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -146,7 +146,7 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     expect(rendered).toContain(`[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`);
   });
 
-  it('契约 2: 普通表情经 renderAttachments 统一清洗嵌套方括号与路径格式后入库检索', () => {
+  it('契约 2: 普通表情经 renderAttachments 统一清洗与精简路径格式后入库检索', () => {
     const stickerPath = path.join(tmpDir, 'sticker.gif');
     const descriptor: AttachmentDescriptor = {
       kind: 'sticker',
@@ -156,7 +156,7 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     };
 
     const content = renderAttachment(descriptor)!;
-    expect(content).toBe(`[表情包: 动画表情 路径: ${stickerPath}]`);
+    expect(content).toBe(`[表情包:${stickerPath}]`);
 
     db.saveMessage({
       msg_id: 'ROBOT1.0_STK_102',
@@ -179,8 +179,9 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
 
     const res = db.readHistory(PEER);
     expect(res.messages).toHaveLength(1);
+    expect(res.messages[0]!.msg_id).toBe('msg_1');
     expect(res.messages[0]!.local_path).toBe(stickerPath);
-    expect(res.messages[0]!.content).toBe(`[表情包: 动画表情 路径: ${stickerPath}]`);
+    expect(res.messages[0]!.content).toBe(`[表情包:${stickerPath}]`);
 
     const parsed = deserializeAttachments(res.messages[0]!.attachments);
     expect(parsed).toHaveLength(1);
@@ -188,7 +189,8 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     expect(parsed[0]!.local?.path).toBe(stickerPath);
 
     const rendered = renderChatHistoryText(res);
-    expect(rendered).toContain(`[表情包: 动画表情 路径: ${stickerPath}]`);
+    expect(rendered).toContain('[msg_1]');
+    expect(rendered).toContain(`[表情包:${stickerPath}]`);
     expect(rendered).not.toContain('[:[');
     expect(rendered).not.toContain('已保存:');
   });
@@ -204,7 +206,7 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
       },
     };
     const [safeContent] = renderAttachments([descriptor]);
-    expect(safeContent).toBe('[表情包: 动画表情]');
+    expect(safeContent).toBe('[表情包]');
     expect(safeContent).not.toContain('rkey=');
     expect(safeContent).not.toContain('SECRET_CREDENTIAL_XYZ');
 
@@ -230,7 +232,7 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     const res = db.readHistory(PEER);
     expect(res.messages).toHaveLength(1);
     expect(res.messages[0]!.local_path).toBeNull();
-    expect(res.messages[0]!.content).toBe('[表情包: 动画表情]');
+    expect(res.messages[0]!.content).toBe('[表情包]');
     const descriptors = deserializeAttachments(res.messages[0]!.attachments);
     expect(descriptors).toHaveLength(1);
     expect(descriptors[0]!.remote?.fileUuid).toBe('uuid_sticker_remote_01');
@@ -270,6 +272,7 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     );
 
     expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]!.msg_id).toBe('msg_1');
     expect(result.messages[0]!.local_path).toBe(filePath);
     expect(deserializeAttachments(result.messages[0]!.attachments)[0]!.face?.id).toBe(
       'face_mock_cat'
@@ -279,8 +282,12 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     const renderedOutput = historyTool.output.render({}, result);
     expect(renderedOutput).toHaveLength(1);
     expect(renderedOutput[0].type).toBe('text');
+    expect(renderedOutput[0].text).toContain('[msg_1]');
     expect(renderedOutput[0].text).toContain(
       `[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`
     );
+    expect(renderedOutput[0].text).not.toContain('ROBOT1.0_STK_104');
+    expect(renderedOutput[0].text).not.toContain('好友A');
+    expect(renderedOutput[0].text).not.toContain(MOCK_OPENID);
   });
 });

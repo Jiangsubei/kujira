@@ -12,11 +12,11 @@ import { openidToPeer } from '../../src/utils/peer.js';
 /**
  * 契约测试: 主动触发 / 定时任务唤醒与历史入站锚点隔离修复 (Stale Inbound Quote Fix Contract)
  *
- * 1. 真实 C2C_MESSAGE_CREATE 登记 inbound_reply_slots 锚点；
- * 2. scheduled_task / is_synthetic: true 系统唤醒严禁在 Prompt 伪造 [消息ID:]，也不抹除历史有效入站 msg_id 锚点；
+ * 1. 真实 C2C_MESSAGE_CREATE 登记 inbound_reply_slots 锚点，唤醒消息头精简为 `[msg_<n>] [时间] 正文`；
+ * 2. scheduled_task / is_synthetic: true 系统唤醒严禁在 Prompt 伪造 `[msg_...]` / `[消息ID:]`（且不含 `[QQ私聊]`），也不抹除历史有效入站 msg_id 锚点；
  * 3. assistant/message 坚决保持用户侧静默（不调用 send_qq_message 时绝不下发任何文本）；
- * 4. 定时任务中显式调用 send_qq_message 仍沿用有效入站 msg_id 且 msg_seq 严格单调递增；
- * 5. 下一条真实 C2C_MESSAGE_CREATE 到来后刷新锚点与 Prompt [消息ID:]。
+ * 4. 定时任务中显式调用 send_qq_message 仍沿用有效入站 msg_id 且 msg_seq 严格单调递增，工具仅返回短出站 ID (`msg_self_<n>`)；
+ * 5. 下一条真实 C2C_MESSAGE_CREATE 到来后刷新锚点与精简唤醒头 `[msg_<n>]`。
  */
 
 const nativeFetch = globalThis.fetch;
@@ -148,6 +148,15 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
         if (method === 'POST' && parsed.pathname === `/v2/users/${MOCK_OPENID}/messages`) {
           const body = typeof init?.body === 'string' && init.body ? JSON.parse(init.body) : {};
           postedMessages.push(body);
+          if (body?.msg_type === 6) {
+            return new Response(
+              JSON.stringify({
+                id: 'ROBOT1.0_STALE_NOTIFY',
+                timestamp: '2026-11-11T12:20:00+08:00',
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
           outSeq += 1;
           return new Response(
             JSON.stringify({
@@ -206,14 +215,14 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
     return agent;
   }
 
-  it('契约 1: 真实入站登记 inbound_reply_slots 后，scheduled_task 唤醒不伪造 [消息ID:]、不擦除历史入站锚点、保持静默且 msg_seq 单调递增', async () => {
+  it('契约 1: 真实入站登记 inbound_reply_slots 后，scheduled_task 唤醒不伪造 [msg_]/[消息ID:]、不擦除历史入站锚点、保持静默且 msg_seq 单调递增', async () => {
     const agent = await preparePeerAgent();
     const bridge = booted.ctx.get('kujira-outbound-bridge') as OutboundStreamBridge;
     const hub = booted.ctx.get('kujira-system-event-hub') as SystemEventHub;
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
     const session = (agent as any).session;
 
-    // 1. 真实用户消息入站 (登记 inbound_reply_slots，msg_type=6 input_notify 占用 msg_seq=1)
+    // 1. 真实用户消息入站 (登记 inbound_reply_slots，固定 msg_type=6 input_notify 占用 msg_seq=1)
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_STALE_IN_1',
       content: '一会儿记得提醒我喝水',
@@ -228,7 +237,13 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
       5000,
       'inbound 1 and input_notify'
     );
-    expect(capturedFollowups[0]!.text).toContain('[消息ID: ROBOT1.0_STALE_IN_1]');
+    expect(capturedFollowups[0]!.text).toMatch(
+      /^\[msg_1\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 一会儿记得提醒我喝水$/
+    );
+    expect(capturedFollowups[0]!.text).not.toContain('[QQ私聊]');
+    expect(capturedFollowups[0]!.text).not.toContain('ROBOT1.0_STALE_IN_1');
+    expect(capturedFollowups[0]!.text).not.toContain('[消息ID:');
+    expect(capturedFollowups[0]!.text).not.toContain(MOCK_OPENID);
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_STALE_IN_1');
 
     // 验证用户侧静默：assistant/message 事件绝不自动发出任何文本消息
@@ -252,8 +267,11 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
 
     await waitUntil(() => capturedFollowups.length === 2, 3000, 'scheduled task wakeup');
     const scheduledPrompt = capturedFollowups[1]!.text;
-    // 绝不在 Prompt 伪造 [消息ID:]
+    // 绝不在 Prompt 伪造 [msg_...] 或 [消息ID:]，且移除 [QQ私聊]
+    expect(scheduledPrompt).not.toContain('[msg_');
     expect(scheduledPrompt).not.toContain('[消息ID:');
+    expect(scheduledPrompt).not.toContain('[QQ私聊]');
+    expect(scheduledPrompt).not.toContain('ROBOT1.0_');
     expect(scheduledPrompt).toContain('系统事件：[定时任务]');
     expect(scheduledPrompt).toContain('提醒用户喝水');
 
@@ -277,7 +295,11 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
     const res1 = await sendTool.execute({ text: '到点啦，记得喝水~' }, { agent });
     const res2 = await sendTool.execute({ text: '再提醒一次，补充水分' }, { agent });
     expect(res1.success).toBe(true);
+    expect(res1.message_id).toBe('msg_self_1');
+    expect((res1 as any).ref_idx).toBeUndefined();
     expect(res2.success).toBe(true);
+    expect(res2.message_id).toBe('msg_self_2');
+    expect((res2 as any).ref_idx).toBeUndefined();
 
     const textPosts = postedMessages.filter((m) => m.msg_type !== 6);
     expect(textPosts).toHaveLength(2);
@@ -314,18 +336,24 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
       5000,
       'inbound 2 and input_notify 2'
     );
-    expect(capturedFollowups[2]!.text).toContain('[消息ID: ROBOT1.0_STALE_IN_2]');
+    expect(capturedFollowups[2]!.text).toMatch(
+      /^\[msg_2\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 好的我喝完啦$/
+    );
+    expect(capturedFollowups[2]!.text).not.toContain('[QQ私聊]');
+    expect(capturedFollowups[2]!.text).not.toContain('ROBOT1.0_STALE_IN_2');
+    expect(capturedFollowups[2]!.text).not.toContain(MOCK_OPENID);
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_STALE_IN_2');
     expect((bridge.getActiveTurnContext(MOCK_PEER) as any)?.is_synthetic).toBeFalsy();
 
     const res3 = await sendTool.execute({ text: '棒棒哒！' }, { agent });
     expect(res3.success).toBe(true);
+    expect(res3.message_id).toBe('msg_self_3');
     const latestTextPost = postedMessages.filter((m) => m.msg_type !== 6).pop();
     expect(latestTextPost.msg_id).toBe('ROBOT1.0_STALE_IN_2');
     expect(latestTextPost.msg_seq).toBe(2);
   });
 
-  it('契约 2: 连续多次 scheduled_task 唤醒均不伪造 [消息ID:]，且保留有效入站槽位供后续单调递增使用', async () => {
+  it('契约 2: 连续多次 scheduled_task 唤醒均不伪造 [msg_]/[消息ID:]，且保留有效入站槽位供后续单调递增使用', async () => {
     const agent = await preparePeerAgent();
     const bridge = booted.ctx.get('kujira-outbound-bridge') as OutboundStreamBridge;
     const hub = booted.ctx.get('kujira-system-event-hub') as SystemEventHub;
@@ -343,6 +371,10 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
       5000,
       'initial inbound'
     );
+    expect(capturedFollowups[0]!.text).toMatch(
+      /^\[msg_1\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 开启周期提醒$/
+    );
+    expect(capturedFollowups[0]!.text).not.toContain('[QQ私聊]');
 
     await hub.dispatchScheduledTask({
       peer: MOCK_PEER,
@@ -362,8 +394,14 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
     });
 
     await waitUntil(() => capturedFollowups.length === 3, 3000, 'two scheduled wakeups');
+    expect(capturedFollowups[1]!.text).not.toContain('[msg_');
     expect(capturedFollowups[1]!.text).not.toContain('[消息ID:');
+    expect(capturedFollowups[1]!.text).not.toContain('[QQ私聊]');
+    expect(capturedFollowups[1]!.text).toContain('系统事件：[定时任务]');
+    expect(capturedFollowups[2]!.text).not.toContain('[msg_');
     expect(capturedFollowups[2]!.text).not.toContain('[消息ID:');
+    expect(capturedFollowups[2]!.text).not.toContain('[QQ私聊]');
+    expect(capturedFollowups[2]!.text).toContain('系统事件：[定时任务]');
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_STALE_MULTI_IN');
 
     // 全程未调用 send_qq_message 时，没有任何文本出站
@@ -371,7 +409,9 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
 
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
-    await sendTool.execute({ text: '周期打卡' }, { agent });
+    const sendRes = await sendTool.execute({ text: '周期打卡' }, { agent });
+    expect(sendRes.success).toBe(true);
+    expect(sendRes.message_id).toBe('msg_self_1');
 
     const sent = postedMessages.filter((m) => m.msg_type !== 6);
     expect(sent).toHaveLength(1);

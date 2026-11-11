@@ -9,12 +9,12 @@
  * 3. 同 peer 重复等待 → wait-active 状态层拒绝
  * 4. AbortSignal 取消 → cancelled 结算，Promise 不悬挂
  * 5. 工具参数校验（timeout 缺失/非法 → 状态层；非单聊 peer → 状态层拦截）
- * 6. 单聊 string msg_id / ref_idx 收集与 renderWaitResultText 引用渲染（无 QQ: 前缀）
+ * 6. 单聊短 ID (`msg_<n>`) 收集与 renderWaitResultText 精简引用渲染（无 `from` / `user_id` / `ref_idx` / `[QQ私聊]`）
  * 7. 真实装配闭环 (bootDshKujira({ mountPlugin: true }) + FakeWs + mockFetch):
  *    - tools 注册表包含 wait_for_user_messages 并经 execute 解析 kujira-user-<hash16>
- *    - 等待期间同 peer 入站 C2C_MESSAGE_CREATE → 门控收集、更新活跃锚点、并抑制同轮额外唤醒
+ *    - 等待期间同 peer 入站 C2C_MESSAGE_CREATE → 门控收集短 ID、更新活跃锚点、并抑制同轮额外唤醒
  *    - 异用户入站消息绝不混入当前单聊等待队列
- *    - 等待期间入站引用回复 (message_type=103) → 还原 quoted 并正确渲染
+ *    - 等待期间入站引用回复 (message_type=103) → 还原短 ID quoted 并正确渲染
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -28,6 +28,7 @@ import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import { QQ_API_BASE, QQ_BOT_TOKEN_URL } from '../../src/constants/index.js';
 import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
 import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
+import { formatDateTime } from '../../src/storage/database.js';
 
 const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
 const OTHER_OPENID = 'B1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6';
@@ -57,7 +58,7 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
     resetGlobalToolContext();
   });
 
-  it('契约 1: MessageWaitRegistry 收集命中消息并在窗口结束返回完整字段', async () => {
+  it('契约 1: MessageWaitRegistry 收集命中消息并在窗口结束返回精简短 ID 字段', async () => {
     const reg = new MessageWaitRegistry();
     const waitPromise = reg.wait(MOCK_PEER, { timeoutMs: 60 });
     expect(reg.isWaiting(MOCK_PEER)).toBe(true);
@@ -65,9 +66,7 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
     // 异 peer 投递不命中、不收集
     expect(
       reg.tryDeliver(openidToPeer(OTHER_OPENID), {
-        msg_id: 'ROBOT1.0_OTHER',
-        from: '他人',
-        user_id: OTHER_OPENID,
+        msg_id: 'msg_99',
         content: 'x',
         time: 1,
       })
@@ -75,10 +74,7 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
 
     const ts = Date.parse('2026-06-01T12:00:00.000Z');
     const delivered = reg.tryDeliver(MOCK_PEER, {
-      msg_id: 'ROBOT1.0_WAIT_1',
-      ref_idx: 'REFIDX_WAIT_1',
-      from: '张三',
-      user_id: MOCK_OPENID,
+      msg_id: 'msg_1',
       content: '补充: 改成周三上线',
       time: ts,
     });
@@ -89,17 +85,17 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
     if (result.ok) {
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0]).toEqual({
-        msg_id: 'ROBOT1.0_WAIT_1',
-        ref_idx: 'REFIDX_WAIT_1',
-        from: '张三',
-        user_id: MOCK_OPENID,
+        msg_id: 'msg_1',
         content: '补充: 改成周三上线',
         time: ts,
       });
+      expect('from' in result.messages[0]!).toBe(false);
+      expect('user_id' in result.messages[0]!).toBe(false);
+      expect('ref_idx' in result.messages[0]!).toBe(false);
     }
     expect(reg.isWaiting(MOCK_PEER)).toBe(false);
     expect(
-      reg.tryDeliver(MOCK_PEER, { from: '乙', user_id: MOCK_OPENID, content: 'y', time: 2 })
+      reg.tryDeliver(MOCK_PEER, { msg_id: 'msg_2', content: 'y', time: 2 })
     ).toBe(false);
   });
 
@@ -178,56 +174,67 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
       waitRegistry: reg,
     });
 
+    const ts = Date.now();
     const delivered = reg.tryDeliver(MOCK_PEER, {
-      msg_id: 'ROBOT1.0_DM_1',
-      ref_idx: 'REFIDX_DM_1',
-      from: '测试好友',
-      user_id: MOCK_OPENID,
+      msg_id: 'msg_1',
       content: '继续说',
-      time: Date.now(),
+      time: ts,
     });
     expect(delivered).toBe(true);
 
     const result = await waitPromise;
     expectLosslessJson(result);
     expect(result).toHaveProperty('total', 1);
-    expect((result as any).messages[0]).toMatchObject({
-      msg_id: 'ROBOT1.0_DM_1',
-      ref_idx: 'REFIDX_DM_1',
-      user_id: MOCK_OPENID,
+    expect((result as any).messages[0]).toEqual({
+      msg_id: 'msg_1',
       content: '继续说',
+      time: ts,
     });
   });
 
-  it('契约 7: renderWaitResultText 正确渲染带 string msg_id、ref_idx 与 quoted 引用回复的消息（无 QQ: 前缀）', () => {
+  it('契约 7: renderWaitResultText 正确渲染精简短 ID 与 quoted 引用回复的消息（无长 ID 与发送者标识）', () => {
+    const msgTs = Date.parse('2026-06-01T12:00:00.000Z');
+    const quotedTs = Date.parse('2026-06-01T11:55:00.000Z');
     const text = renderWaitResultText({
-      total: 1,
+      total: 2,
       messages: [
         {
-          msg_id: 'ROBOT1.0_MSG_88',
-          ref_idx: 'REFIDX_MSG_88',
-          from: '测试用户',
-          user_id: MOCK_OPENID,
+          msg_id: 'msg_8',
           content: '收到请回复',
-          time: Date.parse('2026-06-01T12:00:00.000Z'),
-          reply_to: 'REFIDX_HIST_77',
+          time: msgTs,
+          reply_to: 'msg_3',
           quoted: {
-            msg_id: 'ROBOT1.0_HIST_77',
-            ref_idx: 'REFIDX_HIST_77',
-            user_id: MOCK_OPENID,
-            from_name: '历史用户',
+            short_id: 'msg_3',
+            time: quotedTs,
             text: '你是谁',
+          },
+        },
+        {
+          msg_id: 'msg_9',
+          content: '补充一句',
+          time: msgTs,
+          quoted: {
+            text: '未知历史原文',
           },
         },
       ],
     });
 
-    expect(text).toContain('已收集 1 条新消息:');
-    expect(text).toContain('测试用户');
-    expect(text).toContain('[消息ID: ROBOT1.0_MSG_88]');
-    expect(text).toContain('[ref_idx: REFIDX_MSG_88]');
-    expect(text).toContain(`[引用回复 历史用户 (${MOCK_OPENID}): "你是谁"]`);
-    expect(text).toContain('收到请回复');
+    const expectedMsgTime = formatDateTime(msgTs);
+    const expectedQuotedTime = formatDateTime(quotedTs);
+    expect(text).toContain('已收集 2 条新消息:');
+    expect(text).toContain(
+      `1. [msg_8] [${expectedMsgTime}] [引用回复: "[msg_3] [${expectedQuotedTime}] 你是谁"] 收到请回复`
+    );
+    expect(text).toContain(
+      `2. [msg_9] [${expectedMsgTime}] [引用回复: "未知历史原文"] 补充一句`
+    );
+    expect(text).not.toContain(MOCK_OPENID);
+    expect(text).not.toContain('[QQ私聊]');
+    expect(text).not.toContain('[消息ID:');
+    expect(text).not.toContain('[ref_idx:');
+    expect(text).not.toContain('ROBOT1.0_');
+    expect(text).not.toContain('REFIDX_');
   });
 });
 
@@ -461,22 +468,23 @@ describe('契约测试: EN-005 wait_for_user_messages 真实装配闭环 (bootDs
     expectLosslessJson(result);
     expect(result).toHaveProperty('total', 1);
     expect(result.messages[0]).toMatchObject({
-      msg_id: 'ROBOT1.0_WAIT_HIT',
-      ref_idx: 'REFIDX_WAIT_HIT',
-      from: '测试用户',
-      user_id: MOCK_OPENID,
+      msg_id: 'msg_1',
       content: '补充: 改成周三上线',
     });
+    expect(typeof result.messages[0].time).toBe('number');
+    expect('from' in result.messages[0]).toBe(false);
+    expect('user_id' in result.messages[0]).toBe(false);
+    expect('ref_idx' in result.messages[0]).toBe(false);
 
     // 仅 OTHER_OPENID 触发了正常唤醒；MOCK_PEER 的补充消息被门控消费，抑制了同轮额外唤醒
     const mockPeerWakeups = dispatchSpy.mock.calls.filter((c) => c[0]?.peer === MOCK_PEER);
     expect(mockPeerWakeups).toHaveLength(0);
-    // 被收集消息同时更新了出站活跃回合入站 msg_id 锚点
+    // 被收集消息同时更新了出站活跃回合入站 msg_id 锚点（底层仍保留真实 ROBOT1.0_... 供被动回复）
     const outboundBridge = booted!.ctx.get('kujira-outbound-bridge') as any;
     expect(outboundBridge.getActiveTurnContext(MOCK_PEER)?.msg_id).toBe('ROBOT1.0_WAIT_HIT');
   });
 
-  it('装配: 等待期间入站引用回复 (message_type=103) → 还原 quoted 并抑制额外唤醒', async () => {
+  it('装配: 等待期间入站引用回复 (message_type=103) → 还原短 ID quoted 并抑制额外唤醒', async () => {
     const sessionManager = booted!.ctx.get('kujira-session') as any;
     const dispatchSpy = vi.spyOn(sessionManager, 'dispatchWakeup').mockResolvedValue(undefined as any);
     const provider = booted!.ctx.get('kujiraBridgeTools') as any;
@@ -513,27 +521,31 @@ describe('契约测试: EN-005 wait_for_user_messages 真实装配闭环 (bootDs
     expectLosslessJson(result);
     expect(result).toHaveProperty('total', 1);
     expect(result.messages[0]).toMatchObject({
-      msg_id: 'ROBOT1.0_REPLY_8',
-      ref_idx: 'REFIDX_REPLY_8',
-      from: '测试用户',
-      user_id: MOCK_OPENID,
+      msg_id: 'msg_2',
       content: '这是回复内容',
-      reply_to: 'REFIDX_ORIG_5',
+      reply_to: 'msg_1',
       quoted: {
-        msg_id: 'ROBOT1.0_ORIG_5',
-        ref_idx: 'REFIDX_ORIG_5',
-        user_id: MOCK_OPENID,
-        from_name: '历史用户',
+        short_id: 'msg_1',
         text: '你是硬梨吗',
       },
     });
+    expect(typeof result.messages[0].quoted?.time).toBe('number');
+    expect('from' in result.messages[0]).toBe(false);
+    expect('user_id' in result.messages[0]).toBe(false);
+    expect('ref_idx' in result.messages[0]).toBe(false);
+    expect('msg_id' in result.messages[0].quoted!).toBe(false);
+    expect('ref_idx' in result.messages[0].quoted!).toBe(false);
+    expect('user_id' in result.messages[0].quoted!).toBe(false);
+    expect('from_name' in result.messages[0].quoted!).toBe(false);
     // 等待期间未产生额外唤醒
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
 
     const rendered = renderWaitResultText(result);
-    expect(rendered).toContain('[消息ID: ROBOT1.0_REPLY_8]');
-    expect(rendered).toContain('[ref_idx: REFIDX_REPLY_8]');
-    expect(rendered).toContain(`[引用回复 历史用户 (${MOCK_OPENID}): "你是硬梨吗"]`);
+    expect(rendered).toContain('1. [msg_2] [');
+    expect(rendered).toMatch(/\[引用回复: "\[msg_1\] \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 你是硬梨吗"\]/);
     expect(rendered).toContain('这是回复内容');
+    expect(rendered).not.toContain('ROBOT1.0_');
+    expect(rendered).not.toContain('REFIDX_');
+    expect(rendered).not.toContain(MOCK_OPENID);
   });
 });

@@ -85,11 +85,14 @@ describe('契约测试: 官方字符串 ID 保真与三 ID 严格隔离', () => 
     expect(isPermanentRefIdx(inboundId)).toBe(false);
 
     const decision = await shouldWakeup(event, {
+      shortId: 'msg_12',
       getMessageByRefIdx: async (refIdx) => {
         expect(refIdx).toBe(quotedRefIdx);
         return {
           msg_id: outboundRecallId,
+          short_id: 'msg_self_7',
           ref_idx: quotedRefIdx,
+          time: 1794000000000,
           user_id: 'bot',
           sender_name: 'Kujira',
           self: 1,
@@ -100,11 +103,17 @@ describe('契约测试: 官方字符串 ID 保真与三 ID 严格隔离', () => 
 
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('quote');
-    // 入站被动锚点仍为 event.id，绝不被出站撤回 ID 覆盖
+    // 入站被动锚点仍为 event.id，绝不被出站撤回 ID 覆盖；short_id 与 quoted.short_id 各自独立
     expect(decision.payload?.msg_id).toBe(inboundId);
+    expect(decision.payload?.short_id).toBe('msg_12');
     expect(decision.payload?.ref_idx).toBe(selfRefIdx);
-    expect(decision.payload?.quoted?.msg_id).toBe(outboundRecallId);
-    expect(decision.payload?.quoted?.ref_idx).toBe(quotedRefIdx);
+    expect(decision.payload?.quoted).toEqual({
+      short_id: 'msg_self_7',
+      time: 1794000000000,
+      text: '机器人历史回复',
+    });
+    expect('msg_id' in decision.payload!.quoted!).toBe(false);
+    expect('ref_idx' in decision.payload!.quoted!).toBe(false);
 
     // 校验运行态上下文与发信载荷结构中的三 ID 语义边界
     const replyCtx: InboundReplyContext = {

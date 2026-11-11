@@ -1,10 +1,10 @@
 /**
- * 契约测试: send_file 文件源归一化、四类媒体映射与四步分片上传下发契约
+ * 契约测试: send_file 文件源归一化、四类媒体映射、四步分片上传下发与短出站 ID 契约
  *
  * 覆盖规范:
  * - 支持 本地绝对路径 / file:// URI / http(s):// URL / base64:// & data:;base64 四种形态；
  * - file_type 支持 'image' | 'file' | 'video' | 'voice'，映射到 QQMediaFileType (1/4/2/3)；
- * - 经 OutboundStreamBridge.sendMediaReply 完成 uploadC2CMedia + msg_type=7 下发，返回 string message_id；
+ * - 经 OutboundStreamBridge.sendMediaReply 完成 uploadC2CMedia + msg_type=7 下发，通过 resolveOutboundShortId 返回短出站 ID msg_self_<n>（无 ref_idx，绝不暴露 ROBOT1.0_...）；
  * - HTTP 拉取报错脱敏去 query 凭证，不泄漏 token / rkey；无 gateway/peer 或不存在文件绝不假成功。
  */
 
@@ -14,7 +14,9 @@ import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { sendFile } from '../../src/tools/index.js';
+import { MessageDatabase } from '../../src/storage/database.js';
+import { recordOutboundSelfMessage } from '../../src/outbound/self-record.js';
+import { sendFile, createSendFileTool } from '../../src/tools/index.js';
 import {
   classifySendFileSource,
   detectSendFileType,
@@ -49,9 +51,10 @@ function assertNoUndefinedFields(obj: unknown, currentPath = ''): void {
   }
 }
 
-function stubGateway(overrides: Record<string, any> = {}) {
+function stubGateway(overrides: Record<string, any> = {}, targetDb?: MessageDatabase) {
   const uploadCalls: Array<{ openid: string; size: number; options: any }> = [];
   const sendCalls: Array<{ openid: string; payload: any; meta: any }> = [];
+  let outSeq = 1000;
 
   const gateway = {
     uploadC2CMedia: vi.fn(async (openid: string, bytes: Uint8Array, options: any) => {
@@ -68,12 +71,32 @@ function stubGateway(overrides: Record<string, any> = {}) {
     }),
     sendC2CMessage: vi.fn(async (openid: string, payload: any, meta: any) => {
       sendCalls.push({ openid, payload, meta });
+      outSeq += 1;
+      const rawId = `ROBOT1.0_MEDIA_OUT_${outSeq}`;
+      const refIdx = `REFIDX_MEDIA_${outSeq}`;
+      if (targetDb) {
+        recordOutboundSelfMessage(
+          {
+            peer: meta?.peer ?? USER_PEER,
+            openid,
+            msgId: rawId,
+            refIdx,
+            replyTo: meta?.replyTo ?? null,
+            msgType: 7,
+            text: meta?.text,
+            attachments: meta?.attachments,
+            payload,
+            time: Date.now(),
+          },
+          { db: targetDb, botId: '1000000000', senderName: 'Kujira' }
+        );
+      }
       return {
         ok: true,
         status: 200,
         body: {
-          id: 'ROBOT1.0_MEDIA_OUT_12345',
-          ext_info: { ref_idx: 'REFIDX_MEDIA_12345' },
+          id: rawId,
+          ext_info: { ref_idx: refIdx },
         },
       };
     }),
@@ -89,25 +112,29 @@ function stubGateway(overrides: Record<string, any> = {}) {
 
 describe('契约测试: send_file 四形态归一化与四步上传下发', () => {
   let tmpDir: string;
+  let db: MessageDatabase;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-send-file-'));
+    db = new MessageDatabase(path.join(tmpDir, 'messages.sqlite'));
+    db.init();
   });
 
   afterEach(() => {
+    db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('契约 1: base64:// 与 data:...;base64, 解码 Buffer 并上传下发', async () => {
-    const { gateway, uploadCalls, sendCalls } = stubGateway();
+  it('契约 1: base64:// 与 data:...;base64, 解码 Buffer 并上传下发（仅返回短出站 ID 且绝不暴露长 ID）', async () => {
+    const { gateway, uploadCalls, sendCalls } = stubGateway({}, db);
 
     const resB64 = await sendFile(
       { file_path: 'base64://aGVsbG8=' },
-      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway, db }
     );
     expect(resB64.success).toBe(true);
-    expect(resB64.message_id).toBe('ROBOT1.0_MEDIA_OUT_12345');
-    expect(resB64.ref_idx).toBe('REFIDX_MEDIA_12345');
+    expect(resB64.message_id).toBe('msg_self_1');
+    expect((resB64 as any).ref_idx).toBeUndefined();
     assertNoUndefinedFields(resB64);
     expect(uploadCalls[0]!.options.fileType).toBe(QQ_FILE_TYPE_FILE);
     expect(sendCalls[0]!.payload).toMatchObject({
@@ -118,10 +145,28 @@ describe('契约测试: send_file 四形态归一化与四步上传下发', () =
     const pngHeaderB64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
     const resDataUri = await sendFile(
       { file_path: `data:image/png;base64,${pngHeaderB64}` },
-      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway, db }
     );
     expect(resDataUri.success).toBe(true);
+    expect(resDataUri.message_id).toBe('msg_self_2');
     expect(uploadCalls[1]!.options.fileType).toBe(QQ_FILE_TYPE_IMAGE);
+
+    // 若简化测试未挂载 db 落库，则省略 message_id 绝不泄露 ROBOT1.0_...
+    const { gateway: noDbGw } = stubGateway();
+    const resNoDb = await sendFile(
+      { file_path: 'base64://aGVsbG8=' },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway: noDbGw }
+    );
+    expect(resNoDb.success).toBe(true);
+    expect(resNoDb.message_id).toBeUndefined();
+    assertNoUndefinedFields(resNoDb);
+
+    // 验证 tool.output.render 仅渲染短 ID，不拼 ref_idx
+    const tool = createSendFileTool({ peer: USER_PEER, openid: MOCK_OPENID, gateway, db });
+    expect((tool as any).output.render({}, { success: true, message_id: 'msg_self_1' })[0].text).toBe(
+      '文件发送成功 (ID: msg_self_1)'
+    );
+    expect((tool as any).output.render({}, { success: true })[0].text).toBe('文件发送成功');
   });
 
   it('契约 2: 本地绝对路径与 file:// URI 校验读取并正确映射四类文件类型', async () => {

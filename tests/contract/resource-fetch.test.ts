@@ -89,21 +89,22 @@ describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官�
     return { mediaManager, mediaCalls };
   }
 
-  it('契约 1: createFetchChatResourceTool 参数表中彻底移除 busid', () => {
+  it('契约 1: createFetchChatResourceTool 参数表中彻底移除 busid，msg_id 说明指向短消息 ID', () => {
     const tool = createFetchChatResourceTool();
     const props = (tool.parameters as any)?.properties;
     expect(props?.busid).toBeUndefined();
     expect(props?.files?.items?.properties?.busid).toBeUndefined();
     expect(props?.file_id).toBeDefined();
     expect(props?.msg_id).toBeDefined();
+    expect(props?.msg_id?.description).toContain('msg_12');
     expect(props?.url).toBeDefined();
   });
 
-  it('契约 2: 一级缓存命中 —— db.getByFileId 已有 local_path 且文件存在时直接复用', async () => {
+  it('契约 2: 一级缓存命中 —— db.getByFileId 或短 msg_id (getMessageByShortId) 已有 local_path 直接复用，严禁按长 ID 兜底', async () => {
     const cachedFile = path.join(tmpDir, 'cached.pdf');
     fs.writeFileSync(cachedFile, 'cached-pdf');
 
-    db.saveMessage({
+    const cachedRec = {
       msg_id: 'ROBOT1.0_CACHED_1',
       peer: USER_PEER,
       user_id: MOCK_OPENID,
@@ -118,8 +119,9 @@ describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官�
       recalled: 0,
       self: 0,
       reply_to: null,
-      source: 'qq',
-    });
+      source: 'qq' as const,
+    };
+    db.saveMessage(cachedRec);
 
     const { mediaManager, mediaCalls } = stubMedia();
     const res = await fetchChatResource(
@@ -131,6 +133,31 @@ describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官�
     expect(res.local_path).toBe(cachedFile);
     expect(mediaCalls).toHaveLength(0);
     assertNoUndefinedFields(res);
+
+    // 传入短消息 ID msg_1 成功通过 getMessageByShortId 命中缓存
+    const resByShortMsgId = await fetchChatResource(
+      { msg_id: (cachedRec as any).short_id },
+      { peer: USER_PEER, db, mediaManager }
+    );
+    expect(resByShortMsgId.success).toBe(true);
+    expect(resByShortMsgId.local_path).toBe(cachedFile);
+    assertNoUndefinedFields(resByShortMsgId);
+
+    // 传入原始长 msg_id 不兼容兜底 getMessage，直接报错
+    const resByLongMsgId = await fetchChatResource(
+      { msg_id: 'ROBOT1.0_CACHED_1' },
+      { peer: USER_PEER, db, mediaManager }
+    );
+    expect(resByLongMsgId.success).toBe(false);
+    expect(resByLongMsgId.error).toContain('msg_12');
+    assertNoUndefinedFields(resByLongMsgId);
+
+    const resByLongFileId = await fetchChatResource(
+      { file_id: 'ROBOT1.0_CACHED_1' },
+      { peer: USER_PEER, db, mediaManager }
+    );
+    expect(resByLongFileId.success).toBe(false);
+    assertNoUndefinedFields(resByLongFileId);
   });
 
   it('契约 3: 从 attachments JSON 提取直链裸 GET 落盘（语音优先 voiceWavUrl）并回写 db.updateLocalPath', async () => {
@@ -310,7 +337,7 @@ describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官�
       '[附件1] 类型:图片 文件名:menu.jpg 尺寸:1080x1920 大小:256KB URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=TOP_SECRET_RKEY_123&spec=0',
     ].join('\n');
 
-    db.saveMessage({
+    const fwdRecord = {
       msg_id: 'ROBOT1.0_FWD_102',
       peer: USER_PEER,
       user_id: MOCK_OPENID,
@@ -325,12 +352,15 @@ describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官�
       recalled: 0,
       self: 0,
       reply_to: null,
-      source: 'qq',
-    });
+      source: 'qq' as const,
+    };
+    db.saveMessage(fwdRecord);
+    const fwdShortId = (fwdRecord as any).short_id as string;
+    expect(fwdShortId).toBe('msg_1');
 
     const { mediaManager, mediaCalls } = stubMedia();
     const res = await expandForwardMessage(
-      { msg_id: 'ROBOT1.0_FWD_102' },
+      { msg_id: fwdShortId },
       { peer: USER_PEER, db, mediaManager }
     );
 
@@ -353,16 +383,25 @@ describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官�
 
     // 兼容 forward_id 别名且缺失记录清晰报错
     const resAlias = await expandForwardMessage(
-      { forward_id: 'ROBOT1.0_FWD_102' },
+      { forward_id: fwdShortId },
       { peer: USER_PEER, db, mediaManager }
     );
     expect(resAlias.success).toBe(true);
 
     const resMissing = await expandForwardMessage(
-      { msg_id: 'ROBOT1.0_NOT_EXIST' },
+      { msg_id: 'msg_999' },
       { peer: USER_PEER, db }
     );
     expect(resMissing.success).toBe(false);
     assertNoUndefinedFields(resMissing);
+
+    // 严禁按长 ID / REFIDX / file_id 兼容查询
+    const resLongRejected = await expandForwardMessage(
+      { msg_id: 'ROBOT1.0_FWD_102' },
+      { peer: USER_PEER, db, mediaManager }
+    );
+    expect(resLongRejected.success).toBe(false);
+    expect(resLongRejected.error).toContain('msg_12');
+    assertNoUndefinedFields(resLongRejected);
   });
 });

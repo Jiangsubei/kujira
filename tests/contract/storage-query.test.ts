@@ -162,12 +162,15 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
     });
 
     expect(res.messages).toHaveLength(2);
-    expect(res.messages[0].msg_id).toBe('ROBOT1.0_4');
-    expect(res.messages[1].msg_id).toBe('ROBOT1.0_2');
+    expect(res.messages[0].msg_id).toBe('msg_3');
+    expect(res.messages[1].msg_id).toBe('msg_2');
+    expect('user_id' in res.messages[0]).toBe(false);
+    expect('sender_name' in res.messages[0]).toBe(false);
+    expect('ref_idx' in res.messages[0]).toBe(false);
 
-    // 跨会话隔离断言: PEER_A 绝对查不到 PEER_B 的消息
+    // 跨会话隔离断言: PEER_A 绝对查不到 PEER_B 的消息（PEER_B 的 msg_1 为 Msg 5）
     const resIso = db.readHistory(PEER_A, { since: 0 });
-    expect(resIso.messages.some((m) => m.msg_id === 'ROBOT1.0_5')).toBe(false);
+    expect(resIso.messages.some((m) => m.content === 'Msg 5 (Other C2C Peer)')).toBe(false);
   });
 
   it('契约 3: 撤回通知按字符串 msg_id 更新状态（自身消息保留原文，用户消息脱敏占位）', () => {
@@ -269,15 +272,15 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
     const res = db.readHistory(PEER_A, { keyword: '部署' });
     expect(res.messages).toHaveLength(2);
     expect(res.total).toBe(2);
-    expect(res.messages.map((m) => m.msg_id)).toEqual(['ROBOT1.0_103', 'ROBOT1.0_101']);
+    expect(res.messages.map((m) => m.msg_id)).toEqual(['msg_3', 'msg_1']);
   });
 
-  it('契约 5: 发送者昵称模糊检索 (sender_name)', () => {
-    db.saveMessage({
+  it('契约 5: 短消息 ID 按 (peer, self) 独立单调分配，支持 getMessageByShortId 与 resolveShortId 隔离查询', () => {
+    const r1: MessageRecord = {
       msg_id: 'ROBOT1.0_201',
       peer: PEER_A,
       user_id: OPENID_A,
-      sender_name: '张三【开发组】',
+      sender_name: 'Alice',
       time: 1000,
       type: 'text',
       content: 'Hello',
@@ -288,8 +291,8 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
       recalled: 0,
       self: 0,
       reply_to: null,
-    });
-    db.saveMessage({
+    };
+    const r2: MessageRecord = {
       msg_id: 'ROBOT1.0_202',
       peer: PEER_A,
       user_id: 'bot',
@@ -304,11 +307,49 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
       recalled: 0,
       self: 1,
       reply_to: null,
-    });
+    };
+    const r3: MessageRecord = {
+      msg_id: 'ROBOT1.0_203',
+      peer: PEER_B,
+      user_id: OPENID_B,
+      sender_name: 'Bob',
+      time: 3000,
+      type: 'text',
+      content: 'Other Peer',
+      raw: '{}',
+      file_id: null,
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+    };
 
-    const res = db.readHistory(PEER_A, { sender_name: '张三' });
-    expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].msg_id).toBe('ROBOT1.0_201');
+    db.saveMessage(r1);
+    db.saveMessage(r2);
+    db.saveMessage(r3);
+
+    expect(r1.short_id).toBe('msg_1');
+    expect(r2.short_id).toBe('msg_self_1');
+    expect(r3.short_id).toBe('msg_1');
+
+    expect(db.resolveShortId(PEER_A, 'ROBOT1.0_201')).toBe('msg_1');
+    expect(db.resolveShortId(PEER_A, 'ROBOT1.0_202')).toBe('msg_self_1');
+    expect(db.resolveShortId(PEER_A, 'ROBOT1.0_203')).toBeNull();
+    expect(db.resolveShortId(PEER_B, 'ROBOT1.0_203')).toBe('msg_1');
+
+    expect(db.getMessageByShortId(PEER_A, 'msg_1')?.msg_id).toBe('ROBOT1.0_201');
+    expect(db.getMessageByShortId(PEER_A, 'msg_self_1')?.msg_id).toBe('ROBOT1.0_202');
+    expect(db.getMessageByShortId(PEER_B, 'msg_1')?.msg_id).toBe('ROBOT1.0_203');
+    expect(db.getMessageByShortId(PEER_A, 'ROBOT1.0_201')).toBeNull();
+
+    const hist = db.readHistory(PEER_A, { order: 'asc' });
+    expect(hist.messages.map((m) => m.msg_id)).toEqual(['msg_1', 'msg_self_1']);
+    for (const item of hist.messages) {
+      expect('user_id' in item).toBe(false);
+      expect('sender_name' in item).toBe(false);
+      expect('ref_idx' in item).toBe(false);
+    }
   });
 
   it('契约 6: 消息类型精确与多类型组合筛选 (type)', () => {
@@ -379,11 +420,11 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
 
     const resImg = db.readHistory(PEER_A, { type: 'image' });
     expect(resImg.messages).toHaveLength(1);
-    expect(resImg.messages[0].msg_id).toBe('ROBOT1.0_302');
+    expect(resImg.messages[0].msg_id).toBe('msg_2');
 
     const resMedia = db.readHistory(PEER_A, { type: ['image', 'voice'] });
     expect(resMedia.messages).toHaveLength(2);
-    expect(resMedia.messages.map((m) => m.msg_id)).toEqual(['ROBOT1.0_303', 'ROBOT1.0_302']);
+    expect(resMedia.messages.map((m) => m.msg_id)).toEqual(['msg_3', 'msg_2']);
   });
 
   it('契约 7: 人性化相对时间解析与范围筛选 (relative / since 相对表达式)', () => {
@@ -439,11 +480,11 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
 
     const res1h = db.readHistory(PEER_A, { relative: '1h' });
     expect(res1h.messages).toHaveLength(1);
-    expect(res1h.messages[0].msg_id).toBe('ROBOT1.0_401');
+    expect(res1h.messages[0].msg_id).toBe('msg_1');
 
     const res4h = db.readHistory(PEER_A, { since: '4h' });
     expect(res4h.messages).toHaveLength(2);
-    expect(res4h.messages.map((m) => m.msg_id)).toEqual(['ROBOT1.0_401', 'ROBOT1.0_402']);
+    expect(res4h.messages.map((m) => m.msg_id)).toEqual(['msg_1', 'msg_2']);
   });
 
   it('契约 8: 友好日期字符串时间解析与筛选 (since / until)', () => {
@@ -485,7 +526,7 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
 
     const res = db.readHistory(PEER_A, { since: '2026-08-31' });
     expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].msg_id).toBe('ROBOT1.0_502');
+    expect(res.messages[0].msg_id).toBe('msg_2');
   });
 
   it('契约 9: 附件/文件存在性筛选 (has_file)', () => {
@@ -524,7 +565,7 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
 
     const res = db.readHistory(PEER_A, { has_file: true });
     expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].msg_id).toBe('ROBOT1.0_602');
+    expect(res.messages[0].msg_id).toBe('msg_2');
     expect(res.messages[0].file_id).toBe('f_602');
   });
 
@@ -564,14 +605,15 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
 
     const resEx = db.readHistory(PEER_A, { exclude_self: true });
     expect(resEx.messages).toHaveLength(1);
-    expect(resEx.messages[0].msg_id).toBe('ROBOT1.0_701');
+    expect(resEx.messages[0].msg_id).toBe('msg_1');
 
     const resSelf = db.readHistory(PEER_A, { self_only: true });
     expect(resSelf.messages).toHaveLength(1);
-    expect(resSelf.messages[0].msg_id).toBe('ROBOT1.0_702');
+    expect(resSelf.messages[0].msg_id).toBe('msg_self_1');
+    expect(resSelf.messages[0].reply_to).toBe('msg_1');
   });
 
-  it('契约 11: 引用回复链关系筛选 (字符串 reply_to)', () => {
+  it('契约 11: 引用回复链关系筛选（仅接收短 ID，reply_to 反查同 peer 短 ID 且不泄漏底层索引）', () => {
     db.saveMessage({
       msg_id: 'ROBOT1.0_801',
       peer: PEER_A,
@@ -606,12 +648,43 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
       self: 1,
       reply_to: 'REFIDX_801',
     });
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_803',
+      peer: PEER_A,
+      user_id: OPENID_A,
+      sender_name: 'U1',
+      time: 3000,
+      type: 'reply',
+      content: '引用未知历史',
+      raw: '{}',
+      ref_idx: 'REFIDX_803',
+      file_id: null,
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: 'TMP_unknown_999',
+    });
 
-    const res = db.readHistory(PEER_A, { reply_to: 'REFIDX_801' });
+    // 传入短 ID 查询回复链
+    const res = db.readHistory(PEER_A, { reply_to: 'msg_1' });
     expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].msg_id).toBe('ROBOT1.0_802');
-    expect(res.messages[0].reply_to).toBe('REFIDX_801');
-    expect(res.messages[0].ref_idx).toBe('REFIDX_802');
+    expect(res.messages[0].msg_id).toBe('msg_self_1');
+    expect(res.messages[0].reply_to).toBe('msg_1');
+    expect('ref_idx' in res.messages[0]).toBe(false);
+
+    // 传入裸 REFIDX_ / ROBOT1.0_ 或不存在的短 ID 一律查无结果（不泄漏裸字符串匹配）
+    expect(db.readHistory(PEER_A, { reply_to: 'REFIDX_801' }).messages).toHaveLength(0);
+    expect(db.readHistory(PEER_A, { reply_to: 'ROBOT1.0_801' }).messages).toHaveLength(0);
+    expect(db.readHistory(PEER_A, { reply_to: 'msg_999' }).messages).toHaveLength(0);
+
+    // 未命中同 peer 目标消息的 reply_to 置 null，绝不外泄 TMP_ / REFIDX_ / ROBOT1.0_
+    const allRes = db.readHistory(PEER_A, { order: 'asc' });
+    expect(allRes.messages.map((m) => [m.msg_id, m.reply_to])).toEqual([
+      ['msg_1', null],
+      ['msg_self_1', 'msg_1'],
+      ['msg_2', null],
+    ]);
   });
 
   it('契约 12: 消息出参携带格式化人类可读时间 (formatted_time)', () => {
@@ -770,10 +843,10 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
     });
 
     const resText = db.readHistory(PEER_A, { type: 'text' });
-    expect(resText.messages.map((m) => m.msg_id)).toEqual(['ROBOT1.0_3002', 'ROBOT1.0_3001']);
+    expect(resText.messages.map((m) => m.msg_id)).toEqual(['msg_self_1', 'msg_1']);
 
     const resReply = db.readHistory(PEER_A, { type: 'reply' });
-    expect(resReply.messages.map((m) => m.msg_id)).toEqual(['ROBOT1.0_3002']);
+    expect(resReply.messages.map((m) => m.msg_id)).toEqual(['msg_self_1']);
   });
 
   it('契约 16: parseTimeValue 支持裸时间 ("19:00", "19:00:00")，自动补全本地当前日期且支持防未来跨天回退', async () => {
@@ -891,7 +964,7 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
 
       const res = db.readHistory(PEER_A, { since: '19:00', order: 'asc' });
       expect(res.messages).toHaveLength(1);
-      expect(res.messages[0].msg_id).toBe('ROBOT1.0_5003');
+      expect(res.messages[0].msg_id).toBe('msg_3');
       expect(res.messages[0].content).toBe('今天19点半消息');
     } finally {
       vi.useRealTimers();
@@ -998,6 +1071,157 @@ describe('契约测试: SQLite 消息存储、三 ID 隔离与单聊多条件查
     // 达到或超过 expires_at 过期失效
     expect(db.getCachedMediaUpload(OPENID_A, 'abc123md5', 1, t0 + ttlMs)).toBeNull();
     expect(db.getCachedMediaUpload(OPENID_A, 'abc123md5', 1, t0 + ttlMs + 1)).toBeNull();
+  });
+
+  it('契约 22: 旧库无 short_id 列自动迁移、按 (peer, self) 数值序号回填并建立唯一索引', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const legacyFile = path.join(tmpDir, 'legacy_messages.sqlite');
+    const rawDb = new Database(legacyFile);
+    rawDb.exec(`
+      CREATE TABLE messages (
+        msg_id TEXT PRIMARY KEY,
+        peer TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        sender_name TEXT NOT NULL,
+        time INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        content TEXT NOT NULL,
+        raw TEXT NOT NULL,
+        ref_idx TEXT,
+        file_id TEXT,
+        local_path TEXT,
+        fingerprint TEXT,
+        recalled INTEGER NOT NULL DEFAULT 0,
+        self INTEGER NOT NULL DEFAULT 0,
+        reply_to TEXT,
+        source TEXT NOT NULL DEFAULT 'qq',
+        attachments TEXT
+      );
+    `);
+    const ins = rawDb.prepare(`
+      INSERT INTO messages (msg_id, peer, user_id, sender_name, time, type, content, raw, self)
+      VALUES (?, ?, ?, '', ?, 'text', ?, '{}', ?)
+    `);
+    ins.run('ROBOT1.0_LEG_A2', PEER_A, OPENID_A, 2000, '第二条入站', 0);
+    ins.run('ROBOT1.0_LEG_A1', PEER_A, OPENID_A, 1000, '第一条入站', 0);
+    ins.run('ROBOT1.0_LEG_AS1', PEER_A, 'bot', 1500, '出站一条', 1);
+    ins.run('ROBOT1.0_LEG_B1', PEER_B, OPENID_B, 500, '对方入站', 0);
+    rawDb.close();
+
+    const migrated = new MessageDatabase(legacyFile);
+    migrated.init();
+    try {
+      expect(migrated.getMessage('ROBOT1.0_LEG_A1')?.short_id).toBe('msg_1');
+      expect(migrated.getMessage('ROBOT1.0_LEG_A2')?.short_id).toBe('msg_2');
+      expect(migrated.getMessage('ROBOT1.0_LEG_AS1')?.short_id).toBe('msg_self_1');
+      expect(migrated.getMessage('ROBOT1.0_LEG_B1')?.short_id).toBe('msg_1');
+
+      // 已有 msg_2 与 msg_10 的库再次回填缺失行，应取数值最大 10 + 1 -> msg_11（非字典序）
+      const internalDb = (migrated as any).db;
+      internalDb.prepare('UPDATE messages SET short_id = ? WHERE msg_id = ?').run('msg_10', 'ROBOT1.0_LEG_A2');
+      internalDb
+        .prepare(
+          `INSERT INTO messages (msg_id, short_id, peer, user_id, sender_name, time, type, content, raw, self)
+           VALUES ('ROBOT1.0_LEG_A3', '', ?, ?, '', 3000, 'text', '空短ID待回填', '{}', 0)`
+        )
+        .run(PEER_A, OPENID_A);
+
+      migrated.close();
+      const reopened = new MessageDatabase(legacyFile);
+      reopened.init();
+      try {
+        expect(reopened.getMessage('ROBOT1.0_LEG_A3')?.short_id).toBe('msg_11');
+
+        // 唯一索引生效：同 peer 不得插入重复 short_id
+        expect(() =>
+          (reopened as any).db
+            .prepare(
+              `INSERT INTO messages (msg_id, short_id, peer, user_id, sender_name, time, type, content, raw, self)
+               VALUES ('ROBOT1.0_DUP', 'msg_11', ?, ?, '', 4000, 'text', 'dup', '{}', 0)`
+            )
+            .run(PEER_A, OPENID_A)
+        ).toThrow();
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it('契约 23: saveMessage / saveMessageIfNotExists 事务复用与分配 short_id 并回填入参', () => {
+    // 1. saveMessage 自动分配并写回 record.short_id
+    const rec1: MessageRecord = {
+      msg_id: 'ROBOT1.0_TX_1',
+      peer: PEER_A,
+      user_id: OPENID_A,
+      sender_name: 'Alice',
+      time: 1000,
+      type: 'text',
+      content: '第一条',
+      raw: '{}',
+      file_id: null,
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+    };
+    db.saveMessage(rec1);
+    expect(rec1.short_id).toBe('msg_1');
+
+    // 2. 同 msg_id 再次 saveMessage 必须保留原 short_id，即使传入不同 short_id
+    const rec1Update: MessageRecord = {
+      ...rec1,
+      short_id: 'msg_99',
+      content: '更新内容',
+    };
+    db.saveMessage(rec1Update);
+    expect(rec1Update.short_id).toBe('msg_1');
+    expect(db.getMessage('ROBOT1.0_TX_1')?.short_id).toBe('msg_1');
+    expect(db.getMessage('ROBOT1.0_TX_1')?.content).toBe('更新内容');
+
+    // 3. saveMessageIfNotExists 重复插入返回 false 且回填已有 short_id
+    const dupRec: MessageRecord = {
+      ...rec1,
+      short_id: undefined,
+      content: '不应覆盖',
+    };
+    expect(db.saveMessageIfNotExists(dupRec)).toBe(false);
+    expect(dupRec.short_id).toBe('msg_1');
+    expect(db.getMessage('ROBOT1.0_TX_1')?.content).toBe('更新内容');
+
+    // 4. 传入合法且不冲突的 short_id 可尊重（后续自增从 max + 1 继续）
+    const explicitRec: MessageRecord = {
+      ...rec1,
+      msg_id: 'ROBOT1.0_TX_5',
+      short_id: 'msg_5',
+      time: 2000,
+      content: '显式序号',
+    };
+    expect(db.saveMessageIfNotExists(explicitRec)).toBe(true);
+    expect(explicitRec.short_id).toBe('msg_5');
+
+    // 5. 传入同 peer 冲突或方向不匹配的 short_id 时自动降级顺延分配
+    const conflictRec: MessageRecord = {
+      ...rec1,
+      msg_id: 'ROBOT1.0_TX_6',
+      short_id: 'msg_5',
+      time: 3000,
+      content: '冲突自动分配',
+    };
+    db.saveMessage(conflictRec);
+    expect(conflictRec.short_id).toBe('msg_6');
+
+    const wrongDirRec: MessageRecord = {
+      ...rec1,
+      msg_id: 'ROBOT1.0_TX_7',
+      short_id: 'msg_self_99',
+      time: 4000,
+      content: '方向不匹配自动分配',
+    };
+    db.saveMessage(wrongDirRec);
+    expect(wrongDirRec.short_id).toBe('msg_7');
   });
 });
 

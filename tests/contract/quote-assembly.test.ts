@@ -8,15 +8,30 @@ import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import type { SessionManager } from '../../src/gateway/session.js';
 import type { KujiraGatewayClient } from '../../src/gateway/server.js';
 import { openidToPeer } from '../../src/utils/peer.js';
+import { formatDateTime } from '../../src/storage/time-parser.js';
 
 /**
  * 契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
  *
- * (a) 出站 reply_to（REFIDX_... 或本地带 ref_idx 的 msg_id）发送 message_reference: { message_id: 'REFIDX_...' }；
- * (b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原 quoted（含入站图与出站自身消息）；
- * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（含 URL 凭证脱敏）；
+ * (a) 出站 reply_to 仅接收短 ID（msg_<n> / msg_self_<n>），经 getMessageByShortId 换取 REFIDX_... 后在首片发送 message_reference，拒绝非短 ID；
+ * (b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原精简短 ID 引用头（含入站图与出站自身消息）；
+ * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（含 URL 凭证脱敏），不泄露索引/发送者标识；
  * (d) 双未命中时优雅降级占位，不中断唤醒。
  */
+
+function expectLosslessJson(value: unknown, trail = 'root'): void {
+  if (value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach((item, idx) => expectLosslessJson(item, `${trail}[${idx}]`));
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      expect(v, `${trail}.${k} must not be undefined`).not.toBeUndefined();
+      expectLosslessJson(v, `${trail}.${k}`);
+    }
+  }
+}
 
 const nativeFetch = globalThis.fetch;
 
@@ -182,9 +197,13 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
         const parsed = new URL(url);
         if (method === 'POST' && parsed.pathname === `/v2/users/${MOCK_OPENID}/messages`) {
           const body = typeof init?.body === 'string' && init.body ? JSON.parse(init.body) : {};
-          if (body.msg_type !== 6) {
-            sentBodies.push(body);
+          if (body.msg_type === 6) {
+            return new Response(JSON.stringify({ id: 'ROBOT1.0_INPUT_NOTIFY_1' }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
           }
+          sentBodies.push(body);
           outSeq += 1;
           return new Response(
             JSON.stringify({
@@ -205,9 +224,6 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: true,
-      config: {
-        input_notify_enabled: false,
-      },
     });
 
     const gateway = booted.ctx.get('kujira-gateway') as KujiraGatewayClient;
@@ -249,7 +265,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     return agent;
   }
 
-  it('(a) 出站 reply_to 支持直接传 REFIDX_... 或本地带 ref_idx 的 msg_id，并在首片发送 message_reference', async () => {
+  it('(a) 出站 reply_to 仅接收短 ID（msg_<n> / msg_self_<n>）换取 REFIDX_... 并在首片发送 message_reference，拒绝非短 ID', async () => {
     const agent = await preparePeerAgent();
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
 
@@ -275,32 +291,50 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
 
-    // 1. 直接传入 REFIDX_...
-    const r1 = await sendTool.execute({ text: '直接引用索引', reply_to: 'REFIDX_Q_IN_1' }, { agent });
+    // 0. 传入 REFIDX_... 或 ROBOT1.0_... 等非短 ID 必须被直接校验拦截，不打网关
+    for (const invalidId of ['REFIDX_Q_IN_1', 'ROBOT1.0_Q_IN_1']) {
+      const rejected = await sendTool.execute({ text: '非法引用拦截', reply_to: invalidId }, { agent });
+      expectLosslessJson(rejected);
+      expect(rejected.success).toBe(false);
+      expect(rejected.error).toContain('无效的 reply_to 短消息 ID');
+    }
+    expect(sentBodies).toHaveLength(0);
+
+    // 1. 传入入站短 ID ('msg_1')，经 getMessageByShortId 查得 REFIDX_Q_IN_1 后发送 message_reference，仅返回短出站 ID
+    const r1 = await sendTool.execute({ text: '引用入站短 ID', reply_to: 'msg_1' }, { agent });
+    expectLosslessJson(r1);
     expect(r1.success).toBe(true);
+    expect(r1.message_id).toBe('msg_self_1');
+    expect((r1 as any).ref_idx).toBeUndefined();
     expect(sentBodies[0].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
 
-    // 2. 传入本地入站 msg_id（SQLite 中存有 ref_idx=REFIDX_Q_IN_1）
-    const r2 = await sendTool.execute({ text: '通过本地 msg_id 反查引用', reply_to: 'ROBOT1.0_Q_IN_1' }, { agent });
+    // 2. 传入出站短 ID ('msg_self_1')，同样可查库换取 REFIDX_Q_OUT_1 下发引用
+    const r2 = await sendTool.execute({ text: '引用出站短 ID', reply_to: 'msg_self_1' }, { agent });
+    expectLosslessJson(r2);
     expect(r2.success).toBe(true);
-    expect(sentBodies[1].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
+    expect(r2.message_id).toBe('msg_self_2');
+    expect((r2 as any).ref_idx).toBeUndefined();
+    expect(sentBodies[1].message_reference).toEqual({ message_id: 'REFIDX_Q_OUT_1' });
 
-    // 3. 超长分片回复仅首片附 message_reference，后续分片不重复携带
-    const longText = 'A'.repeat(20_000);
-    const r3 = await sendTool.execute({ text: longText, reply_to: 'REFIDX_Q_IN_1' }, { agent });
+    // 3. 超长（<=6000 字符且 >16 KiB UTF-8 字节）分片回复仅首片附 message_reference，后续分片不重复携带
+    const longText = `${'🐳'.repeat(4500)}\n${'🐳'.repeat(1000)}`;
+    const r3 = await sendTool.execute({ text: longText, reply_to: 'msg_1' }, { agent });
+    expectLosslessJson(r3);
     expect(r3.success).toBe(true);
+    expect(r3.message_id).toMatch(/^msg_self_[1-9]\d*$/);
     expect(sentBodies.length).toBeGreaterThanOrEqual(4);
     expect(sentBodies[2].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
     expect(sentBodies[3].message_reference).toBeUndefined();
 
-    // 4. 目标消息无 ref_idx 时不伪造 message_reference
+    // 4. 目标消息 ('msg_2') 无 ref_idx 时不伪造 message_reference
     const beforeIdx = sentBodies.length;
-    const r4 = await sendTool.execute({ text: '无索引兜底', reply_to: 'ROBOT1.0_Q_NO_REF' }, { agent });
+    const r4 = await sendTool.execute({ text: '无索引兜底', reply_to: 'msg_2' }, { agent });
+    expectLosslessJson(r4);
     expect(r4.success).toBe(true);
     expect(sentBodies[beforeIdx].message_reference).toBeUndefined();
   });
 
-  it('(b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原 quoted（含图片与自身出站）', async () => {
+  it('(b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原精简短 ID 引用（含图片与自身出站）', async () => {
     const agent = await preparePeerAgent();
     const baseUrl = await startImageServer();
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
@@ -323,6 +357,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
       ],
     });
     const imgRow = await waitForDbRow('ROBOT1.0_Q_IMG_1');
+    expect(imgRow.short_id).toBe('msg_1');
     expect(imgRow.local_path).toBeTruthy();
     expect(imgRow.ref_idx).toBe('REFIDX_Q_IMG_1');
 
@@ -340,20 +375,32 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     const replyRow = await waitForDbRow('ROBOT1.0_Q_REPLY_IMG');
     await waitUntil(() => capturedFollowups.length >= 2, 3000, 'quote image followup');
 
+    expect(replyRow.short_id).toBe('msg_2');
     expect(replyRow.type).toBe('reply');
     expect(replyRow.reply_to).toBe('REFIDX_Q_IMG_1');
     expect(replyRow.ref_idx).toBe('REFIDX_Q_REPLY_IMG');
     const prompt1 = capturedFollowups[1]!.content;
-    expect(prompt1).toContain(`[引用回复 测试用户A (${MOCK_OPENID}): "[图片:${imgRow.local_path}]"]`);
-    expect(prompt1).toContain('说的就是这张图');
+    expect(prompt1).toBe(
+      `[msg_2] [${formatDateTime(replyRow.time)}] [引用回复: "[msg_1] [${formatDateTime(imgRow.time)}] [图片:${imgRow.local_path}]"] 说的就是这张图`
+    );
     expect(prompt1).not.toContain('兜底占位文本');
+    expect(prompt1).not.toContain('[QQ私聊]');
+    expect(prompt1).not.toContain(MOCK_OPENID);
+    expect(prompt1).not.toContain('测试用户A');
+    expect(prompt1).not.toContain('ROBOT1.0_');
+    expect(prompt1).not.toContain('REFIDX_');
 
     // 3. 机器人发出出站消息（返回 ext_info.ref_idx=REFIDX_Q_OUT_1），随后用户引用该出站消息
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
     const sent = await sendTool.execute({ text: '这是机器人之前发的话' }, { agent });
-    expect(sent.ref_idx).toBe('REFIDX_Q_OUT_1');
-    await waitForDbRow('ROBOT1.0_Q_OUT_1');
+    expectLosslessJson(sent);
+    expect(sent.success).toBe(true);
+    expect(sent.message_id).toBe('msg_self_1');
+    expect((sent as any).ref_idx).toBeUndefined();
+    const outRow = await waitForDbRow('ROBOT1.0_Q_OUT_1');
+    expect(outRow.short_id).toBe('msg_self_1');
+    expect(outRow.ref_idx).toBe('REFIDX_Q_OUT_1');
 
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_Q_REPLY_SELF',
@@ -364,10 +411,20 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
       message_scene: { ext: ['msg_idx=REFIDX_Q_REPLY_SELF', 'ref_msg_idx=REFIDX_Q_OUT_1'] },
     });
 
+    const replySelfRow = await waitForDbRow('ROBOT1.0_Q_REPLY_SELF');
     await waitUntil(() => capturedFollowups.length >= 3, 3000, 'quote self followup');
+    expect(replySelfRow.short_id).toBe('msg_3');
     const prompt2 = capturedFollowups[2]!.content;
-    expect(prompt2).toContain(`[引用回复 Kujira助手 (${MOCK_BOT_ID}): "这是机器人之前发的话"]`);
-    expect(prompt2).toContain('你刚才说的这句很对');
+    expect(prompt2).toBe(
+      `[msg_3] [${formatDateTime(replySelfRow.time)}] [引用回复: "[msg_self_1] [${formatDateTime(outRow.time)}] 这是机器人之前发的话"] 你刚才说的这句很对`
+    );
+    expect(prompt2).not.toContain('[QQ私聊]');
+    expect(prompt2).not.toContain(MOCK_OPENID);
+    expect(prompt2).not.toContain(MOCK_BOT_ID);
+    expect(prompt2).not.toContain('Kujira助手');
+    expect(prompt2).not.toContain('测试用户A');
+    expect(prompt2).not.toContain('ROBOT1.0_');
+    expect(prompt2).not.toContain('REFIDX_');
   });
 
   it('(c) TMP_... 临时索引或未命中本地 SQLite 时回退解析 msg_elements[] 并脱敏 URL', async () => {
@@ -388,11 +445,18 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
       ],
     });
 
+    const tmpRow = await waitForDbRow('ROBOT1.0_Q_TMP_1');
     await waitUntil(() => capturedFollowups.length >= 1, 3000, 'tmp quote followup');
     const promptTmp = capturedFollowups[0]!.content;
-    expect(promptTmp).toContain('[引用回复 消息ID: TMP_COMPOSITE_1:');
-    expect(promptTmp).toContain('复合引用第一段');
-    expect(promptTmp).toContain('[图片(链接已脱敏)]');
+    expect(promptTmp).toBe(
+      `[msg_1] [${formatDateTime(tmpRow.time)}] [引用回复: "复合引用第一段\n[图片(链接已脱敏)]"] 针对这段复合引用回复一下`
+    );
+    expect(promptTmp).not.toContain('TMP_COMPOSITE_1');
+    expect(promptTmp).not.toContain('ROBOT1.0_');
+    expect(promptTmp).not.toContain('REFIDX_');
+    expect(promptTmp).not.toContain(MOCK_OPENID);
+    expect(promptTmp).not.toContain('提问者');
+    expect(promptTmp).not.toContain('[QQ私聊]');
     expect(promptTmp).not.toContain('rkey');
     expect(promptTmp).not.toContain('mock_secret');
 
@@ -407,10 +471,17 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
       msg_elements: [{ content: '启动前的历史重要消息', message_type: 0, msg_idx: 'REFIDX_NOT_IN_DB' }],
     });
 
+    const missRow = await waitForDbRow('ROBOT1.0_Q_MISS_FB');
     await waitUntil(() => capturedFollowups.length >= 2, 3000, 'miss fallback followup');
     const promptMiss = capturedFollowups[1]!.content;
-    expect(promptMiss).toContain('[引用回复 消息ID: REFIDX_NOT_IN_DB: "启动前的历史重要消息"]');
-    expect(promptMiss).toContain('这句话什么意思');
+    expect(promptMiss).toBe(
+      `[msg_2] [${formatDateTime(missRow.time)}] [引用回复: "启动前的历史重要消息"] 这句话什么意思`
+    );
+    expect(promptMiss).not.toContain('REFIDX_NOT_IN_DB');
+    expect(promptMiss).not.toContain('ROBOT1.0_');
+    expect(promptMiss).not.toContain(MOCK_OPENID);
+    expect(promptMiss).not.toContain('提问者');
+    expect(promptMiss).not.toContain('[QQ私聊]');
   });
 
   it('(d) 本地库与 msg_elements[] 均未命中时优雅降级占位，唤醒不中断', async () => {
@@ -426,9 +497,16 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
       message_scene: { ext: ['msg_idx=REFIDX_Q_EXPIRED', 'ref_msg_idx=REFIDX_EXPIRED_NONE'] },
     });
 
+    const expiredRow = await waitForDbRow('ROBOT1.0_Q_EXPIRED');
     await waitUntil(() => capturedFollowups.length >= 1, 3000, 'degraded quote followup');
     const prompt = capturedFollowups[0]!.content;
-    expect(prompt).toContain('[引用回复 消息ID: REFIDX_EXPIRED_NONE: "〔历史引用消息：内容已过期或无法获取〕"]');
-    expect(prompt).toContain('之前的结论是什么');
+    expect(prompt).toBe(
+      `[msg_1] [${formatDateTime(expiredRow.time)}] [引用回复: "〔历史引用消息：内容已过期或无法获取〕"] 之前的结论是什么`
+    );
+    expect(prompt).not.toContain('REFIDX_EXPIRED_NONE');
+    expect(prompt).not.toContain('ROBOT1.0_');
+    expect(prompt).not.toContain(MOCK_OPENID);
+    expect(prompt).not.toContain('提问者');
+    expect(prompt).not.toContain('[QQ私聊]');
   });
 });

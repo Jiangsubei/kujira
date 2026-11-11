@@ -11,10 +11,8 @@ import {
 import { BridgeConfigSchema } from '../../src/config/schema.js';
 import { DEFAULT_BASE_CONFIG, PLUGIN_NAME, SETTINGS_NAMESPACE } from '../../src/constants/index.js';
 
-const EXPECTED_17_KEYS = [
+const EXPECTED_15_KEYS = [
   'image_ttl_days',
-  'markdown_enabled',
-  'input_notify_enabled',
   'new_message_behavior',
   'persona',
   'behavior',
@@ -31,7 +29,7 @@ const EXPECTED_17_KEYS = [
   'slang_storage_path',
 ] as const;
 
-describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+describe('契约测试: Kujira 15 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -42,23 +40,23 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 17 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 17 项合法键', () => {
+  describe('1. 单一真相源与 15 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 15 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(17);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_17_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_17_KEYS].sort());
+      expect(validKeys.size).toBe(15);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_15_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_15_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_17_KEYS) {
+      for (const field of EXPECTED_15_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_17_KEYS) {
+      for (const field of EXPECTED_15_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'
@@ -73,6 +71,9 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
     it('已废弃的 NapCat / 群聊 / 主动插话 / 安全权限 / 凭据 / 历史迁移键严禁存在于 Schema 中', () => {
       const validKeys = getValidConfigKeys();
       const deadKeys = [
+        // 已固化为默认开启而废除的配置开关
+        'markdown_enabled',
+        'input_notify_enabled',
         // 旧 NapCat & 凭据键
         'ws_port',
         'ws_token',
@@ -120,13 +121,14 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
   });
 
   describe('2. 纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
-    it('分离 17 项合法字段与旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
+    it('分离 15 项合法字段与 markdown_enabled / input_notify_enabled / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
       const dirtyInput = {
-        markdown_enabled: false,
-        input_notify_enabled: true,
+        image_ttl_days: 14,
         new_message_behavior: 'queue',
         persona: '测试单聊人格',
-        // 以下均为已废除键，必须全部剔除
+        // 以下均为已废除键，必须全部剔除（含 markdown_enabled 与 input_notify_enabled）
+        markdown_enabled: false,
+        input_notify_enabled: true,
         ws_port: 3001,
         ws_token: 'legacy-ws-token',
         bot_qq: '1000000021',
@@ -144,13 +146,14 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
 
       const result = sanitizeConfigPayload(dirtyInput);
       expect(result.valid).toEqual({
-        markdown_enabled: false,
-        input_notify_enabled: true,
+        image_ttl_days: 14,
         new_message_behavior: 'queue',
         persona: '测试单聊人格',
       });
       expect(result.removed.sort()).toEqual(
         [
+          'markdown_enabled',
+          'input_notify_enabled',
           'ws_port',
           'ws_token',
           'bot_qq',
@@ -171,8 +174,7 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
     it('输入仅含合法键时 removed 为空；异常非对象输入安全返回空结果', () => {
       const cleanInput = {
         image_ttl_days: 14,
-        markdown_enabled: true,
-        input_notify_enabled: false,
+        new_message_behavior: 'steer' as const,
         face_enabled: true,
         slang_evict_policy: 'evict_lru' as const,
       };
@@ -188,11 +190,20 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
       const schema = BridgeConfigSchema as any;
       const validKeys = new Set(Object.keys(schema.dict || {}));
       const { valid } = sanitizeConfigPayload({
+        image_ttl_days: 7,
+        new_message_behavior: 'steer',
+        face_enabled: true,
         markdown_enabled: true,
         input_notify_enabled: false,
         ws_port: 8080,
         proactive_reply_enabled: true,
         app_secret: 'mock-secret',
+      });
+
+      expect(valid).toEqual({
+        image_ttl_days: 7,
+        new_message_behavior: 'steer',
+        face_enabled: true,
       });
 
       const ops = Object.entries(valid).map(([key, value]) => ({ op: 'set' as const, path: [key], value }));
@@ -208,7 +219,7 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
   });
 
   describe('3. 物理配置文件自愈契约 (healProfileConfigFile & surgicalCleanYamlConfig)', () => {
-    it('精确清理 kujira 块中的旧 NapCat / 群聊 / 安全覆盖多行脏键，绝不误伤兄弟条目 preset-kujira-session 与 kujira-tools', () => {
+    it('精确清理 kujira 块中的已废除开关及旧 NapCat / 群聊 / 安全覆盖多行脏键，绝不误伤兄弟条目 preset-kujira-session 与 kujira-tools', () => {
       const profileDir = path.join(testTmpDir, 'profiles/desktop');
       fs.mkdirSync(profileDir, { recursive: true });
       const patchPath = path.join(profileDir, 'cordis.patch.yml');
@@ -221,6 +232,7 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
         '- id: kujira',
         '  name: kujira',
         '  config:',
+        '    image_ttl_days: 7',
         '    markdown_enabled: true',
         '    input_notify_enabled: false',
         '    ws_port: 3001',
@@ -255,6 +267,8 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
       expect(healResult.filePath).toBe(patchPath);
       expect(healResult.removedKeys.sort()).toEqual(
         [
+          'markdown_enabled',
+          'input_notify_enabled',
           'ws_port',
           'ws_token',
           'bot_qq',
@@ -269,11 +283,12 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
       );
 
       const updated = fs.readFileSync(patchPath, 'utf8');
-      expect(updated).toContain('markdown_enabled: true');
-      expect(updated).toContain('input_notify_enabled: false');
+      expect(updated).toContain('image_ttl_days: 7');
       expect(updated).toContain('persona: "保留的合法单聊人格"');
 
-      // 所有死键及其多行子块已物理删除
+      // 所有死键（含 markdown_enabled / input_notify_enabled）及其多行子块已物理删除
+      expect(updated).not.toContain('markdown_enabled');
+      expect(updated).not.toContain('input_notify_enabled');
       expect(updated).not.toContain('ws_port');
       expect(updated).not.toContain('ws_token');
       expect(updated).not.toContain('bot_qq');
@@ -300,8 +315,6 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
         '  name: kujira',
         '  config:',
         '    image_ttl_days: 7',
-        '    markdown_enabled: true',
-        '    input_notify_enabled: true',
         '    new_message_behavior: steer',
         '    face_evict_policy: evict_lru',
         '    slang_enabled: true',
@@ -340,16 +353,17 @@ describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config
         '- id: kujira',
         '  config:',
         '    # 保留注释',
+        '    image_ttl_days: 7',
         '    markdown_enabled: true',
         '    ws_port: 8080',
         '    persona: "助手"',
         '',
       ].join('\r\n');
 
-      const cleaned = surgicalCleanYamlConfig(input, 'kujira', new Set(['ws_port']));
-      expect(cleaned.removedKeys).toEqual(['ws_port']);
+      const cleaned = surgicalCleanYamlConfig(input, 'kujira', new Set(['ws_port', 'markdown_enabled']));
+      expect(cleaned.removedKeys.sort()).toEqual(['markdown_enabled', 'ws_port']);
       expect(cleaned.newContent).toBe(
-        ['- id: kujira', '  config:', '    # 保留注释', '    markdown_enabled: true', '    persona: "助手"', ''].join(
+        ['- id: kujira', '  config:', '    # 保留注释', '    image_ttl_days: 7', '    persona: "助手"', ''].join(
           '\r\n'
         )
       );
