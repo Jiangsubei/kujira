@@ -184,7 +184,7 @@ describe('契约测试: 入站媒体裸 GET 下载与安全脱敏 (Inbound Media
     expect(warnLogs.join('\n')).not.toContain('WAV_FAIL_SECRET');
   });
 
-  it('契约 4: content_type=file 的 .png 文件保留扩展名与魔数，并对 filename 做路径穿越净化', async () => {
+  it('契约 4: content_type=file 的 .png 按扩展名改判 image，保留扩展名与魔数，并净化 filename 路径穿越', async () => {
     const base = await startServer((_req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
       res.end(PNG_BYTES);
@@ -200,9 +200,9 @@ describe('契约测试: 入站媒体裸 GET 下载与安全脱敏 (Inbound Media
     ]);
 
     const result = await resolveInboundAttachments(event, PEER, manager);
-    const targetDir = path.join(tmpHome, 'downloads', 'files', PEER);
+    const targetDir = path.join(tmpHome, 'downloads', 'image', PEER);
 
-    expect(result[0]!.kind).toBe('file');
+    expect(result[0]!.kind).toBe('image');
     expect(result[0]!.fileName).toBe('real_image.png');
     expect(result[0]!.local?.format).toBe('png');
     expect(result[0]!.local?.path.startsWith(targetDir)).toBe(true);

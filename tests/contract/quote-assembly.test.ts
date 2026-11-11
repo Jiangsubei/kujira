@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import * as http from 'node:http';
 import Database from 'better-sqlite3';
 import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import type { SessionManager } from '../../src/gateway/session.js';
 import type { KujiraGatewayClient } from '../../src/gateway/server.js';
+import { resetMediaUrlCache } from '../../src/attachment/localize.js';
 import { openidToPeer } from '../../src/utils/peer.js';
 import { formatDateTime } from '../../src/storage/time-parser.js';
 
@@ -20,6 +22,7 @@ import { formatDateTime } from '../../src/storage/time-parser.js';
  * (e) 引用未命中本地库时下载 `msg_elements[]` 内合并转发内嵌附件并本地化为 OS 路径；命中本地库时不触发下载。
  * (f) 引用媒体消息时 `msg_elements[].attachments`（实测形态：结构化附件）落盘并替换为 OS 路径；缺 attachments 时保留
  *     `parallel_message` 形态摘要，不臆造下载。
+ * (g) 同一媒体 URL 重复引用命中短期缓存（rkey 轮换仍命中），本地文件缺失后缓存失效并重新下载。
  */
 
 function expectLosslessJson(value: unknown, trail = 'root'): void {
@@ -606,7 +609,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
 
     // 1. 实测形态：引用图片 → msg_elements[0].attachments 携带 content_type='file' 的 .png
-    //    与直发同源分类口径（`content_type='file'` 的 .png 严格保持 file），落盘 files/
+    //    content_type='file' 的图片按扩展名改判为 image，落盘 image/ 并渲染 [图片:path]
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_Q_QUOTE_IMG',
       content: '这是啥',
@@ -634,15 +637,15 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     await waitUntil(() => capturedFollowups.length >= 1, 3000, 'quoted image followup');
     const promptImg = capturedFollowups[0]!.content;
     expect(promptImg).toContain('[引用回复: "');
-    expect(promptImg).toContain('[文件:quoted.png 已保存: ');
+    expect(promptImg).toContain('[图片:');
     expect(promptImg).not.toContain('[图片]');
     expect(promptImg).not.toContain('Q_IMG_SECRET');
     expect(promptImg).not.toContain('rkey');
-    const imgMatch = /已保存: ([^\]]+)\]/.exec(promptImg);
+    const imgMatch = /\[图片:([^\]]+)\]/.exec(promptImg);
     expect(imgMatch).toBeTruthy();
     expect(
       path.resolve(imgMatch![1]!).startsWith(
-        path.resolve(tmpHome, 'kujira', 'downloads', 'files', MOCK_PEER)
+        path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER)
       )
     ).toBe(true);
     expect(requests).toEqual(['/quoted/img.png?rkey=Q_IMG_SECRET']);
@@ -775,6 +778,76 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     expect(promptNoAtt).toContain('[文件]');
     expect(promptNoAtt).not.toContain('内容已过期或无法获取');
     expect(requests.length).toBe(requestsBefore);
+  });
+
+  it('(g) 同一媒体 URL 重复引用命中短期缓存，不再重复下载（rkey 轮换仍命中）', async () => {
+    const requests: string[] = [];
+    const srv = http.createServer((req, res) => {
+      requests.push(req.url || '');
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+    servers.push(srv);
+    await new Promise<void>((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => resolve());
+    });
+    const base = `http://127.0.0.1:${(srv.address() as any).port}`;
+
+    resetMediaUrlCache();
+    await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+    const cacheFile = `${base}/cache/same.png`;
+
+    const emitQuote = (id: string, rkey: string): void => {
+      ws.emitDispatch('C2C_MESSAGE_CREATE', {
+        id,
+        content: '再引用一次',
+        timestamp: '2026-11-11T12:06:00+08:00',
+        author: { user_openid: MOCK_OPENID, username: '提问者' },
+        message_type: 103,
+        message_scene: { ext: [`msg_idx=REFIDX_${id}`, `ref_msg_idx=REFIDX_${id}_SRC`] },
+        msg_elements: [
+          {
+            content: '',
+            message_type: 103,
+            msg_idx: `REFIDX_${id}_SRC`,
+            attachments: [
+              {
+                content_type: 'image/png',
+                filename: 'same.png',
+                size: PNG_BYTES.length,
+                url: `${cacheFile}?rkey=${rkey}&fileid=SAME_FILE`,
+              },
+            ],
+          },
+        ],
+        parallel_message: { msg_nodes: [{ content: '[图片]', message_type: 7 }] },
+      });
+    };
+
+    emitQuote('ROBOT1.0_Q_CACHE_1', 'CACHE_RKEY_A');
+    await waitUntil(() => capturedFollowups.length >= 1, 3000, 'cache first followup');
+    const firstPrompt = capturedFollowups[0]!.content;
+    expect(firstPrompt).toContain('[图片:');
+    const firstMatch = /\[图片:([^\]]+)\]/.exec(firstPrompt);
+    expect(firstMatch).toBeTruthy();
+    const cachedPath = firstMatch![1]!;
+    expect(requests).toHaveLength(1);
+
+    // rkey 轮换但 path 与 fileid 相同 → 命中缓存，不再发起网络请求
+    emitQuote('ROBOT1.0_Q_CACHE_2', 'CACHE_RKEY_B');
+    await waitUntil(() => capturedFollowups.length >= 2, 3000, 'cache second followup');
+    const secondPrompt = capturedFollowups[1]!.content;
+    expect(secondPrompt).toContain(`[图片:${cachedPath}]`);
+    expect(secondPrompt).not.toContain('CACHE_RKEY_B');
+    expect(requests).toHaveLength(1);
+
+    // 本地文件被清理后缓存失效 → 重新下载
+    fs.rmSync(cachedPath, { force: true });
+    emitQuote('ROBOT1.0_Q_CACHE_3', 'CACHE_RKEY_C');
+    await waitUntil(() => capturedFollowups.length >= 3, 3000, 'cache third followup');
+    expect(requests).toHaveLength(2);
   });
 
   it('(d) 本地库与 msg_elements[] 均未命中时优雅降级占位，唤醒不中断', async () => {

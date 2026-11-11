@@ -16,7 +16,7 @@ import { openidToPeer } from '../../src/utils/peer.js';
  * 真实装配路径验证: bootDshKujira({ mountPlugin: true }) -> Official Gateway WS (C2C_MESSAGE_CREATE) ->
  * resolveInboundAttachments -> MediaStorageManager -> SQLite messages -> SessionManager.dispatchWakeup:
  * - PF-1: content_type="file" 常规文件 (.txt / .pdf) 裸 GET 即时落盘至 files/<peer>/ 并渲染 [文件:... 已保存: ...]；
- * - PF-2: 实测特征 — .png 走 content_type="file" 时保持 'file' 分类落盘并保留 .png 扩展名；
+ * - PF-2: 实测特征 — .png 走 content_type="file" 时按扩展名改判 'image'，落盘 image/<peer>/ 并渲染 [图片:path]；
  * - PF-3: 安全文件名净化防 ../ 与 ..\ 路径穿越；
  * - PF-4: content_type="voice" 优先拉取 voice_wav_url（忽略 audio/mp3 错报头），落盘 .wav 并保留 asr_refer_text；
  * - PF-5: voice_wav_url 失败回退 url；双失败时 local_path = null、保留 asr_refer_text、unavailable 脱敏且正文遵循选项 A 保留真实直链；
@@ -317,7 +317,7 @@ describe('契约测试: 单聊文件与语音入站即时落盘装配闭环 (PF-
     expect(rowPdf.content).toContain(`请查收报告 [文件:季度报告.pdf 已保存: ${rowPdf.local_path}]`);
   });
 
-  it('PF-2: 实测特征 — .png 图片走 content_type="file" 保持 file 分类落盘并保留 .png 扩展名', async () => {
+  it('PF-2: 实测特征 — .png 图片虽走 content_type="file"，按扩展名改判为 image 落盘并渲染 [图片:path]', async () => {
     const srv = await startHttpServer((_req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
       res.end(PNG_BYTES);
@@ -341,16 +341,16 @@ describe('契约测试: 单聊文件与语音入站即时落盘装配闭环 (PF-
     });
 
     const row = await waitForDbRow('ROBOT1.0_PF_PNG_AS_FILE');
-    const expectedFilesDir = path.resolve(tmpHome, 'kujira', 'downloads', 'files', MOCK_PEER);
-    expect(row.type).toBe('file');
+    const expectedFilesDir = path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER);
+    expect(row.type).toBe('image');
     expect(row.local_path).toBeTruthy();
     expect(path.resolve(row.local_path).startsWith(expectedFilesDir)).toBe(true);
     expect(String(row.local_path).endsWith('screenshot.png')).toBe(true);
     expect(Buffer.compare(fs.readFileSync(row.local_path), PNG_BYTES)).toBe(0);
-    expect(row.content).toBe(`[文件:screenshot.png 已保存: ${row.local_path}]`);
+    expect(row.content).toBe(`[图片:${row.local_path}]`);
 
     const parsedAtts = JSON.parse(row.attachments);
-    expect(parsedAtts[0].kind).toBe('file');
+    expect(parsedAtts[0].kind).toBe('image');
     expect(parsedAtts[0].local?.format).toBe('png');
   });
 

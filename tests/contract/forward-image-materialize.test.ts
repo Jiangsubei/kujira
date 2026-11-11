@@ -27,6 +27,7 @@ import {
   resolveEmbeddedForwardMedia,
 } from '../../src/gateway/inbound-media.js';
 import { shouldWakeup } from '../../src/gateway/wakeup.js';
+import { resetMediaUrlCache } from '../../src/attachment/localize.js';
 import type { FaceRecord, QQC2CMessageCreateEvent } from '../../src/types/index.js';
 import { openidToPeer } from '../../src/utils/peer.js';
 
@@ -320,6 +321,8 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(res.formattedContent).not.toContain('链接已脱敏');
 
     // 2. 显式传 { limit: 2 }：仅下载前 2 个，超出部分保留选项 A 直链（绝不出现链接已脱敏）
+    //    先清空 URL 短期缓存，确保本段验证的是真实的下载次数与 limit 语义
+    resetMediaUrlCache();
     downloadCalls = 0;
     const limitedRes = await resolveEmbeddedForwardMedia(lines, PEER, manager, { limit: 2 });
 

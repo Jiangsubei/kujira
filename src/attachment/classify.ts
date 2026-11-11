@@ -4,7 +4,7 @@
  * 严格遵循 QQ 官方 Bot API v2 实测行为：
  * - 基于 `QQC2CMessageCreateEvent.attachments[]` 的 `content_type` 判定类型；
  * - 语音严格以 `content_type === 'voice'` 为准，提取 `voice_wav_url` 与 `asr_refer_text`；
- * - 注意实测存在 `.png` 文件以 `content_type === 'file'` 下发，保持 `'file'` 分类并保留真实扩展名；
+ * - 注意实测存在 `.png` / `.mp4` 等媒体以 `content_type === 'file'` 下发，按扩展名改判为图片/视频并保留真实扩展名；
  * - 当 `content_type` 为空或为通用 `application/octet-stream` 时，结合 `filename` 扩展名补充识别图片/视频/音频。
  */
 
@@ -215,6 +215,15 @@ export function classifyAttachment(attachment: QQAttachment | null | undefined):
     return 'video';
   }
   if (ct === 'file') {
+    // 实测：QQ 单聊的图片/视频常以 content_type='file' + 原始扩展名下发，
+    // 因此按扩展名回归语义分类（图片 → image、视频 → video），无法识别的仍保持 file。
+    const ext = extractLowerExt(attachment.filename);
+    if (IMAGE_FILE_EXTENSIONS.has(ext)) {
+      return 'image';
+    }
+    if (VIDEO_FILE_EXTENSIONS.has(ext)) {
+      return 'video';
+    }
     return 'file';
   }
 

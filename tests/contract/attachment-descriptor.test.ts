@@ -67,7 +67,9 @@ describe('契约测试: 官方附件分类与去 OneBot/群文件化', () => {
     expect(classifyAttachment({ content_type: 'image/gif' })).toBe('image');
     expect(classifyAttachment({ content_type: 'voice' })).toBe('record');
     expect(classifyAttachment({ content_type: 'video/mp4' })).toBe('video');
-    expect(classifyAttachment({ content_type: 'file', filename: 'photo.png' })).toBe('file');
+    expect(classifyAttachment({ content_type: 'file', filename: 'photo.png' })).toBe('image');
+    expect(classifyAttachment({ content_type: 'file', filename: 'clip.mp4' })).toBe('video');
+    expect(classifyAttachment({ content_type: 'file', filename: 'report.pdf' })).toBe('file');
   });
 
   it('契约 2: 语音附件提取 voice_wav_url 与 asr_refer_text，文件名执行路径穿越净化', () => {
@@ -346,8 +348,10 @@ describe('契约测试: 唯一安全渲染入口 (renderAttachment)', () => {
     expect(classifyAttachment({ content_type: 'application/octet-stream', filename: 'voice.wav' })).toBe('record');
     expect(classifyAttachment({ content_type: '', filename: 'photo.png' })).toBe('image');
     expect(classifyAttachment({ content_type: 'application/octet-stream', filename: 'photo.png' })).toBe('image');
-    // content_type='file' 的 .png 严格保持 'file'
-    expect(classifyAttachment({ content_type: 'file', filename: 'photo.png' })).toBe('file');
+    // content_type='file' 时按扩展名改判：图片/视频回归语义分类，其余保持 file
+    expect(classifyAttachment({ content_type: 'file', filename: 'photo.png' })).toBe('image');
+    expect(classifyAttachment({ content_type: 'file', filename: 'clip.mp4' })).toBe('video');
+    expect(classifyAttachment({ content_type: 'file', filename: 'report.pdf' })).toBe('file');
 
     expect(renderAttachment({ kind: 'group_file' as any, origin: 'inbound' })).toBeNull();
   });

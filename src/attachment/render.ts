@@ -4,7 +4,8 @@
  * 入站、出站、引用重解析、历史重放共用同一套安全文案：
  * - 命中表情库 → `[表情包: <face_id> (情绪: <mood>) 路径: <local_path>]`（入站/出站完全一致）；
  * - 普通图片 → `[图片:<local_path>]`；
- * - 文件（含以 `content_type='file'` 下发的 `.png` 等文件）→ `[文件:<name> 已保存: <local_path>]`；
+ * - 文件 → `[文件:<name> 已保存: <local_path>]`（`.png` / `.mp4` 等以 `content_type='file'` 下发的媒体
+ *   在分类阶段已按扩展名改判为图片/视频，不再落入文件语义）；
  * - 语音 → 结合 `local.path` 与 `remote.asrReferText` 渲染；
  * - 视频 → `[视频(:<name>) (<dimensions>, <size>, <duration>) 已保存: <local_path>]`（无分辨率/时长时保持简洁路径）；
  * - 合并转发 → 适配官方 `message_type=102` 合并转发占位渲染；

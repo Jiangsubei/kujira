@@ -30,7 +30,7 @@ import {
   describeAttachment,
   sanitizeAttachmentFileName,
 } from './classify.js';
-import type { AttachmentDescriptor, AttachmentFaceMeta } from './types.js';
+import type { AttachmentDescriptor, AttachmentFaceMeta, AttachmentLocalMeta } from './types.js';
 
 export interface AttachmentLocalizeLogger {
   info?: (...args: any[]) => void;
@@ -159,6 +159,86 @@ export function toActiveFaceMeta(
 }
 
 /**
+ * 短期 URL → 本地路径缓存：同一媒体被反复引用/转贴时避免重复网络下载。
+ *
+ * - 键：协议 + host + path + **剔除访问凭证后的其余 query**（`rkey` 会轮换，`fileid` 等必须保留，
+ *   否则不同文件会碰撞到同一路径）；
+ * - 值：首次落盘得到的 `local` 事实；命中时仍会重新校验文件是否存在；
+ * - TTL 10 分钟，容量 256 条（LRU 淘汰），仅进程内内存，不落盘。
+ */
+const MEDIA_URL_CACHE_TTL_MS = 10 * 60 * 1000;
+const MEDIA_URL_CACHE_MAX = 256;
+const MEDIA_URL_CREDENTIAL_PARAMS = new Set([
+  'rkey',
+  'rkeycodec',
+  'token',
+  'auth_token',
+  'access_token',
+  'sig',
+  'sign',
+  'auth',
+  'key',
+]);
+
+interface CachedLocalization {
+  local: AttachmentLocalMeta;
+  expiresAt: number;
+}
+
+const mediaUrlCache = new Map<string, CachedLocalization>();
+
+function mediaUrlCacheKey(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl.trim());
+    const params = [...parsed.searchParams.entries()]
+      .filter(([key]) => !MEDIA_URL_CREDENTIAL_PARAMS.has(key.toLowerCase()))
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => `${key}=${value}`)
+      .join('&');
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}${params ? `?${params}` : ''}`;
+  } catch {
+    return sanitizeUrlForLog(rawUrl);
+  }
+}
+
+function readCachedLocalization(
+  rawUrl: string,
+  fileName?: string
+): AttachmentLocalMeta | undefined {
+  const key = `${mediaUrlCacheKey(rawUrl)}|${fileName ?? ''}`;
+  const hit = mediaUrlCache.get(key);
+  if (!hit) return undefined;
+  if (hit.expiresAt <= Date.now() || !fs.existsSync(hit.local.path)) {
+    mediaUrlCache.delete(key);
+    return undefined;
+  }
+  // LRU 刷新
+  mediaUrlCache.delete(key);
+  mediaUrlCache.set(key, hit);
+  return hit.local;
+}
+
+function writeCachedLocalization(
+  rawUrl: string,
+  fileName: string | undefined,
+  local: AttachmentLocalMeta
+): void {
+  const key = `${mediaUrlCacheKey(rawUrl)}|${fileName ?? ''}`;
+  mediaUrlCache.delete(key);
+  mediaUrlCache.set(key, { local, expiresAt: Date.now() + MEDIA_URL_CACHE_TTL_MS });
+  while (mediaUrlCache.size > MEDIA_URL_CACHE_MAX) {
+    const oldest = mediaUrlCache.keys().next().value;
+    if (oldest === undefined) break;
+    mediaUrlCache.delete(oldest);
+  }
+}
+
+/** 清空媒体 URL 短期缓存（测试与运行时手动回收用）。 */
+export function resetMediaUrlCache(): void {
+  mediaUrlCache.clear();
+}
+
+/**
  * 单个结构化附件 → 落盘后的统一描述符（直发、引用、合并转发共用）。
  * 失败只标记 `unavailable`（已脱敏），绝不抛出。
  */
@@ -211,6 +291,10 @@ export async function localizeInboundAttachment(
 
     let lastError = 'download_failed';
     for (const candidate of candidates) {
+      const cachedVoice = readCachedLocalization(candidate.url, candidate.filename);
+      if (cachedVoice) {
+        return withFace({ ...base, local: cachedVoice });
+      }
       try {
         const saveOpts: SaveResourceOptions = {
           type: 'voice',
@@ -222,17 +306,16 @@ export async function localizeInboundAttachment(
         const format = detectSavedFormat(saved.localPath, candidate.ext);
         const size = readLocalSize(saved.localPath, declaredSize);
         const durationSec = normalizePositiveDuration(saved.durationSec);
-        return withFace({
-          ...base,
-          local: {
-            path: saved.localPath,
-            ...(format ? { format } : {}),
-            ...(size !== undefined ? { size } : {}),
-            ...(saved.md5 ? { md5: saved.md5 } : {}),
-            ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
-            ...(durationSec !== undefined ? { durationSec } : {}),
-          },
-        });
+        const local: AttachmentLocalMeta = {
+          path: saved.localPath,
+          ...(format ? { format } : {}),
+          ...(size !== undefined ? { size } : {}),
+          ...(saved.md5 ? { md5: saved.md5 } : {}),
+          ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+          ...(durationSec !== undefined ? { durationSec } : {}),
+        };
+        writeCachedLocalization(candidate.url, candidate.filename, local);
+        return withFace({ ...base, local });
       } catch (err) {
         lastError = sanitizeErrorMessage(err);
         logger?.warn?.(
@@ -247,12 +330,17 @@ export async function localizeInboundAttachment(
     };
   }
 
-  // 图片 / 表情包 / 视频 / 文件（含以 content_type='file' 下发的 .png 等文件）
+  // 图片 / 表情包 / 视频 / 文件（含以 content_type='file' 下发、按扩展名改判的媒体）
   if (!rawUrl) {
     return {
       ...base,
       unavailable: 'no_download_url',
     };
+  }
+
+  const cachedLocal = readCachedLocalization(rawUrl, safeName);
+  if (cachedLocal) {
+    return withFace({ ...base, local: cachedLocal });
   }
 
   const targetType: MediaResourceType =
@@ -280,19 +368,18 @@ export async function localizeInboundAttachment(
     const format = detectSavedFormat(saved.localPath, fallbackExt);
     const size = readLocalSize(saved.localPath, declaredSize);
     const durationSec = normalizePositiveDuration(saved.durationSec);
+    const local: AttachmentLocalMeta = {
+      path: saved.localPath,
+      ...(format ? { format } : {}),
+      ...(size !== undefined ? { size } : {}),
+      ...(saved.md5 ? { md5: saved.md5 } : {}),
+      ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+      ...(base.kind === 'video' && dimensions ? { dimensions } : {}),
+      ...(durationSec !== undefined ? { durationSec } : {}),
+    };
+    writeCachedLocalization(rawUrl, safeName, local);
 
-    return withFace({
-      ...base,
-      local: {
-        path: saved.localPath,
-        ...(format ? { format } : {}),
-        ...(size !== undefined ? { size } : {}),
-        ...(saved.md5 ? { md5: saved.md5 } : {}),
-        ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
-        ...(base.kind === 'video' && dimensions ? { dimensions } : {}),
-        ...(durationSec !== undefined ? { durationSec } : {}),
-      },
-    });
+    return withFace({ ...base, local });
   } catch (err) {
     const safeError = sanitizeErrorMessage(err);
     logger?.warn?.(
@@ -320,3 +407,4 @@ export async function localizeInboundAttachments(
 
   return mapWithConcurrency(valid, 4, (att) => localizeInboundAttachment(att, options));
 }
+
