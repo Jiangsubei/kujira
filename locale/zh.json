@@ -1,4 +1,4 @@
 {
-  "title": "NapCat QQ 接入",
-  "description": "接入 NapCat(OneBot 11) 让 DeepSeek Harness agent 在 QQ 群聊/私聊对话、检索历史、收发文件"
+  "title": "Kujira QQ 助手",
+  "description": "接入 QQ 官方 Bot API v2 让 DeepSeek Harness agent 在合规单聊（C2C）中拟人化对话、管理记忆与黑话、收发富媒体文件"
 }

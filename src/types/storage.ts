@@ -1,12 +1,12 @@
 /**
- * dsh-napcat-bridge: SQLite 持久化表契约与存储模型
+ * kujira: SQLite 持久化表契约与存储模型
  */
 
-/** 消息来源：qq = 真实 QQ 收发；agent = Agent 内部协同通讯（QQ 用户不可见） */
-export type MessageSource = 'qq' | 'agent';
+/** 消息来源：qq = QQ 官方 Bot 单聊收发 */
+export type MessageSource = 'qq';
 
 export interface MessageRecord {
-  msg_id: number;
+  msg_id: string;
   peer: string;
   user_id: string;
   sender_name: string;
@@ -15,16 +15,47 @@ export interface MessageRecord {
   content: string;
   raw: string; // 原始 JSON 字符串
   file_id: string | null;
-  busid: number | null;
   local_path: string | null;
   fingerprint: string | null;
   recalled: number; // 0 | 1
   self: number; // 0 | 1
-  reply_to: number | null;
-  /** 消息来源，缺省视为 'qq'（存量数据同值） */
+  reply_to: string | null;
+  /** 消息引用索引（入站 message_scene.ext msg_idx 或出站 ext_info.ref_idx，形如 REFIDX_...） */
+  ref_idx?: string | null;
+  /** 消息来源，缺省视为 'qq' */
   source?: MessageSource;
-  /** 统一附件描述符 JSON（精简数组，不含原始段；raw 已保存原始段） */
+  /** 统一附件描述符 JSON（精简数组，不含原始事件或带凭证 URL 明文） */
   attachments?: string | null;
+}
+
+/** 方案 A 身份映射表：内部 peer (`user_<hash16>`) 与真实 `openid` 双向映射 */
+export interface PeerOpenidMapping {
+  peer: string;
+  openid: string;
+  remark: string;
+  updated_at: number; // 毫秒时间戳
+}
+
+/** 入站被动回复锚点与 `msg_seq` 槽位持久化表 */
+export interface InboundReplySlot {
+  msg_id: string;
+  peer: string;
+  openid: string;
+  last_seq: number;
+  received_at: number; // 毫秒时间戳
+  invalidated: number; // 0 | 1
+  updated_at: number; // 毫秒时间戳
+}
+
+/** 富媒体四步上传 `file_info` 本地缓存表（主键 `(openid, md5, file_type)`） */
+export interface MediaUploadCacheRecord {
+  openid: string;
+  md5: string;
+  /** 1=图片, 2=视频, 3=语音, 4=文件 */
+  file_type: number;
+  file_info: string;
+  file_uuid?: string;
+  expires_at: number; // 毫秒时间戳
 }
 
 export interface FaceRecord {

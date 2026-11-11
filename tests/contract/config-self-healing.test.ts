@@ -1,421 +1,358 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import { EventEmitter } from 'node:events';
-import type { IncomingMessage, ServerResponse } from 'node:http';
-
-vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
-  IconChevronDownOutlineMedium: () => null,
-  IconChevronDownOutlineRegular: () => null,
-}));
-
 import {
   getValidConfigKeys,
   sanitizeConfigPayload,
+  surgicalCleanYamlConfig,
   healProfileConfigFile,
 } from '../../src/config/heal.js';
-import {
-  registerConfigRoute,
-  CONFIG_ROUTE_PATH,
-} from '../../src/server/routes.js';
 import { BridgeConfigSchema } from '../../src/config/schema.js';
-import type { BridgePluginConfig } from '../../src/types/index.js';
+import { DEFAULT_BASE_CONFIG, PLUGIN_NAME, SETTINGS_NAMESPACE } from '../../src/constants/index.js';
 
-function createMockReq(method: string, body?: any): IncomingMessage {
-  const req = new EventEmitter() as any;
-  req.method = method;
-  req.headers = { 'content-type': 'application/json' };
-  process.nextTick(() => {
-    if (body !== undefined) {
-      req.emit('data', Buffer.from(JSON.stringify(body)));
-    }
-    req.emit('end');
-  });
-  return req;
-}
+const EXPECTED_17_KEYS = [
+  'image_ttl_days',
+  'markdown_enabled',
+  'input_notify_enabled',
+  'new_message_behavior',
+  'persona',
+  'behavior',
+  'memory_storage_dir',
+  'user_profile_budget_chars',
+  'session_memory_budget_chars',
+  'face_enabled',
+  'face_store_max',
+  'face_store_dir',
+  'face_evict_policy',
+  'slang_enabled',
+  'slang_max_entries',
+  'slang_evict_policy',
+  'slang_storage_path',
+] as const;
 
-function createMockRes(): {
-  res: ServerResponse;
-  getResult: () => Promise<{ status: number; headers: any; body: any }>;
-} {
-  const res = new EventEmitter() as any;
-  let statusCode = 200;
-  let headers: any = {};
-  const chunks: Buffer[] = [];
-  let isFinished = false;
-
-  res.writeHead = vi.fn((status: number, h?: any) => {
-    statusCode = status;
-    if (h) headers = { ...headers, ...h };
-    return res;
-  });
-
-  res.end = vi.fn((data?: any) => {
-    if (data) chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
-    isFinished = true;
-    res.emit('finish');
-    return res;
-  });
-
-  const parseResult = () => {
-    const text = Buffer.concat(chunks).toString('utf8');
-    let body: any = null;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-    return { status: statusCode, headers, body };
-  };
-
-  const getResult = () =>
-    new Promise<{ status: number; headers: any; body: any }>((resolve) => {
-      if (isFinished) {
-        resolve(parseResult());
-        return;
-      }
-      res.on('finish', () => {
-        resolve(parseResult());
-      });
-    });
-
-  return { res, getResult };
-}
-
-describe('契约测试: 配置动态校验与配置文件自愈机制 (Config Self-Healing Contract)', () => {
-  const testTmpDir = path.resolve(process.cwd(), 'tmp/test-config-heal');
+describe('契约测试: Kujira 17 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+  let testTmpDir: string;
 
   beforeEach(() => {
-    fs.mkdirSync(testTmpDir, { recursive: true });
+    testTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-config-heal-'));
   });
 
   afterEach(() => {
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
-    it('getValidConfigKeys 动态返回 BridgeConfigSchema 中声明的 38 项合法键', () => {
-      const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(40);
-      expect(validKeys.has('new_message_behavior')).toBe(true);
-      expect(validKeys.has('proactive_interval_mins')).toBe(true);
-      expect(validKeys.has('proactive_buffer_size')).toBe(true);
-      expect(validKeys.has('ws_port')).toBe(true);
-      expect(validKeys.has('bot_qq')).toBe(true);
-      expect(validKeys.has('face_enabled')).toBe(true);
-      expect(validKeys.has('user_profile_budget_chars')).toBe(true);
-      expect(validKeys.has('session_memory_budget_chars')).toBe(true);
-      expect(validKeys.has('group_memory_total_budget_chars')).toBe(true);
+  describe('1. 单一真相源与 17 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 17 项合法键', () => {
+      expect(PLUGIN_NAME).toBe('kujira');
+      expect(SETTINGS_NAMESPACE).toBe('kujira');
 
-      // 已下线的历史键严禁存在于有效键集合中
-      expect(validKeys.has('at_questioner')).toBe(false);
-      expect(validKeys.has('quote_original')).toBe(false);
-      expect(validKeys.has('review_enabled')).toBe(false);
-      expect(validKeys.has('face_auto_curate')).toBe(false);
-      expect(validKeys.has('memory_budget_chars')).toBe(false);
-      expect(validKeys.has('group_memory_budget_chars')).toBe(false);
-      expect(validKeys.has('slang_budget_chars')).toBe(false);
-      expect(validKeys.has('slang_max_entries')).toBe(true);
-      expect(validKeys.has('slang_evict_policy')).toBe(true);
-      expect(validKeys.has('private_memory_budget_chars')).toBe(false);
+      const validKeys = getValidConfigKeys();
+      expect(validKeys.size).toBe(17);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_17_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_17_KEYS].sort());
+
+      const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
+      for (const field of EXPECTED_17_KEYS) {
+        expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
+      }
+
+      const resolvedDefaults = (BridgeConfigSchema as any)({});
+      for (const field of EXPECTED_17_KEYS) {
+        const rawDefault = schemaShape[field]?.meta?.default;
+        const volatileVal =
+          typeof resolvedDefaults[field]?.get === 'function'
+            ? resolvedDefaults[field].get()
+            : resolvedDefaults[field];
+        const expected = (DEFAULT_BASE_CONFIG as Record<string, unknown>)[field];
+        expect(rawDefault).toEqual(expected);
+        expect(volatileVal).toEqual(expected);
+      }
     });
 
-    it('sanitizeConfigPayload 正确分离合法字段与脏字段，并剔除无效键', () => {
+    it('已废弃的 NapCat / 群聊 / 主动插话 / 安全权限 / 凭据 / 历史迁移键严禁存在于 Schema 中', () => {
+      const validKeys = getValidConfigKeys();
+      const deadKeys = [
+        // 旧 NapCat & 凭据键
+        'ws_port',
+        'ws_token',
+        'bot_qq',
+        'app_id',
+        'app_secret',
+        'admins',
+        'aliases',
+        // 旧群聊 & 主动回复 & 免打扰键
+        'proactive_reply_enabled',
+        'proactive_only_text',
+        'proactive_interval_mins',
+        'proactive_buffer_size',
+        'proactive_random_enabled',
+        'proactive_random_probability',
+        'proactive_idle_enabled',
+        'proactive_idle_timeout_mins',
+        'proactive_cooldown_mins',
+        'proactive_night_dnd',
+        'group_memory_total_budget_chars',
+        'group_blacklist',
+        'session_permission_group_default',
+        'coding_tools_group_default',
+        // 旧安全覆盖 & 早期废弃键
+        'private_blacklist',
+        'session_permission_private_default',
+        'session_permission_overrides',
+        'coding_tools_private_default',
+        'coding_tools_overrides',
+        'face_sub_type',
+        'at_questioner',
+        'quote_original',
+        'review_enabled',
+        'face_auto_curate',
+        'memory_budget_chars',
+        'group_memory_budget_chars',
+        'private_memory_budget_chars',
+        'slang_budget_chars',
+      ];
+
+      for (const deadKey of deadKeys) {
+        expect(validKeys.has(deadKey), `${deadKey} should be removed`).toBe(false);
+      }
+    });
+  });
+
+  describe('2. 纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
+    it('分离 17 项合法字段与旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
       const dirtyInput = {
+        markdown_enabled: false,
+        input_notify_enabled: true,
+        new_message_behavior: 'queue',
+        persona: '测试单聊人格',
+        // 以下均为已废除键，必须全部剔除
         ws_port: 3001,
+        ws_token: 'legacy-ws-token',
         bot_qq: '1000000021',
-        at_questioner: false, // 脏字段
-        quote_original: true, // 脏字段
-        review_enabled: true, // 历史脏字段
-        some_random_alien_key: 'hacked', // 未知脏字段
-        persona: '测试人格',
+        app_id: '1000000001',
+        app_secret: 'mock-secret-never-persist-in-config',
+        admins: ['1000000002'],
+        proactive_reply_enabled: true,
+        proactive_night_dnd: true,
+        group_memory_total_budget_chars: 8000,
+        private_memory_budget_chars: 1900,
+        memory_budget_chars: 3300,
+        session_permission_overrides: [],
+        some_unknown_key: 'stale',
       };
 
       const result = sanitizeConfigPayload(dirtyInput);
       expect(result.valid).toEqual({
-        ws_port: 3001,
-        bot_qq: '1000000021',
-        persona: '测试人格',
+        markdown_enabled: false,
+        input_notify_enabled: true,
+        new_message_behavior: 'queue',
+        persona: '测试单聊人格',
       });
-
       expect(result.removed.sort()).toEqual(
-        ['at_questioner', 'quote_original', 'review_enabled', 'some_random_alien_key'].sort()
+        [
+          'ws_port',
+          'ws_token',
+          'bot_qq',
+          'app_id',
+          'app_secret',
+          'admins',
+          'proactive_reply_enabled',
+          'proactive_night_dnd',
+          'group_memory_total_budget_chars',
+          'private_memory_budget_chars',
+          'memory_budget_chars',
+          'session_permission_overrides',
+          'some_unknown_key',
+        ].sort()
       );
     });
 
-    it('当输入已是 100% 纯净配置时，removed 数组为空', () => {
+    it('输入仅含合法键时 removed 为空；异常非对象输入安全返回空结果', () => {
       const cleanInput = {
-        ws_port: 8080,
-        bot_qq: '10001',
+        image_ttl_days: 14,
+        markdown_enabled: true,
+        input_notify_enabled: false,
+        face_enabled: true,
+        slang_evict_policy: 'evict_lru' as const,
       };
+      const cleanRes = sanitizeConfigPayload(cleanInput);
+      expect(cleanRes.valid).toEqual(cleanInput);
+      expect(cleanRes.removed).toEqual([]);
 
-      const result = sanitizeConfigPayload(cleanInput);
-      expect(result.valid).toEqual(cleanInput);
-      expect(result.removed).toEqual([]);
+      expect(sanitizeConfigPayload(null as any)).toEqual({ valid: {}, removed: [] });
+      expect(sanitizeConfigPayload(['bad'] as any)).toEqual({ valid: {}, removed: [] });
     });
 
-    it('sanitizeConfigPayload 在清洗前将旧记忆预算键的值搬运至新键', () => {
-      const legacyInput = {
+    it('清洗结果直接提交 DSH settings.mutate volatile 白名单校验绝不抛出 is not volatile', () => {
+      const schema = BridgeConfigSchema as any;
+      const validKeys = new Set(Object.keys(schema.dict || {}));
+      const { valid } = sanitizeConfigPayload({
+        markdown_enabled: true,
+        input_notify_enabled: false,
         ws_port: 8080,
-        memory_budget_chars: 3300,
-        private_memory_budget_chars: 1900,
-      };
+        proactive_reply_enabled: true,
+        app_secret: 'mock-secret',
+      });
 
-      const result = sanitizeConfigPayload(legacyInput);
-      expect(result.valid.ws_port).toBe(8080);
-      expect(result.valid.group_memory_total_budget_chars).toBe(3300);
-      expect(result.valid.user_profile_budget_chars).toBe(1900);
-      expect(result.removed).toEqual([]);
+      const ops = Object.entries(valid).map(([key, value]) => ({ op: 'set' as const, path: [key], value }));
+      expect(() => {
+        for (const op of ops) {
+          const key = op.path[0];
+          if (!validKeys.has(key) || !schema.dict[key]?.meta?.volatile) {
+            throw new Error(`Config field "${key}" is not volatile`);
+          }
+        }
+      }).not.toThrow();
     });
   });
 
-  describe('2. 物理配置文件自愈契约 (healProfileConfigFile)', () => {
-    it('探测到 profile patch 中存在 dsh-napcat-bridge 的脏键时，安全剔除并写回文件，且保留其他合法项', () => {
+  describe('3. 物理配置文件自愈契约 (healProfileConfigFile & surgicalCleanYamlConfig)', () => {
+    it('精确清理 kujira 块中的旧 NapCat / 群聊 / 安全覆盖多行脏键，绝不误伤兄弟条目 preset-kujira-session 与 kujira-tools', () => {
       const profileDir = path.join(testTmpDir, 'profiles/desktop');
       fs.mkdirSync(profileDir, { recursive: true });
       const patchPath = path.join(profileDir, 'cordis.patch.yml');
 
-      // 构造包含历史废弃键与合法键的 YAML 内容
-      const mockYaml = `
-- id: ui-theme
-  name: "@deepseek-ai/dsh-client-ui-theme"
-  config:
-    preference: system
-- id: dsh-napcat-bridge
-  name: dsh-napcat-bridge
-  config:
-    ws_port: 3001
-    bot_qq: "1000000000"
-    admins:
-      - "1000000001"
-    at_questioner: false
-    quote_original: true
-    review_enabled: true
-    persona: "测试人格"
-`;
+      const mockYaml = [
+        '- id: ui-theme',
+        '  name: "@deepseek-ai/dsh-client-ui-theme"',
+        '  config:',
+        '    preference: system',
+        '- id: kujira',
+        '  name: kujira',
+        '  config:',
+        '    markdown_enabled: true',
+        '    input_notify_enabled: false',
+        '    ws_port: 3001',
+        '    ws_token: "legacy-token"',
+        '    bot_qq: "1000000000"',
+        '    app_id: "1000000001"',
+        '    app_secret: "mock-secret-remove"',
+        '    admins:',
+        '      - "1000000002"',
+        '    proactive_reply_enabled: true',
+        '    proactive_night_dnd: true',
+        '    group_memory_total_budget_chars: 8000',
+        '    session_permission_overrides:',
+        '      - id: "8000000001"',
+        '        type: group',
+        '        permission: read-only',
+        '    persona: "保留的合法单聊人格"',
+        '- id: preset-kujira-session',
+        '  name: "@deepseek-ai/dsh-agent-preset"',
+        '  config:',
+        '    id: kujira-session',
+        '    order: 10',
+        '    plugins:',
+        '      - id: kujira-tools',
+        '        name: "kujira/tools"',
+        '',
+      ].join('\n');
       fs.writeFileSync(patchPath, mockYaml, 'utf8');
 
       const healResult = healProfileConfigFile(testTmpDir, 'desktop');
       expect(healResult.healed).toBe(true);
+      expect(healResult.filePath).toBe(patchPath);
       expect(healResult.removedKeys.sort()).toEqual(
-        ['at_questioner', 'quote_original', 'review_enabled'].sort()
+        [
+          'ws_port',
+          'ws_token',
+          'bot_qq',
+          'app_id',
+          'app_secret',
+          'admins',
+          'proactive_reply_enabled',
+          'proactive_night_dnd',
+          'group_memory_total_budget_chars',
+          'session_permission_overrides',
+        ].sort()
       );
 
-      // 读取写回后的内容，验证脏键被彻底移除，合法键完整保留
-      const updatedContent = fs.readFileSync(patchPath, 'utf8');
-      expect(updatedContent).not.toContain('at_questioner');
-      expect(updatedContent).not.toContain('quote_original');
-      expect(updatedContent).not.toContain('review_enabled');
+      const updated = fs.readFileSync(patchPath, 'utf8');
+      expect(updated).toContain('markdown_enabled: true');
+      expect(updated).toContain('input_notify_enabled: false');
+      expect(updated).toContain('persona: "保留的合法单聊人格"');
 
-      expect(updatedContent).toContain('3001');
-      expect(updatedContent).toContain('1000000000');
-      expect(updatedContent).toContain('1000000001');
-      expect(updatedContent).toContain('测试人格');
-      expect(updatedContent).toContain('ui-theme');
+      // 所有死键及其多行子块已物理删除
+      expect(updated).not.toContain('ws_port');
+      expect(updated).not.toContain('ws_token');
+      expect(updated).not.toContain('bot_qq');
+      expect(updated).not.toContain('app_secret');
+      expect(updated).not.toContain('1000000002');
+      expect(updated).not.toContain('8000000001');
+      expect(updated).not.toContain('proactive_reply_enabled');
+      expect(updated).not.toContain('group_memory_total_budget_chars');
+
+      // 名字包含 kujira 子串的兄弟插件条目必须完好无损
+      expect(updated).toContain('- id: ui-theme');
+      expect(updated).toContain('- id: preset-kujira-session');
+      expect(updated).toContain('id: kujira-session');
+      expect(updated).toContain('- id: kujira-tools');
     });
 
-    it('当 profile patch 文件中没有任何脏键时，保持文件不变且 healed 为 false', () => {
+    it('当 cordis.patch.yml 仅含合法配置键时，保持文件内容不变且 healed 为 false', () => {
       const profileDir = path.join(testTmpDir, 'profiles/desktop');
       fs.mkdirSync(profileDir, { recursive: true });
       const patchPath = path.join(profileDir, 'cordis.patch.yml');
 
-      const cleanYaml = `
-- id: dsh-napcat-bridge
-  name: dsh-napcat-bridge
-  config:
-    ws_port: 3001
-    bot_qq: "1000000000"
-`;
+      const cleanYaml = [
+        '- id: kujira',
+        '  name: kujira',
+        '  config:',
+        '    image_ttl_days: 7',
+        '    markdown_enabled: true',
+        '    input_notify_enabled: true',
+        '    new_message_behavior: steer',
+        '    face_evict_policy: evict_lru',
+        '    slang_enabled: true',
+        '',
+      ].join('\n');
       fs.writeFileSync(patchPath, cleanYaml, 'utf8');
 
       const healResult = healProfileConfigFile(testTmpDir, 'desktop');
       expect(healResult.healed).toBe(false);
       expect(healResult.removedKeys).toEqual([]);
+      expect(fs.readFileSync(patchPath, 'utf8')).toBe(cleanYaml);
     });
 
-    it('探测到旧记忆预算键时原地重命名为新键并保留用户旧值', () => {
-      const profileDir = path.join(testTmpDir, 'profiles/desktop');
+    it('仅包含旧 dsh-napcat-bridge 条目或无 config 块时不会误操作', () => {
+      const profileDir = path.join(testTmpDir, 'profiles/default');
       fs.mkdirSync(profileDir, { recursive: true });
       const patchPath = path.join(profileDir, 'cordis.patch.yml');
 
-      const legacyYaml = `
-- id: dsh-napcat-bridge
-  name: dsh-napcat-bridge
-  config:
-    ws_port: 3001
-    group_memory_budget_chars: 4100
-    private_memory_budget_chars: 1900
-    persona: "测试人格"
-`;
-      fs.writeFileSync(patchPath, legacyYaml, 'utf8');
+      const legacyOnlyYaml = [
+        '- id: dsh-napcat-bridge',
+        '  name: dsh-napcat-bridge',
+        '  config:',
+        '    ws_port: 8080',
+        '',
+      ].join('\n');
+      fs.writeFileSync(patchPath, legacyOnlyYaml, 'utf8');
 
-      const healResult = healProfileConfigFile(testTmpDir, 'desktop');
-      expect(healResult.healed).toBe(true);
-      expect(healResult.removedKeys).toEqual([]);
-      expect(healResult.renamedKeys).toEqual(
-        expect.arrayContaining([
-          { from: 'group_memory_budget_chars', to: 'group_memory_total_budget_chars' },
-          { from: 'private_memory_budget_chars', to: 'user_profile_budget_chars' },
-        ])
-      );
-
-      const updatedContent = fs.readFileSync(patchPath, 'utf8');
-      expect(updatedContent).toContain('group_memory_total_budget_chars: 4100');
-      expect(updatedContent).toContain('user_profile_budget_chars: 1900');
-      expect(updatedContent).not.toContain('group_memory_budget_chars');
-      expect(updatedContent).not.toContain('private_memory_budget_chars');
-      expect(updatedContent).toContain('测试人格');
-    });
-
-    it('当 profile patch 包含对象数组（如 coding_tools_overrides 及其子属性 type/enabled/permission）时，绝不误杀子字段', () => {
-      const profileDir = path.join(testTmpDir, 'profiles/desktop');
-      fs.mkdirSync(profileDir, { recursive: true });
-      const patchPath = path.join(profileDir, 'cordis.patch.yml');
-
-      const complexYaml = `
-- id: dsh-napcat-bridge
-  name: "@jiangsubei/dsh-napcat-bridge"
-  config:
-    ws_port: 3001
-    coding_tools_overrides:
-      - id: "8000000002"
-        type: group
-        enabled: true
-    session_permission_overrides:
-      - id: "8000000001"
-        type: group
-        permission: read-only
-`;
-      fs.writeFileSync(patchPath, complexYaml, 'utf8');
-
-      const healResult = healProfileConfigFile(testTmpDir, 'desktop');
+      const healResult = healProfileConfigFile(testTmpDir, 'default');
       expect(healResult.healed).toBe(false);
       expect(healResult.removedKeys).toEqual([]);
-
-      const updatedContent = fs.readFileSync(patchPath, 'utf8');
-      expect(updatedContent).toContain('type: group');
-      expect(updatedContent).toContain('enabled: true');
-      expect(updatedContent).toContain('permission: read-only');
-    });
-  });
-
-  describe('3. 保存配置时自愈与防 500 契约 (Save Route Interception)', () => {
-    it('POST 收到包含历史废弃键（at_questioner / quote_original）时，服务端自愈过滤并成功持久化，绝不抛出 500', async () => {
-      let handler: any;
-      const mutateMock = vi.fn().mockImplementation(async (ns: string, ops: any[]) => {
-        // 模拟 DSH 真实 settings.mutate 的严格 volatile 校验
-        const schema = BridgeConfigSchema as any;
-        const validKeys = new Set(Object.keys(schema.dict || {}));
-        for (const op of ops) {
-          const key = op.path[0];
-          if (!validKeys.has(key)) {
-            throw new Error(`Config field "${key}" is not volatile`);
-          }
-        }
-        return { ok: true };
-      });
-
-            const mockCtx: any = {
-        get: vi.fn((name) => {
-          if (name === 'connection') return { requestRejection: () => undefined };
-          if (name === 'webServer') {
-            return {
-              register: (route: any) => {
-                handler = route.handler;
-                return () => {};
-              },
-            };
-          }
-          if (name === 'settings') {
-            return { mutate: mutateMock };
-          }
-          return undefined;
-        }),
-        inject: vi.fn(),
-      };
-
-            let currentCfg: BridgePluginConfig = {
-        ws_port: 8080,
-        ws_token: 'test_token',
-        bot_qq: '1000000021',
-      };
-
-      const reconcileMock = vi.fn().mockImplementation(async (next) => {
-        if (next) currentCfg = { ...next };
-      });
-
-      registerConfigRoute(mockCtx, () => currentCfg, reconcileMock);
-
-      // 模拟前端带有历史脏字段提交
-      const dirtyPayload = {
-        ws_port: 9000,
-        bot_qq: '1000000026',
-        at_questioner: false, // 脏字段
-        quote_original: true, // 脏字段
-      };
-
-      const req = createMockReq('POST', dirtyPayload);
-      const { res, getResult } = createMockRes();
-
-      await handler(req, res);
-      const result = await getResult();
-
-      // 必须响应 200，绝不崩溃 500
-      expect(result.status).toBe(200);
-      expect(result.body.ok).toBe(true);
-
-      // 验证交给 settings.mutate 的 ops 绝不包含 at_questioner 或 quote_original
-      expect(mutateMock).toHaveBeenCalled();
-      const passedOps = mutateMock.mock.calls[0][1];
-      const passedPaths = passedOps.map((op: any) => op.path[0]);
-      expect(passedPaths).not.toContain('at_questioner');
-      expect(passedPaths).not.toContain('quote_original');
-      expect(passedPaths).toContain('ws_port');
-      expect(passedPaths).toContain('bot_qq');
+      expect(fs.readFileSync(patchPath, 'utf8')).toBe(legacyOnlyYaml);
     });
 
-    it('GET 请求下发配置时，仅下发 Schema 范围内的干净字段，避免向前端渗透脏数据', async () => {
-      let handler: any;
-            const mockCtx: any = {
-        get: vi.fn((name) => {
-          if (name === 'connection') return { requestRejection: () => undefined };
-          if (name === 'webServer') {
-            return {
-              register: (route: any) => {
-                handler = route.handler;
-                return () => {};
-              },
-            };
-          }
-          return undefined;
-        }),
-        inject: vi.fn(),
-      };
+    it('surgicalCleanYamlConfig 在精确删除指定过期键时保留注释与 CRLF 换行风格', () => {
+      const input = [
+        '- id: kujira',
+        '  config:',
+        '    # 保留注释',
+        '    markdown_enabled: true',
+        '    ws_port: 8080',
+        '    persona: "助手"',
+        '',
+      ].join('\r\n');
 
-      // 模拟存量配置中持有历史废弃字段
-      const dirtyCurrentCfg = {
-        ws_port: 8080,
-        bot_qq: '1000000021',
-        at_questioner: false,
-        quote_original: true,
-        review_enabled: true,
-      };
-
-      registerConfigRoute(mockCtx, () => dirtyCurrentCfg as any, async () => {});
-
-      const req = createMockReq('GET');
-      const { res, getResult } = createMockRes();
-
-      await handler(req, res);
-      const result = await getResult();
-
-      expect(result.status).toBe(200);
-      expect(result.body.ok).toBe(true);
-      expect(result.body.config.at_questioner).toBeUndefined();
-      expect(result.body.config.quote_original).toBeUndefined();
-      expect(result.body.config.review_enabled).toBeUndefined();
-      expect(result.body.config.ws_port).toBe(8080);
-      expect(result.body.config.bot_qq).toBe('1000000021');
+      const cleaned = surgicalCleanYamlConfig(input, 'kujira', new Set(['ws_port']));
+      expect(cleaned.removedKeys).toEqual(['ws_port']);
+      expect(cleaned.newContent).toBe(
+        ['- id: kujira', '  config:', '    # 保留注释', '    markdown_enabled: true', '    persona: "助手"', ''].join(
+          '\r\n'
+        )
+      );
     });
   });
 });

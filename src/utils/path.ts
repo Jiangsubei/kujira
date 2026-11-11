@@ -1,3 +1,7 @@
+/**
+ * kujira: DSH 路径锚定、路径段转义与 Windows 超长路径保护工具
+ */
+
 import * as path from 'node:path';
 import * as os from 'node:os';
 
@@ -34,4 +38,23 @@ export function encodeSegment(raw: string): string {
     else out += '~' + code.toString(16).toUpperCase().padStart(4, '0');
   }
   return out;
+}
+
+/**
+ * Windows 超长路径保护辅助：
+ * 在 Windows 下当解析后的绝对路径长度达到或超过 248 字符且尚未带 `\\?\` 前缀时，
+ * 转换为 Win32 命名空间路径（`\\?\...` 或 `\\?\UNC\...`）；非 Windows 或短路径保持原样。
+ */
+export function toSafeNamespacedPath(p: string): string {
+  if (!p || process.platform !== 'win32') {
+    return p;
+  }
+  if (p.startsWith('\\\\?\\')) {
+    return p;
+  }
+  const resolved = path.resolve(p);
+  if (resolved.length >= 248) {
+    return path.toNamespacedPath(resolved);
+  }
+  return p;
 }

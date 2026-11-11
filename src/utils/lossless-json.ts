@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: DSH Lossless JSON 辅助函数
+ * kujira: DSH Lossless JSON 辅助函数
  * 确保工具返回值严格符合 DSH 无损 JSON 规范，递归剥离所有 undefined 字段。
  */
 

@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: Agent 工具入参、出参及执行结果 Schema
+ * kujira: Agent 工具入参、出参及执行结果 Schema（QQ 官方 Bot API v2 合规单聊）
  */
 
 import type {
@@ -11,20 +11,16 @@ import type {
   FaceSummaryItem,
 } from './storage.js';
 
-// ==================== 1. 聊天历史与群文件检索 ====================
+// ==================== 1. 聊天历史检索（单聊强隔离，禁止跨会话） ====================
 
 export interface ReadChatHistoryParams {
-  /** 可选目标会话 peer (如 "group_8000000001" 或 "user_1000000001")，缺省时默认为当前会话 */
-  peer?: string;
-  /** 按指定发送者 QQ 号精确筛选 */
-  user_id?: string;
-  /** 按发送者昵称/群名片模糊匹配 (SQL LIKE %sender_name%) */
+  /** 按发送者展示名模糊匹配 (SQL LIKE %sender_name%) */
   sender_name?: string;
   /** 按消息内容关键词模糊匹配 (SQL LIKE %keyword%) */
   keyword?: string;
   /**
    * 按消息类型筛选，支持单类型或类型数组:
-   * 'text' | 'image' | 'sticker' | 'file' | 'group_file' | 'forward' | 'record' | 'video' | 'poke' | 'reply' | 'emoji_like'
+   * 'text' | 'image' | 'sticker' | 'file' | 'forward' | 'record' | 'video' | 'reply' | 'card'
    */
   type?: string | string[];
   /** 起始时间: 支持毫秒数字、秒级数字、相对时间字符串 ("30m", "2h", "1d", "7d")、裸时间 ("19:00", "19:00:00") 或日期时间字符串 ("10-30 19:00", "2026-10-30 12:00:00") */
@@ -36,16 +32,13 @@ export interface ReadChatHistoryParams {
   /** 是否仅筛选带有文件/图片/多媒体附件的消息 (local_path 或 file_id 不为空) */
   has_file?: boolean;
   /** 查询指定 msg_id 消息的直接回复消息 (reply_to = ?) */
-  reply_to?: number | string;
+  reply_to?: string;
   /** 是否排除机器人自己发出的消息 (self = 0) */
   exclude_self?: boolean;
   /** 是否仅查询机器人自己发出的消息 (self = 1) */
   self_only?: boolean;
-  /**
-   * 按消息来源筛选: 'qq' = 真实 QQ 消息；'agent' = Agent 内部协同通讯；
-   * 'all' = 不过滤（两者都返回）。缺省按 'qq' 处理（历史查询默认不展示内部通讯）。
-   */
-  source?: MessageSource | 'all' | Array<MessageSource | 'all'>;
+  /** 消息来源筛选：单聊仅支持真实 QQ 消息 ('qq') */
+  source?: MessageSource;
   /** 起始序号偏移，从 0 开始 (默认 0) */
   offset?: number;
   /** 返回最大条数 (默认 20，上限 100) */
@@ -55,7 +48,7 @@ export interface ReadChatHistoryParams {
 }
 
 export interface ChatMessageSummary {
-  msg_id: number;
+  msg_id: string;
   user_id: string;
   sender_name: string;
   time: number;
@@ -64,12 +57,13 @@ export interface ChatMessageSummary {
   content: string;
   recalled: boolean;
   self: boolean;
-  reply_to?: number | null;
+  reply_to?: string | null;
+  ref_idx?: string | null;
   local_path?: string | null;
   file_id?: string | null;
   /** 统一附件描述符 JSON（与 MessageRecord.attachments 同源） */
   attachments?: string | null;
-  /** 消息来源: 'qq' | 'agent' */
+  /** 消息来源: 'qq' */
   source?: MessageSource;
 }
 
@@ -88,15 +82,17 @@ export interface ReadChatHistoryResult {
 // ==================== 2. 资源下载与合并转发展开 ====================
 
 export interface FetchResourceItem {
+  /** 入站附件索引、文件标识或消息 ID */
   file_id: string;
-  busid?: number;
+  /** 保存文件名建议（落盘前执行 basename 与安全净化） */
   file_name?: string;
+  /** 可选直链 URL（裸 GET 拉取；严禁在结果中明文回显带凭证 query） */
+  url?: string;
 }
 
 export interface FetchChatResourceItemResult {
   file_id: string;
   file_name?: string;
-  busid?: number;
   success: boolean;
   local_path?: string;
   error?: string;
@@ -104,8 +100,10 @@ export interface FetchChatResourceItemResult {
 
 export interface FetchChatResourceParams {
   file_id?: string;
-  busid?: number;
   file_name?: string;
+  url?: string;
+  /** 可选：通过消息 ID 重新拉取该条消息关联的入站附件 */
+  msg_id?: string;
   files?: FetchResourceItem[];
 }
 
@@ -118,54 +116,96 @@ export interface FetchChatResourceResult {
   results?: FetchChatResourceItemResult[];
 }
 
+/** 展开合并转发入参（适配 QQ 官方 Bot message_type=102 展开文本与内嵌图片提取） */
 export interface ExpandForwardMessageParams {
-  forward_id: string;
+  /** 入站合并转发消息的 msg_id（优先查库获取 message_type=102 原始内容并提取内嵌图片） */
+  msg_id?: string;
+  /** 可选：直接传入的 message_type=102 合并转发原文 */
+  content?: string;
+  /** 可选兼容别名：等价于 msg_id */
+  forward_id?: string;
 }
 
+/** 合并转发节点中提取的内嵌附件摘要（URL 仅内部裸 GET 使用，不对外暴露带凭证地址） */
+export interface ForwardEmbeddedAttachment {
+  type?: string;
+  filename?: string;
+  dimensions?: string;
+  size_text?: string;
+  local_path?: string;
+  error?: string;
+}
+
+/** 合并转发单条展开节点（适配官方 message_type=102 结构化文本段落） */
 export interface ForwardNode {
-  sender_name: string;
-  user_id: string;
-  time: number;
+  /** 节点序号（如 === 消息 1 ===） */
+  index?: number;
+  /** 节点文本中解析出的展示名（[发送者]） */
+  sender_name?: string;
+  /** 节点正文内容（已剥离含访问凭证的原始下载 URL） */
   content: string;
+  /** 从节点 [附件k] 提取并尝试裸 GET 落盘的附件列表 */
+  attachments?: ForwardEmbeddedAttachment[];
 }
 
 export interface ExpandForwardMessageResult {
   success: boolean;
+  /** 合并转发首行标题（若有） */
+  title?: string;
   messages?: ForwardNode[];
-  /** FC-1: 本次展开中成功落盘的内层图片数量（缺省表示无新增落盘） */
+  /** 本次展开中成功裸 GET 落盘的内嵌图片数量（缺省表示无新增落盘） */
   images_downloaded?: number;
   error?: string;
 }
 
-// ==================== 3. 消息/文件发送与轻量互动 ====================
+// ==================== 3. 消息/文件发送、撤回与轻量等待 ====================
 
 export interface SendFileParams {
   file_path: string;
-  file_type?: 'image' | 'file';
+  file_type?: 'image' | 'file' | 'video' | 'voice';
 }
 
 export interface SendFileResult {
   success: boolean;
-  message_id?: number;
+  /** 出站消息撤回 ID（body.id，仅用于 120s 内撤回，不可作被动回复锚点） */
+  message_id?: string;
+  /** 出站消息引用索引（ext_info.ref_idx） */
+  ref_idx?: string;
   error?: string;
 }
 
 export interface SendQqMessageParams {
   text: string;
-  reply_to?: number | string;
-  at_user?: string | number;
+  /** 引用的目标消息索引或 ID（优先 ref_idx；若为本地库内 msg_id 则自动查表换取 ref_idx） */
+  reply_to?: string;
+  /** 是否按原生 Markdown (msg_type=2) 下发；省略时遵循插件配置 markdown_enabled */
+  markdown?: boolean;
 }
 
 export interface SendQqMessageResult {
   success: boolean;
-  message_id?: number;
+  /** 出站消息撤回 ID（body.id） */
+  message_id?: string;
+  /** 出站消息引用索引（ext_info.ref_idx） */
+  ref_idx?: string;
   error?: string;
   sent_preview?: string;
 }
 
+export interface RecallMessageParams {
+  /** 需要撤回的机器人自身出站消息 ID（严格限制 120 秒内） */
+  message_id: string;
+}
+
+export interface RecallMessageResult {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
 export interface WaitForUserMessagesParams {
+  /** 等待超时秒数（正数） */
   timeout?: number;
-  user_id?: string;
 }
 
 // ==================== 4. 表情包工具 ====================
@@ -197,14 +237,17 @@ export interface SendFaceParams {
 
 export interface SendFaceResult {
   success: boolean;
-  message_id?: number;
+  /** 出站消息撤回 ID（body.id） */
+  message_id?: string;
+  /** 出站消息引用索引（ext_info.ref_idx） */
+  ref_idx?: string;
   error?: string;
 }
 
 export interface CollectFaceParams {
   tags: string[];
   mood: string;
-  message_id?: number | string;
+  message_id?: string;
 }
 
 export interface CollectFaceResult {
@@ -345,3 +388,46 @@ export interface ManageSlangResult {
   message?: string;
   error?: string;
 }
+
+// ==================== 7. 记忆工具（单聊强隔离，禁止跨会话） ====================
+
+export type MemoryScope = 'session' | 'user';
+
+/**
+ * 读取当前单聊会话记忆入参（禁止跨会话调用：始终绑定当前会话 peer，不提供跨会话目标参数）
+ */
+export interface ReadMemoryParams {
+  /** 记忆类型：'session' 表示当前会话规则与文化；'user' 表示当前对话用户画像 */
+  type?: MemoryScope;
+}
+
+/**
+ * 创建当前单聊会话记忆入参（禁止跨会话调用：始终绑定当前会话 peer，不提供跨会话目标参数）
+ */
+export interface CreateMemoryParams {
+  type: MemoryScope;
+  content: string;
+}
+
+/**
+ * 编辑当前单聊会话记忆入参（禁止跨会话调用：始终绑定当前会话 peer，不提供跨会话目标参数）
+ */
+export interface EditMemoryParams {
+  type: MemoryScope;
+  old_string: string;
+  new_string?: string;
+}
+
+export interface MemoryToolResult {
+  success: boolean;
+  message?: string;
+  type?: MemoryScope;
+  target?: string;
+  content?: string;
+  preview?: string;
+}
+
+export type ReadMemoryResult = MemoryToolResult;
+export type ReadMemoryArgs = ReadMemoryParams;
+export type CreateMemoryArgs = CreateMemoryParams;
+export type EditMemoryArgs = EditMemoryParams;

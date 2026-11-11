@@ -1,7 +1,7 @@
 /**
- * dsh-napcat-bridge Client WebUI Bundle Builder
+ * kujira Client WebUI Bundle Builder
  * Compiles src/client/index.tsx into DSH lazy-CJS bundle format:
- * window.__ModuleLoader__.load({ id: "dsh-napcat-bridge", factory: (require) => { ... } })
+ * window.__ModuleLoader__.load({ id: "kujira", factory: (require) => { ... } })
  */
 
 import * as esbuild from 'esbuild';
@@ -43,7 +43,7 @@ async function buildClientBundle() {
   // Wrap in DSH lazy-CJS module loader format
   const wrappedBundle = [
     'window.__ModuleLoader__.load({',
-    '  id: "dsh-napcat-bridge",',
+    '  id: "kujira",',
     '  factory: (require) => {',
     '    var module = { exports: {} };',
     '    var exports = module.exports;',

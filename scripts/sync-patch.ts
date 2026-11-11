@@ -14,13 +14,13 @@ import {
 
 export function generateCordisPatch(): string {
   const lines: string[] = [
-    '# dsh-napcat-bridge bundle patch: inserts this plugin and the qq-session preset into the profile layer stack.',
+    '# kujira bundle patch: inserts this plugin and the kujira-session preset into the profile layer stack.',
     '# Generated automatically by scripts/sync-patch.ts - DO NOT EDIT MANUALLY.',
     '- insert:',
-    '    - id: dsh-napcat-bridge',
-    '      name: dsh-napcat-bridge',
+    '    - id: kujira',
+    '      name: kujira',
     '',
-    '    - id: preset-qq-session',
+    `    - id: preset-${QQ_PRESET_ID}`,
     "      name: '@deepseek-ai/dsh-agent-preset'",
     '      config:',
     `        id: ${QQ_PRESET_ID}`,

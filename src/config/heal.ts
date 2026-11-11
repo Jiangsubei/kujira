@@ -1,20 +1,20 @@
 /**
- * dsh-napcat-bridge: 配置动态校验与自愈模块 (Self-Healing Configuration Engine)
+ * kujira: 配置动态校验与自愈模块 (Self-Healing Configuration Engine)
  *
  * 核心设计：以 src/config/schema.ts 中的 BridgeConfigSchema 为单一真相源（SSOT），
  * 提供运行时配置清洗与物理配置文件主动自愈能力：
  *   1. getValidConfigKeys: 动态提取当前 Schema 支持的全量有效 volatile 键集合；
  *   2. sanitizeConfigPayload: 纯函数，分离有效配置与无效/过期字段；
- *   3. healProfileConfigFile: 物理级安全自愈，扫描并移除 profile patch 中残留的已废弃死配置；
- *   4. 一次改造，终身受益：无论后续如何增删配置，自愈机制全生命周期自洽运作。
+ *   3. surgicalCleanYamlConfig / healProfileConfigFile: 物理级安全自愈，扫描并移除 profile patch 中残留的已废弃死配置。
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { BridgeConfigSchema } from './schema.js';
-import { LEGACY_CONFIG_KEY_MIGRATIONS, migrateLegacyConfigKeys } from './legacy.js';
+import { resolveDshHome } from './credentials.js';
 import type { BridgePluginConfig } from '../types/index.js';
 import { PLUGIN_NAME, SETTINGS_NAMESPACE } from '../constants/index.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 /**
  * 动态获取当前配置 Schema 定义的所有有效键集合 (单一真相源)
@@ -30,20 +30,18 @@ export interface SanitizeResult {
 }
 
 /**
- * 纯函数：根据当前 Schema 清洗配置对象，分离出干净合法的配置项与脏键/过期键。
- * 清洗前先将历史配置键的值搬运到当前键，避免升级后用户配置丢失。
+ * 纯函数：根据当前 Schema 清洗配置对象，分离出干净合法的配置项与无效/过期键。
  */
 export function sanitizeConfigPayload<T extends Record<string, any>>(raw: T): SanitizeResult {
-  if (!raw || typeof raw !== 'object') {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { valid: {}, removed: [] };
   }
 
-  const migrated = migrateLegacyConfigKeys(raw);
   const validKeys = getValidConfigKeys();
   const valid: Record<string, any> = {};
   const removed: string[] = [];
 
-  for (const [key, value] of Object.entries(migrated)) {
+  for (const [key, value] of Object.entries(raw)) {
     if (validKeys.has(key)) {
       valid[key] = value;
     } else {
@@ -54,45 +52,71 @@ export function sanitizeConfigPayload<T extends Record<string, any>>(raw: T): Sa
   return { valid: valid as BridgePluginConfig, removed };
 }
 
+interface ParsedEntryId {
+  indent: number;
+  id: string;
+}
+
+function parseEntryIdLine(line: string): ParsedEntryId | undefined {
+  const match = line.match(/^(\s*)-\s+id:\s*(['"]?)([^'"#\s]+)\2\s*(?:#.*)?$/);
+  if (!match) return undefined;
+  return { indent: match[1].length, id: match[3] };
+}
+
 /**
- * 外科手术式行级 YAML 清洗：
- * 仅定位指定 pluginId 下的 config 节点，精确删除其中的 staleKeys，
- * 并将 renameMap 中指定的历史键原地重命名为当前键（保留原值与其子块），
- * 绝不重排整个文件，严格保留用户的缩进、注释、空行与 !!js 等特殊语法。
+ * 计算某个缩进层级多行配置块的结束行索引（不含尾部用于分隔同级/外层条目的空行）。
  */
-export function surgicalCleanYamlConfig(
+function findChildBlockEnd(lines: string[], startIndex: number, parentIndent: number): number {
+  let end = startIndex;
+  let j = startIndex + 1;
+  while (j < lines.length) {
+    const nextLine = lines[j];
+    if (nextLine.trim().length === 0) {
+      j++;
+      continue;
+    }
+    const nextIndent = nextLine.search(/\S/);
+    if (nextIndent !== -1 && nextIndent > parentIndent) {
+      end = j;
+      j++;
+    } else {
+      break;
+    }
+  }
+  return end;
+}
+
+/**
+ * 共享 YAML `config:` 顶层键单趟扫描与外科手术级清洗实现。
+ * 严格按精确 `- id:`（非子串匹配）定位目标插件块，避免误伤 `preset-kujira-session` 或 `kujira-tools`。
+ */
+function scanAndCleanPluginConfig(
   yamlContent: string,
-  pluginId: string,
-  staleKeys: Set<string>,
-  renameMap: Map<string, string> = new Map()
+  targetIds: Set<string>,
+  isStaleKey: (key: string) => boolean
 ): {
   newContent: string;
   removedKeys: string[];
-  renamedKeys: Array<{ from: string; to: string }>;
 } {
-  if (!staleKeys.size && !renameMap.size) {
-    return { newContent: yamlContent, removedKeys: [], renamedKeys: [] };
-  }
-
+  const eol = yamlContent.includes('\r\n') ? '\r\n' : '\n';
   const lines = yamlContent.split(/\r?\n/);
+  const removed = new Set<string>();
+  const outputLines: string[] = [];
+
   let inTargetPlugin = false;
+  let targetEntryIndent = -1;
   let inConfig = false;
   let configIndent = -1;
   let topKeyIndent = -1;
-  const removed = new Set<string>();
-  const renamed: Array<{ from: string; to: string }> = [];
-  const outputLines: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // 检测顶层列表项声明 (例如: "- id: dsh-napcat-bridge" 或 "- id: ui-theme")
-    if (/^-\s+id:\s*/.test(line)) {
-      if (line.includes(pluginId)) {
-        inTargetPlugin = true;
-      } else {
-        inTargetPlugin = false;
-      }
+    const entry = parseEntryIdLine(line);
+    // 只有外层（未进入 config 或缩进不深于目标条目/config 节点）的 `- id:` 才切换插件作用域，避免误判配置数组内部元素
+    if (entry && (!inConfig || entry.indent <= configIndent || entry.indent <= targetEntryIndent)) {
+      inTargetPlugin = targetIds.has(entry.id);
+      targetEntryIndent = entry.indent;
       inConfig = false;
       configIndent = -1;
       topKeyIndent = -1;
@@ -101,9 +125,18 @@ export function surgicalCleanYamlConfig(
     }
 
     if (inTargetPlugin) {
-      // 检测进入 config 节点
-      const configMatch = line.match(/^(\s+)config:\s*$/);
-      if (configMatch) {
+      const lineIndent = line.search(/\S/);
+      if (line.trim().length > 0 && lineIndent !== -1 && lineIndent <= targetEntryIndent) {
+        inTargetPlugin = false;
+        inConfig = false;
+        configIndent = -1;
+        topKeyIndent = -1;
+        outputLines.push(line);
+        continue;
+      }
+
+      const configMatch = line.match(/^(\s+)config:\s*(?:#.*)?$/);
+      if (configMatch && configMatch[1].length > targetEntryIndent) {
         inConfig = true;
         configIndent = configMatch[1].length;
         topKeyIndent = -1;
@@ -112,55 +145,29 @@ export function surgicalCleanYamlConfig(
       }
 
       if (inConfig) {
-        const lineIndent = line.search(/\S/);
-        // 若缩进小于等于 configIndent 且非空行，说明已退出 config 块
         if (line.trim().length > 0 && lineIndent !== -1 && lineIndent <= configIndent) {
           inConfig = false;
+          topKeyIndent = -1;
           outputLines.push(line);
           continue;
         }
 
-        // 探测 config 下顶层键的基准缩进 (忽略空行与纯注释)
-        if (topKeyIndent === -1 && line.trim().length > 0 && !line.trim().startsWith("#")) {
-          const match = line.match(/^(\s+)([a-zA-Z0-9_]+):/);
-          if (match && match[1].length > configIndent) {
-            topKeyIndent = match[1].length;
-          }
-        }
-
-        // 仅对与 topKeyIndent 严格齐平的直接顶层配置键执行过期检测与重命名，绝不误触子对象字段 (如 overrides 中的 type/enabled)
-        if (topKeyIndent !== -1 && lineIndent === topKeyIndent) {
-          const keyMatch = line.match(/^(\s+)([a-zA-Z0-9_]+):(.*)$/);
-          const configKey = keyMatch?.[2];
-
-          // 历史键原地重命名，保留原值与多行子块
-          if (configKey && renameMap.has(configKey)) {
-            const targetKey = renameMap.get(configKey)!;
-            outputLines.push(`${keyMatch![1]}${targetKey}:${keyMatch![3]}`);
-            renamed.push({ from: configKey, to: targetKey });
-            continue;
-          }
-
-          // 检查是否是需要剔除的过期键
-          if (configKey && staleKeys.has(configKey)) {
-            removed.add(configKey);
-            // 若该键的值为多行（如缩进的数组或多行字符串），跳过后续所有更深缩进的行
-            let j = i + 1;
-            while (j < lines.length) {
-              const nextLine = lines[j];
-              if (nextLine.trim().length === 0) {
-                j++;
-                continue;
-              }
-              const nextIndent = nextLine.search(/\S/);
-              if (nextIndent !== -1 && nextIndent > lineIndent) {
-                j++;
-              } else {
-                break;
-              }
+        if (line.trim().length > 0 && !line.trim().startsWith('#')) {
+          if (topKeyIndent === -1) {
+            const firstMatch = line.match(/^(\s+)([a-zA-Z0-9_]+):/);
+            if (firstMatch && firstMatch[1].length > configIndent) {
+              topKeyIndent = firstMatch[1].length;
             }
-            i = j - 1; // 跳过整个子块
-            continue;
+          }
+
+          if (topKeyIndent !== -1 && lineIndent === topKeyIndent) {
+            const keyMatch = line.match(/^(\s+)([a-zA-Z0-9_]+):/);
+            const configKey = keyMatch?.[2];
+            if (configKey && isStaleKey(configKey)) {
+              removed.add(configKey);
+              i = findChildBlockEnd(lines, i, lineIndent);
+              continue;
+            }
           }
         }
       }
@@ -168,17 +175,40 @@ export function surgicalCleanYamlConfig(
 
     outputLines.push(line);
   }
+
   return {
-    newContent: outputLines.join('\n'),
+    newContent: outputLines.join(eol),
     removedKeys: Array.from(removed),
-    renamedKeys: renamed,
   };
+}
+
+/**
+ * 外科手术式行级 YAML 清洗：
+ * 仅定位指定 pluginId 下的 config 节点，精确删除其中的 staleKeys，
+ * 绝不重排整个文件，严格保留用户的缩进、注释、空行与 !!js 等特殊语法。
+ */
+export function surgicalCleanYamlConfig(
+  yamlContent: string,
+  pluginId: string,
+  staleKeys: Set<string>
+): {
+  newContent: string;
+  removedKeys: string[];
+} {
+  if (!staleKeys.size) {
+    return { newContent: yamlContent, removedKeys: [] };
+  }
+
+  return scanAndCleanPluginConfig(
+    yamlContent,
+    new Set([pluginId]),
+    (key) => staleKeys.has(key)
+  );
 }
 
 export interface HealResult {
   healed: boolean;
   removedKeys: string[];
-  renamedKeys?: Array<{ from: string; to: string }>;
   filePath?: string;
 }
 
@@ -190,15 +220,10 @@ export function healProfileConfigFile(
   explicitProfile?: string,
   logger?: any
 ): HealResult {
-  const dshHome = explicitDshHome
-    ? path.resolve(explicitDshHome)
-    : path.resolve(
-        process.env.DSH_HOME ||
-          path.join(process.env.HOME || process.env.USERPROFILE || '/tmp', '.dsh')
-      );
-
+  const dshHome = resolveDshHome(explicitDshHome);
   const candidateProfiles = explicitProfile ? [explicitProfile] : ['desktop', 'default'];
   const validKeys = getValidConfigKeys();
+  const targetIds = new Set([SETTINGS_NAMESPACE, PLUGIN_NAME]);
 
   for (const profile of candidateProfiles) {
     const patchFile = path.join(dshHome, 'profiles', profile, 'cordis.patch.yml');
@@ -212,103 +237,21 @@ export function healProfileConfigFile(
         continue;
       }
 
-      // 提取目标插件 config 块下所有的 key，比对是否存在脏键
-      const lines = content.split('\n');
-      const presentKeys = new Set<string>();
-      let inTarget = false;
-      let inCfg = false;
-      let cfgIndent = -1;
-
-      let topKeyIndent = -1;
-      for (const line of lines) {
-        if (/^-\s+id:\s*/.test(line)) {
-          inTarget = line.includes(SETTINGS_NAMESPACE) || line.includes(PLUGIN_NAME);
-          inCfg = false;
-          cfgIndent = -1;
-          topKeyIndent = -1;
-          continue;
-        }
-        if (inTarget) {
-          const cfgMatch = line.match(/^(\s+)config:\s*$/);
-          if (cfgMatch) {
-            inCfg = true;
-            cfgIndent = cfgMatch[1].length;
-            topKeyIndent = -1;
-            continue;
-          }
-          if (inCfg) {
-            const indent = line.search(/\S/);
-            if (line.trim().length > 0 && indent <= cfgIndent) {
-              inCfg = false;
-              continue;
-            }
-            if (line.trim().length === 0 || indent === -1 || line.trim().startsWith("#")) {
-              continue;
-            }
-            if (topKeyIndent === -1) {
-              const firstMatch = line.match(/^(\s+)([a-zA-Z0-9_]+):/);
-              if (firstMatch && firstMatch[1].length > cfgIndent) {
-                topKeyIndent = firstMatch[1].length;
-              }
-            }
-            if (topKeyIndent !== -1 && indent === topKeyIndent) {
-              const keyMatch = line.match(/^(\s+)([a-zA-Z0-9_]+):/);
-              if (keyMatch) {
-                presentKeys.add(keyMatch[2]);
-              }
-            }
-          }
-        }
-      }
-      const staleKeys = new Set<string>();
-      const renameMap = new Map<string, string>();
-      const renameTargets = new Set<string>();
-
-      // 按迁移表优先级决定由哪个旧键胜出，避免多代旧键同时存在时产生重复新键
-      for (const migration of LEGACY_CONFIG_KEY_MIGRATIONS) {
-        if (!presentKeys.has(migration.legacy)) continue;
-        if (presentKeys.has(migration.current) || renameTargets.has(migration.current)) {
-          staleKeys.add(migration.legacy);
-          continue;
-        }
-        renameMap.set(migration.legacy, migration.current);
-        renameTargets.add(migration.current);
-      }
-
-      for (const k of presentKeys) {
-        if (!validKeys.has(k) && !renameMap.has(k)) {
-          staleKeys.add(k);
-        }
-      }
-
-      if (staleKeys.size > 0 || renameMap.size > 0) {
-        const cleaned = surgicalCleanYamlConfig(
-          content,
-          SETTINGS_NAMESPACE,
-          staleKeys,
-          renameMap
+      const cleaned = scanAndCleanPluginConfig(
+        content,
+        targetIds,
+        (key) => !validKeys.has(key)
+      );
+      if (cleaned.removedKeys.length > 0) {
+        atomicWriteFileSync(patchFile, cleaned.newContent, 'utf8');
+        logger?.info?.(
+          `[Config] 配置文件自愈成功 (${patchFile})，已物理清除失效配置项: ${cleaned.removedKeys.join(', ')}`
         );
-        if (cleaned.removedKeys.length > 0 || cleaned.renamedKeys.length > 0) {
-          fs.writeFileSync(patchFile, cleaned.newContent, 'utf8');
-          const details: string[] = [];
-          if (cleaned.renamedKeys.length > 0) {
-            details.push(
-              `已迁移历史配置项: ${cleaned.renamedKeys
-                .map((r) => `${r.from} -> ${r.to}`)
-                .join(', ')}`
-            );
-          }
-          if (cleaned.removedKeys.length > 0) {
-            details.push(`已物理清除失效配置项: ${cleaned.removedKeys.join(', ')}`);
-          }
-          logger?.info?.(`[Config] 配置文件自愈成功 (${patchFile})，${details.join('；')}`);
-          return {
-            healed: true,
-            removedKeys: cleaned.removedKeys,
-            renamedKeys: cleaned.renamedKeys,
-            filePath: patchFile,
-          };
-        }
+        return {
+          healed: true,
+          removedKeys: cleaned.removedKeys,
+          filePath: patchFile,
+        };
       }
     } catch (err: any) {
       logger?.warn?.(`[Config] 物理配置文件自愈扫描异常 (非致命): ${err?.message || err}`);
