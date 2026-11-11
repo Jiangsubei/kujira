@@ -62,11 +62,10 @@ export const QQ_MEDIA_HARD_LIMIT = 200 * 1024 * 1024;
 
 export const QQ_UPLOAD_MD5_10M_BYTES = 10002432;
 
-export const QQ_STREAM_REQUEST_MAX_BYTES = 8 * 1024;
-
 export const QQ_MESSAGE_MAX_BYTES = 16 * 1024;
 
-export const QQ_STREAM_THROTTLE_MS = 1000;
+/** send_qq_message 单次发送本地字符拦截上限（超长需拆条发送） */
+export const QQ_SEND_MESSAGE_MAX_CHARS = 6000;
 
 export const QQ_INPUT_NOTIFY_MAX_SECONDS = 60;
 
@@ -83,10 +82,6 @@ export const QQ_WS_BACKOFF_MS = [2000, 5000, 10000, 30000, 60000] as const;
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_IMAGE_TTL_DAYS = 7;
-
-export const DEFAULT_MARKDOWN_ENABLED = true;
-
-export const DEFAULT_INPUT_NOTIFY_ENABLED = true;
 
 export const DEFAULT_NEW_MESSAGE_BEHAVIOR = 'steer' as const;
 
@@ -128,21 +123,19 @@ export const DEFAULT_MEMORY_GUIDANCE =
 export const DEFAULT_BEHAVIOR =
   '## 交互与输出规范\n' +
   '- 消息排版：QQ 官方 Bot 单聊原生支持 Markdown 富文本格式（包括标题、列表、表格、加粗、引用、代码块与链接等），可按表达需要清晰排版；使用 `#` 标题时建议在 `#` 后保留一个空格。\n' +
-  '- 消息下发：向用户回复消息、告知结论或同步长任务进展时，必须调用 send_qq_message 工具。请将正文完整传入 text 参数，并根据需要显式传入可选的 reply_to（引用目标消息 ID）。严禁在直接回复中重复输出已发送的正文内容。\n' +
+  '- 消息下发：向用户回复消息、告知结论或同步长任务进展时，必须调用 send_qq_message 工具。请将正文完整传入 text 参数（单次文本上限 6000 字符，超长需拆条发送），并根据需要显式传入可选的 reply_to（传短消息 ID，如 msg_12 或 msg_self_8）。严禁在直接回复中重复输出已发送的正文内容。\n' +
   '- 用户提问与抉择：若需要用户澄清需求、提供缺失信息或在多选项中进行抉择确认，可调用官方 ask_user_question 工具发起结构化交互。\n' +
   '- 文件与表情：生成或需发送给用户的图片、音视频与文件必须保存到本地持久化路径或工作区目录，并调用 send_file 下发；发送表情包请调用 send_face（若已启用表情包工具）。\n' +
-  '- 消息撤回：若发现发错内容、产生幻觉或被用户指出要求撤回，可调用 recall_message 撤回指定消息（传入 message_id）。受 QQ 官方平台严格限制，单聊仅支持在发送后 2 分钟（120 秒）内撤回机器人自身发出的消息，超时或传入非本机出站消息 ID 将如实报错。\n' +
+  '- 消息撤回：若发现发错内容、产生幻觉或被用户指出要求撤回，可调用 recall_message 撤回指定消息（传入短出站消息 ID，如 msg_self_8）。受 QQ 官方平台严格限制，单聊仅支持在发送后 2 分钟（120 秒）内撤回机器人自身发出的消息，超时或传入非本机出站消息 ID 将如实报错。\n' +
   '- ' +
   DEFAULT_MEMORY_GUIDANCE;
 
 // ---------------------------------------------------------------------------
-// 核心配置默认值单一真相源 (与 BridgePluginConfig 17 项核心配置对齐)
+// 核心配置默认值单一真相源 (与 BridgePluginConfig 15 项核心配置对齐)
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_BASE_CONFIG = {
   image_ttl_days: DEFAULT_IMAGE_TTL_DAYS,
-  markdown_enabled: DEFAULT_MARKDOWN_ENABLED,
-  input_notify_enabled: DEFAULT_INPUT_NOTIFY_ENABLED,
   new_message_behavior: DEFAULT_NEW_MESSAGE_BEHAVIOR,
   persona: DEFAULT_PERSONA,
   behavior: DEFAULT_BEHAVIOR,

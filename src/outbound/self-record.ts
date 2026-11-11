@@ -16,6 +16,7 @@ import type { MessageRecord } from '../types/index.js';
 
 export interface SelfRecordDb {
   saveMessageIfNotExists(record: MessageRecord): boolean;
+  getMessage?(msgId: string): MessageRecord | null;
 }
 
 export interface SelfRecordDeps {
@@ -191,9 +192,15 @@ export function recordOutboundSelfMessage(
 
   try {
     const inserted = deps.db.saveMessageIfNotExists(record);
+    if (!record.short_id && typeof deps.db.getMessage === 'function') {
+      const stored = deps.db.getMessage(record.msg_id);
+      if (stored?.short_id) {
+        record.short_id = stored.short_id;
+      }
+    }
     if (inserted) {
       deps.logger?.debug?.(
-        `[Kujira] 出站消息已落库 (peer: ${record.peer}, msg_id: ${record.msg_id}${record.ref_idx ? `, ref_idx: ${record.ref_idx}` : ''})`
+        `[Kujira] 出站消息已落库 (peer: ${record.peer}, msg_id: ${record.msg_id}${record.short_id ? `, short_id: ${record.short_id}` : ''}${record.ref_idx ? `, ref_idx: ${record.ref_idx}` : ''})`
       );
     }
     return record;

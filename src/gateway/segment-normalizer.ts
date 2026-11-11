@@ -10,6 +10,7 @@
 
 import type { FaceRecord, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
+import { hasFaceXmlTag, stripFaceXmlTags } from '../attachment/classify.js';
 import {
   formatFacePlaceholder as renderFacePlaceholder,
   renderAttachment,
@@ -18,6 +19,8 @@ import {
 import { computeFileMd5 } from '../storage/media.js';
 import { extractArkDataContent } from './card-parser.js';
 import { sanitizeForwardContentUrls } from './inbound-media.js';
+
+export { hasFaceXmlTag, stripFaceXmlTags };
 
 export interface MatchedFaceInfo {
   id: string;
@@ -152,10 +155,20 @@ export function parseNormalizedContent(
   descriptors: AttachmentDescriptor[] = [],
   options?: ParseNormalizedContentOptions
 ): string {
+  const rawContent = typeof event?.content === 'string' ? event.content : '';
+  const { text: cleanText, hadFaceTag } = stripFaceXmlTags(rawContent);
+
+  if (hadFaceTag) {
+    for (const descriptor of descriptors) {
+      if (descriptor.origin !== 'outbound' && descriptor.kind === 'image') {
+        descriptor.kind = 'sticker';
+      }
+    }
+  }
+
   enrichDescriptorsWithFaces(descriptors, options?.getFaceByMd5);
 
   const renderedAttachments = renderAttachments(descriptors);
-  const rawContent = typeof event?.content === 'string' ? event.content : '';
 
   // 1. 合并转发消息（message_type === 102）
   if (event?.message_type === 102) {
@@ -179,14 +192,16 @@ export function parseNormalizedContent(
 
   // 3. 普通文本 / 富媒体 / 引用回复（message_type === 0 / 103）
   const parts: string[] = [];
-  if (rawContent !== '') {
-    parts.push(rawContent);
+  if (cleanText !== '') {
+    parts.push(cleanText);
   }
   if (renderedAttachments.length > 0) {
     parts.push(...renderedAttachments);
   }
 
-  if (parts.length === 0) return '';
+  if (parts.length === 0) {
+    return hadFaceTag ? '[表情]' : '';
+  }
   if (parts.length === 1) return parts[0]!;
   return parts.join(' ');
 }

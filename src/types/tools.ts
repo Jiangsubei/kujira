@@ -14,8 +14,6 @@ import type {
 // ==================== 1. 聊天历史检索（单聊强隔离，禁止跨会话） ====================
 
 export interface ReadChatHistoryParams {
-  /** 按发送者展示名模糊匹配 (SQL LIKE %sender_name%) */
-  sender_name?: string;
   /** 按消息内容关键词模糊匹配 (SQL LIKE %keyword%) */
   keyword?: string;
   /**
@@ -31,7 +29,7 @@ export interface ReadChatHistoryParams {
   relative?: string;
   /** 是否仅筛选带有文件/图片/多媒体附件的消息 (local_path 或 file_id 不为空) */
   has_file?: boolean;
-  /** 查询指定 msg_id 消息的直接回复消息 (reply_to = ?) */
+  /** 查询引用了指定短消息 ID（如 `msg_5` 或 `msg_self_8`）的回复消息 */
   reply_to?: string;
   /** 是否排除机器人自己发出的消息 (self = 0) */
   exclude_self?: boolean;
@@ -48,17 +46,16 @@ export interface ReadChatHistoryParams {
 }
 
 export interface ChatMessageSummary {
+  /** 短消息 ID（入站 `msg_<n>` / 出站 `msg_self_<n>`） */
   msg_id: string;
-  user_id: string;
-  sender_name: string;
   time: number;
   formatted_time?: string;
   type: string;
   content: string;
   recalled: boolean;
   self: boolean;
+  /** 被引用消息的短消息 ID（`msg_<n>` / `msg_self_<n>`） */
   reply_to?: string | null;
-  ref_idx?: string | null;
   local_path?: string | null;
   file_id?: string | null;
   /** 统一附件描述符 JSON（与 MessageRecord.attachments 同源） */
@@ -102,7 +99,7 @@ export interface FetchChatResourceParams {
   file_id?: string;
   file_name?: string;
   url?: string;
-  /** 可选：通过消息 ID 重新拉取该条消息关联的入站附件 */
+  /** 可选：仅接收短消息 ID（`msg_<n>` / `msg_self_<n>`），重新拉取该条消息关联的入站附件 */
   msg_id?: string;
   files?: FetchResourceItem[];
 }
@@ -118,11 +115,11 @@ export interface FetchChatResourceResult {
 
 /** 展开合并转发入参（适配 QQ 官方 Bot message_type=102 展开文本与内嵌图片提取） */
 export interface ExpandForwardMessageParams {
-  /** 入站合并转发消息的 msg_id（优先查库获取 message_type=102 原始内容并提取内嵌图片） */
+  /** 入站合并转发消息的短消息 ID（仅接收 `msg_<n>` / `msg_self_<n>`，优先查库获取 message_type=102 原始内容并提取内嵌图片） */
   msg_id?: string;
   /** 可选：直接传入的 message_type=102 合并转发原文 */
   content?: string;
-  /** 可选兼容别名：等价于 msg_id */
+  /** 可选兼容别名：仅接收短消息 ID（`msg_<n>` / `msg_self_<n>`，等价于 msg_id） */
   forward_id?: string;
 }
 
@@ -167,33 +164,27 @@ export interface SendFileParams {
 
 export interface SendFileResult {
   success: boolean;
-  /** 出站消息撤回 ID（body.id，仅用于 120s 内撤回，不可作被动回复锚点） */
+  /** 短出站消息 ID（如 `msg_self_12`，可用于 120s 内撤回或后续引用） */
   message_id?: string;
-  /** 出站消息引用索引（ext_info.ref_idx） */
-  ref_idx?: string;
   error?: string;
 }
 
 export interface SendQqMessageParams {
   text: string;
-  /** 引用的目标消息索引或 ID（优先 ref_idx；若为本地库内 msg_id 则自动查表换取 ref_idx） */
+  /** 引用的目标短消息 ID（如 `msg_12` 或 `msg_self_8`） */
   reply_to?: string;
-  /** 是否按原生 Markdown (msg_type=2) 下发；省略时遵循插件配置 markdown_enabled */
-  markdown?: boolean;
 }
 
 export interface SendQqMessageResult {
   success: boolean;
-  /** 出站消息撤回 ID（body.id） */
+  /** 短出站消息 ID（如 `msg_self_12`，可用于 120s 内撤回或后续引用） */
   message_id?: string;
-  /** 出站消息引用索引（ext_info.ref_idx） */
-  ref_idx?: string;
   error?: string;
   sent_preview?: string;
 }
 
 export interface RecallMessageParams {
-  /** 需要撤回的机器人自身出站消息 ID（严格限制 120 秒内） */
+  /** 需要撤回的机器人自身短出站消息 ID（仅接收 `msg_self_<n>`，严格限制 120 秒内） */
   message_id: string;
 }
 
@@ -237,16 +228,15 @@ export interface SendFaceParams {
 
 export interface SendFaceResult {
   success: boolean;
-  /** 出站消息撤回 ID（body.id） */
+  /** 短出站消息 ID（如 `msg_self_12`，可用于 120s 内撤回或后续引用） */
   message_id?: string;
-  /** 出站消息引用索引（ext_info.ref_idx） */
-  ref_idx?: string;
   error?: string;
 }
 
 export interface CollectFaceParams {
   tags: string[];
   mood: string;
+  /** 仅接收短消息 ID（如 `msg_<n>` 或 `msg_self_<n>`），指定要提取表情图片的目标消息 */
   message_id?: string;
 }
 

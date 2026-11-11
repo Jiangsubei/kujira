@@ -3,7 +3,7 @@
  *
  * 适配 QQ 官方 Bot API v2 `message_type = 102` 已展开合并转发文本：
  * - 彻底移除 OneBot `get_forward_msg` 与段 JSON 数组解析；
- * - 按 msg_id / forward_id / message_id 从本地消息库查找持久化的合并转发记录（或直接解析传入的 content）；
+ * - 按短消息 ID (`msg_<n>` / `msg_self_<n>`) 从本地消息库查找持久化的合并转发记录（或直接解析传入的 content）；
  * - 若含 `multimedia.nt.qq.com.cn` 等内嵌凭证图片 URL，调用 `resolveEmbeddedForwardImages` 裸 GET 限量落盘（上限 10 张）
  *   并通过 `sanitizeForwardContentUrls` 彻底脱敏（绝不返回明文 rkey / token）；
  * - 解析 `=== 消息 N ===`、`[发送者]`、`[消息内容]`、`[附件k]` 为结构化 ForwardNode 列表返回。
@@ -21,6 +21,7 @@ import {
   resolveEmbeddedForwardImages,
   sanitizeForwardContentUrls,
 } from '../../gateway/inbound-media.js';
+import { isShortMessageId } from '../../utils/short-id.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
@@ -215,18 +216,26 @@ export async function expandForwardMessage(
   let peer = ctx.peer ? normalizePeer(ctx.peer) : '';
 
   if (!rawForwardText && targetId) {
+    if (!isShortMessageId(targetId)) {
+      return toLosslessJson({
+        success: false,
+        error: `展开合并转发失败: 无效的短消息 ID "${targetId}"，请传入如 msg_12 或 msg_self_8`,
+      });
+    }
     if (!ctx.db) {
       return toLosslessJson({
         success: false,
         error: '展开合并转发失败: 数据库不可用，无法查询合并转发消息记录',
       });
     }
+    if (!peer) {
+      return toLosslessJson({
+        success: false,
+        error: '展开合并转发失败: 缺少当前单聊会话上下文 (peer)，无法按短消息 ID 查询',
+      });
+    }
 
-    const record =
-      ctx.db.getMessage?.(targetId) ??
-      ctx.db.getMessageByRefIdx?.(targetId) ??
-      ctx.db.getByFileId?.(targetId) ??
-      null;
+    const record = ctx.db.getMessageByShortId?.(peer, targetId) ?? null;
 
     if (!record) {
       return toLosslessJson({
@@ -235,9 +244,6 @@ export async function expandForwardMessage(
       });
     }
 
-    if (!peer && record.peer) {
-      peer = normalizePeer(record.peer);
-    }
     rawForwardText = selectRawForwardText(record);
   }
 
@@ -281,19 +287,20 @@ export function createExpandForwardMessageTool(context?: ContextSource): ToolDef
   return defineTool({
     name: 'expand_forward_message',
     description:
-      '解析并整理单聊收到的聊天记录合并转发（official message_type=102 已展开文本）的结构化节点，并将其中内嵌的图片附件限量下载落盘（最多 10 张）且替换为安全本地路径。传入合并转发消息的 msg_id（或 forward_id / content）即可使用。',
+      '解析并整理单聊收到的聊天记录合并转发（official message_type=102 已展开文本）的结构化节点，并将其中内嵌的图片附件限量下载落盘（最多 10 张）且替换为安全本地路径。传入合并转发消息的短消息 ID msg_id（如 msg_12，或 forward_id / content）即可使用。',
     parameters: {
       msg_id: {
         type: 'string',
-        description: '入站合并转发消息的 msg_id（优先查库读取 message_type=102 原文并落盘内嵌图片）',
+        description:
+          '入站合并转发消息的短消息 ID（如 msg_12，来自入站消息头或 read_chat_history；优先查库读取 message_type=102 原文并落盘内嵌图片）',
       },
       forward_id: {
         type: 'string',
-        description: '可选兼容参数，等价于 msg_id',
+        description: '可选兼容参数，等价于 msg_id（仅接收短消息 ID，如 msg_12）',
       },
       message_id: {
         type: 'string',
-        description: '可选兼容参数，等价于 msg_id',
+        description: '可选兼容参数，等价于 msg_id（仅接收短消息 ID，如 msg_12）',
       },
       content: {
         type: 'string',

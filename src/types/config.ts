@@ -25,14 +25,10 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（17 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（15 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
-  /** 是否启用单聊原生 Markdown 消息发送 (`msg_type=2`) */
-  markdown_enabled?: boolean;
-  /** 是否在收到单聊消息时下发「正在输入」状态 (`msg_type=6`) */
-  input_notify_enabled?: boolean;
   /** 一轮 Agent 循环正在进行时收到新消息的行为模式 ('steer' 及时插话并在当前 Step 完成后接纳; 'queue' 加入队列等待整轮结束) */
   new_message_behavior?: 'steer' | 'queue';
   /** 助手人格设定 (注入 SystemPrompt 动态段) */

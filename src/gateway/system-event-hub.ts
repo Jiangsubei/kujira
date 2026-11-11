@@ -47,7 +47,7 @@ export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
         '（说明：这是此前在当前 QQ 单聊中设定的定时任务触发。如需回顾前序聊天背景，可先调用 read_chat_history 工具查询最近记录；发言内容应自然贴切，请通过 send_qq_message 发送给对方，切勿向用户透露内部 task_id 或系统事件代码等调试信息。）';
 
       return (
-        `系统事件：[定时任务]${taskTag} [QQ私聊] [${timeStr}]${ruleLine}\n\n` +
+        `系统事件：[定时任务]${taskTag}${timeStr ? ` [${timeStr}]` : ''}${ruleLine}\n\n` +
         `任务内容：\n` +
         `${event.prompt}\n\n` +
         guide

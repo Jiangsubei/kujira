@@ -156,9 +156,11 @@ function toQuotedRecord(row: MessageRecord | null | undefined): QuotedMessageRec
   }
   return {
     msg_id: row.msg_id,
+    short_id: row.short_id ?? null,
     ref_idx: row.ref_idx ?? null,
     user_id: row.user_id,
     sender_name: row.sender_name,
+    time: row.time,
     content: row.content,
     self: row.self,
     local_path: row.local_path,
@@ -563,9 +565,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     const refIdx = extractMessageRefIdx(event) ?? null;
     const refMsgIdx = extractQuotedRefIdx(event) ?? null;
     const senderName =
-      (typeof event.author?.username === 'string' && event.author.username.trim()) ||
-      sessionManager.getPeerName(peer) ||
-      '';
+      (typeof event.author?.username === 'string' && event.author.username.trim()) || '';
 
     // 注册 peer <-> openid 双向映射，并登记最新入站 msg_id 被动回复槽位
     try {
@@ -625,7 +625,6 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       ...(forwardImages ? { forwardImages } : {}),
       ...(sanitizeForwardContent ? { sanitizeForwardContent } : {}),
       botName: gateway.getStatus().botName,
-      senderRemark: sessionManager.getPeerName(peer),
       getMessageByRefIdx: (idx) => toQuotedRecord(db.getMessageByRefIdx(idx)),
       getFaceByMd5: (md5) => db.getFaceByMd5(md5),
     });
@@ -639,30 +638,43 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     const description = describeInboundAttachments(event, descriptors);
     const mediaFields = toMessageMediaFields(description);
 
+    let savedShortId: string | undefined;
     if (msgId) {
+      const inboundRecord: MessageRecord = {
+        msg_id: msgId,
+        peer,
+        user_id: openid,
+        sender_name: senderName,
+        time: receivedAt,
+        type: mediaFields.type,
+        content,
+        raw: JSON.stringify(event),
+        file_id: mediaFields.file_id,
+        local_path: mediaFields.local_path,
+        fingerprint: mediaFields.fingerprint,
+        recalled: 0,
+        self: 0,
+        reply_to: refMsgIdx,
+        ref_idx: refIdx,
+        source: 'qq',
+        attachments: serializeAttachments(description.attachments),
+      };
       try {
-        db.saveMessage({
-          msg_id: msgId,
-          peer,
-          user_id: openid,
-          sender_name: senderName,
-          time: receivedAt,
-          type: mediaFields.type,
-          content,
-          raw: JSON.stringify(event),
-          file_id: mediaFields.file_id,
-          local_path: mediaFields.local_path,
-          fingerprint: mediaFields.fingerprint,
-          recalled: 0,
-          self: 0,
-          reply_to: refMsgIdx,
-          ref_idx: refIdx,
-          source: 'qq',
-          attachments: serializeAttachments(description.attachments),
-        });
+        db.saveMessage(inboundRecord);
+        const resolvedShortId =
+          (typeof inboundRecord.short_id === 'string' && inboundRecord.short_id.trim() !== ''
+            ? inboundRecord.short_id.trim()
+            : undefined) ?? (db.resolveShortId(peer, msgId) ?? undefined);
+        if (resolvedShortId) {
+          savedShortId = resolvedShortId;
+        }
       } catch (err) {
         logger.error?.('[Plugin] 入站消息落库失败:', err);
       }
+    }
+
+    if (savedShortId) {
+      decision.payload.short_id = savedShortId;
     }
 
     // 拦截 1：斜杠命令
@@ -720,14 +732,18 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
 
     // 拦截 2：wait_for_user_messages 单轮等待收集门控
     if (waitRegistry.isWaiting(peer)) {
+      const rawQuotedShortId =
+        decision.payload.quoted?.short_id ??
+        (refMsgIdx ? db.getMessageByRefIdx(refMsgIdx)?.short_id ?? undefined : undefined);
+      const quotedShortId =
+        typeof rawQuotedShortId === 'string' && rawQuotedShortId.trim() !== ''
+          ? rawQuotedShortId.trim()
+          : undefined;
       const deliveredMsg: WaitCollectedMessage = {
-        ...(msgId ? { msg_id: msgId } : {}),
-        ...(refIdx ? { ref_idx: refIdx } : {}),
-        from: senderName,
-        user_id: openid,
+        msg_id: savedShortId || '',
         content,
         time: receivedAt,
-        ...(refMsgIdx ? { reply_to: refMsgIdx } : {}),
+        ...(quotedShortId ? { reply_to: quotedShortId } : {}),
         ...(decision.payload.quoted ? { quoted: decision.payload.quoted } : {}),
       };
       if (waitRegistry.tryDeliver(peer, deliveredMsg) && msgId) {

@@ -29,6 +29,7 @@ import {
   isKujiraUserPeer,
   resolveSessionPeerFromExec,
   resolveOutboundBridge,
+  resolveOutboundShortId,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 
@@ -141,26 +142,22 @@ export async function sendFile(
       });
     }
 
-    const messageId =
+    const rawMessageId =
       typeof res.body?.id === 'string' && res.body.id.trim() !== ''
         ? res.body.id.trim()
         : undefined;
-    if (!messageId) {
+    if (!rawMessageId) {
       return toLosslessJson({
         success: false,
         error: '发送结果未知: QQ 网关未返回 message_id，请确认文件已成功下发',
       });
     }
 
-    const refIdx =
-      typeof res.body?.ext_info?.ref_idx === 'string' && res.body.ext_info.ref_idx.trim() !== ''
-        ? res.body.ext_info.ref_idx.trim()
-        : undefined;
+    const shortId = resolveOutboundShortId(ctx, bridge, peer, rawMessageId);
 
     return toLosslessJson({
       success: true,
-      message_id: messageId,
-      ...(refIdx ? { ref_idx: refIdx } : {}),
+      ...(shortId ? { message_id: shortId } : {}),
     });
   } catch (err: any) {
     return toLosslessJson({
@@ -194,7 +191,7 @@ export function createSendFileTool(context?: ContextSource): ToolDefinition {
         {
           type: 'text',
           text: (value as any)?.success
-            ? `文件发送成功 (message_id: ${(value as any).message_id})`
+            ? `文件发送成功${(value as any).message_id ? ` (ID: ${(value as any).message_id})` : ''}`
             : `文件发送失败: ${(value as any)?.error}`,
         },
       ],

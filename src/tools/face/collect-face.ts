@@ -2,7 +2,7 @@
  * kujira: 偷表情/收藏工具 (collect_face)
  *
  * 适配 QQ 官方 Bot API v2 C2C 单聊：
- * - msg_id 保持字符串（如 ROBOT1.0_...），严禁 Number() 强转；
+ * - message_id 仅认短消息 ID（如 msg_12 或 msg_self_8），不兼容长 ID；
  * - 图片判定兼容 targetMsg.attachments 描述符 JSON（kind === 'image' || 'sticker'）与 type；
  * - 使用 DEFAULT_FACE_STORE_DIR (.dsh/kujira/faces) 作为默认存储目录。
  */
@@ -14,6 +14,7 @@ import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { CollectFaceParams, CollectFaceResult, MessageRecord } from '../../types/index.js';
 import { DEFAULT_FACE_STORE_DIR } from '../../constants/index.js';
 import { resolveDshPath } from '../../utils/path.js';
+import { isShortMessageId } from '../../utils/short-id.js';
 import { isImageFileExt } from '../../attachment/classify.js';
 import { descriptorsFromRaw, deserializeAttachments } from '../../attachment/store.js';
 import { detectBufferExt } from '../../storage/media.js';
@@ -24,6 +25,7 @@ import {
   resolveToolContext,
   normalizePeer,
   resolveSessionPeerFromExec,
+  resolveShortMessageRecord,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 
@@ -91,24 +93,33 @@ export async function collectFace(
   }
 
   const sessionPeer = ctx.peer ? normalizePeer(ctx.peer) : '';
-  let targetMsgId: string | undefined;
-  if (typeof params.message_id === 'string' && params.message_id.trim() !== '') {
-    targetMsgId = params.message_id.trim();
-  }
-  if (!targetMsgId && ctx.inboundMsgIdGetter && sessionPeer) {
-    const inboundId = ctx.inboundMsgIdGetter(sessionPeer);
-    if (typeof inboundId === 'string' && inboundId.trim() !== '') {
-      targetMsgId = inboundId.trim();
-    }
-  }
+  const explicitId =
+    typeof params.message_id === 'string' && params.message_id.trim() !== ''
+      ? params.message_id.trim()
+      : undefined;
 
   let targetMsg: MessageRecord | null = null;
-  if (targetMsgId) {
-    targetMsg = ctx.db.getMessage(targetMsgId);
+  if (explicitId) {
+    if (!isShortMessageId(explicitId)) {
+      return toLosslessJson({
+        success: false,
+        error: `无效的 message_id "${explicitId}"，请传入短消息 ID（如 msg_12 或 msg_self_8）`,
+      });
+    }
+    targetMsg = resolveShortMessageRecord(ctx.db, sessionPeer, explicitId);
   } else if (sessionPeer) {
-    const recent = ctx.db.readHistory(sessionPeer, { has_file: true, limit: 1 });
-    if (recent.messages.length > 0) {
-      targetMsg = ctx.db.getMessage(recent.messages[0]!.msg_id);
+    const inboundId = ctx.inboundMsgIdGetter?.(sessionPeer);
+    const cleanInboundId = typeof inboundId === 'string' ? inboundId.trim() : '';
+    if (cleanInboundId) {
+      targetMsg = isShortMessageId(cleanInboundId)
+        ? resolveShortMessageRecord(ctx.db, sessionPeer, cleanInboundId)
+        : (ctx.db.getMessage?.(cleanInboundId) ?? null);
+    }
+    if (!targetMsg) {
+      const recent = ctx.db.readHistory(sessionPeer, { has_file: true, limit: 1 });
+      if (recent.messages.length > 0) {
+        targetMsg = ctx.db.getMessageByShortId(sessionPeer, recent.messages[0]!.msg_id);
+      }
     }
   }
 
@@ -214,7 +225,7 @@ export function createCollectFaceTool(context?: ContextSource): ToolDefinition {
       message_id: {
         type: 'string',
         description:
-          '收藏新表情时的目标消息 ID 字符串（如 ROBOT1.0_...）。若省略则自动绑定当前回合正在回复的入站消息',
+          '收藏新表情时的目标短消息 ID（如 msg_12 或 msg_self_8，来自入站消息头或 read_chat_history 中的 msg_id）。若省略则自动绑定当前回合正在回复的入站消息',
       },
     },
     output: {

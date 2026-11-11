@@ -7,6 +7,8 @@ export type MessageSource = 'qq';
 
 export interface MessageRecord {
   msg_id: string;
+  /** 单聊短消息 ID（按单聊 peer 持久化单调自增：入站 msg_<n>，出站 msg_self_<n>） */
+  short_id?: string | null;
   peer: string;
   user_id: string;
   sender_name: string;

@@ -4,8 +4,9 @@
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { SendQqMessageParams, SendQqMessageResult } from '../../types/index.js';
-import { QQ_MESSAGE_MAX_BYTES } from '../../constants/index.js';
+import { QQ_MESSAGE_MAX_BYTES, QQ_SEND_MESSAGE_MAX_CHARS } from '../../constants/index.js';
 import { splitByUtf8Bytes } from '../../outbound/render.js';
+import { isShortMessageId } from '../../utils/short-id.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
@@ -15,6 +16,7 @@ import {
   isKujiraUserPeer,
   resolveSessionPeerFromExec,
   resolveOutboundBridge,
+  resolveOutboundShortId,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 
@@ -34,7 +36,7 @@ export function splitMessageText(
 
 /**
  * 发送 QQ 单聊消息工具 (send_qq_message)
- * 经由 OutboundStreamBridge 统一完成 Markdown 分流、16 KiB UTF-8 分片、msg_seq 重试与主动降级。
+ * 经由 OutboundStreamBridge 统一完成原生 Markdown 发送、6000 字符本地拦截、16 KiB UTF-8 分片、msg_seq 重试与主动降级。
  */
 export async function sendQqMessage(
   params: SendQqMessageParams,
@@ -42,9 +44,17 @@ export async function sendQqMessage(
 ): Promise<SendQqMessageResult> {
   const ctx = { ...getGlobalToolContext(), ...context };
 
-  // 1. 参数非空校验
+  // 1. 参数非空与 6000 字符硬拦截校验
   if (!params || typeof params.text !== 'string' || params.text.trim() === '') {
     return toLosslessJson({ success: false, error: '发送内容不能为空。' });
+  }
+
+  const charCount = [...params.text].length;
+  if (charCount > QQ_SEND_MESSAGE_MAX_CHARS) {
+    return toLosslessJson({
+      success: false,
+      error: `消息过长（当前 ${charCount} 字符，单次发送上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符），请拆分成多条较短的 send_qq_message 分开发送，避免超出 QQ 单条消息限制被客户端截断或静默丢弃。`,
+    });
   }
 
   // 2. QQ 单聊会话上下文校验
@@ -63,14 +73,29 @@ export async function sendQqMessage(
     return toLosslessJson({ success: false, error: 'QQ Gateway 未连接' });
   }
 
-  const replyTo =
-    typeof params.reply_to === 'string' && params.reply_to.trim() !== ''
-      ? params.reply_to.trim()
-      : undefined;
+  // 4. 校验可选 reply_to 短消息 ID
+  let replyTo: string | undefined;
+  if (params.reply_to !== undefined && params.reply_to !== null) {
+    if (typeof params.reply_to !== 'string') {
+      return toLosslessJson({
+        success: false,
+        error: `无效的 reply_to 短消息 ID "${String(params.reply_to)}"，请传入如 msg_12 或 msg_self_8`,
+      });
+    }
+    const trimmedReplyTo = params.reply_to.trim();
+    if (trimmedReplyTo !== '') {
+      if (!isShortMessageId(trimmedReplyTo)) {
+        return toLosslessJson({
+          success: false,
+          error: `无效的 reply_to 短消息 ID "${trimmedReplyTo}"，请传入如 msg_12 或 msg_self_8`,
+        });
+      }
+      replyTo = trimmedReplyTo;
+    }
+  }
 
   const sendOptions = {
     ...(replyTo ? { replyTo } : {}),
-    ...(params.markdown !== undefined ? { markdown: params.markdown } : {}),
     ...(ctx.openid ? { openid: ctx.openid } : {}),
   };
 
@@ -88,24 +113,21 @@ export async function sendQqMessage(
       });
     }
 
-    const msgId =
+    const rawMsgId =
       typeof res.body?.id === 'string' && res.body.id.trim() !== ''
         ? res.body.id.trim()
         : undefined;
-    const refIdx =
-      typeof res.body?.ext_info?.ref_idx === 'string' && res.body.ext_info.ref_idx.trim() !== ''
-        ? res.body.ext_info.ref_idx.trim()
-        : undefined;
+    const shortId = resolveOutboundShortId(ctx, bridge, peer, rawMsgId);
 
     const previewBase = params.text.trim();
+    const previewChars = [...previewBase];
     const sentPreview =
-      previewBase.length > 60 ? `${previewBase.slice(0, 60)}...` : previewBase;
+      previewChars.length > 60 ? `${previewChars.slice(0, 60).join('')}...` : previewBase;
 
     return toLosslessJson({
       success: true,
-      ...(msgId ? { message_id: msgId } : {}),
-      ...(refIdx ? { ref_idx: refIdx } : {}),
-      sent_preview: sentPreview,
+      ...(shortId ? { message_id: shortId } : {}),
+      ...(sentPreview ? { sent_preview: sentPreview } : {}),
     });
   } catch (err: any) {
     return toLosslessJson({
@@ -119,23 +141,18 @@ export function createSendQqMessageTool(context?: ContextSource): ToolDefinition
   return defineTool({
     name: 'send_qq_message',
     description:
-      '向当前 QQ 单聊会话发送文本或 Markdown 消息。注意：你的直接文本回复是内部日志，用户不可见；若要向用户发言、回答问题、同步进展或输出结论，必须调用本工具传入 text 参数。单聊原生完整支持 Markdown 富文本格式（包括标题、列表、表格、加粗、引用、代码块与链接等，使用 `#` 标题时建议保留空格）。若要发送的内容较长，或包含多个不同要点、转折与独立意思，可以拆分成多条简短消息，多次调用本工具分开发送。如需引用消息，请显式传入其字符串 reply_to（优先 REFIDX_... 引用索引，或本地历史消息 ID）。发送图片、音视频或文件请使用 send_file，发送表情包请使用 send_face，向用户提问或抉择可使用 ask_user_question。',
+      `向当前 QQ 单聊会话发送文本或 Markdown 消息。注意：你的直接文本回复是内部日志，用户不可见；若要向用户发言、回答问题、同步进展或输出结论，必须调用本工具传入 text 参数。单聊原生完整支持 Markdown 富文本格式（包括标题、列表、表格、加粗、引用、代码块与链接等，使用 \`#\` 标题时建议保留空格）。单次发送上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符；若要发送的内容较长，或包含多个不同要点、转折与独立意思，可以拆分成多条简短消息，多次调用本工具分开发送。如需引用消息，请显式传入其短消息 ID（如 msg_12 或 msg_self_8）作为 reply_to。发送图片、音视频或文件请使用 send_file，发送表情包请使用 send_face，向用户提问或抉择可使用 ask_user_question。`,
     parameters: {
       text: {
         type: 'string',
         required: true,
         description:
-          '要发送给用户的聊天正文（支持 Markdown 排版）。直接填写展示给用户的原始文本，禁止附加任何 XML/HTML 标签、标签闭合符或外层包裹标记。',
+          `要发送给用户的聊天正文（原生支持 Markdown 排版，单次上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符，超长请分条发送）。直接填写展示给用户的原始文本，禁止附加任何 XML/HTML 标签、标签闭合符或外层包裹标记。`,
       },
       reply_to: {
         type: 'string',
         description:
-          '需要引用的目标消息索引或消息 ID（优先传入 REFIDX_... 引用索引，或来自入站消息/read_chat_history 的 msg_id 字符串）。',
-      },
-      markdown: {
-        type: 'boolean',
-        description:
-          '可选：显式指定是否按原生 Markdown (msg_type=2) 发送；省略时遵循插件配置 markdown_enabled。',
+          '需要引用的目标短消息 ID（如 msg_12 或 msg_self_8，来自入站消息头、wait_for_user_messages 或 read_chat_history 中的 msg_id）。',
       },
     },
     output: {
@@ -143,12 +160,10 @@ export function createSendQqMessageTool(context?: ContextSource): ToolDefinition
       render: (_args, value) => {
         const v = value as any;
         if (v?.success) {
-          const idPart = v.message_id ? ` (ID: ${v.message_id})` : '';
-          const refPart = v.ref_idx ? ` [ref_idx: ${v.ref_idx}]` : '';
           return [
             {
               type: 'text',
-              text: `消息已发出${idPart}${refPart}`,
+              text: `消息已发送${v.message_id ? ` (ID: ${v.message_id})` : ''}`,
             },
           ];
         }

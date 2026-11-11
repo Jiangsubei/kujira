@@ -3,26 +3,17 @@
  * 专供 Agent 工具 wait_for_user_messages 在 QQ 单聊中挂起等待并收集入站消息。
  */
 
+import type { WakeupQuotedInfo } from '../types/index.js';
+
 /**
- * 等待收集的一条单聊入站消息（字段与唤醒包同源：from 展示名 / user_id 内部标识 /
- * content 归一化文本 / time 毫秒时间戳 / msg_id 字符串与 ref_idx 引用索引）
+ * 等待收集的一条单聊入站消息（精简契约：`msg_id` 与 `reply_to` 均为短 ID，无 `from` / `user_id` / `ref_idx`）
  */
 export interface WaitCollectedMessage {
-  msg_id?: string;
-  ref_idx?: string;
-  from: string;
-  user_id: string;
+  msg_id: string;
   content: string;
   time: number;
   reply_to?: string | null;
-  quoted?: {
-    msg_id?: string;
-    ref_idx?: string;
-    user_id?: string;
-    from_name?: string;
-    text?: string;
-    images?: string[];
-  } | null;
+  quoted?: WakeupQuotedInfo | null;
 }
 
 /**
@@ -131,7 +122,6 @@ export class MessageWaitRegistry {
   tryDeliver(peer: string, msg: WaitCollectedMessage): boolean {
     const entry = this.waits.get(peer);
     if (!entry) return false;
-    if (entry.userId !== undefined && String(entry.userId) !== String(msg.user_id)) return false;
     entry.messages.push(msg);
     return true;
   }

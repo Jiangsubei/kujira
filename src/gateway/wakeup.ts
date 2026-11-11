@@ -32,9 +32,11 @@ export * from './segment-normalizer.js';
 
 export interface QuotedMessageRecord {
   msg_id?: string;
+  short_id?: string | null;
   ref_idx?: string | null;
   user_id?: string;
   sender_name?: string;
+  time?: number;
   content: string;
   self?: number;
   images?: string[];
@@ -45,6 +47,8 @@ export interface QuotedMessageRecord {
 export interface WakeupOptions {
   /** 已落盘的入站附件描述符（由 resolveInboundAttachments 产出；缺省时由 event.attachments 推导） */
   descriptors?: AttachmentDescriptor[];
+  /** 当前入站消息分配到的单聊短消息 ID（如 `msg_<n>`），可选注入到 WakeupPayload */
+  shortId?: string;
   /** 从 message_type=102 合并转发内嵌图片下载落盘得到的本地路径 */
   forwardImages?: string[];
   /** 合并转发文本 URL 脱敏替换回调 */
@@ -128,13 +132,13 @@ async function resolveQuotedInfo(
       const hit = await options.getMessageByRefIdx(refMsgIdx);
       if (hit) {
         const quotedImages = resolveQuotedImages(hit);
-        const fromName =
-          hit.sender_name?.trim() || (hit.self === 1 ? options.botName?.trim() || 'Bot' : '');
+        const shortId =
+          typeof hit.short_id === 'string' && hit.short_id.trim() !== ''
+            ? hit.short_id.trim()
+            : undefined;
         return {
-          ...(hit.msg_id ? { msg_id: hit.msg_id } : {}),
-          ref_idx: hit.ref_idx || refMsgIdx,
-          ...(hit.user_id ? { user_id: hit.user_id } : {}),
-          ...(fromName ? { from_name: fromName } : {}),
+          ...(shortId ? { short_id: shortId } : {}),
+          ...(typeof hit.time === 'number' && Number.isFinite(hit.time) ? { time: hit.time } : {}),
           text: hit.content || '',
           ...(quotedImages ? { images: quotedImages } : {}),
         };
@@ -148,14 +152,12 @@ async function resolveQuotedInfo(
   const fallbackText = extractMsgElementsText(event);
   if (fallbackText) {
     return {
-      ...(refMsgIdx ? { ref_idx: refMsgIdx } : {}),
       text: fallbackText,
     };
   }
 
   // 3. 二者皆不可得时优雅降级占位
   return {
-    ...(refMsgIdx ? { ref_idx: refMsgIdx } : {}),
     text: '〔历史引用消息：内容已过期或无法获取〕',
   };
 }
@@ -186,6 +188,8 @@ export async function shouldWakeup(
     (typeof event.author?.username === 'string' ? event.author.username.trim() : '');
   const timestamp = parseIsoTimestamp(event.timestamp);
   const msgId = typeof event.id === 'string' && event.id.trim() ? event.id.trim() : undefined;
+  const shortId =
+    typeof options.shortId === 'string' && options.shortId.trim() ? options.shortId.trim() : undefined;
   const refIdx = extractMessageRefIdx(event);
 
   // 2. 附件描述符与正文归一化
@@ -233,6 +237,7 @@ export async function shouldWakeup(
   const trigger: WakeupTriggerType = quoted ? 'quote' : 'direct';
   const payload: WakeupPayload = {
     ...(msgId ? { msg_id: msgId } : {}),
+    ...(shortId ? { short_id: shortId } : {}),
     ...(refIdx ? { ref_idx: refIdx } : {}),
     trigger,
     peer,

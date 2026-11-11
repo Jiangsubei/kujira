@@ -108,6 +108,14 @@ export class MessageDatabase {
     return this.messageRepo.getMessage(msgId);
   }
 
+  getMessageByShortId(peer: string, shortId: string): MessageRecord | null {
+    return this.messageRepo.getMessageByShortId(peer, shortId);
+  }
+
+  resolveShortId(peer: string, msgId: string): string | null {
+    return this.messageRepo.resolveShortId(peer, msgId);
+  }
+
   getMessageByRefIdx(refIdx: string): MessageRecord | null {
     return this.messageRepo.getMessageByRefIdx(refIdx);
   }

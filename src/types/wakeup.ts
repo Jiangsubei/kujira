@@ -8,17 +8,17 @@ export type WakeupTriggerType = 'direct' | 'quote' | 'scheduled';
 
 /** 入站引用消息快照（优先通过 ref_idx 反查库；TMP_ 或未命中时由 msg_elements 回退填充） */
 export interface WakeupQuotedInfo {
-  msg_id?: string;
-  ref_idx?: string;
-  user_id?: string;
-  from_name?: string;
+  short_id?: string;
+  time?: number;
   text: string;
   images?: string[];
 }
 
 export interface WakeupPayload {
-  /** 入站消息 ID（来自 C2C_MESSAGE_CREATE d.id，如 ROBOT1.0_...） */
+  /** 入站消息 ID（来自 C2C_MESSAGE_CREATE d.id，如 ROBOT1.0_...；仅内部逻辑使用，不在展示头暴露） */
   msg_id?: string;
+  /** 单聊短消息 ID（如 msg_<n>） */
+  short_id?: string;
   /** 入站消息自身引用索引（来自 message_scene.ext msg_idx=REFIDX_...） */
   ref_idx?: string;
   trigger: WakeupTriggerType;

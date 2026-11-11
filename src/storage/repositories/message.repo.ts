@@ -11,6 +11,7 @@ import type {
   ReadChatHistoryParams,
   ReadChatHistoryResult,
 } from '../../types/index.js';
+import { formatShortMessageId, parseShortMessageId } from '../../utils/short-id.js';
 import { formatDateTime, parseTimeValue } from '../time-parser.js';
 
 export class MessageRepository {
@@ -29,6 +30,7 @@ export class MessageRepository {
   private mapMessageRow(row: any): MessageRecord {
     return {
       msg_id: String(row.msg_id),
+      short_id: row.short_id ?? null,
       peer: String(row.peer),
       user_id: String(row.user_id),
       sender_name: String(row.sender_name ?? ''),
@@ -48,9 +50,10 @@ export class MessageRepository {
     };
   }
 
-  private buildMessageBindings(record: MessageRecord): Record<string, any> {
+  private buildMessageBindings(record: MessageRecord, shortId: string | null): Record<string, any> {
     return {
       msg_id: String(record.msg_id),
+      short_id: shortId,
       peer: record.peer,
       user_id: String(record.user_id),
       sender_name: record.sender_name || '',
@@ -70,18 +73,122 @@ export class MessageRepository {
     };
   }
 
+  private getMaxShortIdSeq(db: any, peer: string, selfBit: number): number {
+    const isSelf = selfBit === 1;
+    const prefixLen = isSelf ? 10 : 5;
+    const globPattern = isSelf ? 'msg_self_[1-9]*' : 'msg_[1-9]*';
+    const row = db
+      .prepare(
+        `SELECT MAX(CAST(substr(short_id, ?) AS INTEGER)) AS max_seq
+         FROM messages
+         WHERE peer = ?
+           AND short_id GLOB ?
+           AND substr(short_id, ?) NOT GLOB '*[^0-9]*'`
+      )
+      .get(prefixLen, peer, globPattern, prefixLen) as { max_seq: number | null } | undefined;
+    const maxSeq = row?.max_seq;
+    return typeof maxSeq === 'number' && Number.isSafeInteger(maxSeq) && maxSeq > 0 ? maxSeq : 0;
+  }
+
+  private resolveShortIdForInsert(db: any, record: MessageRecord): string {
+    const selfBit = record.self ? 1 : 0;
+    const parsed = parseShortMessageId(record.short_id);
+    if (parsed) {
+      const expectedDirection = selfBit === 1 ? 'outbound' : 'inbound';
+      if (parsed.direction === expectedDirection) {
+        const conflict = db
+          .prepare('SELECT 1 FROM messages WHERE peer = ? AND short_id = ? LIMIT 1')
+          .get(record.peer, parsed.shortId);
+        if (!conflict) {
+          return parsed.shortId;
+        }
+      }
+    }
+    const nextSeq = this.getMaxShortIdSeq(db, record.peer, selfBit) + 1;
+    return formatShortMessageId(selfBit, nextSeq);
+  }
+
+  private ensureRowShortId(db: any, peer: string, row: any): string {
+    const existing = typeof row.short_id === 'string' ? row.short_id.trim() : '';
+    if (existing !== '') {
+      return existing;
+    }
+
+    const msgId = String(row.msg_id);
+    const selfBit = row.self ? 1 : 0;
+    try {
+      const allocated = db.transaction((): string => {
+        const current = db
+          .prepare('SELECT short_id FROM messages WHERE peer = ? AND msg_id = ? LIMIT 1')
+          .get(peer, msgId) as { short_id?: string | null } | undefined;
+        const currentShortId = typeof current?.short_id === 'string' ? current.short_id.trim() : '';
+        if (currentShortId !== '') {
+          return currentShortId;
+        }
+        const nextShortId = formatShortMessageId(selfBit, this.getMaxShortIdSeq(db, peer, selfBit) + 1);
+        db.prepare("UPDATE messages SET short_id = ? WHERE peer = ? AND msg_id = ? AND (short_id IS NULL OR short_id = '')").run(
+          nextShortId,
+          peer,
+          msgId
+        );
+        return nextShortId;
+      })();
+      return allocated;
+    } catch {
+      return formatShortMessageId(selfBit, 1);
+    }
+  }
+
   saveMessage(record: MessageRecord): void {
     const db = this.getDb();
-    const stmt = db.prepare(`
-      INSERT OR REPLACE INTO messages (
-        msg_id, peer, user_id, sender_name, time, type, content, raw,
-        ref_idx, file_id, local_path, fingerprint, recalled, self, reply_to, source, attachments
-      ) VALUES (
-        @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
-        @ref_idx, @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
-      )
-    `);
-    stmt.run(this.buildMessageBindings(record));
+    const run = db.transaction((): string => {
+      const msgId = String(record.msg_id);
+      const existing = db
+        .prepare('SELECT peer, short_id FROM messages WHERE msg_id = ? LIMIT 1')
+        .get(msgId) as { peer: string; short_id: string | null } | undefined;
+
+      const existingShortId =
+        existing &&
+        String(existing.peer) === record.peer &&
+        typeof existing.short_id === 'string' &&
+        existing.short_id.trim() !== ''
+          ? existing.short_id.trim()
+          : '';
+
+      const shortId = existingShortId || this.resolveShortIdForInsert(db, record);
+
+      db.prepare(`
+        INSERT INTO messages (
+          msg_id, short_id, peer, user_id, sender_name, time, type, content, raw,
+          ref_idx, file_id, local_path, fingerprint, recalled, self, reply_to, source, attachments
+        ) VALUES (
+          @msg_id, @short_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
+          @ref_idx, @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
+        )
+        ON CONFLICT(msg_id) DO UPDATE SET
+          short_id = excluded.short_id,
+          peer = excluded.peer,
+          user_id = excluded.user_id,
+          sender_name = excluded.sender_name,
+          time = excluded.time,
+          type = excluded.type,
+          content = excluded.content,
+          raw = excluded.raw,
+          ref_idx = excluded.ref_idx,
+          file_id = excluded.file_id,
+          local_path = excluded.local_path,
+          fingerprint = excluded.fingerprint,
+          recalled = excluded.recalled,
+          self = excluded.self,
+          reply_to = excluded.reply_to,
+          source = excluded.source,
+          attachments = excluded.attachments
+      `).run(this.buildMessageBindings(record, shortId));
+
+      return shortId;
+    });
+
+    record.short_id = run();
   }
 
   /**
@@ -110,17 +217,45 @@ export class MessageRepository {
    */
   saveMessageIfNotExists(record: MessageRecord): boolean {
     const db = this.getDb();
-    const stmt = db.prepare(`
-      INSERT OR IGNORE INTO messages (
-        msg_id, peer, user_id, sender_name, time, type, content, raw,
-        ref_idx, file_id, local_path, fingerprint, recalled, self, reply_to, source, attachments
-      ) VALUES (
-        @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
-        @ref_idx, @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
-      )
-    `);
-    const result = stmt.run(this.buildMessageBindings(record));
-    return result.changes > 0;
+    const run = db.transaction((): { inserted: boolean; shortId: string } => {
+      const msgId = String(record.msg_id);
+      const existing = db
+        .prepare('SELECT peer, self, short_id FROM messages WHERE msg_id = ? LIMIT 1')
+        .get(msgId) as { peer: string; self: number; short_id: string | null } | undefined;
+
+      if (existing) {
+        let existingShortId =
+          typeof existing.short_id === 'string' && existing.short_id.trim() !== ''
+            ? existing.short_id.trim()
+            : '';
+        if (!existingShortId) {
+          const existingSelfBit = existing.self ? 1 : 0;
+          const existingPeer = String(existing.peer);
+          existingShortId = formatShortMessageId(
+            existingSelfBit,
+            this.getMaxShortIdSeq(db, existingPeer, existingSelfBit) + 1
+          );
+          db.prepare('UPDATE messages SET short_id = ? WHERE msg_id = ?').run(existingShortId, msgId);
+        }
+        return { inserted: false, shortId: existingShortId };
+      }
+
+      const shortId = this.resolveShortIdForInsert(db, record);
+      db.prepare(`
+        INSERT INTO messages (
+          msg_id, short_id, peer, user_id, sender_name, time, type, content, raw,
+          ref_idx, file_id, local_path, fingerprint, recalled, self, reply_to, source, attachments
+        ) VALUES (
+          @msg_id, @short_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
+          @ref_idx, @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
+        )
+      `).run(this.buildMessageBindings(record, shortId));
+      return { inserted: true, shortId };
+    });
+
+    const outcome = run();
+    record.short_id = outcome.shortId;
+    return outcome.inserted;
   }
 
   readHistory(peer: string, params: ReadChatHistoryParams = {}): ReadChatHistoryResult {
@@ -128,19 +263,13 @@ export class MessageRepository {
     const conditions: string[] = ['peer = ?'];
     const sqlParams: any[] = [peer];
 
-    // 1. 发送者展示名模糊搜索
-    if (params.sender_name !== undefined && params.sender_name.trim() !== '') {
-      conditions.push('sender_name LIKE ?');
-      sqlParams.push(`%${params.sender_name.trim()}%`);
-    }
-
-    // 2. 消息内容关键词模糊搜索
+    // 1. 消息内容关键词模糊搜索
     if (params.keyword !== undefined && params.keyword.trim() !== '') {
       conditions.push('content LIKE ?');
       sqlParams.push(`%${params.keyword.trim()}%`);
     }
 
-    // 3. 消息类型筛选 (支持单类型或类型数组，且查询 text 时兼顾带引用的回复文本 reply)
+    // 2. 消息类型筛选 (支持单类型或类型数组，且查询 text 时兼顾带引用的回复文本 reply)
     if (params.type !== undefined) {
       if (Array.isArray(params.type)) {
         const types = params.type.filter((t) => typeof t === 'string' && t.trim() !== '');
@@ -167,7 +296,7 @@ export class MessageRepository {
       }
     }
 
-    // 4. 友好时间解析与范围筛选
+    // 3. 友好时间解析与范围筛选
     let sinceTs = parseTimeValue(params.since, false);
     const untilTs = parseTimeValue(params.until, true);
 
@@ -192,20 +321,36 @@ export class MessageRepository {
       sqlParams.push(untilTs);
     }
 
-    // 5. 附件/多媒体存在性筛选
+    // 4. 附件/多媒体存在性筛选
     if (params.has_file) {
       conditions.push(
         "(local_path IS NOT NULL OR file_id IS NOT NULL OR (attachments IS NOT NULL AND attachments != '' AND attachments != '[]'))"
       );
     }
 
-    // 6. 回复链关系筛选
+    // 5. 回复链关系筛选（仅接收短消息 ID，查不到则匹配 1 = 0 不泄漏底层索引）
     if (params.reply_to !== undefined && params.reply_to !== null && String(params.reply_to).trim() !== '') {
-      conditions.push('reply_to = ?');
-      sqlParams.push(String(params.reply_to).trim());
+      const trimmedReplyTo = String(params.reply_to).trim();
+      const target = this.getMessageByShortId(peer, trimmedReplyTo);
+      const candidates = Array.from(
+        new Set(
+          [target?.ref_idx, target?.msg_id]
+            .map((v) => (typeof v === 'string' ? v.trim() : ''))
+            .filter((v) => v !== '')
+        )
+      );
+      if (!target || candidates.length === 0) {
+        conditions.push('1 = 0');
+      } else if (candidates.length === 1) {
+        conditions.push('reply_to = ?');
+        sqlParams.push(candidates[0]);
+      } else {
+        conditions.push(`reply_to IN (${candidates.map(() => '?').join(', ')})`);
+        sqlParams.push(...candidates);
+      }
     }
 
-    // 7. 机器人自身消息过滤
+    // 6. 机器人自身消息过滤
     if (params.exclude_self) {
       conditions.push('self = 0');
     }
@@ -213,7 +358,7 @@ export class MessageRepository {
       conditions.push('self = 1');
     }
 
-    // 8. 消息来源筛选 (单聊仅支持 'qq')
+    // 7. 消息来源筛选 (单聊仅支持 'qq')
     if (params.source === 'qq') {
       conditions.push('source = ?');
       sqlParams.push('qq');
@@ -236,18 +381,41 @@ export class MessageRepository {
       LIMIT ? OFFSET ?
     `).all(...sqlParams, limit, offset) as any[];
 
+    const replyTargetCache = new Map<string, string | null>();
+    const lookupReplyTargetShortId = db.prepare(`
+      SELECT short_id FROM messages
+      WHERE peer = ? AND (ref_idx = ? OR msg_id = ?)
+      ORDER BY time DESC, rowid DESC
+      LIMIT 1
+    `);
+
+    const resolveReplyToShortId = (rawReplyTo: unknown): string | null => {
+      if (rawReplyTo === null || rawReplyTo === undefined) return null;
+      const trimmed = String(rawReplyTo).trim();
+      if (!trimmed) return null;
+      if (replyTargetCache.has(trimmed)) {
+        return replyTargetCache.get(trimmed)!;
+      }
+      const target = lookupReplyTargetShortId.get(peer, trimmed, trimmed) as
+        | { short_id?: string | null }
+        | undefined;
+      const resolved =
+        target && typeof target.short_id === 'string' && target.short_id.trim() !== ''
+          ? target.short_id.trim()
+          : null;
+      replyTargetCache.set(trimmed, resolved);
+      return resolved;
+    };
+
     const messages: ChatMessageSummary[] = rows.map((row) => ({
-      msg_id: String(row.msg_id),
-      user_id: String(row.user_id),
-      sender_name: String(row.sender_name ?? ''),
+      msg_id: this.ensureRowShortId(db, peer, row),
       time: Number(row.time),
       formatted_time: formatDateTime(Number(row.time)),
       type: String(row.type),
       content: String(row.content ?? ''),
       recalled: row.recalled === 1,
       self: row.self === 1,
-      reply_to: row.reply_to !== null && row.reply_to !== undefined ? String(row.reply_to) : null,
-      ref_idx: row.ref_idx ?? null,
+      reply_to: resolveReplyToShortId(row.reply_to),
       local_path: row.local_path ?? null,
       file_id: row.file_id ?? null,
       attachments: this.safeParseAttachmentsField(row.attachments),
@@ -285,6 +453,30 @@ export class MessageRepository {
     const db = this.getDb();
     const row = db.prepare(`SELECT * FROM messages WHERE msg_id = ?`).get(String(msgId)) as any;
     return row ? this.mapMessageRow(row) : null;
+  }
+
+  getMessageByShortId(peer: string, shortId: string): MessageRecord | null {
+    const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
+    const parsed = parseShortMessageId(shortId);
+    if (!cleanPeer || !parsed) return null;
+    const db = this.getDb();
+    const row = db
+      .prepare('SELECT * FROM messages WHERE peer = ? AND short_id = ? LIMIT 1')
+      .get(cleanPeer, parsed.shortId) as any;
+    return row ? this.mapMessageRow(row) : null;
+  }
+
+  resolveShortId(peer: string, msgId: string): string | null {
+    const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
+    const cleanMsgId = typeof msgId === 'string' ? msgId.trim() : '';
+    if (!cleanPeer || !cleanMsgId) return null;
+    const db = this.getDb();
+    const row = db
+      .prepare('SELECT short_id FROM messages WHERE peer = ? AND msg_id = ? LIMIT 1')
+      .get(cleanPeer, cleanMsgId) as { short_id?: string | null } | undefined;
+    if (!row || typeof row.short_id !== 'string') return null;
+    const trimmed = row.short_id.trim();
+    return trimmed !== '' ? trimmed : null;
   }
 
   getMessageByRefIdx(refIdx: string): MessageRecord | null {

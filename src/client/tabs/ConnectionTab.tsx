@@ -1,5 +1,5 @@
 import React from 'react';
-import { SwitchField, ValueField } from '../fields.js';
+import { ValueField } from '../fields.js';
 import { cardStyle, fieldStyle } from '../card-styles.js';
 import type {
   BridgePluginConfig,
@@ -8,8 +8,6 @@ import type {
 } from '../../types/index.js';
 import {
   DEFAULT_IMAGE_TTL_DAYS,
-  DEFAULT_INPUT_NOTIFY_ENABLED,
-  DEFAULT_MARKDOWN_ENABLED,
   DEFAULT_NEW_MESSAGE_BEHAVIOR,
 } from '../../constants/index.js';
 import type { KujiraFormModel } from '../model.js';
@@ -104,28 +102,6 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
         disabled={saving}
         statusBadge={renderCredentialBadge(credentialsStatus.appSecret)}
         onChange={onAppSecretChange}
-      />
-
-      <SwitchField
-        id="kujira-markdown-enabled"
-        label="启用单聊原生 Markdown (markdown_enabled)"
-        hint="使用 QQ 官方 Bot 单聊原生 Markdown 消息类型发送回复 (msg_type=2，支持表格、代码块与链接，默认开启)"
-        checked={draft.markdown_enabled ?? DEFAULT_MARKDOWN_ENABLED}
-        disabled={saving}
-        overridden={model.isOverridden('markdown_enabled')}
-        onReset={() => onResetField('markdown_enabled')}
-        onChange={(checked) => onFieldChange('markdown_enabled', checked)}
-      />
-
-      <SwitchField
-        id="kujira-input-notify-enabled"
-        label="启用「对方正在输入...」提示 (input_notify_enabled)"
-        hint="收到单聊消息开始生成回复时下发输入状态提示 (msg_type=6，默认开启)"
-        checked={draft.input_notify_enabled ?? DEFAULT_INPUT_NOTIFY_ENABLED}
-        disabled={saving}
-        overridden={model.isOverridden('input_notify_enabled')}
-        onReset={() => onResetField('input_notify_enabled')}
-        onChange={(checked) => onFieldChange('input_notify_enabled', checked)}
       />
 
       <div className={fieldStyle.field}>

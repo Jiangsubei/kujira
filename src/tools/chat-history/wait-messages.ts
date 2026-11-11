@@ -4,7 +4,7 @@
  * 适配 QQ 官方 Bot API v2 C2C 单聊：
  * - 校验当前会话为 `user_` 单聊；
  * - 移除 `user_id` 参数与 `QQ_ID_RE` 校验（单聊天然单用户）；
- * - 返回收集消息含 string `msg_id` 与可选 `ref_idx`。
+ * - 返回收集消息含短消息 ID (`msg_<n>`)、正文、时间戳与可选引用快照。
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -93,21 +93,12 @@ export function renderWaitResultText(value: WaitForUserMessagesResult): string {
     return '未收集到新消息。';
   }
   const lines = messages.map((m, i) => {
-    const head = m.from || m.user_id || '用户';
     const timeStr = m.time ? formatDateTime(m.time) : '';
-    const idStr =
-      typeof m.msg_id === 'string' && m.msg_id.trim() !== ''
-        ? ` [消息ID: ${m.msg_id.trim()}]`
-        : '';
-    const refStr =
-      typeof m.ref_idx === 'string' && m.ref_idx.trim() !== ''
-        ? ` [ref_idx: ${m.ref_idx.trim()}]`
-        : '';
     const quotedText = formatQuotedString(
       m.quoted ? { ...m.quoted, text: m.quoted.text ?? '' } : undefined
     );
     const quoteStr = quotedText ? ` ${quotedText}` : '';
-    return `${i + 1}. [${head}${timeStr ? ` ${timeStr}` : ''}]${idStr}${refStr}${quoteStr} ${m.content}`;
+    return `${i + 1}. [${m.msg_id}]${timeStr ? ` [${timeStr}]` : ''}${quoteStr} ${m.content}`;
   });
   return `已收集 ${messages.length} 条新消息:\n${lines.join('\n')}`;
 }

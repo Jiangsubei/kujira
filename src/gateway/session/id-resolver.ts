@@ -4,7 +4,7 @@
  */
 
 import * as crypto from 'node:crypto';
-import { computeOpenidHash16, openidToSessionBaseId } from '../../utils/peer.js';
+import { openidToSessionBaseId } from '../../utils/peer.js';
 import type { ParsedSessionId } from './types.js';
 
 /**
@@ -118,64 +118,27 @@ export function isKujiraSession(sessionId: string): boolean {
 /** 内部兼容别名，等价于 {@link isKujiraSession} */
 export const isQQSession = isKujiraSession;
 
-function extractPeerDisplayId(peer: string): string {
-  if (peer.startsWith('user_')) {
-    return peer.slice(5).split('-')[0] || peer;
-  }
-  if (peer.startsWith('kujira-user-')) {
-    return parseSessionId(peer)?.id || peer.slice('kujira-user-'.length).split('-')[0] || peer;
-  }
-  if (/^[0-9a-fA-F]{32}$/.test(peer)) {
-    return computeOpenidHash16(peer);
-  }
-  return peer;
-}
-
 /**
- * 从单聊会话标题中反向提取显示名称（格式：`私聊: ... <id> #N`）
- * 无法提取出名称时返回 undefined。
+ * 格式化会话版本轮次标签（如 `#1`、`#2` 或多轮归档 `#2 (1)`）
  */
-export function extractNameFromSessionTitle(
-  title: string | undefined,
-  peer: string
-): string | undefined {
-  if (!title || typeof title !== 'string') return undefined;
-
-  const stripped = title
-    .replace(/^私聊:\s*/, '')
-    .replace(/\s+#\d+.*$/, '')
-    .trim();
-  if (!stripped) return undefined;
-
-  const peerId = extractPeerDisplayId(peer);
-  let name = stripped;
-  if (peerId && name.endsWith(peerId)) {
-    name = name.slice(0, -peerId.length).trim();
-  }
-  return name || undefined;
-}
-
-/**
- * 根据 peer、sessionId 与昵称格式化单聊会话标题（支持多轮归档格式如 `#1 (1)`）
- */
-export function formatSessionTitle(
-  peer: string,
-  sessionId: string,
-  name?: string
-): string {
-  let versionNum = '1';
-  let roundNum = 0;
+export function formatSessionVersionTag(sessionId: string): string {
   const parsed = parseSessionId(sessionId);
-  if (parsed) {
-    versionNum = String(parsed.version);
-    roundNum = parsed.round;
+  if (!parsed) {
+    return '#1';
   }
-
-  const tag = roundNum > 0 ? `#${versionNum} (${roundNum})` : `#${versionNum}`;
-  const hashOrId = extractPeerDisplayId(peer);
-  const displayName = name ? `${name} ` : '';
-  return `私聊: ${displayName}${hashOrId} ${tag}`;
+  return parsed.round > 0
+    ? `#${parsed.version} (${parsed.round})`
+    : `#${parsed.version}`;
 }
+
+/**
+ * 生成尚无原生 AI 总结标题时的默认回退会话标题（如 `新会话 #1`、`新会话 #2 (1)`）
+ */
+export function formatFallbackSessionTitle(sessionId: string): string {
+  return `新会话 ${formatSessionVersionTag(sessionId)}`;
+}
+
+export { encodeSegment } from '../../utils/path.js';
 
 export {
   formatTimeOnly,

@@ -2,7 +2,7 @@
  * kujira Server Configuration REST Routes
  *
  * 为 DSH 桌面端与 Web 端客户端提供独立的 HTTP 配置读取与更新通道：
- *   - GET  /plugins/kujira/config: 获取当前 17 项核心配置与脱敏凭据状态元数据（绝不回显 AppID/AppSecret 明文）
+ *   - GET  /plugins/kujira/config: 获取当前 15 项核心配置与脱敏凭据状态元数据（绝不回显 AppID/AppSecret 明文）
  *   - POST /plugins/kujira/config: 保存配置与可选凭据（写入 ctx.credentials，剥离非 schema 字段后持久化 settings 并触发热更新）
  */
 
@@ -161,7 +161,7 @@ export function registerConfigRoute(
         delete settingsCandidate.app_id;
         delete settingsCandidate.app_secret;
 
-        // 自愈过滤：仅保留 100% 符合当前 17 项 Schema 的干净配置字段，剔除任何已下线或未知字段
+        // 自愈过滤：仅保留 100% 符合当前 15 项 Schema 的干净配置字段，剔除任何已下线或未知字段
         const { valid: cleanPayload, removed } = sanitizeConfigPayload(settingsCandidate);
 
         // 先处理可选凭据写入/清除（留空不覆盖既有凭据）
@@ -211,7 +211,7 @@ export function registerConfigRoute(
 
         const hasSettingsChanges = Object.keys(cleanPayload).length > 0;
 
-        // 持久化到 settings（仅提交通过 17 项 Schema 白名单校验的干净字段）
+        // 持久化到 settings（仅提交通过 15 项 Schema 白名单校验的干净字段）
         if (hasSettingsChanges) {
           const settings = (ctx as any).get?.('settings');
           if (settings) {

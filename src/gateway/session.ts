@@ -24,11 +24,13 @@ export {
   generateSessionHash,
   findSmallestAvailableVersion,
   buildSessionId,
-  formatSessionTitle,
-  extractNameFromSessionTitle,
+  formatSessionVersionTag,
+  formatFallbackSessionTitle,
   formatWakeupPrompt,
   isKujiraSession,
   isQQSession,
+  peerToBaseId,
+  sessionIdToPeer,
 } from './session/id-resolver.js';
 export { encodeSegment };
 export { formatExternalPrompt } from './session/id-resolver.js';
@@ -44,7 +46,6 @@ import {
   generateSessionHash,
   findSmallestAvailableVersion,
   buildSessionId,
-  extractNameFromSessionTitle,
   formatWakeupPrompt,
   isKujiraSession,
   peerToBaseId,
@@ -53,7 +54,7 @@ import {
 import { SessionWorkspaceManager } from './session/workspace.js';
 import { SessionPersistenceManager } from './session/persistence.js';
 import { SessionModelSelector } from './session/model-selector.js';
-import { SessionAgentRunner, isSystemSenderName } from './session/agent-runner.js';
+import { SessionAgentRunner } from './session/agent-runner.js';
 
 export class SessionManager {
   private peerCurrentSessionId = new Map<string, string>();
@@ -431,40 +432,12 @@ export class SessionManager {
     return this.getAllKujiraSessionIds();
   }
 
+  public getSessionTitle(sessionId: string): string | undefined {
+    return this.agentRunner.getSessionTitle(sessionId);
+  }
+
   public getSessionDisplayName(sessionId: string): string | undefined {
-    const peer = this.sessionIdToPeer(sessionId);
-    const peerName = this.getPeerName(peer);
-    if (peerName) return peerName;
-
-    const isUserPeer = peer.startsWith('user_') || peer.startsWith('kujira-user-');
-    const cleanName = (title: string | undefined): string | undefined => {
-      const name = extractNameFromSessionTitle(title, peer);
-      if (!name) return undefined;
-      if (isUserPeer && isSystemSenderName(name)) return undefined;
-      return name;
-    };
-
-    // 1. 从活跃 Agent 的会话标题反向提取
-    const titleSvc = this.ctx.get?.('sessionTitle') || (this.ctx as any)?.sessionTitle;
-    try {
-      const agent = this.getAgent(sessionId);
-      const session = (agent as any)?.session;
-      const snapshot = session ? titleSvc?.get?.(session) : undefined;
-      if (typeof snapshot?.title === 'string') {
-        const name = cleanName(snapshot.title);
-        if (name) return name;
-      }
-    } catch {}
-
-    // 2. 回退到 sessions store 的标题
-    const sessionsSvc = this.ctx.get?.('sessions') || (this.ctx as any)?.sessions;
-    if (sessionsSvc?.get && typeof sessionsSvc.get === 'function') {
-      try {
-        const s = sessionsSvc.get(sessionId);
-        return cleanName(s?.title);
-      } catch {}
-    }
-    return undefined;
+    return this.getSessionTitle(sessionId);
   }
 
   // --- Agent 运行时与并发锁委托 ---
@@ -497,21 +470,6 @@ export class SessionManager {
     return this.agentRunner.isSessionBusy(sessionId) || this.agentRunner.isSessionBusy(peerOrSessionId);
   }
 
-  public setPeerName(peer: string, name: string): void {
-    this.agentRunner.setPeerName(peer, name);
-  }
-
-  public getPeerName(peer: string): string | undefined {
-    return this.agentRunner.getPeerName(peer);
-  }
-
-  /**
-   * 确保 peer 的显示名称已解析（优先缓存/持久化，缺失时从历史记录/网关补充）。
-   */
-  public async ensurePeerName(peer: string): Promise<string | undefined> {
-    return this.agentRunner.resolvePeerName(peer);
-  }
-
   public isKujiraSession(sessionId: string): boolean {
     return isKujiraSession(sessionId);
   }
@@ -522,10 +480,6 @@ export class SessionManager {
 
   public getAgent(peerOrSessionId: string): Agent | undefined {
     return this.agentRunner.getAgent(peerOrSessionId);
-  }
-
-  public updateSessionTitle(session: any, peer: string, sessionId: string, name?: string): void {
-    this.agentRunner.updateSessionTitle(session, peer, sessionId, name);
   }
 
   public getActiveHandleKeys(): IterableIterator<string> {

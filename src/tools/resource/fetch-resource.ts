@@ -22,6 +22,7 @@ import { sanitizeAttachmentFileName } from '../../attachment/classify.js';
 import { descriptorsFromRaw, deserializeAttachments } from '../../attachment/store.js';
 import { sanitizeUrlForLog, type MediaResourceType } from '../../storage/media.js';
 import { sanitizeErrorMessage } from '../../gateway/inbound-media.js';
+import { isShortMessageId } from '../../utils/short-id.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
@@ -136,15 +137,19 @@ export async function fetchSingleChatResourceItem(
   const downloadPromise = (async (): Promise<FetchChatResourceItemResult> => {
     const sessionPeer = ctx.peer ? normalizePeer(ctx.peer) : '';
 
-    // 1. 查库：优先 getByFileId，兜底按 msg_id 查询消息记录
+    // 1. 查库：若传入短消息 ID 严格走 getMessageByShortId，否则保留 getByFileId（绝不按长 ROBOT1.0_... 兜底 getMessage）
     let dbRecord: MessageRecord | null = null;
     if (ctx.db && rawFileId && !isHttpUrl(rawFileId)) {
-      try {
-        dbRecord = ctx.db.getByFileId?.(rawFileId) ?? null;
-      } catch {}
+      if (isShortMessageId(rawFileId)) {
+        if (sessionPeer) {
+          try {
+            dbRecord = ctx.db.getMessageByShortId?.(sessionPeer, rawFileId) ?? null;
+          } catch {}
+        }
+      }
       if (!dbRecord) {
         try {
-          dbRecord = ctx.db.getMessage?.(rawFileId) ?? null;
+          dbRecord = ctx.db.getByFileId?.(rawFileId) ?? null;
         } catch {}
       }
     }
@@ -251,9 +256,17 @@ export async function fetchChatResource(
   const ctx = { ...getGlobalToolContext(), ...context };
 
   const hasFilesArray = Array.isArray(params?.files) && params.files.length > 0;
+  const trimmedExplicitMsgId = typeof params?.msg_id === 'string' ? params.msg_id.trim() : '';
+  if (!hasFilesArray && trimmedExplicitMsgId && !params?.file_id?.trim() && !isShortMessageId(trimmedExplicitMsgId)) {
+    return toLosslessJson({
+      success: false,
+      error: `无效的 msg_id "${trimmedExplicitMsgId}"，请传入短消息 ID（如 msg_12 或 msg_self_8）`,
+    });
+  }
+
   const singleFileId =
     (typeof params?.file_id === 'string' && params.file_id.trim()) ||
-    (typeof params?.msg_id === 'string' && params.msg_id.trim()) ||
+    trimmedExplicitMsgId ||
     (isHttpUrl(params?.url) ? params.url!.trim() : '');
 
   if (!hasFilesArray && !singleFileId) {
@@ -328,8 +341,8 @@ export function createFetchChatResourceTool(context?: ContextSource): ToolDefini
     description:
       '根据资源 file_id、msg_id 或缓存直链将单聊聊天中的附件（图片、语音、视频、文档）拉取到本地磁盘。用于复查本地缓存缺失的入站媒体；下载完成后返回本地物理路径（local_path），供后续文件或图片读取工具消费。如需拉取多个文件，请在单次调用中使用 files 参数批量传入。注意：QQ 官方 Bot API 不支持按 file_id 事后刷新已过期的旧资源链接。',
     parameters: {
-      file_id: { type: 'string', description: '单个资源 file_id 或消息标识 (单文件模式填写)' },
-      msg_id: { type: 'string', description: '可选：通过入站消息 msg_id 定位该消息关联的附件并补全落盘' },
+      file_id: { type: 'string', description: '单个资源 file_id 或短消息 ID（如 msg_12）(单文件模式填写)' },
+      msg_id: { type: 'string', description: '可选：通过短消息 ID（如 msg_12 或 msg_self_8）定位该消息关联的附件并补全落盘' },
       file_name: { type: 'string', description: '保存文件名建议' },
       url: { type: 'string', description: '可选：已知的媒体下载直链（裸 GET 拉取，结果不回显凭证）' },
       files: {
@@ -339,7 +352,7 @@ export function createFetchChatResourceTool(context?: ContextSource): ToolDefini
           type: 'object',
           additionalProperties: false,
           properties: {
-            file_id: { type: 'string', required: true, description: '资源 ID 或消息 ID' },
+            file_id: { type: 'string', required: true, description: '资源 ID 或短消息 ID（如 msg_12）' },
             file_name: { type: 'string', description: '保存文件名建议' },
             url: { type: 'string', description: '可选下载直链' },
           },

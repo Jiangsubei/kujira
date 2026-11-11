@@ -8,8 +8,6 @@
 import z from '@deepseek-ai/schemastery';
 import {
   DEFAULT_IMAGE_TTL_DAYS,
-  DEFAULT_MARKDOWN_ENABLED,
-  DEFAULT_INPUT_NOTIFY_ENABLED,
   DEFAULT_NEW_MESSAGE_BEHAVIOR,
   DEFAULT_PERSONA,
   DEFAULT_BEHAVIOR,
@@ -33,16 +31,6 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_IMAGE_TTL_DAYS)
     .volatile()
     .description('外来图片与媒体资源本地缓存保留天数 (默认 7 天)'),
-  markdown_enabled: z
-    .boolean()
-    .default(DEFAULT_MARKDOWN_ENABLED)
-    .volatile()
-    .description('启用 QQ 官方单聊原生 Markdown 富文本发送 (msg_type=2，默认开启)'),
-  input_notify_enabled: z
-    .boolean()
-    .default(DEFAULT_INPUT_NOTIFY_ENABLED)
-    .volatile()
-    .description('启用「对方正在输入...」状态提示 (msg_type=6，默认开启)'),
   new_message_behavior: z
     .union([z.const('steer'), z.const('queue')])
     .default(DEFAULT_NEW_MESSAGE_BEHAVIOR)

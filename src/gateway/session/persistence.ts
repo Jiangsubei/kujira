@@ -39,25 +39,6 @@ export class SessionPersistenceManager {
   }
 
   /**
-   * 从历史入站消息中读取对端最近非空发送者名称（供无用户名字段的 C2C 场景补全昵称）
-   */
-  public getLatestInboundSenderName(peer: string): string | undefined {
-    try {
-      const history = this.db?.readHistory?.(peer, {
-        exclude_self: true,
-        limit: 5,
-        order: 'desc',
-      });
-      if (!history?.messages) return undefined;
-      for (const msg of history.messages) {
-        const name = typeof msg.sender_name === 'string' ? msg.sender_name.trim() : '';
-        if (name) return name;
-      }
-    } catch {}
-    return undefined;
-  }
-
-  /**
    * 判断指定 SessionId 是否已被 DSH Web UI / workspaceRegistry 归档
    */
   public isSessionArchived(sessionId: string): boolean {

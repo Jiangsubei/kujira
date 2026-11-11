@@ -32,6 +32,33 @@ export interface MessageMediaFields {
 }
 
 const IMAGE_FILE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+const FACE_XML_TAG_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/;
+const FACE_XML_TAG_GLOBAL_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/g;
+
+/** 判断文本中是否包含 QQ 网关入站 `<faceType=...>` 原始 XML 标签。 */
+export function hasFaceXmlTag(content?: string): boolean {
+  if (typeof content !== 'string' || content === '') return false;
+  return FACE_XML_TAG_RE.test(content);
+}
+
+/** 剥离 QQ 网关入站 `<faceType=...>` 原始 XML 标签并保留其余文本（无标签时原样返回）。 */
+export function stripFaceXmlTags(content?: string): { text: string; hadFaceTag: boolean } {
+  if (typeof content !== 'string' || content === '') {
+    return { text: '', hadFaceTag: false };
+  }
+  let hadFaceTag = false;
+  const stripped = content.replace(FACE_XML_TAG_GLOBAL_RE, () => {
+    hadFaceTag = true;
+    return '';
+  });
+  if (!hadFaceTag) {
+    return { text: content, hadFaceTag: false };
+  }
+  return {
+    text: stripped.replace(/[ \t]{2,}/g, ' ').trim(),
+    hadFaceTag: true,
+  };
+}
 
 function nonEmptyString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -163,11 +190,21 @@ export function inferInboundMessageType(
   if (event.message_type === 3 || event.ark_data) return 'card';
 
   if (descriptors.length > 0) {
+    const isFaceTagged = hasFaceXmlTag(event?.content);
     if (descriptors.some((d) => d.kind === 'file')) return 'file';
     if (descriptors.some((d) => d.kind === 'forward')) return 'forward';
     if (descriptors.some((d) => d.kind === 'record')) return 'record';
     if (descriptors.some((d) => d.kind === 'video')) return 'video';
-    if (descriptors.some((d) => d.kind === 'sticker' || Boolean(d.face?.id))) return 'sticker';
+    if (
+      descriptors.some(
+        (d) =>
+          d.kind === 'sticker' ||
+          Boolean(d.face?.id) ||
+          (isFaceTagged && d.kind === 'image' && d.origin !== 'outbound')
+      )
+    ) {
+      return 'sticker';
+    }
     return 'image';
   }
 
@@ -183,13 +220,19 @@ export function describeInboundAttachments(
   event: QQC2CMessageCreateEvent,
   resolvedDescriptors?: AttachmentDescriptor[]
 ): MessageDescription {
-  const attachments: AttachmentDescriptor[] = Array.isArray(resolvedDescriptors)
+  const rawAttachments: AttachmentDescriptor[] = Array.isArray(resolvedDescriptors)
     ? resolvedDescriptors
     : Array.isArray(event?.attachments)
       ? event.attachments
           .filter((att): att is QQAttachment => Boolean(att) && typeof att === 'object')
           .map((att) => describeAttachment(att, 'inbound'))
       : [];
+
+  const attachments: AttachmentDescriptor[] = hasFaceXmlTag(event?.content)
+    ? rawAttachments.map((d) =>
+        d.kind === 'image' && d.origin !== 'outbound' ? { ...d, kind: 'sticker' as const } : d
+      )
+    : rawAttachments;
 
   return {
     type: inferInboundMessageType(event, attachments),

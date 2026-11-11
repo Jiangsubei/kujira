@@ -41,11 +41,13 @@ function renderSticker(descriptor: AttachmentDescriptor): string {
   if (descriptor.face?.id) {
     return formatFacePlaceholder(descriptor.face, descriptor.local?.path);
   }
-  const cleanSummary = cleanStickerSummary(descriptor.summary);
   if (descriptor.local?.path) {
-    return `[表情包: ${cleanSummary} 路径: ${descriptor.local.path}]`;
+    return `[表情包:${descriptor.local.path}]`;
   }
-  return cleanSummary && cleanSummary !== '表情' ? `[表情包: ${cleanSummary}]` : '[表情包]';
+  if (descriptor.unavailable) {
+    return '[表情包 (入站落盘失败)]';
+  }
+  return '[表情包]';
 }
 
 function renderImage(descriptor: AttachmentDescriptor): string {

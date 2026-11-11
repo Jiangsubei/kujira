@@ -11,10 +11,11 @@ import {
   type KujiraGatewayClientLike,
 } from '../../outbound/stream.js';
 import type { PerPeerSerialSender } from '../../outbound/queue.js';
-import type { SerialSender, BridgePluginConfig } from '../../types/index.js';
+import type { SerialSender, BridgePluginConfig, MessageRecord } from '../../types/index.js';
 import type { TaskScheduler } from '../../scheduler/index.js';
 import type { SlangStorage } from '../../slang/index.js';
 import { isValidOpenid, openidToPeer } from '../../utils/peer.js';
+import { isShortMessageId, isShortOutboundMessageId } from '../../utils/short-id.js';
 
 export interface ToolExecutionContext {
   db?: MessageDatabase | null;
@@ -210,4 +211,72 @@ export function resolveOutboundBridge(ctx: ToolExecutionContext): OutboundStream
   }
 
   return bridge;
+}
+
+/**
+ * 将出站原始消息 ID (`ROBOT1.0_...` 或已归一化的 `msg_self_<n>`) 解析为对外暴露的短出站 ID (`msg_self_<n>`)。
+ * 严禁将原始长 `ROBOT1.0_...` 返回给模型：找不到短 ID 时一律返回 `undefined`。
+ */
+export function resolveOutboundShortId(
+  ctx: Pick<ToolExecutionContext, 'db'> | undefined,
+  bridge: Pick<OutboundStreamBridge, 'resolveShortId'> | null | undefined,
+  peer: string,
+  rawMsgId?: string
+): string | undefined {
+  if (!rawMsgId || typeof rawMsgId !== 'string' || !rawMsgId.trim()) {
+    return undefined;
+  }
+  const cleaned = rawMsgId.trim();
+  if (isShortOutboundMessageId(cleaned)) {
+    return cleaned;
+  }
+  const normalizedPeer = peer ? normalizePeer(peer) : '';
+  try {
+    const row = ctx?.db?.getMessage?.(cleaned);
+    if (row && (!normalizedPeer || !row.peer || row.peer === normalizedPeer)) {
+      const fromDb = typeof row.short_id === 'string' ? row.short_id.trim() : '';
+      if (isShortMessageId(fromDb)) {
+        return fromDb;
+      }
+    }
+  } catch {}
+  try {
+    const dbResolved = normalizedPeer ? ctx?.db?.resolveShortId?.(normalizedPeer, cleaned) : null;
+    if (typeof dbResolved === 'string') {
+      const trimmed = dbResolved.trim();
+      if (isShortMessageId(trimmed)) {
+        return trimmed;
+      }
+    }
+  } catch {}
+  try {
+    const fromBridge = bridge?.resolveShortId?.(normalizedPeer || peer, cleaned);
+    if (typeof fromBridge === 'string') {
+      const trimmed = fromBridge.trim();
+      if (isShortMessageId(trimmed)) {
+        return trimmed;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
+/**
+ * 严格按短消息 ID（`msg_<n>` / `msg_self_<n>`）查询当前单聊会话消息记录。
+ * 非短 ID 或未命中返回 `null`，绝不做长 ID 兼容回退。
+ */
+export function resolveShortMessageRecord(
+  db: Pick<MessageDatabase, 'getMessageByShortId'> | null | undefined,
+  peer: string,
+  shortId: string
+): MessageRecord | null {
+  if (!db || typeof shortId !== 'string') {
+    return null;
+  }
+  const trimmed = shortId.trim();
+  const normalizedPeer = peer ? normalizePeer(peer) : '';
+  if (!normalizedPeer || !isShortMessageId(trimmed)) {
+    return null;
+  }
+  return db.getMessageByShortId?.(normalizedPeer, trimmed) ?? null;
 }

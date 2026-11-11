@@ -5,7 +5,7 @@
  * - 移除群聊、sub_type、file:/// URI 与 .dsh/napcat 路径；
  * - 经 OutboundStreamBridge.sendMediaReply 完成四步分片上传 + msg_type=7 下发，
  *   配合 buildOutboundFaceAttachment 在本地精准标注 kind: 'sticker' + face 元信息；
- * - 记录使用频次并返回 string message_id 与可选 ref_idx。
+ * - 记录使用频次并返回短出站 ID message_id（msg_self_<n>）。
  */
 
 import * as fs from 'node:fs';
@@ -24,6 +24,7 @@ import {
   isKujiraUserPeer,
   resolveSessionPeerFromExec,
   resolveOutboundBridge,
+  resolveOutboundShortId,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 
@@ -120,19 +121,15 @@ export async function sendFace(
 
     ctx.db.recordFaceUsage(face.id);
 
-    const messageId =
+    const rawMessageId =
       typeof res.body?.id === 'string' && res.body.id.trim() !== ''
         ? res.body.id.trim()
         : undefined;
-    const refIdx =
-      typeof res.body?.ext_info?.ref_idx === 'string' && res.body.ext_info.ref_idx.trim() !== ''
-        ? res.body.ext_info.ref_idx.trim()
-        : undefined;
+    const shortId = resolveOutboundShortId(ctx, bridge, peer, rawMessageId);
 
     return toLosslessJson({
       success: true,
-      ...(messageId ? { message_id: messageId } : {}),
-      ...(refIdx ? { ref_idx: refIdx } : {}),
+      ...(shortId ? { message_id: shortId } : {}),
     });
   } catch (err: any) {
     return toLosslessJson({
@@ -162,7 +159,7 @@ export function createSendFaceTool(context?: ContextSource): ToolDefinition {
           {
             type: 'text',
             text: v?.success
-              ? `已成功发送表情包${v.message_id ? ` (message_id: ${v.message_id})` : ''}`
+              ? `已成功发送表情包${v.message_id ? ` (ID: ${v.message_id})` : ''}`
               : `发送表情包失败: ${v?.error}`,
           },
         ];

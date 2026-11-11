@@ -25,8 +25,6 @@ import {
   parseSessionId,
   buildSessionId,
   generateSessionHash,
-  formatSessionTitle,
-  extractNameFromSessionTitle,
   formatWakeupPrompt,
   isKujiraSession,
 } from './id-resolver.js';
@@ -52,50 +50,6 @@ export function safeGetService(ctx: any, name: string): any {
   return undefined;
 }
 
-export function parsePeerTarget(peer: string): { type: 'user'; id: string } {
-  if (peer.startsWith('user_')) {
-    return { type: 'user', id: peer.slice(5) };
-  }
-  if (peer.startsWith('user:')) {
-    return { type: 'user', id: peer.slice(5) };
-  }
-  if (peer.startsWith('kujira-user-')) {
-    const parsed = parseSessionId(peer);
-    if (parsed) {
-      return { type: 'user', id: parsed.id };
-    }
-    const stripped = peer.slice(12);
-    return { type: 'user', id: stripped.split('-')[0] || stripped };
-  }
-  return { type: 'user', id: peer };
-}
-
-/**
- * 系统触发器可能写入 `payload.from_name` 的伪发送者名称。
- * 这些名称绝不能进入会话标题或昵称缓存，否则单聊会话会被永久改名成系统身份。
- */
-const SYSTEM_SENDER_NAMES = new Set([
-  '系统定时任务',
-  '系统主动唤醒',
-  '协同 Agent',
-  '系统协作总线',
-  '内部通讯',
-]);
-
-/**
- * 只有真实单聊入站触发源的 from_name 才能代表真实 QQ 发送者。
- */
-const REAL_SENDER_TRIGGERS = new Set(['direct', 'quote']);
-
-function isUserPeer(peer: string): boolean {
-  return peer.startsWith('user_') || peer.startsWith('kujira-user-');
-}
-
-/** 判断名称是否为系统伪发送者名称（用于标题与昵称缓存的历史污染清理） */
-export function isSystemSenderName(name: string | undefined): boolean {
-  return typeof name === 'string' && SYSTEM_SENDER_NAMES.has(name.trim());
-}
-
 export interface AgentRunnerDelegate {
   peerToSessionId(peer: string): string;
   sessionIdToPeer(sessionId: string): string;
@@ -105,12 +59,8 @@ export interface AgentRunnerDelegate {
 }
 
 export class SessionAgentRunner {
-  /** 单聊昵称持久化键（跨重启保留，避免标题退化为纯 hash） */
-  private static readonly PEER_NAMES_KEY = 'kujira_peer_names';
-
   private activeHandles = new Map<string, AgentHandle>();
   private busySessions = new Set<string>();
-  private peerNames = new Map<string, string>();
   private persistedSessions = new Set<string>();
   private pendingFirstTurnSessions = new Set<string>();
   private outboundBridge?: OutboundBridgeLike;
@@ -124,9 +74,7 @@ export class SessionAgentRunner {
     private readonly modelSelector: SessionModelSelector,
     private readonly delegate: AgentRunnerDelegate,
     private readonly options?: SessionManagerOptions
-  ) {
-    this.loadPeerNames();
-  }
+  ) {}
 
   public getConfig(): any {
     const getter: any = this.options?.configGetter || safeGetService(this.ctx, 'kujira-bridge-config');
@@ -199,123 +147,47 @@ export class SessionAgentRunner {
     this.persistedSessions.add(sessionId);
   }
 
-  public setPeerName(peer: string, name: string): void {
-    if (name && typeof name === 'string' && name.trim()) {
-      const trimmed = name.trim();
-      if (isUserPeer(peer) && isSystemSenderName(trimmed)) {
-        return;
-      }
-      this.peerNames.set(peer, trimmed);
-      this.persistPeerNames();
-    }
-  }
-
-  public getPeerName(peer: string): string | undefined {
-    return this.peerNames.get(peer);
-  }
-
   /**
-   * 确保 peer 显示名称已解析：
-   * 1. 优先返回内存/KV 持久化缓存；
-   * 2. 回退从本地历史入站消息中提取最近非系统发送者名称；
-   * 3. 若 `kujira-gateway` 提供可选的自定义备注/昵称查询接口，带超时尝试获取。
+   * 只读查询会话标题（优先活跃 handle 的 sessionTitle 投影，其次 sessionsSvc.get(sid)），
+   * 绝不调用 sessionTitle.rename 锁定或覆盖 DSH 原生 AI 总结标题。
    */
-  public async resolvePeerName(peer: string, timeoutMs = 3000): Promise<string | undefined> {
-    const cached = this.getPeerName(peer);
-    if (cached) return cached;
+  public getSessionTitle(sessionId: string): string | undefined {
+    if (!sessionId || typeof sessionId !== 'string') return undefined;
+    const titleSvc = safeGetService(this.ctx, 'sessionTitle') || (this.ctx as any)?.sessionTitle;
+    const sessionsSvc = safeGetService(this.ctx, 'sessions') || (this.ctx as any)?.sessions;
 
-    const fromDb = this.persistence.getLatestInboundSenderName(peer);
-    if (fromDb && !isSystemSenderName(fromDb)) {
-      this.setPeerName(peer, fromDb);
-      return fromDb;
-    }
-
-    const gateway: any =
-      safeGetService(this.ctx, 'kujira-gateway') || (this.ctx as any)['kujira-gateway'];
-    if (!gateway) return undefined;
-
-    const { id } = parsePeerTarget(peer);
-    if (!id) return undefined;
-
-    try {
-      const getter =
-        typeof gateway.getPeerName === 'function'
-          ? gateway.getPeerName(peer)
-          : typeof gateway.getRemark === 'function'
-            ? gateway.getRemark(peer)
-            : undefined;
-      if (!getter || typeof getter.then !== 'function') {
-        if (typeof getter === 'string' && getter.trim() && !isSystemSenderName(getter)) {
-          this.setPeerName(peer, getter.trim());
-          return getter.trim();
+    const readFromSession = (session: any): string | undefined => {
+      if (!session) return undefined;
+      try {
+        const snapshot = titleSvc?.get?.(session);
+        if (typeof snapshot?.title === 'string' && snapshot.title.trim()) {
+          return snapshot.title.trim();
         }
-        return undefined;
+      } catch {}
+      if (typeof session.title === 'string' && session.title.trim()) {
+        return session.title.trim();
       }
-
-      const res: any = await Promise.race([
-        getter,
-        new Promise((resolve) => setTimeout(() => resolve(undefined), timeoutMs)),
-      ]);
-      const rawName =
-        typeof res === 'string'
-          ? res
-          : res?.name || res?.remark || res?.nickname || '';
-      const name = String(rawName).trim();
-      if (!name || isSystemSenderName(name)) return undefined;
-
-      this.setPeerName(peer, name);
-      return name;
-    } catch {
       return undefined;
-    }
-  }
+    };
 
-  private loadPeerNames(): void {
-    try {
-      const raw = this.persistence.getPluginConfig(SessionAgentRunner.PEER_NAMES_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-      let dropped = false;
-      for (const [peer, name] of Object.entries(parsed)) {
-        if (typeof peer === 'string' && peer && typeof name === 'string' && name.trim()) {
-          const trimmed = name.trim();
-          if (isUserPeer(peer) && isSystemSenderName(trimmed)) {
-            dropped = true;
-            continue;
-          }
-          this.peerNames.set(peer, trimmed);
-        }
-      }
-      if (dropped) this.persistPeerNames();
-    } catch {
-      // 持久化数据损坏时忽略，按无缓存继续
-    }
-  }
+    const handle = this.activeHandles.get(sessionId);
+    const fromHandle = readFromSession((handle?.agent as any)?.session);
+    if (fromHandle) return fromHandle;
 
-  private persistPeerNames(): void {
     try {
-      this.persistence.setPluginConfig(
-        SessionAgentRunner.PEER_NAMES_KEY,
-        JSON.stringify(Object.fromEntries(this.peerNames))
-      );
-    } catch {}
-  }
-
-  private getSessionTitle(session: any, sessionId: string): string | undefined {
-    const titleSvc = safeGetService(this.ctx, 'sessionTitle');
-    try {
-      const snapshot = titleSvc?.get?.(session);
-      if (typeof snapshot?.title === 'string') return snapshot.title;
+      const storedSession = sessionsSvc?.get?.(sessionId);
+      const fromStore = readFromSession(storedSession);
+      if (fromStore) return fromStore;
     } catch {}
 
-    const sessionsSvc = safeGetService(this.ctx, 'sessions');
     try {
-      const s = sessionsSvc?.get?.(sessionId);
-      return typeof s?.title === 'string' ? s.title : undefined;
-    } catch {
-      return undefined;
-    }
+      const agentsSvc = safeGetService(this.ctx, 'agents') || (this.ctx as any)?.agents;
+      const liveAgent = agentsSvc?.get?.(sessionId as any);
+      const fromAgent = readFromSession((liveAgent as any)?.session);
+      if (fromAgent) return fromAgent;
+    } catch {}
+
+    return undefined;
   }
 
   public hasActiveHandle(sessionId: string): boolean {
@@ -402,40 +274,6 @@ export class SessionAgentRunner {
     }
   }
 
-  public updateSessionTitle(session: any, peer: string, sessionId: string, name?: string): void {
-    if (!session) return;
-    if (name) {
-      this.setPeerName(peer, name);
-    }
-
-    const existingTitle = this.getSessionTitle(session, sessionId);
-    const existingName = extractNameFromSessionTitle(existingTitle, peer);
-    const isPollutedName = isUserPeer(peer) && isSystemSenderName(existingName);
-
-    const currentName =
-      (name && !isSystemSenderName(name) ? name : undefined) ||
-      this.getPeerName(peer) ||
-      (isPollutedName ? undefined : existingName);
-
-    // 已知标题且非系统污染但无法解析出昵称时，不降级覆盖已有标题
-    if (!currentName && existingTitle && !isPollutedName) return;
-
-    const title = formatSessionTitle(peer, sessionId, currentName);
-    if (existingTitle === title) return;
-
-    const sessionTitleSvc = this.ctx.get?.('sessionTitle') || (this.ctx as any).sessionTitle;
-    if (sessionTitleSvc && typeof sessionTitleSvc.rename === 'function') {
-      try {
-        sessionTitleSvc.rename(session, title);
-      } catch (err: any) {
-        this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
-          `[SessionAgentRunner] 锁定会话标题 ${sessionId} 失败:`,
-          err?.message
-        );
-      }
-    }
-  }
-
   public async getOrCreateAgent(peerOrSessionId: string): Promise<Agent> {
     let sessionId = this.delegate.peerToSessionId(peerOrSessionId);
     const peer = this.delegate.sessionIdToPeer(peerOrSessionId);
@@ -470,7 +308,6 @@ export class SessionAgentRunner {
 
       if (isHandleValid) {
         (handle.agent as any).modelSelection = selectionRef;
-        this.updateSessionTitle((handle.agent as any).session, peer, sessionId);
         return handle.agent;
       }
       this.activeHandles.delete(sessionId);
@@ -491,7 +328,6 @@ export class SessionAgentRunner {
 
       if (!isExistingZombie) {
         (existingAgent as any).modelSelection = selectionRef;
-        this.updateSessionTitle((existingAgent as any).session, peer, sessionId);
         return existingAgent;
       }
       this.delegate.onSessionReassigned?.(peer, '');
@@ -572,7 +408,7 @@ export class SessionAgentRunner {
       const maxRetries = delays.length;
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-          handle = await agents.resume({
+          const resumedHandle = await agents.resume({
             resumeSessionId: sessionId as any,
             agentOptions: {
               provider,
@@ -581,7 +417,10 @@ export class SessionAgentRunner {
             },
             setup: setupFn,
           });
-          isResumed = true;
+          if (resumedHandle) {
+            handle = resumedHandle;
+            isResumed = true;
+          }
           break;
         } catch (err: any) {
           const isOwnedError =
@@ -704,9 +543,6 @@ export class SessionAgentRunner {
     // 自动在 DSH workspaceRegistry 中登记单一 Kujira 顶级工作区并关联活跃会话
     await this.workspace.registerWorkspace(cwd, sessionId, 'Kujira');
 
-    // 锁定会话标题，防止 LLM 自动总结覆盖
-    this.updateSessionTitle(handle.agent.session, peer, sessionId);
-
     // 固化 agentPreset 投影至 session，确保冷重启恢复时绝不 fallback 至默认 coding 预设
     const presets: any = safeGetService(this.ctx, 'agentPresets');
     const sessionProjections: any = safeGetService(this.ctx, 'sessionProjections');
@@ -759,16 +595,6 @@ export class SessionAgentRunner {
 
     const agent = await this.getOrCreateAgent(payload.peer);
     const sessionId = (agent as any).session?.id || this.delegate.peerToSessionId(payload.peer);
-
-    // 仅当唤醒来源是真实 QQ 单聊发送者（direct / quote）时才允许用 from_name 更新单聊标题
-    if (
-      !payload.is_system &&
-      payload.from_name &&
-      REAL_SENDER_TRIGGERS.has(String(payload.trigger)) &&
-      isUserPeer(payload.peer)
-    ) {
-      this.updateSessionTitle((agent as any).session, payload.peer, sessionId, payload.from_name);
-    }
 
     const promptText =
       payload.is_system && payload.system_event
@@ -830,7 +656,6 @@ export class SessionAgentRunner {
     this.activeHandles.clear();
     this.pendingFirstTurnSessions.clear();
     this.persistedSessions.clear();
-    this.peerNames.clear();
     this.busySessions.clear();
   }
 }

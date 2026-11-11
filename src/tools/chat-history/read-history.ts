@@ -2,14 +2,13 @@
  * kujira: 单聊聊天历史检索工具 (read_chat_history)
  *
  * 严格单聊强隔离：
- * - Agent 工具 schema 与 execute 均不接受跨会话 peer 或 source 覆盖，强制绑定当前单聊 session 归一化后的 user_<hash16>；
- * - 仅检索 source='qq' 的真实单聊收发消息，输出 string msg_id 与可选 ref_idx。
+ * - Agent 工具 schema 与 execute 均不接受跨会话 peer、source、user_id 或 sender_name 覆盖，强制绑定当前单聊 session 归一化后的 user_<hash16>；
+ * - 仅检索 source='qq' 的真实单聊收发消息，输出短消息 ID (`msg_<n>` / `msg_self_<n>`)。
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { ReadChatHistoryParams, ReadChatHistoryResult } from '../../types/index.js';
 import type { MessageDatabase } from '../../storage/database.js';
-import { formatSenderString } from '../../gateway/external-prompt.js';
 import {
   type ContextSource,
   getGlobalToolContext,
@@ -97,12 +96,10 @@ export function renderChatHistoryText(result: ReadChatHistoryResult): string {
   ];
   for (let i = 0; i < result.messages.length; i++) {
     const m = result.messages[i]!;
-    const selfTag = m.self ? ' [自身发言]' : '';
     const recalledTag = m.recalled ? ' [已撤回]' : '';
-    const refTag = m.ref_idx ? ` | ref_idx: ${m.ref_idx}` : '';
-    lines.push(
-      `${offset + i + 1}. [${m.formatted_time}] ${formatSenderString(m.sender_name, m.user_id)}${selfTag}${recalledTag} | msg_id: ${m.msg_id}${refTag} | ${m.type}`
-    );
+    const replyTag = m.reply_to ? ` [回复 ${m.reply_to}]` : '';
+    const timeStr = m.formatted_time || '';
+    lines.push(`${offset + i + 1}. [${m.msg_id}] [${timeStr}]${recalledTag}${replyTag} ${m.type}`);
     if (m.content) lines.push(`   ${m.content}`);
   }
   if (result.has_more) {
@@ -119,10 +116,9 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
   return defineTool({
     name: 'read_chat_history',
     description:
-      '检索当前 QQ 单聊会话的本地历史聊天记录（严格隔离在当前会话内）。用于指代不明追溯前情、响应用户查询/复述历史发言，或为引用回复、消息撤回、收藏表情及转发展开等下游工具获取目标消息的 msg_id 与 ref_idx。',
+      '检索当前 QQ 单聊会话的本地历史聊天记录（严格隔离在当前会话内）。用于指代不明追溯前情、响应用户查询/复述历史发言，或为引用回复、消息撤回、收藏表情及转发展开等下游工具获取目标消息的短消息 ID（msg_id，如 msg_12 或 msg_self_8）。',
     parameters: {
       keyword: { type: 'string', description: '按消息文本内容关键词模糊搜索' },
-      sender_name: { type: 'string', description: '按发送者展示名模糊搜索' },
       type: {
         type: 'string',
         description:
@@ -144,7 +140,7 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
       has_file: { type: 'boolean', description: '是否仅筛选带有文件/图片/媒体附件的消息' },
       reply_to: {
         type: 'string',
-        description: '查询引用了指定 msg_id 的直接回复消息（字符串 ID）',
+        description: '查询引用了指定短消息 ID 的直接回复消息（如 msg_12 或 msg_self_8）',
       },
       exclude_self: { type: 'boolean', description: '是否排除机器人自身的发言 (默认 false)' },
       self_only: { type: 'boolean', description: '是否仅查询机器人自身的发言 (默认 false)' },
@@ -181,6 +177,7 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
         peer: _ignoredPeer,
         source: _ignoredSource,
         user_id: _ignoredUserId,
+        sender_name: _ignoredSenderName,
         ...safeParams
       } = (args || {}) as Record<string, any>;
 

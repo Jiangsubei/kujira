@@ -2,7 +2,10 @@
  * kujira: /会话 命令处理器
  */
 
-import { formatSessionTitle } from '../../gateway/session.js';
+import {
+  formatFallbackSessionTitle,
+  formatSessionVersionTag,
+} from '../../gateway/session.js';
 import type { CommandContext, CommandResult } from '../types.js';
 
 export async function handleSessionCommand(
@@ -18,28 +21,42 @@ export async function handleSessionCommand(
     };
   }
   const peer = sm.sessionIdToPeer(context.session.id);
-  const peerName = sm.getPeerName(peer);
   const sessions = sm.listPeerSessionIds(peer); // 升序：旧→新
 
+  const formatEntry = (sid: string): { displayTitle: string; tag: string; label: string } => {
+    const aiTitle = sm.getSessionTitle?.(sid);
+    const tag = formatSessionVersionTag(sid);
+    const displayTitle = aiTitle || formatFallbackSessionTitle(sid);
+    const label = aiTitle ? `${displayTitle} (${tag})` : displayTitle;
+    return { displayTitle, tag, label };
+  };
+
   if (!args) {
+    if (sessions.length === 0) {
+      return {
+        handled: true,
+        success: true,
+        reply: '历史会话列表：\n暂无历史会话。',
+      };
+    }
     const currentSid = sm.peerToSessionId(peer);
     const lines = [...sessions].reverse().map((sid, i) => {
       const num = sessions.length - i;
       const isCurrent = sid === currentSid ? ' [当前]' : '';
-      const title = formatSessionTitle(peer, sid, peerName);
-      return `${num}.${isCurrent} ${title} (${sid})`;
+      const { label } = formatEntry(sid);
+      return `${num}.${isCurrent} ${label} [${sid}]`;
     });
-    const peerDesc = formatSessionTitle(peer, currentSid, peerName).replace(/#\d+.*$/, '').trim();
     return {
       handled: true,
       success: true,
-      reply: `历史会话列表（${peerDesc}）：\n${lines.join('\n')}\n\n切换方法：\n- 按序号切换：/会话 <序号>\n- 按标题切换：/会话 <标题>`,
+      reply: `历史会话列表：\n${lines.join('\n')}\n\n切换方法：\n- 按序号切换：/会话 <序号>\n- 按标题或标识切换：/会话 <关键字>`,
     };
   }
 
+  const trimmedArgs = args.trim();
   let targetSid: string | undefined;
-  const numArg = parseInt(args, 10);
-  if (!isNaN(numArg) && /^\d+$/.test(args)) {
+  const numArg = parseInt(trimmedArgs, 10);
+  if (!isNaN(numArg) && /^\d+$/.test(trimmedArgs)) {
     if (numArg < 1 || numArg > sessions.length) {
       return {
         handled: true,
@@ -49,14 +66,21 @@ export async function handleSessionCommand(
     }
     targetSid = sessions[numArg - 1];
   } else {
+    const lowerArgs = trimmedArgs.toLowerCase();
     const matched = sessions.filter((sid) => {
-      const title = formatSessionTitle(peer, sid, peerName);
-      return title.toLowerCase().includes(args.toLowerCase()) || sid.toLowerCase().includes(args.toLowerCase());
+      const { displayTitle, tag } = formatEntry(sid);
+      return (
+        displayTitle.toLowerCase().includes(lowerArgs) ||
+        tag.toLowerCase().includes(lowerArgs) ||
+        sid.toLowerCase().includes(lowerArgs)
+      );
     });
     if (matched.length === 1) {
       targetSid = matched[0];
     } else if (matched.length > 1) {
-      const candidates = matched.map((sid) => `- ${formatSessionTitle(peer, sid, peerName)} (${sid})`).join('\n');
+      const candidates = matched
+        .map((sid) => `- ${formatEntry(sid).label} [${sid}]`)
+        .join('\n');
       return {
         handled: true,
         success: false,
@@ -80,12 +104,12 @@ export async function handleSessionCommand(
   }
 
   const ok = sm.resumeSession(peer, targetSid);
-  const targetTitle = formatSessionTitle(peer, targetSid, peerName);
+  const { label } = formatEntry(targetSid);
   return ok
     ? {
         handled: true,
         success: true,
-        reply: `已切换到会话：${targetTitle} (${targetSid})`,
+        reply: `已切换到会话：${label} [${targetSid}]`,
       }
     : {
         handled: true,
