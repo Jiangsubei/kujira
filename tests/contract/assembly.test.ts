@@ -2,24 +2,25 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import WebSocket from 'ws';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import { PLUGIN_NAME } from '../../src/constants/index.js';
-import * as NapCatBridgePlugin from '../../src/index.js';
+import { QQ_PRESET_ID } from '../../src/constants/preset.js';
+import * as KujiraPlugin from '../../src/index.js';
+import { openidToSessionBaseId } from '../../src/utils/peer.js';
 
-describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract)', () => {
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_SESSION_BASE = openidToSessionBaseId(MOCK_OPENID);
+
+describe('契约测试: DSH 真实服务装配与 Kujira 插件挂载 (Assembly Contract)', () => {
   let tmpHome: string;
   let booted: BootedDsh;
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-napcat-assembly-'));
-    booted = await bootDshNapcatBridge({
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-assembly-'));
+    booted = await bootDshKujira({
       dshHome: tmpHome,
-      config: {
-        bot_qq: '1000000001',
-        ws_port: 18080,
-      },
+      config: {},
     });
   });
 
@@ -65,55 +66,60 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
     expect(typeof ctx.permissionPresets.set).toBe('function');
   });
 
-  it('断言 2: dsh-napcat-bridge 插件已成功注册并在 Context 上生效', () => {
+  it('断言 2: kujira 插件已成功注册并在 Context 上生效', () => {
     expect(booted.ctx).toBeDefined();
-    expect(booted.ctx.get('napcatBridgeTools') || (booted.ctx as any).napcatBridgeTools).toBeDefined();
+    expect(KujiraPlugin.name).toBe(PLUGIN_NAME);
+    expect(booted.ctx.get('kujiraBridgeTools') || (booted.ctx as any).kujiraBridgeTools).toBeDefined();
+    expect(booted.ctx.get('kujira-session') || (booted.ctx as any)['kujira-session']).toBeDefined();
+    expect(booted.ctx.get('kujira-gateway') || (booted.ctx as any)['kujira-gateway']).toBeDefined();
+    expect(
+      booted.ctx.get('kujira-outbound-bridge') || (booted.ctx as any)['kujira-outbound-bridge']
+    ).toBeDefined();
   });
 
-  it('B2-契约 3: 插件通过 user-questions/request waterfall 接入 NapCat 提问渠道', async () => {
+  it('B2-契约 3: 插件通过 user-questions/request waterfall 接入 Kujira 单聊提问渠道', async () => {
     const uq = booted.ctx.userQuestions;
     expect(uq).toBeDefined();
 
     const handle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-123',
+      sessionId: MOCK_SESSION_BASE,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: path.join(tmpHome, 'qq-ws') },
+      meta: { cwd: path.join(tmpHome, 'kujira-ws') },
     });
     const qqAgent = handle.agent || handle;
 
-    // 未连接 gateway 时向 QQ 会话提问，会由 NapCatQuestionProvider 处理并抛出连接错误
+    // 无 openid 映射或未连接 gateway 时向 Kujira 会话提问，由 KujiraQuestionProvider 拦截并按真实出站错误拒绝
     await expect(
       uq.ask({
         agent: qqAgent,
         questions: [{ id: 'q1', question: 'x' }],
       })
-    ).rejects.toThrow(/NapCat.*未连接/);
+    ).rejects.toThrow(/\[KujiraQuestionProvider\].*(?:发送提问消息.*失败|QQ Gateway 不可用|outboundBridge\/gateway 不可用)/);
   });
 
-  it('TD001-契约 4: 插件通过 user-questions/request waterfall 级联共存，QQ 会话由插件处理，Web 会话委托宿主', async () => {
-    const booted2 = await bootDshNapcatBridge({
-      dshHome: tmpHome,
+  it('TD001-契约 4: 插件通过 user-questions/request waterfall 级联共存，Kujira 会话由插件处理，Web 会话委托宿主', async () => {
+    const tmpHome2 = path.join(tmpHome, 'booted2');
+    await fsp.mkdir(tmpHome2, { recursive: true });
+    const booted2 = await bootDshKujira({
+      dshHome: tmpHome2,
       mountPlugin: false,
     });
     try {
       let webCalled = false;
       booted2.ctx.on('user-questions/request', async (req: any, next: any) => {
         const sid = req.agent?.session?.id || req.agent?.id || '';
-        if (!sid.startsWith('qq-')) {
+        if (!sid.startsWith('kujira-')) {
           webCalled = true;
           return { answers: [{ id: 'q1', selected: ['web'] }] };
         }
         return next();
       });
-      await booted2.ctx.plugin(NapCatBridgePlugin, {
-        bot_qq: '1000000001',
-        ws_port: 18082,
-      });
+      await booted2.ctx.plugin(KujiraPlugin, {});
 
       const webHandle = await booted2.ctx.agents.create({
         sessionId: 'web-session-1',
         agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-        meta: { cwd: path.join(tmpHome, 'web-ws-2') },
+        meta: { cwd: path.join(tmpHome2, 'web-ws-2') },
       });
       const webAgent = webHandle.agent || webHandle;
 
@@ -129,13 +135,13 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
     }
   });
 
-  it('B3-契约 5: 预设体系工具隔离 — 非 QQ 会话不含 NapCat 专属工具，QQ 会话挂载预设正常放行', async () => {
+  it('B3-契约 5: 预设体系工具隔离 — 非 Kujira 会话不含 Kujira 专属工具，Kujira 会话挂载预设正常放行', async () => {
     const tools: any = booted.ctx.get('tools');
 
     await fsp.mkdir(path.join(tmpHome, 'web-ws'), { recursive: true });
-    await fsp.mkdir(path.join(tmpHome, 'qq-ws'), { recursive: true });
+    await fsp.mkdir(path.join(tmpHome, 'kujira-ws'), { recursive: true });
 
-    // 非 QQ (Web) 会话 agent (未挂载 qq-session 预设)
+    // 非 Kujira (Web) 会话 agent (未挂载 kujira-session 预设)
     const webHandle = await booted.ctx.agents.create({
       sessionId: 'web-session-1',
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
@@ -150,13 +156,13 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
     });
     expect(denied.isError).toBe(true);
 
-    // QQ 会话 agent (挂载 qq-session 预设)
+    // Kujira 会话 agent (挂载 kujira-session 预设)
     const qqHandle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-1001',
+      sessionId: `${MOCK_SESSION_BASE}-1`,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: path.join(tmpHome, 'qq-ws') },
+      meta: { cwd: path.join(tmpHome, 'kujira-ws') },
       setup: async (agentCtx: any) => {
-        await (booted.ctx as any).agentPresets.mount(agentCtx, 'qq-session');
+        await (booted.ctx as any).agentPresets.mount(agentCtx, QQ_PRESET_ID);
       },
     });
     const qqAgent = qqHandle.agent || qqHandle;
@@ -169,8 +175,8 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
     expect(allowed.isError).toBe(false);
   });
 
-  it('B3-契约 6: system-prompt/assemble 呈现侧预设隔离 — Web 装配不含 NapCat 工具，QQ 装配含全量', async () => {
-    const NAPCAT_TOOLS = new Set([
+  it('B3-契约 6: system-prompt/assemble 呈现侧预设隔离 — Web 装配不含 Kujira 工具，Kujira 装配含全量', async () => {
+    const KUJIRA_TOOLS = new Set([
       'read_chat_history',
       'fetch_chat_resource',
       'expand_forward_message',
@@ -178,7 +184,7 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
     ]);
 
     await fsp.mkdir(path.join(tmpHome, 'web-ws-2'), { recursive: true });
-    await fsp.mkdir(path.join(tmpHome, 'qq-ws-2'), { recursive: true });
+    await fsp.mkdir(path.join(tmpHome, 'kujira-ws-2'), { recursive: true });
 
     const webHandle = await booted.ctx.agents.create({
       sessionId: 'web-session-2',
@@ -187,34 +193,34 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
     });
     const webAgent = webHandle.agent || webHandle;
     const asmWeb = await booted.ctx.systemPrompt.assemble({ scope: webAgent, agent: webAgent } as any);
-    const webNapcat = (asmWeb.tools as any[]).filter((t) => NAPCAT_TOOLS.has(t.name));
-    expect(webNapcat).toHaveLength(0);
+    const webKujira = (asmWeb.tools as any[]).filter((t) => KUJIRA_TOOLS.has(t.name));
+    expect(webKujira).toHaveLength(0);
 
     const qqHandle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-1002',
+      sessionId: `${MOCK_SESSION_BASE}-2`,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: path.join(tmpHome, 'qq-ws-2') },
+      meta: { cwd: path.join(tmpHome, 'kujira-ws-2') },
       setup: async (agentCtx: any) => {
-        await (booted.ctx as any).agentPresets.mount(agentCtx, 'qq-session');
+        await (booted.ctx as any).agentPresets.mount(agentCtx, QQ_PRESET_ID);
       },
     });
     const qqAgent = qqHandle.agent || qqHandle;
     const asmQq = await booted.ctx.systemPrompt.assemble({ scope: qqAgent, agent: qqAgent } as any);
-    const qqNapcat = (asmQq.tools as any[]).filter((t) => NAPCAT_TOOLS.has(t.name));
-    expect(qqNapcat.map((t) => t.name).sort()).toEqual([...NAPCAT_TOOLS].sort());
+    const qqKujira = (asmQq.tools as any[]).filter((t) => KUJIRA_TOOLS.has(t.name));
+    expect(qqKujira.map((t) => t.name).sort()).toEqual([...KUJIRA_TOOLS].sort());
   });
 
   it('断言 7: 审批本轮唤醒者追踪器真实装配，并经 session/event 严格绑定与清理', async () => {
-    const sessionManager: any = (booted.ctx as any)['napcat-session'];
+    const sessionManager: any = (booted.ctx as any)['kujira-session'];
     expect(sessionManager).toBeDefined();
 
     const tracker = sessionManager.getTurnInitiatorTracker?.();
     expect(tracker).toBeDefined();
 
     const handle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-1003',
+      sessionId: `${MOCK_SESSION_BASE}-3`,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: path.join(tmpHome, 'qq-ws-3') },
+      meta: { cwd: path.join(tmpHome, 'kujira-ws-3') },
     });
     const agent = handle.agent || handle;
     const session = agent.session;
@@ -224,10 +230,10 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
       source: { kind: 'user' },
     });
 
-    expect(tracker.expect(userMsg.id, session.id, '1000000002')).toBe(true);
+    expect(tracker.expect(userMsg.id, session.id, MOCK_OPENID)).toBe(true);
     session.append('turn/start', { turn: 1 });
     session.append('user/message', userMsg, { surfaceOp: 'append' });
-    expect(tracker.getInitiator(session.id)).toBe('1000000002');
+    expect(tracker.getInitiator(session.id)).toBe(MOCK_OPENID);
 
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
     expect(tracker.getInitiator(session.id)).toBeUndefined();

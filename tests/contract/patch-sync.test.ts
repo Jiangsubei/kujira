@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as yaml from 'js-yaml';
 import {
   QQ_PRESET_ID,
+  QQ_PRESET_NAME,
   QQ_PRESET_PERSONA_PREFIX,
   QQ_PRESET_PLUGINS,
 } from '../../src/constants/preset.js';
@@ -15,12 +16,14 @@ describe('cordis.patch.yml 与预设单一真相源同步契约测试', () => {
     expect(fs.existsSync(patchPath)).toBe(true);
   });
 
-  it('cordis.patch.yml 中的 preset-qq-session 必须包含所有必要插件与最新提示词', () => {
+  it('cordis.patch.yml 中的 kujira 与 preset-kujira-session 必须包含所有必要插件与最新提示词', () => {
     const rawContent = fs.readFileSync(patchPath, 'utf8');
 
     // 1. 文本层面核验 !!js 关键字段与提示词
     expect(rawContent).toContain('tool-ask-user');
     expect(rawContent).toContain('@deepseek-ai/dsh-tool-ask-user');
+    expect(rawContent).toContain('kujira-tools');
+    expect(rawContent).toContain('kujira/tools');
     // YAML 以 JSON 字符串形式写入 prefix，多段文本中的换行会被转义为 \n
     expect(rawContent).toContain(JSON.stringify(QQ_PRESET_PERSONA_PREFIX));
 
@@ -43,11 +46,16 @@ describe('cordis.patch.yml 与预设单一真相源同步契约测试', () => {
     const insertBlock = parsed.find((item: any) => Array.isArray(item.insert));
     expect(insertBlock).toBeDefined();
 
+    const kujiraEntry = insertBlock.insert.find((entry: any) => entry.id === 'kujira');
+    expect(kujiraEntry).toBeDefined();
+    expect(kujiraEntry.name).toBe('kujira');
+
     const qqPresetEntry = insertBlock.insert.find(
-      (entry: any) => entry.id === 'preset-qq-session'
+      (entry: any) => entry.id === 'preset-kujira-session'
     );
     expect(qqPresetEntry).toBeDefined();
     expect(qqPresetEntry.config?.id).toBe(QQ_PRESET_ID);
+    expect(qqPresetEntry.config?.name).toBe(QQ_PRESET_NAME);
 
     const plugins: any[] = qqPresetEntry.config?.plugins;
     expect(Array.isArray(plugins)).toBe(true);
