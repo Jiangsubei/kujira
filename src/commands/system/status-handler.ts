@@ -1,9 +1,10 @@
 /**
- * dsh-napcat-bridge: /状态 命令处理器
+ * kujira: /状态 命令处理器
  */
 
 import { parseSessionId } from '../../gateway/session.js';
 import { safeGetService } from '../../gateway/session/agent-runner.js';
+import type { GatewayStatus } from '../../gateway/server.js';
 import { formatTokens } from '../utils/usage.js';
 import { getModelReasoningInfo } from '../model/reasoning.js';
 import type { CommandContext, CommandResult } from '../types.js';
@@ -22,6 +23,29 @@ export async function handleStatusCommand(
     statusStr = `正在运行（轮次 #${activeTurn}）`;
   } else if (isBusy) {
     statusStr = '正在运行';
+  }
+
+  let gatewayLine: string | undefined;
+  const gateway =
+    safeGetService(context.ctx, 'kujira-gateway') || (context.ctx as any)?.['kujira-gateway'];
+  if (gateway && typeof gateway.getStatus === 'function') {
+    try {
+      const st = gateway.getStatus() as GatewayStatus | undefined;
+      if (st?.connected) {
+        const detail = st.ready
+          ? st.botName || st.botId
+            ? `${st.botName || 'Bot'}${st.botId ? ` (${st.botId})` : ''}`
+            : '就绪'
+          : '握手中';
+        gatewayLine = `网关状态：已连接 (${detail})`;
+      } else {
+        const retrySuffix =
+          typeof st?.reconnectAttempts === 'number' && st.reconnectAttempts > 0
+            ? ` (重连尝试 ${st.reconnectAttempts})`
+            : '';
+        gatewayLine = `网关状态：未连接${retrySuffix}`;
+      }
+    } catch {}
   }
 
   const agents = safeGetService(context.ctx, 'agents');
@@ -87,6 +111,7 @@ export async function handleStatusCommand(
 
   const lines = [
     '【当前会话状态】',
+    ...(gatewayLine ? [gatewayLine] : []),
     `运行状态：${statusStr}`,
     `当前模型：${curProv} / ${curMod}`,
     `思考等级：${effortStr}`,

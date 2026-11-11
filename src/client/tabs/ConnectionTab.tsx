@@ -1,22 +1,39 @@
 import React from 'react';
-import { ValueField } from '../fields.js';
-import { cardStyle } from '../card-styles.js';
-import type { BridgePluginConfig } from '../../types/index.js';
-import { DEFAULT_WS_PORT } from '../../constants/index.js';
-import type { NapCatFormModel } from '../model.js';
+import { SwitchField, ValueField } from '../fields.js';
+import { cardStyle, fieldStyle } from '../card-styles.js';
+import type {
+  BridgePluginConfig,
+  CredentialSlotStatus,
+  CredentialStatusSummary,
+} from '../../types/index.js';
+import {
+  DEFAULT_IMAGE_TTL_DAYS,
+  DEFAULT_INPUT_NOTIFY_ENABLED,
+  DEFAULT_MARKDOWN_ENABLED,
+  DEFAULT_NEW_MESSAGE_BEHAVIOR,
+} from '../../constants/index.js';
+import type { KujiraFormModel } from '../model.js';
 
 export interface ConnectionTabProps {
   active: boolean;
   draft: Partial<BridgePluginConfig>;
-  model: NapCatFormModel;
+  model: KujiraFormModel;
   saving: boolean;
-  hasSecret: boolean;
-  adminsInput: string;
-  aliasesInput: string;
+  credentialsStatus: CredentialStatusSummary;
+  appIdInput: string;
+  appSecretInput: string;
+  onAppIdChange: (val: string) => void;
+  onAppSecretChange: (val: string) => void;
   onFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
   onResetField: (key: keyof BridgePluginConfig) => void;
-  onAdminsChange: (raw: string) => void;
-  onAliasesChange: (raw: string) => void;
+}
+
+function renderCredentialBadge(slot: CredentialSlotStatus): React.JSX.Element {
+  if (slot.configured) {
+    const sourceSuffix = slot.source ? ` (来源: ${slot.source})` : '';
+    return <span className={fieldStyle.badge}>{`已配置${sourceSuffix}`}</span>;
+  }
+  return <span className={fieldStyle.badgeMuted}>未配置</span>;
 }
 
 export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
@@ -25,21 +42,21 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
     draft,
     model,
     saving,
-    hasSecret,
-    adminsInput,
-    aliasesInput,
+    credentialsStatus,
+    appIdInput,
+    appSecretInput,
+    onAppIdChange,
+    onAppSecretChange,
     onFieldChange,
     onResetField,
-    onAdminsChange,
-    onAliasesChange,
   } = props;
 
   return (
     <div
-      id="napcat-tabpanel-connection"
-      data-testid="napcat-tabpanel-connection"
+      id="kujira-tabpanel-connection"
+      data-testid="kujira-tabpanel-connection"
       role="tabpanel"
-      aria-labelledby="napcat-tab-connection"
+      aria-labelledby="kujira-tab-connection"
       hidden={!active}
       className={[
         cardStyle.tabPanel,
@@ -48,81 +65,113 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
       style={!active ? { display: 'none' } : undefined}
     >
       <ValueField
-        id="napcat-ws-port"
-        label="WebSocket 监听端口 (ws_port)"
-        hint="NapCat 连接的反向 WebSocket 服务端端口 (默认 8080)"
-        placeholder="8080"
-        numeric
-        value={String(draft.ws_port ?? DEFAULT_WS_PORT)}
-        disabled={saving}
-        overridden={model.isOverridden('ws_port')}
-        onReset={() => onResetField('ws_port')}
-        onChange={(val) => onFieldChange('ws_port', parseInt(val, 10) || DEFAULT_WS_PORT)}
-      />
-
-      <ValueField
-        id="napcat-ws-token"
-        label="WebSocket 鉴权 Token (ws_token) *"
+        id="kujira-cred-app-id"
+        label="Bot AppID (QQ_BOT_APP_ID)"
         hint={
-          hasSecret
-            ? '当前已配置鉴权 Token；留空保存将保留现有 Token，输入新值将覆盖更新'
-            : 'NapCat 请求 Authorization 头 Bearer Token 鉴权 (必填，空着直接拒绝连接)'
+          credentialsStatus.appId.configured
+            ? '当前已配置 AppID；采用只写保护（绝不回显明文），留空将保留现有凭据，输入新值将持久化至 DSH 凭据库并触发重连'
+            : '请填写 QQ 开放平台机器人 AppID（安全存储于 DSH .credentials.yaml，不会写入普通配置文件）'
         }
-        placeholder={hasSecret ? '已配置（已脱敏，留空保持不变）' : '必填，请输入与 NapCat 一致的 Token'}
-        value={draft.ws_token || ''}
+        placeholder={
+          credentialsStatus.appId.configured
+            ? '已配置（只写保护，留空保持不变）'
+            : '请输入 QQ Bot AppID'
+        }
+        inputType="text"
+        autoComplete="off"
+        value={appIdInput}
         disabled={saving}
-        overridden={model.isOverridden('ws_token')}
-        onReset={() => onResetField('ws_token')}
-        onChange={(val) => onFieldChange('ws_token', val)}
+        statusBadge={renderCredentialBadge(credentialsStatus.appId)}
+        onChange={onAppIdChange}
       />
 
       <ValueField
-        id="napcat-bot-qq"
-        label="Bot 自身 QQ 号 (bot_qq)"
-        hint="机器人的 QQ 号，用于过滤自我消息循环与 At 唤醒精准比对"
-        placeholder="例如: 3889001234"
-        value={draft.bot_qq || ''}
+        id="kujira-cred-app-secret"
+        label="Bot AppSecret (QQ_BOT_SECRET)"
+        hint={
+          credentialsStatus.appSecret.configured
+            ? '当前已配置 AppSecret；采用只写保护（绝不回显明文），留空将保留现有密钥，输入新值将覆盖更新并触发重连'
+            : '请填写 QQ 开放平台机器人 AppSecret（安全存储于 DSH .credentials.yaml）'
+        }
+        placeholder={
+          credentialsStatus.appSecret.configured
+            ? '已配置（只写保护，留空保持不变）'
+            : '请输入 QQ Bot AppSecret'
+        }
+        inputType="password"
+        autoComplete="new-password"
+        value={appSecretInput}
         disabled={saving}
-        overridden={model.isOverridden('bot_qq')}
-        onReset={() => onResetField('bot_qq')}
-        onChange={(val) => onFieldChange('bot_qq', val)}
+        statusBadge={renderCredentialBadge(credentialsStatus.appSecret)}
+        onChange={onAppSecretChange}
       />
 
-      <ValueField
-        id="napcat-admins"
-        label="管理员 QQ 白名单 (admins)"
-        hint="拥有斜杠命令执行权限的 QQ 号列表（支持英文逗号、中文逗号或空格分隔）"
-        placeholder="例如: 10001, 10002"
-        value={adminsInput}
+      <SwitchField
+        id="kujira-markdown-enabled"
+        label="启用单聊原生 Markdown (markdown_enabled)"
+        hint="使用 QQ 官方 Bot 单聊原生 Markdown 消息类型发送回复 (msg_type=2，支持表格、代码块与链接，默认开启)"
+        checked={draft.markdown_enabled ?? DEFAULT_MARKDOWN_ENABLED}
         disabled={saving}
-        overridden={model.isOverridden('admins')}
-        onReset={() => onResetField('admins')}
-        onChange={onAdminsChange}
+        overridden={model.isOverridden('markdown_enabled')}
+        onReset={() => onResetField('markdown_enabled')}
+        onChange={(checked) => onFieldChange('markdown_enabled', checked)}
       />
 
-      <ValueField
-        id="napcat-aliases"
-        label="Bot 唤醒别名列表 (aliases)"
-        hint="群聊中前缀点名唤醒机器人的别名列表（支持英文逗号、中文逗号或空格分隔）"
-        placeholder="例如: 助手, bot, 小明"
-        value={aliasesInput}
+      <SwitchField
+        id="kujira-input-notify-enabled"
+        label="启用「对方正在输入...」提示 (input_notify_enabled)"
+        hint="收到单聊消息开始生成回复时下发输入状态提示 (msg_type=6，默认开启)"
+        checked={draft.input_notify_enabled ?? DEFAULT_INPUT_NOTIFY_ENABLED}
         disabled={saving}
-        overridden={model.isOverridden('aliases')}
-        onReset={() => onResetField('aliases')}
-        onChange={onAliasesChange}
+        overridden={model.isOverridden('input_notify_enabled')}
+        onReset={() => onResetField('input_notify_enabled')}
+        onChange={(checked) => onFieldChange('input_notify_enabled', checked)}
       />
 
+      <div className={fieldStyle.field}>
+        <div className={fieldStyle.head}>
+          <label htmlFor="kujira-new-message-behavior" className={fieldStyle.label}>
+            新消息行为 (new_message_behavior)
+          </label>
+          {model.isOverridden('new_message_behavior') && (
+            <div className={fieldStyle.badges}>
+              <span className={fieldStyle.badge}>已自定义</span>
+              <button
+                type="button"
+                className={fieldStyle.reset}
+                onClick={() => onResetField('new_message_behavior')}
+              >
+                重置
+              </button>
+            </div>
+          )}
+        </div>
+        <select
+          id="kujira-new-message-behavior"
+          className={fieldStyle.input}
+          disabled={saving}
+          value={draft.new_message_behavior || DEFAULT_NEW_MESSAGE_BEHAVIOR}
+          onChange={(e) => onFieldChange('new_message_behavior', e.target.value as any)}
+        >
+          <option value="steer">及时插话 (steer) - 等待当前 Step 完成后立即接纳新消息并调整行动</option>
+          <option value="queue">加入队列 (queue) - 等待当前轮次（Turn）完全结束后依次排队执行</option>
+        </select>
+        <p className={fieldStyle.hint}>
+          一轮 Agent 循环正在进行时收到单聊新消息的处理行为。即时对话场景推荐「及时插话」。
+        </p>
+      </div>
+
       <ValueField
-        id="napcat-image-ttl"
+        id="kujira-image-ttl"
         label="多媒体文件缓存 TTL 天数 (image_ttl_days)"
-        hint="接收与生成的图片/文件在本地的保留天数，过期定时自动清理 (默认 7)"
-        placeholder="7"
+        hint="接收与生成的图片/音视频/文件在本地的保留天数，过期定时自动清理 (默认 7)"
+        placeholder={String(DEFAULT_IMAGE_TTL_DAYS)}
         numeric
-        value={String(draft.image_ttl_days ?? 7)}
+        value={String(draft.image_ttl_days ?? DEFAULT_IMAGE_TTL_DAYS)}
         disabled={saving}
         overridden={model.isOverridden('image_ttl_days')}
         onReset={() => onResetField('image_ttl_days')}
-        onChange={(val) => onFieldChange('image_ttl_days', parseInt(val, 10) || 7)}
+        onChange={(val) => onFieldChange('image_ttl_days', parseInt(val, 10) || DEFAULT_IMAGE_TTL_DAYS)}
       />
     </div>
   );

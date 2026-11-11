@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 会话持久化与物理磁盘有效性探查模块
+ * kujira: 会话持久化与物理磁盘有效性探查模块
  * 负责与 SQLite 数据库同步会话状态，并双向校验磁盘物理会话日志存活性。
  */
 
@@ -36,6 +36,25 @@ export class SessionPersistenceManager {
 
   public saveSessionState(state: any): void {
     this.db?.saveSessionState?.(state);
+  }
+
+  /**
+   * 从历史入站消息中读取对端最近非空发送者名称（供无用户名字段的 C2C 场景补全昵称）
+   */
+  public getLatestInboundSenderName(peer: string): string | undefined {
+    try {
+      const history = this.db?.readHistory?.(peer, {
+        exclude_self: true,
+        limit: 5,
+        order: 'desc',
+      });
+      if (!history?.messages) return undefined;
+      for (const msg of history.messages) {
+        const name = typeof msg.sender_name === 'string' ? msg.sender_name.trim() : '';
+        if (name) return name;
+      }
+    } catch {}
+    return undefined;
   }
 
   /**

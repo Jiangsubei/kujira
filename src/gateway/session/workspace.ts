@@ -1,13 +1,13 @@
 /**
- * dsh-napcat-bridge: 工作区与 CWD 解析模块
- * 负责解析 DSH 宿主环境根路径、为对端分配独立隔离的工作区目录，并注册至 DSH 工作区服务。
+ * kujira: 工作区与 CWD 解析模块
+ * 负责解析 DSH 宿主环境根路径、为单聊统一分配 Kujira 工作区目录，并注册至 DSH 工作区服务。
  */
 
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { promises as fsp } from 'node:fs';
 import type { Context } from '@deepseek-ai/cordis';
-import { DEFAULT_WORKSPACE_ROOT } from '../../constants/index.js';
+import { DEFAULT_WORKSPACE_ROOT, PLUGIN_NAME } from '../../constants/index.js';
 import { resolveDshPath } from '../../utils/path.js';
 
 export class SessionWorkspaceManager {
@@ -31,7 +31,7 @@ export class SessionWorkspaceManager {
   public async registerWorkspace(
     cwd: string,
     sessionId?: string,
-    title = 'NapCat'
+    title = 'Kujira'
   ): Promise<void> {
     const wsRegistry = this.ctx?.get?.('workspaceRegistry') || (this.ctx as any)?.workspaceRegistry;
     if (!wsRegistry || typeof wsRegistry.create !== 'function') return;
@@ -46,7 +46,7 @@ export class SessionWorkspaceManager {
         await ws.attachSession(sessionId).catch(() => {});
       }
     } catch (err) {
-      this.ctx?.logger?.('dsh-napcat-bridge')?.warn?.(`[SessionWorkspaceManager] 注册工作区 ${cwd} 失败:`, err);
+      this.ctx?.logger?.(PLUGIN_NAME)?.warn?.(`[SessionWorkspaceManager] 注册工作区 ${cwd} 失败:`, err);
     }
   }
 }

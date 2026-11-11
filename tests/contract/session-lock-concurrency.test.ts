@@ -3,21 +3,33 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { Context } from '@deepseek-ai/cordis';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import {
   SessionManager,
   SessionAlreadyOwnedError,
   RemoteError,
 } from '../../src/gateway/session.js';
 import { MessageDatabase } from '../../src/storage/database.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
-describe('契约测试: DSH 0.1.5 会话排他锁、退避重试、live agent 复用不抢占与 Web UI 只读守护 (Session Lock & Concurrency Contract)', () => {
+const PEER_1 = openidToPeer('10000000000000000000000000000001');
+const SID_1 = openidToSessionBaseId('10000000000000000000000000000001');
+const PEER_2 = openidToPeer('10000000000000000000000000000002');
+const SID_2 = openidToSessionBaseId('10000000000000000000000000000002');
+const PEER_3 = openidToPeer('10000000000000000000000000000003');
+const SID_3 = openidToSessionBaseId('10000000000000000000000000000003');
+const PEER_4 = openidToPeer('10000000000000000000000000000004');
+const SID_4 = openidToSessionBaseId('10000000000000000000000000000004');
+const PEER_5 = openidToPeer('10000000000000000000000000000012');
+const SID_5 = openidToSessionBaseId('10000000000000000000000000000012');
+
+describe('契约测试: DSH 会话排他锁、退避重试、live agent 复用不抢占与 Web UI 只读守护 (Session Lock & Concurrency Contract)', () => {
   let tmpHome: string;
   let booted: BootedDsh | null = null;
   let db: MessageDatabase | null = null;
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-lock-concurrency-'));
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-lock-concurrency-'));
   });
 
   afterEach(async () => {
@@ -52,26 +64,25 @@ describe('契约测试: DSH 0.1.5 会话排他锁、退避重试、live agent �
     };
     (ctx as any).agents = mockAgents;
 
-    // 传入极短重试延迟以加速单测执行 (10ms, 20ms, 30ms)
     const sessionManager = new SessionManager(ctx, tmpHome, undefined, {
       retryDelays: [10, 20, 30],
     });
 
-    await expect(sessionManager.getOrCreateAgent('user_1000000001')).rejects.toThrow(
-      /会话 qq-user-1000000001 当前正被其他控制台或任务占用（排他锁冲突）/
+    await expect(sessionManager.getOrCreateAgent(PEER_1)).rejects.toThrow(
+      new RegExp(`会话 ${SID_1} 当前正被其他控制台或任务占用（排他锁冲突）`)
     );
 
-    // 验证 resume 重试了 3 次
     expect(resumeAttempts).toBe(3);
-    // 关键质量红线：绝不能为了兜底而调用 agents.create，避免连环崩溃 (SessionAlreadyExistsError)
     expect(createAttempts).toBe(0);
     expect(mockAgents.create).not.toHaveBeenCalled();
+
+    await sessionManager.dispose();
   });
 
   it('契约 2: 前置重试捕获 SessionAlreadyOwnedError，后续重试锁释放成功恢复会话', async () => {
     const ctx = new Context();
     let resumeAttempts = 0;
-    const fakeSession = { id: 'qq-user-1000000002' };
+    const fakeSession = { id: SID_2 };
     const fakeAgent = { session: fakeSession, cancel: vi.fn() };
     const fakeHandle = { agent: fakeAgent, dispose: vi.fn() };
 
@@ -92,32 +103,28 @@ describe('契约测试: DSH 0.1.5 会话排他锁、退避重试、live agent �
       retryDelays: [10, 20, 30],
     });
 
-    const agent = await sessionManager.getOrCreateAgent('user_1000000002');
+    const agent = await sessionManager.getOrCreateAgent(PEER_2);
     expect(agent).toBe(fakeAgent);
     expect(resumeAttempts).toBe(3);
-    expect(sessionManager.hasActiveHandle('qq-user-1000000002')).toBe(true);
-    expect(sessionManager.getActiveHandle('qq-user-1000000002')).toBe(fakeHandle);
+    expect(sessionManager.hasActiveHandle(SID_2)).toBe(true);
+    expect(sessionManager.getActiveHandle(SID_2)).toBe(fakeHandle);
     expect(mockAgents.create).not.toHaveBeenCalled();
+
+    await sessionManager.dispose();
   });
 
-  it('契约 3: 内存中存在 live agent（0.1.5 bare Agent，无 handle）时只复用：绝不 cancel 在途回合、绝不重建会话', async () => {
+  it('契约 3: 内存中存在 live agent（bare Agent，无 handle）时只复用：绝不 cancel 在途回合、绝不重建会话', async () => {
     const ctx = new Context();
-    const sessionId = 'qq-group-2000000003';
-
-    // 模拟其它 owner（如 Web UI 会话控制器）持有的 live agent：
-    // 0.1.5 下 ctx.agents.get() 只返回 bare Agent —— 真实 Agent **没有** handle 属性
-    // （AgentHandle { agent, dispose } 只暴露给创建者），故此处 mock 不得再挂 handle。
     const oldCancelMock = vi.fn();
     const fakeLiveAgent = {
-      id: sessionId,
-      session: { id: sessionId },
+      id: SID_3,
+      session: { id: SID_3 },
       status: 'running',
       cancel: oldCancelMock,
       followup: vi.fn(),
     };
 
-    // 内存中有该 agent，但 QQ 的 activeHandles 中没有
-    const agentStore = new Map<string, any>([[sessionId, fakeLiveAgent]]);
+    const agentStore = new Map<string, any>([[SID_3, fakeLiveAgent]]);
 
     const mockAgents = {
       get: vi.fn().mockImplementation((id: string) => agentStore.get(id)),
@@ -130,24 +137,21 @@ describe('契约测试: DSH 0.1.5 会话排他锁、退避重试、live agent �
       retryDelays: [10, 20, 30],
     });
 
-    expect(sessionManager.hasActiveHandle(sessionId)).toBe(false);
+    expect(sessionManager.hasActiveHandle(SID_3)).toBe(false);
 
-    // QQ 收到消息触发 getOrCreateAgent
-    const agent = await sessionManager.getOrCreateAgent('group_2000000003');
+    const agent = await sessionManager.getOrCreateAgent(PEER_3);
 
-    // 核心红线：复用同一 live agent（串行排队交给 followup），绝不取消在途回合
     expect(agent).toBe(fakeLiveAgent);
     expect(oldCancelMock).not.toHaveBeenCalled();
-    // 不得为"抢占"而 resume / create 重建会话
     expect(mockAgents.resume).not.toHaveBeenCalled();
     expect(mockAgents.create).not.toHaveBeenCalled();
+
+    await sessionManager.dispose();
   });
 
-  it('契约 4: Web UI 只读锁定与拦截守护：QQ 独占活跃时拒绝 Web prompt 并返回标准 RemoteError', async () => {
+  it('契约 4: Web UI 只读锁定与拦截守护：QQ Kujira 独占活跃时拒绝 Web prompt 并返回标准 RemoteError', async () => {
     const ctx = new Context();
-    const sessionId = 'qq-user-1000000004';
-
-    const fakeAgent = { id: sessionId, session: { id: sessionId }, cancel: vi.fn() };
+    const fakeAgent = { id: SID_4, session: { id: SID_4 }, cancel: vi.fn() };
     const fakeHandle = { agent: fakeAgent, dispose: vi.fn() };
 
     (ctx as any).agents = {
@@ -164,23 +168,20 @@ describe('契约测试: DSH 0.1.5 会话排他锁、退避重试、live agent �
 
     const sessionManager = new SessionManager(ctx, tmpHome);
 
-    // 1. 在 QQ 尚未持有该会话时，Web 端 prompt 正常放行
     const preResult = await mockSessionController.prompt({
-      sessionId,
+      sessionId: SID_4,
       content: [{ type: 'text', text: 'hi from web' }],
     });
     expect(preResult).toEqual({ accepted: true });
     expect(originalPromptMock).toHaveBeenCalledTimes(1);
 
-    // 2. QQ 收到消息并获取/激活会话
-    await sessionManager.getOrCreateAgent('user_1000000004');
-    expect(sessionManager.hasActiveHandle(sessionId)).toBe(true);
+    await sessionManager.getOrCreateAgent(PEER_4);
+    expect(sessionManager.hasActiveHandle(SID_4)).toBe(true);
 
-    // 3. 此时 Web 端再次尝试调用 sessionController.prompt 向该会话发消息 -> 必须被拦截并抛出 RemoteError
     let thrownError: any = null;
     try {
       await mockSessionController.prompt({
-        sessionId,
+        sessionId: SID_4,
         content: [{ type: 'text', text: 'hi again from web' }],
       });
     } catch (err: any) {
@@ -191,47 +192,43 @@ describe('契约测试: DSH 0.1.5 会话排他锁、退避重试、live agent �
     expect(thrownError).toBeInstanceOf(RemoteError);
     expect(thrownError.code).toBe('session/agent-busy');
     expect(thrownError.isDSHRemoteError).toBe(true);
-    expect(thrownError.message).toContain('该会话当前正由 QQ 独占使用中，Web 端处于只读监视模式');
-    // Web prompt 被拦截后，原函数未被二次调用
+    expect(thrownError.message).toContain('该会话当前正由 QQ Kujira 独占使用中，Web 端处于只读监视模式');
     expect(originalPromptMock).toHaveBeenCalledTimes(1);
 
-    // 4. 当 QQ 释放该会话后，Web 端 prompt 恢复正常
-    await sessionManager.releaseActiveHandle(sessionId);
-    expect(sessionManager.hasActiveHandle(sessionId)).toBe(false);
+    await sessionManager.releaseActiveHandle(SID_4);
+    expect(sessionManager.hasActiveHandle(SID_4)).toBe(false);
 
     const postResult = await mockSessionController.prompt({
-      sessionId,
+      sessionId: SID_4,
       content: [{ type: 'text', text: 'hi after qq released' }],
     });
     expect(postResult).toEqual({ accepted: true });
     expect(originalPromptMock).toHaveBeenCalledTimes(2);
+
+    await sessionManager.dispose();
   });
 
   it('契约 5: 真实装配路径下 SessionManager 守卫 sessionController.prompt 拦截闭环验证', async () => {
-    booted = await bootDshNapcatBridge({
+    booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: false,
     });
 
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
-    const sessionId = 'qq-group-3000000012';
 
-    // 注入模拟的 sessionController 挂入 booted.ctx
     const realPromptMock = vi.fn().mockResolvedValue({ accepted: true });
     (booted.ctx as any).sessionController = {
       prompt: realPromptMock,
     };
     sessionManager.guardSessionController();
 
-    // 唤醒并获取 QQ Agent
-    const agent = await sessionManager.getOrCreateAgent('group_3000000012');
-    expect(agent.session.id).toBe(sessionId);
-    expect(sessionManager.hasActiveHandle(sessionId)).toBe(true);
+    const agent = await sessionManager.getOrCreateAgent(PEER_5);
+    expect(agent.session.id).toBe(SID_5);
+    expect(sessionManager.hasActiveHandle(SID_5)).toBe(true);
 
-    // Web 端向群聊会话发送消息，验证拦截
     await expect(
       (booted.ctx as any).sessionController.prompt({
-        sessionId,
+        sessionId: SID_5,
         content: [{ type: 'text', text: 'interception test' }],
       })
     ).rejects.toThrow(RemoteError);

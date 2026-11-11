@@ -4,7 +4,14 @@ import { cardStyle, fieldStyle, faceStyle } from '../card-styles.js';
 import { IconUpload, IconEdit, IconTrash, IconBan } from '../icons.js';
 import { parseStringToArray } from '../utils.js';
 import type { BridgePluginConfig } from '../../types/index.js';
-import type { NapCatFormModel } from '../model.js';
+import {
+  DEFAULT_FACE_EVICT_POLICY,
+  DEFAULT_FACE_STORE_DIR,
+  DEFAULT_FACE_STORE_MAX,
+} from '../../constants/index.js';
+import type { KujiraFormModel } from '../model.js';
+
+const FACES_ENDPOINT = '/plugins/kujira/faces';
 
 export interface FaceItem {
   id: string;
@@ -25,7 +32,7 @@ export interface PendingUpload {
 export interface FaceTabProps {
   active: boolean;
   draft: Partial<BridgePluginConfig>;
-  model: NapCatFormModel;
+  model: KujiraFormModel;
   saving: boolean;
   onFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
   onResetField: (key: keyof BridgePluginConfig) => void;
@@ -49,7 +56,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
   const loadFaces = useCallback(async () => {
     setFacesLoading(true);
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/faces');
+      const res = await fetch(FACES_ENDPOINT);
       if (!res.ok) return;
       const data = await res.json();
       if (data?.ok && Array.isArray(data.faces)) {
@@ -94,7 +101,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
     onError?.(null);
     try {
       const parsedTags = parseStringToArray(uploadTags);
-      const res = await fetch('/plugins/dsh-napcat-bridge/faces', {
+      const res = await fetch(FACES_ENDPOINT, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -121,7 +128,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
 
   const handleDeleteFace = async (id: string) => {
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/faces/delete', {
+      const res = await fetch(`${FACES_ENDPOINT}/delete`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ id }),
@@ -136,7 +143,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
   const handleSaveEditFace = async (id: string) => {
     try {
       const parsedTags = parseStringToArray(editingTags);
-      const res = await fetch('/plugins/dsh-napcat-bridge/faces/edit', {
+      const res = await fetch(`${FACES_ENDPOINT}/edit`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -155,10 +162,10 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
 
   return (
     <div
-      id="napcat-tabpanel-face"
-      data-testid="napcat-tabpanel-face"
+      id="kujira-tabpanel-face"
+      data-testid="kujira-tabpanel-face"
       role="tabpanel"
-      aria-labelledby="napcat-tab-face"
+      aria-labelledby="kujira-tab-face"
       hidden={!active}
       className={[
         cardStyle.tabPanel,
@@ -167,7 +174,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
       style={!active ? { display: 'none' } : undefined}
     >
       <SwitchField
-        id="napcat-face-enabled"
+        id="kujira-face-enabled"
         label="装载表情包工具集 (face_enabled)"
         hint="控制新建会话是否在预设中包含表情包工具集，保存后对后续新会话生效"
         checked={Boolean(draft.face_enabled)}
@@ -180,21 +187,23 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
       {draft.face_enabled && (
         <>
           <ValueField
-            id="napcat-face-store-max"
+            id="kujira-face-store-max"
             label="表情库容量上限 (face_store_max)"
-            hint="本地表情库最多保存多少张可用表情（默认 100 张）"
-            placeholder="100"
+            hint={`本地表情库最多保存多少张可用表情（默认 ${DEFAULT_FACE_STORE_MAX} 张）`}
+            placeholder={String(DEFAULT_FACE_STORE_MAX)}
             numeric
-            value={String(draft.face_store_max ?? 100)}
+            value={String(draft.face_store_max ?? DEFAULT_FACE_STORE_MAX)}
             disabled={saving}
             overridden={model.isOverridden('face_store_max')}
             onReset={() => onResetField('face_store_max')}
-            onChange={(val) => onFieldChange('face_store_max', parseInt(val, 10) || 100)}
+            onChange={(val) =>
+              onFieldChange('face_store_max', parseInt(val, 10) || DEFAULT_FACE_STORE_MAX)
+            }
           />
 
           <div className={fieldStyle.field}>
             <div className={fieldStyle.head}>
-              <label htmlFor="napcat-face-evict-policy" className={fieldStyle.label}>
+              <label htmlFor="kujira-face-evict-policy" className={fieldStyle.label}>
                 满额淘汰策略 (face_evict_policy)
               </label>
               {model.isOverridden('face_evict_policy') && (
@@ -211,10 +220,10 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
               )}
             </div>
             <select
-              id="napcat-face-evict-policy"
+              id="kujira-face-evict-policy"
               className={fieldStyle.input}
               disabled={saving}
-              value={draft.face_evict_policy || 'reject'}
+              value={draft.face_evict_policy || DEFAULT_FACE_EVICT_POLICY}
               onChange={(e) => onFieldChange('face_evict_policy', e.target.value as any)}
             >
               <option value="reject">拒绝新增 (reject) - 满额后停止收录，不删旧表情</option>
@@ -224,18 +233,17 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
           </div>
 
           <ValueField
-            id="napcat-face-store-dir"
+            id="kujira-face-store-dir"
             label="表情库存储目录 (face_store_dir)"
-            hint="本地表情图片原图落盘存储目录 (默认 .dsh/napcat/faces)"
-            placeholder=".dsh/napcat/faces"
-            value={draft.face_store_dir || '.dsh/napcat/faces'}
+            hint={`本地表情图片原图落盘存储目录 (默认 ${DEFAULT_FACE_STORE_DIR})`}
+            placeholder={DEFAULT_FACE_STORE_DIR}
+            value={draft.face_store_dir || DEFAULT_FACE_STORE_DIR}
             disabled={saving}
             overridden={model.isOverridden('face_store_dir')}
             onReset={() => onResetField('face_store_dir')}
             onChange={(val) => onFieldChange('face_store_dir', val)}
           />
 
-          {/* 上传操作栏 (标准按钮触发文件选择，输入框移至选择图片后的确认弹窗内) */}
           <input
             ref={fileInputRef}
             type="file"
@@ -243,10 +251,10 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
             style={{ display: 'none' }}
             onChange={handleFileSelect}
           />
-          <div className={`napcat-face-upload-bar ${faceStyle.uploadBar}`}>
+          <div className={`kujira-face-upload-bar ${faceStyle.uploadBar}`}>
             <button
               type="button"
-              className={`napcat-face-upload-btn ${cardStyle.discard}`}
+              className={`kujira-face-upload-btn ${cardStyle.discard}`}
               onClick={() => fileInputRef.current?.click()}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
             >
@@ -258,8 +266,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
             </span>
           </div>
 
-          {/* 资产画廊区 (严格契合 DSH 主题设计，空状态居中展示静止符号，多图真实渲染且上下间距大于左右) */}
-          <div className={`napcat-face-gallery ${faceStyle.gallery}`}>
+          <div className={`kujira-face-gallery ${faceStyle.gallery}`}>
             <div className={faceStyle.galleryHead}>
               <h4 className={faceStyle.galleryTitle}>已收录表情包资产 ({faces.length})</h4>
               <p className={faceStyle.gallerySub}>
@@ -268,14 +275,14 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
             </div>
 
             {faces.length === 0 ? (
-              <div className={`napcat-face-empty ${faceStyle.empty}`}>
+              <div className={`kujira-face-empty ${faceStyle.empty}`}>
                 <IconBan size={36} />
                 <p className={faceStyle.emptyText}>
                   {facesLoading ? '正在加载表情库...' : '暂未收录表情包，点击上方「上传表情」即可添加'}
                 </p>
               </div>
             ) : (
-              <div className={`napcat-face-grid ${faceStyle.grid}`}>
+              <div className={`kujira-face-grid ${faceStyle.grid}`}>
                 {faces.map((f) => (
                   <div key={f.id} className={faceStyle.card}>
                     <div className={faceStyle.cardPreview}>
@@ -285,11 +292,10 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
                       {f.tags.length > 0 ? f.tags.join(', ') : f.id}
                     </div>
 
-                    {/* 操作按钮区：线性 SVG 铅笔与垃圾桶 */}
                     <div className={faceStyle.cardActions}>
                       <button
                         type="button"
-                        className={`napcat-face-edit-btn ${faceStyle.actionBtn}`}
+                        className={`kujira-face-edit-btn ${faceStyle.actionBtn}`}
                         title="编辑表情标签与情绪"
                         onClick={() => {
                           if (editingFaceId === f.id) {
@@ -305,7 +311,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
                       </button>
                       <button
                         type="button"
-                        className={`napcat-face-delete-btn ${faceStyle.actionBtn} ${faceStyle.actionDelete}`}
+                        className={`kujira-face-delete-btn ${faceStyle.actionBtn} ${faceStyle.actionDelete}`}
                         title="删除表情包 (保留 7 天后悔期)"
                         onClick={() => handleDeleteFace(f.id)}
                       >
@@ -313,9 +319,8 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
                       </button>
                     </div>
 
-                    {/* 画框范围内内联展开的小输入框二次编辑区域 */}
                     {editingFaceId === f.id && (
-                      <div className={`napcat-face-inline-editor ${faceStyle.inlineEditor}`}>
+                      <div className={`kujira-face-inline-editor ${faceStyle.inlineEditor}`}>
                         <input
                           type="text"
                           className={fieldStyle.input}
@@ -347,7 +352,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
                         <div style={{ display: 'flex', gap: '4px', marginTop: '2px' }}>
                           <button
                             type="button"
-                            className={`napcat-face-save-edit-btn ${cardStyle.save}`}
+                            className={`kujira-face-save-edit-btn ${cardStyle.save}`}
                             onClick={() => handleSaveEditFace(f.id)}
                             style={{
                               flex: 1,
@@ -385,7 +390,6 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
             )}
           </div>
 
-          {/* 上传确认弹窗 Modal (上方大图预览，下方左到右排布输入框与提交按钮) */}
           {pendingUpload && (
             <div className={faceStyle.modalOverlay} onClick={() => setPendingUpload(null)}>
               <div className={faceStyle.modalPanel} onClick={(e) => e.stopPropagation()}>
@@ -438,7 +442,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
                   </button>
                   <button
                     type="button"
-                    className={`napcat-face-modal-submit-btn ${cardStyle.save}`}
+                    className={`kujira-face-modal-submit-btn ${cardStyle.save}`}
                     onClick={submitPendingUpload}
                     disabled={uploading}
                     style={{ height: '32px', padding: '0 14px', fontSize: '12px', whiteSpace: 'nowrap', flexShrink: 0 }}

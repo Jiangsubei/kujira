@@ -1,5 +1,9 @@
 /**
- * dsh-napcat-bridge: 读历史记录工具 (read_chat_history)
+ * kujira: 单聊聊天历史检索工具 (read_chat_history)
+ *
+ * 严格单聊强隔离：
+ * - Agent 工具 schema 与 execute 均不接受跨会话 peer 或 source 覆盖，强制绑定当前单聊 session 归一化后的 user_<hash16>；
+ * - 仅检索 source='qq' 的真实单聊收发消息，输出 string msg_id 与可选 ref_idx。
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -11,6 +15,8 @@ import {
   getGlobalToolContext,
   resolveToolContext,
   normalizePeer,
+  isKujiraUserPeer,
+  resolveSessionPeerFromExec,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 import { normalizeLimit, normalizeOffset } from '../pagination.js';
@@ -19,8 +25,7 @@ export type { ReadChatHistoryParams, ReadChatHistoryResult };
 export { normalizePeer };
 
 /**
- * 6.1 读历史记录工具 (read_chat_history)
- * 检索当前群聊或私聊的历史聊天记录，支持多维度组合筛选。
+ * 检索当前单聊会话历史聊天记录，支持多维度组合筛选。
  */
 export async function readChatHistory(
   peerOrParams: string | (ReadChatHistoryParams & { peer?: string }),
@@ -47,7 +52,7 @@ export async function readChatHistory(
   }
 
   if (!db) {
-    return {
+    return toLosslessJson({
       messages: [],
       total: 0,
       total_matched: 0,
@@ -55,23 +60,31 @@ export async function readChatHistory(
       limit: normalizeLimit(params.limit, 20, 100),
       has_more: false,
       message: '数据库不可用，暂时无法读取聊天记录。',
-    };
+    });
   }
 
-  // 默认只查真实 QQ 消息：内部协同通讯需显式传 source='agent' 才展示；
-  // source='all' 表示两者都要。
-  if (params.source === 'all') {
-    const { source: _all, ...rest } = params;
-    params = rest;
-  } else if (params.source === undefined) {
-    params = { ...params, source: 'qq' };
+  if (!isKujiraUserPeer(peer)) {
+    return toLosslessJson({
+      messages: [],
+      total: 0,
+      total_matched: 0,
+      offset: normalizeOffset(params.offset),
+      limit: normalizeLimit(params.limit, 20, 100),
+      has_more: false,
+      message: 'read_chat_history 仅支持在 QQ 单聊会话中查询当前会话历史记录。',
+    });
   }
 
-  return db.readHistory(peer, params);
+  const sanitizedParams: ReadChatHistoryParams = {
+    ...params,
+    source: 'qq',
+  };
+
+  return toLosslessJson(db.readHistory(peer, sanitizedParams));
 }
 
 /**
- * 格式化聊天记录为带跨页连续序号的 Markdown 文本
+ * 格式化单聊聊天记录为带跨页连续序号的 Markdown 文本
  */
 export function renderChatHistoryText(result: ReadChatHistoryResult): string {
   if (!result || !Array.isArray(result.messages) || result.messages.length === 0) {
@@ -83,11 +96,12 @@ export function renderChatHistoryText(result: ReadChatHistoryResult): string {
     `共匹配 ${totalMatched} 条消息（序号 ${offset + 1}~${offset + result.messages.length}，本次返回 ${result.messages.length} 条）:`,
   ];
   for (let i = 0; i < result.messages.length; i++) {
-    const m = result.messages[i];
+    const m = result.messages[i]!;
     const selfTag = m.self ? ' [自身发言]' : '';
     const recalledTag = m.recalled ? ' [已撤回]' : '';
+    const refTag = m.ref_idx ? ` | ref_idx: ${m.ref_idx}` : '';
     lines.push(
-      `${offset + i + 1}. [${m.formatted_time}] ${formatSenderString(m.sender_name, m.user_id)}${selfTag}${recalledTag} | msg_id: ${m.msg_id} | ${m.type}`
+      `${offset + i + 1}. [${m.formatted_time}] ${formatSenderString(m.sender_name, m.user_id)}${selfTag}${recalledTag} | msg_id: ${m.msg_id}${refTag} | ${m.type}`
     );
     if (m.content) lines.push(`   ${m.content}`);
   }
@@ -105,19 +119,14 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
   return defineTool({
     name: 'read_chat_history',
     description:
-      '检索当前会话的本地历史聊天记录。用于指代不明追溯前情、响应用户查询/复述历史发言，或为引用/收藏表情等下游工具捞取目标消息的 message_id。',
+      '检索当前 QQ 单聊会话的本地历史聊天记录（严格隔离在当前会话内）。用于指代不明追溯前情、响应用户查询/复述历史发言，或为引用回复、消息撤回、收藏表情及转发展开等下游工具获取目标消息的 msg_id 与 ref_idx。',
     parameters: {
-      peer: {
-        type: 'string',
-        description: '可选目标会话标识 (如 "group_8000000001" 或 "user_1000000001")。缺省时默认为当前会话。',
-      },
       keyword: { type: 'string', description: '按消息文本内容关键词模糊搜索' },
-      sender_name: { type: 'string', description: '按发送者昵称模糊搜索' },
-      user_id: { type: 'string', description: '按指定发送者标识精确筛选' },
+      sender_name: { type: 'string', description: '按发送者展示名模糊搜索' },
       type: {
         type: 'string',
         description:
-          "按消息类型筛选，如 'text'(文本), 'image'(图片), 'sticker'(表情包), 'file'(私聊文件), 'group_file'(群文件), 'forward'(合并转发), 'poke'(戳一戳)",
+          "按消息类型筛选，如 'text'(文本), 'image'(图片), 'sticker'(表情包), 'file'(文件), 'forward'(合并转发), 'record'(语音), 'video'(视频), 'reply'(引用回复), 'card'(卡片消息)",
       },
       since: {
         type: 'string',
@@ -134,17 +143,11 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
       },
       has_file: { type: 'boolean', description: '是否仅筛选带有文件/图片/媒体附件的消息' },
       reply_to: {
-        oneOf: [{ type: 'number' }, { type: 'string' }],
-        description: '查询引用了指定 msg_id 的直接回复消息（支持数字或数字字符串）',
+        type: 'string',
+        description: '查询引用了指定 msg_id 的直接回复消息（字符串 ID）',
       },
       exclude_self: { type: 'boolean', description: '是否排除机器人自身的发言 (默认 false)' },
       self_only: { type: 'boolean', description: '是否仅查询机器人自身的发言 (默认 false)' },
-      source: {
-        type: 'string',
-        enum: ['qq', 'agent', 'all'],
-        description:
-          "按消息来源筛选：默认（不传）仅返回真实 QQ 消息；'agent' 仅返回 Agent 内部协同通讯（sender_name 为「内部通讯」，user_id 形如 agent:<来源SessionID>）；'all' 返回两者。",
-      },
       limit: { type: 'number', description: '返回最大条数 (默认 20，上限 100)' },
       offset: {
         type: 'number',
@@ -159,17 +162,33 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
       ],
     },
     async execute(args, exec) {
-      const session = (exec.agent as any)?.session;
-      const rawPeer = session?.id || 'common';
-      const currentPeer = normalizePeer(rawPeer);
-      // 显式传入的 peer 优先于当前会话：支持在私聊中只读查看某个群/其他好友的近期消息
-      const requestedPeer =
-        typeof (args as any)?.peer === 'string' && String((args as any).peer).trim()
-          ? normalizePeer(String((args as any).peer).trim())
-          : currentPeer;
-      const { peer: _peer, ...params } = (args || {}) as any;
       const resolved = resolveToolContext(context);
-      const res = await readChatHistory(requestedPeer, params, resolved.db || undefined);
+      const currentPeer = resolveSessionPeerFromExec(exec, resolved.peer);
+      if (!isKujiraUserPeer(currentPeer)) {
+        return toLosslessJson({
+          messages: [],
+          total: 0,
+          total_matched: 0,
+          offset: normalizeOffset((args as any)?.offset),
+          limit: normalizeLimit((args as any)?.limit, 20, 100),
+          has_more: false,
+          message: 'read_chat_history 仅支持在 QQ 单聊会话中查询当前会话历史记录。',
+        }) as any;
+      }
+
+      // 单聊强隔离：强制剔除任何潜在的跨会话参数，锁死当前会话 peer 与 source='qq'
+      const {
+        peer: _ignoredPeer,
+        source: _ignoredSource,
+        user_id: _ignoredUserId,
+        ...safeParams
+      } = (args || {}) as Record<string, any>;
+
+      const res = await readChatHistory(
+        currentPeer,
+        { ...safeParams, source: 'qq' } as ReadChatHistoryParams,
+        resolved.db || undefined
+      );
       return toLosslessJson(res) as any;
     },
   });

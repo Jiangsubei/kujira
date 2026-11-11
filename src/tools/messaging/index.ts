@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 消息互动类工具集
+ * kujira: QQ 官方 Bot 单聊消息发送与撤回工具集
  */
 
 export * from './send-message.js';

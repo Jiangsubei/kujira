@@ -3,7 +3,15 @@ import { SwitchField, ValueField } from '../fields.js';
 import { cardStyle, fieldStyle, faceStyle } from '../card-styles.js';
 import { IconPlus, IconEdit, IconTrash } from '../icons.js';
 import type { BridgePluginConfig } from '../../types/index.js';
-import type { NapCatFormModel } from '../model.js';
+import {
+  DEFAULT_SLANG_ENABLED,
+  DEFAULT_SLANG_EVICT_POLICY,
+  DEFAULT_SLANG_MAX_ENTRIES,
+  DEFAULT_SLANG_STORAGE_PATH,
+} from '../../constants/index.js';
+import type { KujiraFormModel } from '../model.js';
+
+const SLANG_ENDPOINT = '/plugins/kujira/slang';
 
 export interface SlangEntry {
   term: string;
@@ -16,7 +24,7 @@ export interface SlangEntry {
 export interface SlangTabProps {
   active: boolean;
   draft: Partial<BridgePluginConfig>;
-  model: NapCatFormModel;
+  model: KujiraFormModel;
   saving: boolean;
   onFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
   onResetField: (key: keyof BridgePluginConfig) => void;
@@ -44,7 +52,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
   const loadSlang = useCallback(async () => {
     setSlangLoading(true);
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/slang');
+      const res = await fetch(SLANG_ENDPOINT);
       if (!res.ok) return;
       const data = await res.json();
       if (data?.ok && Array.isArray(data.entries)) {
@@ -66,7 +74,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
 
   const handleDeleteSlang = async (term: string) => {
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/slang/delete', {
+      const res = await fetch(`${SLANG_ENDPOINT}/delete`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ term }),
@@ -79,7 +87,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
 
   const handleSaveEditSlang = async (term: string) => {
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/slang/edit', {
+      const res = await fetch(`${SLANG_ENDPOINT}/edit`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -116,7 +124,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
     }
     setAddingSlangLoading(true);
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/slang', {
+      const res = await fetch(SLANG_ENDPOINT, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -144,12 +152,14 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
     }
   };
 
+  const slangEnabled = draft.slang_enabled ?? DEFAULT_SLANG_ENABLED;
+
   return (
     <div
-      id="napcat-tabpanel-slang"
-      data-testid="napcat-tabpanel-slang"
+      id="kujira-tabpanel-slang"
+      data-testid="kujira-tabpanel-slang"
       role="tabpanel"
-      aria-labelledby="napcat-tab-slang"
+      aria-labelledby="kujira-tab-slang"
       hidden={!active}
       className={[
         cardStyle.tabPanel,
@@ -158,34 +168,36 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
       style={!active ? { display: 'none' } : undefined}
     >
       <SwitchField
-        id="napcat-slang-enabled"
+        id="kujira-slang-enabled"
         label="装载黑话学习套件 (slang_enabled)"
         hint="控制新建会话是否在预设中包含黑话学习工具集与动态上下文，保存后对后续新会话生效"
-        checked={Boolean(draft.slang_enabled ?? true)}
+        checked={Boolean(slangEnabled)}
         disabled={saving}
         overridden={model.isOverridden('slang_enabled')}
         onReset={() => onResetField('slang_enabled')}
         onChange={(checked) => onFieldChange('slang_enabled', checked)}
       />
 
-      {(draft.slang_enabled ?? true) && (
+      {slangEnabled && (
         <>
           <ValueField
-            id="napcat-slang-max-entries"
+            id="kujira-slang-max-entries"
             label="黑话条数容量上限 (slang_max_entries)"
-            hint="黑话知识库最大允许收录条数 (默认 300 条)"
-            placeholder="300"
+            hint={`黑话知识库最大允许收录条数 (默认 ${DEFAULT_SLANG_MAX_ENTRIES} 条)`}
+            placeholder={String(DEFAULT_SLANG_MAX_ENTRIES)}
             numeric
-            value={String(draft.slang_max_entries ?? 300)}
+            value={String(draft.slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES)}
             disabled={saving}
             overridden={model.isOverridden('slang_max_entries')}
             onReset={() => onResetField('slang_max_entries')}
-            onChange={(val) => onFieldChange('slang_max_entries', parseInt(val, 10) || 300)}
+            onChange={(val) =>
+              onFieldChange('slang_max_entries', parseInt(val, 10) || DEFAULT_SLANG_MAX_ENTRIES)
+            }
           />
 
           <div className={fieldStyle.field}>
             <div className={fieldStyle.head}>
-              <label htmlFor="napcat-slang-evict-policy" className={fieldStyle.label}>
+              <label htmlFor="kujira-slang-evict-policy" className={fieldStyle.label}>
                 满额淘汰策略 (slang_evict_policy)
               </label>
               {model.isOverridden('slang_evict_policy') && (
@@ -202,10 +214,10 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
               )}
             </div>
             <select
-              id="napcat-slang-evict-policy"
+              id="kujira-slang-evict-policy"
               className={fieldStyle.input}
               disabled={saving}
-              value={draft.slang_evict_policy || 'reject'}
+              value={draft.slang_evict_policy || DEFAULT_SLANG_EVICT_POLICY}
               onChange={(e) => onFieldChange('slang_evict_policy', e.target.value as any)}
             >
               <option value="reject">拒绝新增 (reject) - 满额后停止收录，提示手动清理</option>
@@ -214,14 +226,26 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
             <p className={fieldStyle.hint}>达到条数上限后的行为策略。淘汰依据为模型调用工具查询黑话的次数与活跃度。</p>
           </div>
 
+          <ValueField
+            id="kujira-slang-storage-path"
+            label="黑话文档参考路径 (slang_storage_path)"
+            hint={`黑话知识库参考 Markdown 导出路径 (默认 ${DEFAULT_SLANG_STORAGE_PATH})`}
+            placeholder={DEFAULT_SLANG_STORAGE_PATH}
+            value={draft.slang_storage_path || DEFAULT_SLANG_STORAGE_PATH}
+            disabled={saving}
+            overridden={model.isOverridden('slang_storage_path')}
+            onReset={() => onResetField('slang_storage_path')}
+            onChange={(val) => onFieldChange('slang_storage_path', val)}
+          />
+
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0 8px', borderTop: '1px solid var(--dsw-alias-border-l2)', fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' }}>
             <div>
-              容量状态: <strong style={{ color: 'var(--dsw-alias-label-primary)' }}>{slangTotal}</strong> / {draft.slang_max_entries ?? 300} 条 (策略: {draft.slang_evict_policy || 'reject'})
+              容量状态: <strong style={{ color: 'var(--dsw-alias-label-primary)' }}>{slangTotal}</strong> / {draft.slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES} 条 (策略: {draft.slang_evict_policy || DEFAULT_SLANG_EVICT_POLICY})
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <button
                 type="button"
-                className={`napcat-slang-add-btn ${faceStyle.actionBtn}`}
+                className={`kujira-slang-add-btn ${faceStyle.actionBtn}`}
                 title="添加黑话词条"
                 disabled={isAddingSlang}
                 onClick={() => {
@@ -309,7 +333,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
                       </button>
                       <button
                         type="button"
-                        className={`napcat-slang-save-add-btn ${cardStyle.save}`}
+                        className={`kujira-slang-save-add-btn ${cardStyle.save}`}
                         disabled={addingSlangLoading}
                         onClick={handleAddSlangSubmit}
                         style={{ height: '24px', padding: '0 10px', fontSize: '11px' }}
@@ -342,7 +366,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
                       <div style={{ display: 'flex', gap: '4px' }}>
                         <button
                           type="button"
-                          className={`napcat-slang-edit-btn ${faceStyle.actionBtn}`}
+                          className={`kujira-slang-edit-btn ${faceStyle.actionBtn}`}
                           title="编辑词条"
                           onClick={() => {
                             if (isEditing) {
@@ -360,7 +384,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
                         </button>
                         <button
                           type="button"
-                          className={`napcat-slang-delete-btn ${faceStyle.actionBtn} ${faceStyle.actionDelete}`}
+                          className={`kujira-slang-delete-btn ${faceStyle.actionBtn} ${faceStyle.actionDelete}`}
                           title="删除词条"
                           onClick={() => handleDeleteSlang(item.term)}
                         >
@@ -374,7 +398,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
                           {item.tags && (
                             <span style={{ fontSize: '11px', background: 'var(--dsw-alias-bg-layer-3)', padding: '2px 6px', borderRadius: '4px', color: 'var(--dsw-alias-label-primary)' }}>
-                              🏷️ {item.tags}
+                              {item.tags}
                             </span>
                           )}
                           {item.query_count !== undefined && item.query_count > 0 && (

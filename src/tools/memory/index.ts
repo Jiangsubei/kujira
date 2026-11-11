@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: Memory Agent 工具集聚合导出
+ * kujira: Memory Agent 工具集聚合导出
  */
 
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';

@@ -1,3 +1,40 @@
+/**
+ * kujira: Agent 运行时生命周期与执行调度模块
+ * 负责 Agent 创建与恢复、会话独占锁与 Web 只读看门狗、以及入站唤醒 (dispatchWakeup) 的消息排队下发。
+ */
+
+import { promises as fsp } from 'node:fs';
+import type { Context } from '@deepseek-ai/cordis';
+import {
+  installModelSelection,
+  type Agent,
+  type AgentHandle,
+} from '@deepseek-ai/dsh-agent';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { QQ_PRESET_ID } from '../../constants/preset.js';
+import { DEFAULT_NEW_MESSAGE_BEHAVIOR, PLUGIN_NAME } from '../../constants/index.js';
+import type { WakeupPayload } from '../../types/index.js';
+import { TurnInitiatorTracker, resolveWakeupInitiator } from '../../approval/turn-initiator.js';
+import {
+  RemoteError,
+  SessionAlreadyOwnedError,
+  type OutboundBridgeLike,
+  type SessionManagerOptions,
+} from './types.js';
+import {
+  parseSessionId,
+  buildSessionId,
+  generateSessionHash,
+  formatSessionTitle,
+  extractNameFromSessionTitle,
+  formatWakeupPrompt,
+  isKujiraSession,
+} from './id-resolver.js';
+import { formatSystemEventPrompt } from '../system-event-hub.js';
+import type { SessionWorkspaceManager } from './workspace.js';
+import type { SessionPersistenceManager } from './persistence.js';
+import type { SessionModelSelector } from './model-selector.js';
+
 export function safeGetService(ctx: any, name: string): any {
   if (!ctx) return undefined;
   try {
@@ -15,95 +52,49 @@ export function safeGetService(ctx: any, name: string): any {
   return undefined;
 }
 
-export function parsePeerTarget(peer: string): { type: 'user' | 'group'; id: string } {
-  if (peer.startsWith('group_')) {
-    return { type: 'group', id: peer.slice(6) };
-  }
-  if (peer.startsWith('group:')) {
-    return { type: 'group', id: peer.slice(6) };
-  }
-  if (peer.startsWith('qq-group-')) {
-    const stripped = peer.slice(9);
-    const id = stripped.split('-')[0];
-    return { type: 'group', id };
-  }
+export function parsePeerTarget(peer: string): { type: 'user'; id: string } {
   if (peer.startsWith('user_')) {
     return { type: 'user', id: peer.slice(5) };
   }
   if (peer.startsWith('user:')) {
     return { type: 'user', id: peer.slice(5) };
   }
-  if (peer.startsWith('qq-user-')) {
-    const stripped = peer.slice(8);
-    const id = stripped.split('-')[0];
-    return { type: 'user', id };
+  if (peer.startsWith('kujira-user-')) {
+    const parsed = parseSessionId(peer);
+    if (parsed) {
+      return { type: 'user', id: parsed.id };
+    }
+    const stripped = peer.slice(12);
+    return { type: 'user', id: stripped.split('-')[0] || stripped };
   }
   return { type: 'user', id: peer };
 }
 
 /**
  * 系统触发器可能写入 `payload.from_name` 的伪发送者名称。
- * 这些名称绝不能进入会话标题或昵称缓存，否则私聊会话会被永久改名成系统身份。
+ * 这些名称绝不能进入会话标题或昵称缓存，否则单聊会话会被永久改名成系统身份。
  */
 const SYSTEM_SENDER_NAMES = new Set([
   '系统定时任务',
+  '系统主动唤醒',
   '协同 Agent',
   '系统协作总线',
   '内部通讯',
 ]);
 
 /**
- * 只有这些触发源的 from_name 才能代表真实 QQ 发送者。
- * - at / mention / quote / poke：生产链路真实消息与戳一戳；
- * - private：历史/兼容标识，语义同样是真实私聊发送者。
+ * 只有真实单聊入站触发源的 from_name 才能代表真实 QQ 发送者。
  */
-const REAL_SENDER_TRIGGERS = new Set(['at', 'mention', 'quote', 'poke', 'private']);
+const REAL_SENDER_TRIGGERS = new Set(['direct', 'quote']);
 
 function isUserPeer(peer: string): boolean {
-  return peer.startsWith('user_') || peer.startsWith('qq-user-');
+  return peer.startsWith('user_') || peer.startsWith('kujira-user-');
 }
 
 /** 判断名称是否为系统伪发送者名称（用于标题与昵称缓存的历史污染清理） */
 export function isSystemSenderName(name: string | undefined): boolean {
   return typeof name === 'string' && SYSTEM_SENDER_NAMES.has(name.trim());
 }
-
-/**
- * dsh-napcat-bridge: Agent 运行时生命周期与执行调度模块
- * 负责 Agent 创建与恢复、会话独占锁与看门狗、以及入站唤醒 (dispatchWakeup) 的消息排队下发。
- */
-
-import { promises as fsp } from 'node:fs';
-import type { Context } from '@deepseek-ai/cordis';
-import {
-  installModelSelection,
-  type Agent,
-  type AgentHandle,
-} from '@deepseek-ai/dsh-agent';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { QQ_PRESET_ID } from '../../constants/preset.js';
-import { DEFAULT_NEW_MESSAGE_BEHAVIOR } from '../../constants/index.js';
-import type { WakeupPayload } from '../../types/index.js';
-import { TurnInitiatorTracker, resolveWakeupInitiator } from '../../approval/turn-initiator.js';
-import {
-  RemoteError,
-  SessionAlreadyOwnedError,
-  type OutboundBridgeLike,
-  type SessionManagerOptions,
-} from './types.js';
-import {
-  parseSessionId,
-  buildSessionId,
-  generateSessionHash,
-  formatSessionTitle,
-  extractNameFromSessionTitle,
-  formatWakeupPrompt,
-  isQQSession,
-} from './id-resolver.js';
-import { formatSystemEventPrompt } from '../system-event-hub.js';
-import type { SessionWorkspaceManager } from './workspace.js';
-import type { SessionPersistenceManager } from './persistence.js';
-import type { SessionModelSelector } from './model-selector.js';
 
 export interface AgentRunnerDelegate {
   peerToSessionId(peer: string): string;
@@ -114,8 +105,8 @@ export interface AgentRunnerDelegate {
 }
 
 export class SessionAgentRunner {
-  /** 会话/群昵称持久化键（跨重启保留，避免标题退化为纯号码） */
-  private static readonly PEER_NAMES_KEY = 'napcat_peer_names';
+  /** 单聊昵称持久化键（跨重启保留，避免标题退化为纯 hash） */
+  private static readonly PEER_NAMES_KEY = 'kujira_peer_names';
 
   private activeHandles = new Map<string, AgentHandle>();
   private busySessions = new Set<string>();
@@ -138,55 +129,13 @@ export class SessionAgentRunner {
   }
 
   public getConfig(): any {
-    const getter: any = this.options?.configGetter || safeGetService(this.ctx, 'napcat-bridge-config');
+    const getter: any = this.options?.configGetter || safeGetService(this.ctx, 'kujira-bridge-config');
     return (typeof getter === 'function' ? getter() : getter) || (this.ctx as any).config || (this.ctx.root as any)?.config || {};
   }
 
   private resolveNewMessageBehavior(): 'steer' | 'queue' {
     const config = this.getConfig();
     return config?.new_message_behavior || DEFAULT_NEW_MESSAGE_BEHAVIOR;
-  }
-
-  private resolveSessionPermission(peer: string): string {
-    const config = this.getConfig();
-    const { type, id } = parsePeerTarget(peer);
-
-    // 1. 特例覆盖优先
-    if (Array.isArray(config.session_permission_overrides)) {
-      const match = config.session_permission_overrides.find((item: any) => {
-        return item && String(item.id).trim() === id && item.type === type;
-      });
-      if (match?.permission) {
-        return match.permission;
-      }
-    }
-
-    // 2. 全局默认
-    if (type === 'group') {
-      return config.session_permission_group_default || 'read-only';
-    }
-    return config.session_permission_private_default || 'workspace-write';
-  }
-
-  private resolveCodingToolsEnabled(peer: string): boolean {
-    const config = this.getConfig();
-    const { type, id } = parsePeerTarget(peer);
-
-    // 1. 特例覆盖优先
-    if (Array.isArray(config.coding_tools_overrides)) {
-      const match = config.coding_tools_overrides.find((item: any) => {
-        return item && String(item.id).trim() === id && item.type === type;
-      });
-      if (match && typeof match.enabled === 'boolean') {
-        return match.enabled;
-      }
-    }
-
-    // 2. 全局默认
-    if (type === 'group') {
-      return Boolean(config.coding_tools_group_default ?? false);
-    }
-    return Boolean(config.coding_tools_private_default ?? true);
   }
 
   public setOutboundBridge(bridge: OutboundBridgeLike): void {
@@ -252,7 +201,11 @@ export class SessionAgentRunner {
 
   public setPeerName(peer: string, name: string): void {
     if (name && typeof name === 'string' && name.trim()) {
-      this.peerNames.set(peer, name.trim());
+      const trimmed = name.trim();
+      if (isUserPeer(peer) && isSystemSenderName(trimmed)) {
+        return;
+      }
+      this.peerNames.set(peer, trimmed);
       this.persistPeerNames();
     }
   }
@@ -262,37 +215,53 @@ export class SessionAgentRunner {
   }
 
   /**
-   * 确保 peer 名称已解析：优先内存/持久化缓存，缺失时通过 NapCat 查询群信息或用户资料。
-   * 网络查询带超时，失败返回 undefined，绝不阻塞主链路。
+   * 确保 peer 显示名称已解析：
+   * 1. 优先返回内存/KV 持久化缓存；
+   * 2. 回退从本地历史入站消息中提取最近非系统发送者名称；
+   * 3. 若 `kujira-gateway` 提供可选的自定义备注/昵称查询接口，带超时尝试获取。
    */
   public async resolvePeerName(peer: string, timeoutMs = 3000): Promise<string | undefined> {
     const cached = this.getPeerName(peer);
     if (cached) return cached;
 
+    const fromDb = this.persistence.getLatestInboundSenderName(peer);
+    if (fromDb && !isSystemSenderName(fromDb)) {
+      this.setPeerName(peer, fromDb);
+      return fromDb;
+    }
+
     const gateway: any =
-      safeGetService(this.ctx, 'napcat-gateway') || (this.ctx as any)['napcat-gateway'];
+      safeGetService(this.ctx, 'kujira-gateway') || (this.ctx as any)['kujira-gateway'];
     if (!gateway) return undefined;
 
-    const { type, id } = parsePeerTarget(peer);
+    const { id } = parsePeerTarget(peer);
     if (!id) return undefined;
 
     try {
-      const request: Promise<any> =
-        type === 'group' ? gateway.getGroupInfo?.(id) : gateway.getStrangerInfo?.(id);
-      if (!request || typeof request.then !== 'function') return undefined;
+      const getter =
+        typeof gateway.getPeerName === 'function'
+          ? gateway.getPeerName(peer)
+          : typeof gateway.getRemark === 'function'
+            ? gateway.getRemark(peer)
+            : undefined;
+      if (!getter || typeof getter.then !== 'function') {
+        if (typeof getter === 'string' && getter.trim() && !isSystemSenderName(getter)) {
+          this.setPeerName(peer, getter.trim());
+          return getter.trim();
+        }
+        return undefined;
+      }
 
       const res: any = await Promise.race([
-        request,
+        getter,
         new Promise((resolve) => setTimeout(() => resolve(undefined), timeoutMs)),
       ]);
-      const data = res?.data;
-      if (!data) return undefined;
-
-      const name =
-        type === 'group'
-          ? String(data.group_name || data.group_remark || '').trim()
-          : String(data.nickname || data.remark || '').trim();
-      if (!name) return undefined;
+      const rawName =
+        typeof res === 'string'
+          ? res
+          : res?.name || res?.remark || res?.nickname || '';
+      const name = String(rawName).trim();
+      if (!name || isSystemSenderName(name)) return undefined;
 
       this.setPeerName(peer, name);
       return name;
@@ -311,8 +280,6 @@ export class SessionAgentRunner {
       for (const [peer, name] of Object.entries(parsed)) {
         if (typeof peer === 'string' && peer && typeof name === 'string' && name.trim()) {
           const trimmed = name.trim();
-          // 历史污染清理：旧版本曾把定时任务的「系统定时任务」写进私聊昵称缓存。
-          // 这不是真实昵称，跳过；后续真实消息 / ensurePeerName 会重新解析正确昵称。
           if (isUserPeer(peer) && isSystemSenderName(trimmed)) {
             dropped = true;
             continue;
@@ -320,7 +287,6 @@ export class SessionAgentRunner {
           this.peerNames.set(peer, trimmed);
         }
       }
-      // 把清理结果回写持久化，避免每次启动都重复丢弃同一批污染数据
       if (dropped) this.persistPeerNames();
     } catch {
       // 持久化数据损坏时忽略，按无缓存继续
@@ -389,7 +355,7 @@ export class SessionAgentRunner {
   }
 
   public getAgent(peerOrSessionId: string): Agent | undefined {
-    const sessionId = isQQSession(peerOrSessionId)
+    const sessionId = isKujiraSession(peerOrSessionId)
       ? peerOrSessionId
       : this.delegate.peerToSessionId(peerOrSessionId);
 
@@ -404,7 +370,7 @@ export class SessionAgentRunner {
 
   /**
    * 拦截 Web UI 发送消息 (sessionController.prompt)：
-   * 当 QQ 会话处于活跃状态或独占持有时，强制拒绝并返回只读提示
+   * 当 Kujira 会话处于活跃状态或独占持有时，强制拒绝并返回只读提示
    */
   public guardSessionController(sc?: any): void {
     let target = sc;
@@ -417,20 +383,20 @@ export class SessionAgentRunner {
         } catch {}
       }
     }
-    if (target && typeof target.prompt === 'function' && !(target.prompt as any).__dsh_napcat_guarded) {
+    if (target && typeof target.prompt === 'function' && !(target.prompt as any).__dsh_kujira_guarded) {
       const originalPrompt = target.prompt.bind(target);
       const guardedPrompt = async (request: any) => {
         const sid = request?.sessionId;
-        if (sid && (this.activeHandles.has(sid) || (isQQSession(sid) && this.isSessionBusy(sid)))) {
+        if (sid && (this.activeHandles.has(sid) || (isKujiraSession(sid) && this.isSessionBusy(sid)))) {
           throw new RemoteError(
             'session/agent-busy',
-            '该会话当前正由 QQ 独占使用中，Web 端处于只读监视模式。请在 QQ 端发送消息。',
+            '该会话当前正由 QQ Kujira 独占使用中，Web 端处于只读监视模式。请在 QQ 端发送消息。',
             { reason: 'EXCLUSIVE_QQ_SESSION', sessionId: sid }
           );
         }
         return originalPrompt(request);
       };
-      (guardedPrompt as any).__dsh_napcat_guarded = true;
+      (guardedPrompt as any).__dsh_kujira_guarded = true;
       (guardedPrompt as any).__originalPrompt = originalPrompt;
       target.prompt = guardedPrompt;
     }
@@ -444,16 +410,14 @@ export class SessionAgentRunner {
 
     const existingTitle = this.getSessionTitle(session, sessionId);
     const existingName = extractNameFromSessionTitle(existingTitle, peer);
-    // 历史污染自愈：旧版本曾把系统身份（如「系统定时任务」）写进私聊标题。
-    // 它不是真实昵称，视为无名称，允许重写为中性号码标题；真实消息到达后会补回昵称。
     const isPollutedName = isUserPeer(peer) && isSystemSenderName(existingName);
 
-    // 名字来源优先级：显式传入 > 内存/持久化缓存 > 从现有标题反向提取
     const currentName =
-      name || this.getPeerName(peer) || (isPollutedName ? undefined : existingName);
+      (name && !isSystemSenderName(name) ? name : undefined) ||
+      this.getPeerName(peer) ||
+      (isPollutedName ? undefined : existingName);
 
-    // 已知标题但无法解析出昵称时，绝不降级为「群聊: 123456 #1」这类纯号码标题
-    // （系统身份污染标题除外：它本就不是有效昵称，重写为中性标题属于自愈）
+    // 已知标题且非系统污染但无法解析出昵称时，不降级覆盖已有标题
     if (!currentName && existingTitle && !isPollutedName) return;
 
     const title = formatSessionTitle(peer, sessionId, currentName);
@@ -464,7 +428,7 @@ export class SessionAgentRunner {
       try {
         sessionTitleSvc.rename(session, title);
       } catch (err: any) {
-        this.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
+        this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
           `[SessionAgentRunner] 锁定会话标题 ${sessionId} 失败:`,
           err?.message
         );
@@ -496,7 +460,7 @@ export class SessionAgentRunner {
     const selectionRef = this.modelSelector.getOrCreateSelectionRef(sessionId);
     const agents = this.ctx.get?.('agents') || (this.ctx as any).agents;
 
-    // 1. 若当前会话已由 QQ 自身持有专属写句柄，检查其归档状态与物理有效性
+    // 1. 若当前会话已由 Kujira 持有专属写句柄，检查其归档状态与物理有效性
     if (this.activeHandles.has(sessionId)) {
       const handle = this.activeHandles.get(sessionId)!;
       const isHandleValid =
@@ -519,7 +483,6 @@ export class SessionAgentRunner {
 
     // 2. 内存中已存在该会话的 live agent（由 Web UI 会话控制器等其它 owner 创建/持有）：
     //    只复用同一 agent，让新消息经 agent.followup() 排队等待（同 peer 串行）
-    //    但若物理文件已确认被删除或处于僵尸状态，绝不能复用残留的僵尸 Agent
     const existingAgent = agents?.get?.(sessionId as any);
     if (existingAgent && !this.persistence.isSessionArchived(sessionId)) {
       const isExistingZombie =
@@ -531,7 +494,6 @@ export class SessionAgentRunner {
         this.updateSessionTitle((existingAgent as any).session, peer, sessionId);
         return existingAgent;
       }
-      // 物理文件已不存在或已被删除，绝不能复用残留的僵尸 Agent
       this.delegate.onSessionReassigned?.(peer, '');
       sessionId = this.delegate.peerToSessionId(peer);
     }
@@ -543,7 +505,6 @@ export class SessionAgentRunner {
     const provider = selectionRef.current?.provider || defaultSel.provider;
     const model = selectionRef.current?.model || defaultSel.model;
 
-    // 确保 reasoningEffort 明确解析，防止 undefined 导致 DSH installModelSelection 清空思考档位
     let effort: any = selectionRef.current?.reasoningEffort || defaultSel.reasoningEffort;
     if (effort === undefined) {
       effort = await this.modelSelector.resolveDefaultEffort(provider, model);
@@ -572,28 +533,6 @@ export class SessionAgentRunner {
       }
     }
 
-    const codingToolsEnabled = this.resolveCodingToolsEnabled(peer);
-    const applyCodingToolsRestriction = (agentCtx: any) => {
-      const toolsSvc: any = agentCtx?.tools || (agentCtx?.get && agentCtx.get('tools'));
-      if (toolsSvc && typeof toolsSvc.restrict === 'function') {
-        const potential = ['bash', 'pwsh', 'read', 'write', 'edit'];
-        const known: string[] | undefined = Array.isArray(toolsSvc.names) ? toolsSvc.names : undefined;
-        const deny = known
-          ? potential.filter((t) => known.includes(t))
-          : potential.filter((t) => (process.platform === 'win32' ? t !== 'bash' : t !== 'pwsh'));
-        if (deny.length > 0) {
-          try {
-            toolsSvc.restrict({ deny });
-          } catch (rErr: any) {
-            this.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
-              '[SessionAgentRunner] tools.restrict 执行告警:',
-              rErr?.message
-            );
-          }
-        }
-      }
-    };
-
     const setupFn = (agentCtx: any) => {
       if (typeof agentCtx?.on === 'function') {
         installModelSelection(agentCtx, selectionRef);
@@ -603,34 +542,23 @@ export class SessionAgentRunner {
       if (presets?.mount) {
         return presets
           .mount(agentCtx, QQ_PRESET_ID)
-          .then(() => {
-            if (!codingToolsEnabled) {
-              applyCodingToolsRestriction(agentCtx);
-            }
-            return undefined;
-          })
+          .then(() => undefined)
           .catch((err: any) => {
-            this.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
-              '[SessionAgentRunner] mount preset qq-session failed, falling back:',
+            this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
+              `[SessionAgentRunner] mount preset ${QQ_PRESET_ID} failed, falling back:`,
               err?.message
             );
-            const provider =
-              (this.ctx as any).napcatBridgeTools ||
-              (this.ctx.root as any)?.napcatBridgeTools;
-            provider?.registerTools?.(agentCtx);
-            if (!codingToolsEnabled) {
-              applyCodingToolsRestriction(agentCtx);
-            }
+            const toolsProvider =
+              (this.ctx as any).kujiraBridgeTools ||
+              (this.ctx.root as any)?.kujiraBridgeTools;
+            toolsProvider?.registerTools?.(agentCtx);
             return undefined;
           });
       }
-      const provider =
-        (this.ctx as any).napcatBridgeTools ||
-        (this.ctx.root as any)?.napcatBridgeTools;
-      provider?.registerTools?.(agentCtx);
-      if (!codingToolsEnabled) {
-        applyCodingToolsRestriction(agentCtx);
-      }
+      const toolsProvider =
+        (this.ctx as any).kujiraBridgeTools ||
+        (this.ctx.root as any)?.kujiraBridgeTools;
+      toolsProvider?.registerTools?.(agentCtx);
       return undefined;
     };
 
@@ -667,7 +595,7 @@ export class SessionAgentRunner {
 
           if (isOwnedError) {
             isSessionLocked = true;
-            this.ctx.logger?.('dsh-napcat-bridge')?.warn?.(
+            this.ctx.logger?.(PLUGIN_NAME)?.warn?.(
               `[SessionAgentRunner] 会话 ${sessionId} 正在被其他进程或控制台占用 (SessionAlreadyOwnedError)，正在进行第 ${attempt + 1}/${maxRetries} 次重试...`
             );
 
@@ -681,7 +609,7 @@ export class SessionAgentRunner {
             );
           }
 
-          this.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
+          this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
             `[SessionAgentRunner] Resume session ${sessionId} 未命中或异常:`,
             err?.message
           );
@@ -715,13 +643,13 @@ export class SessionAgentRunner {
           const parsed = parseSessionId(sessionId);
           const fallbackSid = parsed
             ? buildSessionId(
-                parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`,
+                `kujira-user-${parsed.id}`,
                 parsed.round,
                 parsed.version,
                 hash
               )
             : `${sessionId}-${hash}`;
-          this.ctx.logger?.('dsh-napcat-bridge')?.warn?.(
+          this.ctx.logger?.(PLUGIN_NAME)?.warn?.(
             `[SessionAgentRunner] 创建会话 ${sessionId} 遭遇宿主内存残留冲突 (${createErr.message})，自动切换短哈希防撞会话: ${fallbackSid}`
           );
           sessionId = fallbackSid;
@@ -750,16 +678,15 @@ export class SessionAgentRunner {
 
     this.activeHandles.set(sessionId, handle);
 
-    // CHK-04: 全新会话初始化权限模式
+    // 单聊新会话统一默认装配 workspace-write 权限，不限制 Preset 内置工作区与 Shell 工具
     if (!isResumed) {
-      const targetPermission = this.resolveSessionPermission(peer);
       const permissionPresets: any = safeGetService(this.ctx, 'permissionPresets');
       if (permissionPresets && typeof permissionPresets.set === 'function') {
         try {
-          permissionPresets.set(handle.agent.session, targetPermission);
+          permissionPresets.set(handle.agent.session, 'workspace-write');
         } catch (permErr: any) {
-          this.ctx.logger?.('dsh-napcat-bridge')?.warn?.(
-            `[SessionAgentRunner] 设置会话 ${sessionId} 权限预设 (${targetPermission}) 异常:`,
+          this.ctx.logger?.(PLUGIN_NAME)?.warn?.(
+            `[SessionAgentRunner] 设置会话 ${sessionId} 权限预设 (workspace-write) 异常:`,
             permErr?.message
           );
         }
@@ -774,8 +701,8 @@ export class SessionAgentRunner {
       this.markPendingFirstTurn(sessionId);
     }
 
-    // 自动在 DSH workspaceRegistry 中登记单一 NapCat 顶级工作区并关联活跃会话
-    await this.workspace.registerWorkspace(cwd, sessionId, 'NapCat');
+    // 自动在 DSH workspaceRegistry 中登记单一 Kujira 顶级工作区并关联活跃会话
+    await this.workspace.registerWorkspace(cwd, sessionId, 'Kujira');
 
     // 锁定会话标题，防止 LLM 自动总结覆盖
     this.updateSessionTitle(handle.agent.session, peer, sessionId);
@@ -789,7 +716,7 @@ export class SessionAgentRunner {
         try {
           await presets.select(handle.agent, QQ_PRESET_ID);
         } catch (selErr: any) {
-          this.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
+          this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
             `[SessionAgentRunner] presets.select(${sessionId}, ${QQ_PRESET_ID}) 忽略非致命异常:`,
             selErr?.message
           );
@@ -817,29 +744,23 @@ export class SessionAgentRunner {
       onMessageCreated?: (userMsg: any) => void;
     }
   ): Promise<any> {
-    const isNoMessageWakeup =
+    const isSystemWakeup =
       Boolean(payload.is_system) ||
-      payload.trigger === 'poke' ||
       payload.trigger === 'scheduled' ||
-      (payload.trigger === 'proactive' && payload.sub_trigger === 'idle') ||
       (!(payload as any).msg_id && !payload.from_user);
 
-    if (isNoMessageWakeup && this.outboundBridge) {
-      const isGroup = payload.peer.startsWith('group_') || payload.peer.startsWith('qq-group-');
+    // 关键约束：系统合成唤醒绝不传 msg_id: undefined 或空串，以免覆盖或擦除历史有效入站被动 msg_id 锚点
+    if (isSystemWakeup && this.outboundBridge) {
       this.outboundBridge.trackInboundContext(payload.peer, {
-        msg_id: undefined,
-        from_user: '',
-        is_group: isGroup,
-        trigger: payload.trigger === 'poke' ? 'poke' : payload.trigger === 'scheduled' ? 'scheduled' : 'idle',
+        is_synthetic: true,
+        trigger: 'scheduled',
       });
     }
 
     const agent = await this.getOrCreateAgent(payload.peer);
     const sessionId = (agent as any).session?.id || this.delegate.peerToSessionId(payload.peer);
 
-    // 仅当唤醒来源是真实 QQ 发送者（消息 / 戳一戳）时才允许用 from_name 更新私聊标题。
-    // 系统触发器（scheduled / proactive）的 from_name 是系统身份，
-    // 若写入标题会把私聊永久改名成系统身份。
+    // 仅当唤醒来源是真实 QQ 单聊发送者（direct / quote）时才允许用 from_name 更新单聊标题
     if (
       !payload.is_system &&
       payload.from_name &&
@@ -852,15 +773,14 @@ export class SessionAgentRunner {
     const promptText =
       payload.is_system && payload.system_event
         ? formatSystemEventPrompt(payload.system_event)
-        : formatWakeupPrompt(payload, { bufferSize: this.getConfig()?.proactive_buffer_size });
+        : formatWakeupPrompt(payload);
 
     const userMsg = createUserMessage({
       content: [{ type: 'text', text: promptText }],
       source: { kind: 'user' },
     });
 
-    // 审批「本轮唤醒者」登记：只登记真实 QQ 发送者唤醒（系统触发返回 null）。
-    // 必须在 followup/steer 之前登记——followup 可能同步 append turn/start。
+    // 审批「本轮唤醒者」登记：只登记真实 QQ 单聊发送者唤醒（系统触发返回 null）
     const wakeupInitiator = payload.is_system
       ? null
       : resolveWakeupInitiator(payload.trigger, payload.from_user);
@@ -868,13 +788,10 @@ export class SessionAgentRunner {
       this.turnInitiatorTracker?.expect(userMsg?.id, sessionId, wakeupInitiator);
     }
 
-    if (isNoMessageWakeup && this.outboundBridge && userMsg?.id) {
-      const isGroup = payload.peer.startsWith('group_') || payload.peer.startsWith('qq-group-');
+    if (isSystemWakeup && this.outboundBridge && userMsg?.id) {
       this.outboundBridge.trackPendingMessage?.(userMsg.id, payload.peer, {
-        msg_id: undefined,
-        from_user: '',
-        is_group: isGroup,
-        trigger: payload.trigger === 'poke' ? 'poke' : payload.trigger === 'scheduled' ? 'scheduled' : 'idle',
+        is_synthetic: true,
+        trigger: 'scheduled',
       });
     }
 
@@ -891,7 +808,6 @@ export class SessionAgentRunner {
       return userMsg;
     } finally {
       this.markSessionBusy(sessionId, false);
-      // 若此时物理磁盘已完成写入落盘，解除新建保护期
       if (this.persistence.isSessionPhysicallyPresent(sessionId)) {
         this.clearPendingFirstTurn(sessionId);
         this.markSessionPersisted(sessionId);
@@ -901,14 +817,14 @@ export class SessionAgentRunner {
 
   public async dispose(): Promise<void> {
     const sc = this.ctx.get?.('sessionController') || (this.ctx as any).sessionController;
-    if (sc && (sc.prompt as any)?.__dsh_napcat_guarded) {
+    if (sc && (sc.prompt as any)?.__dsh_kujira_guarded) {
       sc.prompt = (sc.prompt as any).__originalPrompt;
     }
     for (const [id, handle] of this.activeHandles.entries()) {
       try {
         await handle.dispose();
       } catch (err) {
-        this.ctx.logger?.('dsh-napcat-bridge')?.warn?.(`[SessionAgentRunner] 销毁 Agent ${id} 失败:`, err);
+        this.ctx.logger?.(PLUGIN_NAME)?.warn?.(`[SessionAgentRunner] 销毁 Agent ${id} 失败:`, err);
       }
     }
     this.activeHandles.clear();

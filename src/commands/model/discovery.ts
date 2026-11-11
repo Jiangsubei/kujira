@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: LLM 模型发现与探测模块
+ * kujira: LLM 模型发现与探测模块
  */
 
 import type { Context } from '@deepseek-ai/cordis';

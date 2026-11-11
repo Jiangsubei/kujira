@@ -66,9 +66,7 @@ describe('契约测试: safeSyncSessionModel 并发互斥锁与模型目录补�
       const sessionController = {
         selectModel: vi.fn(async (req: any) => {
           selectModelCalls.push(req);
-          // 模拟 DSH 官方 selectModel 内部无条件调用 saveSelection
           await agentDefaultModel.saveSelection(req);
-          // 模拟异步延迟以激化并发交叉
           await new Promise((resolve) => setTimeout(resolve, 15));
           return { selected: { provider: req.provider, model: req.model } };
         }),
@@ -86,7 +84,7 @@ describe('契约测试: safeSyncSessionModel 并发互斥锁与模型目录补�
       const tasks = Array.from({ length: CONCURRENCY }, (_, i) =>
         safeSyncSessionModel(
           mockCtx,
-          `session-concurrent-${i}`,
+          `kujira-user-${String(i).padStart(16, '0')}`,
           'deepseek-official',
           'deepseek-flash',
           i % 2 === 0 ? 'high' : undefined
@@ -95,13 +93,9 @@ describe('契约测试: safeSyncSessionModel 并发互斥锁与模型目录补�
 
       await Promise.all(tasks);
 
-      // 1. 所有调用均已执行
       expect(selectModelCalls).toHaveLength(CONCURRENCY);
-
-      // 2. 所有并发均严格通过互斥锁排队执行，保证调用次数完备
       expect(sessionController.selectModel).toHaveBeenCalledTimes(CONCURRENCY);
 
-      // 4. 后续正常业务调用必须能正常触发 trueOriginalSave
       await agentDefaultModel.saveSelection({ provider: 'deepseek-official', model: 'deepseek-chat' });
       expect(trueOriginalSave).toHaveBeenCalledTimes(CONCURRENCY + 1);
     });
@@ -134,8 +128,8 @@ describe('契约测试: safeSyncSessionModel 并发互斥锁与模型目录补�
       } as unknown as Context;
 
       const tasks = [
-        safeSyncSessionModel(mockCtx, 'session-fail', 'deepseek-official', 'deepseek-flash'),
-        safeSyncSessionModel(mockCtx, 'session-success', 'deepseek-official', 'deepseek-flash'),
+        safeSyncSessionModel(mockCtx, 'kujira-user-00000000000000f1', 'deepseek-official', 'deepseek-flash'),
+        safeSyncSessionModel(mockCtx, 'kujira-user-00000000000000f2', 'deepseek-official', 'deepseek-flash'),
       ];
 
       const results = await Promise.allSettled(tasks);

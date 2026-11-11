@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 聊天历史与会话展开类工具集
+ * kujira: 单聊聊天历史、合并转发展开与轻量等待工具集
  */
 
 export * from './read-history.js';

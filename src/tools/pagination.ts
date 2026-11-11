@@ -1,7 +1,5 @@
 /**
- * src/tools/pagination.ts
- *
- * 列表工具统一 offset + limit 分页工具。
+ * kujira: 列表工具统一 offset + limit 分页工具
  *
  * 约定:
  * - offset 从 0 开始，表示过滤后结果集的起始序号偏移；
@@ -79,7 +77,7 @@ export interface OffsetMessageOptions {
   totalMatched: number;
   hasMore: boolean;
   nextOffset?: number;
-  /** 计量单位，如 '人'、'个群'、'个表情' */
+  /** 计量单位，如 '条消息'、'条黑话词条'、'个表情' */
   unit: string;
 }
 

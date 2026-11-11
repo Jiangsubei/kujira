@@ -1,37 +1,121 @@
 /**
- * 契约测试: send_qq_message 工具回归与参数校验契约 (Tool Registration & Validation Contract)
+ * 契约测试: send_qq_message 工具装配、协议下发、UTF-8 分片与参数校验契约
  *
  * 覆盖规范清单:
- * 契约 1: 真实装配下，QQ 群聊与私聊会话均包含 send_qq_message 工具；非 QQ 会话安全排除；
- * 契约 2: splitMessageText 消息分段工具函数纯算法契约；
- * 契约 3: send_qq_message 参数校验与错误反馈（空文本、非 QQ 会话防御）。
+ * 契约 1: 真实 DSH 服务装配下（bootDshKujira + mountPlugin: false + kujira-tools 插件与 OutboundStreamBridge）：
+ *         QQ 单聊会话包含 send_qq_message；非单聊会话（WebUI / Review）安全排除；
+ * 契约 2: splitMessageText 基于 UTF-8 字节安全切分算法契约（绝不从多字节码点中间切断、绝不丢字）；
+ * 契约 3: send_qq_message 参数校验、Markdown 分流、reply_to 引用换取与 Lossless JSON 输出契约。
  */
 
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
-import { splitMessageText, sendQqMessage } from '../../src/tools/index.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
+import { MessageDatabase } from '../../src/storage/database.js';
+import { MediaStorageManager } from '../../src/storage/media.js';
+import { OutboundStreamBridge } from '../../src/outbound/stream.js';
+import {
+  splitMessageText,
+  sendQqMessage,
+  registerAgentTools,
+  resetGlobalToolContext,
+} from '../../src/tools/index.js';
+import KujiraToolsPlugin, {
+  setGlobalBridgeToolsProvider,
+} from '../../src/tools/plugin.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
+import { QQ_MSG_TYPE_MARKDOWN, QQ_MSG_TYPE_TEXT } from '../../src/constants/index.js';
 
-describe('契约 1: send_qq_message 工具回归与会话隔离契约', () => {
+const TEST_OPENID = '0123456789ABCDEF0123456789ABCDEF';
+const TEST_PEER = openidToPeer(TEST_OPENID);
+const TEST_SESSION_ID = openidToSessionBaseId(TEST_OPENID);
+
+function assertNoUndefinedFields(obj: unknown, currentPath = ''): void {
+  if (obj === undefined) {
+    throw new Error(`Found undefined at "${currentPath}"`);
+  }
+  if (obj === null || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    obj.forEach((item, idx) => assertNoUndefinedFields(item, `${currentPath}[${idx}]`));
+    return;
+  }
+  for (const key of Object.keys(obj)) {
+    const val = (obj as Record<string, unknown>)[key];
+    if (val === undefined) {
+      throw new Error(`Found undefined key "${currentPath ? `${currentPath}.${key}` : key}"`);
+    }
+    assertNoUndefinedFields(val, currentPath ? `${currentPath}.${key}` : key);
+  }
+}
+
+describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
   let tmpHome: string;
   let booted: BootedDsh;
-  const TEST_PORT = 29899;
+  let db: MessageDatabase;
+  let mediaManager: MediaStorageManager;
+  let outboundBridge: OutboundStreamBridge;
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-send-tool-asm-'));
-    booted = await bootDshNapcatBridge({
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-send-tool-asm-'));
+    booted = await bootDshKujira({
       dshHome: tmpHome,
-      mountPlugin: true,
-      config: {
-        bot_qq: '1000000001',
-        ws_port: TEST_PORT,
-      },
+      mountPlugin: false,
     });
+    db = new MessageDatabase(path.join(tmpHome, 'messages.sqlite'));
+    db.init();
+    db.upsertPeerOpenid(TEST_PEER, TEST_OPENID);
+    mediaManager = new MediaStorageManager({ dshHome: tmpHome, db });
+
+    const mockGateway: any = {
+      sendC2CMessage: vi.fn(async (_openid: string, payload: any) => ({
+        ok: true,
+        status: 200,
+        body: {
+          id: 'ROBOT1.0_OUT_BOOT_01',
+          ext_info: { ref_idx: 'REFIDX_OUT_BOOT_01' },
+          payload,
+        },
+      })),
+      sendC2CStreamMessage: vi.fn(),
+      sendInputNotify: vi.fn(),
+      deleteC2CMessage: vi.fn(),
+      uploadC2CMedia: vi.fn(),
+      emitMessageSent: vi.fn(),
+    };
+
+    outboundBridge = new OutboundStreamBridge(booted.ctx, {
+      gateway: mockGateway,
+      db,
+      getConfig: () => ({ markdown_enabled: true }),
+    });
+
+    const provider = {
+      registerTools(targetCtx: any) {
+        return registerAgentTools(targetCtx, {
+          db,
+          outboundBridge,
+          gateway: mockGateway,
+          mediaManager,
+          dshHome: tmpHome,
+          config: () => ({ markdown_enabled: true }),
+        });
+      },
+    };
+    setGlobalBridgeToolsProvider(provider);
+    if (typeof (booted.ctx as any).provide === 'function') {
+      try {
+        (booted.ctx as any).provide('kujiraBridgeTools', provider);
+      } catch {}
+    }
   });
 
   afterEach(async () => {
+    resetGlobalToolContext();
+    setGlobalBridgeToolsProvider(undefined);
+    outboundBridge?.dispose();
+    db?.close();
     if (booted) {
       await booted.dispose().catch(() => {});
     }
@@ -40,208 +124,221 @@ describe('契约 1: send_qq_message 工具回归与会话隔离契约', () => {
     }
   });
 
-  it('1.1 真实装配下：QQ 群聊会话 assemble 结果中包含 send_qq_message 工具', async () => {
+  it('1.1 真实装配下：QQ 单聊会话经 kujira-tools 挂载后 assemble 结果包含 send_qq_message', async () => {
     const ctx = booted.ctx;
-    const presetsSvc: any = (ctx as any).agentPresets || ctx.get?.('agentPresets');
-    const qqWs = path.join(tmpHome, 'qq-ws-group');
-    await fsp.mkdir(qqWs, { recursive: true });
-
-    const qqGroupHandle = await ctx.agents.create({
-      sessionId: 'qq-group-8888',
-      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: qqWs },
-      setup: async (agentCtx: any) => {
-        if (presetsSvc?.mount) {
-          await presetsSvc.mount(agentCtx, 'qq-session');
-        } else {
-          (ctx as any).napcatBridgeTools?.registerTools?.(agentCtx);
-        }
-      },
-    });
-    const qqGroupAgent = qqGroupHandle.agent || qqGroupHandle;
-    const asmGroup = await ctx.systemPrompt.assemble({ scope: qqGroupAgent, agent: qqGroupAgent } as any);
-    const groupToolNames = (asmGroup.tools as any[]).map((t) => t.name);
-    expect(groupToolNames).toContain('send_qq_message');
-  });
-
-  it('1.2 真实装配下：QQ 私聊会话 assemble 结果中包含 send_qq_message 工具', async () => {
-    const ctx = booted.ctx;
-    const presetsSvc: any = (ctx as any).agentPresets || ctx.get?.('agentPresets');
     const qqWs = path.join(tmpHome, 'qq-ws-user');
     await fsp.mkdir(qqWs, { recursive: true });
 
     const qqUserHandle = await ctx.agents.create({
-      sessionId: 'qq-user-9999',
+      sessionId: TEST_SESSION_ID as any,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: qqWs },
       setup: async (agentCtx: any) => {
-        if (presetsSvc?.mount) {
-          await presetsSvc.mount(agentCtx, 'qq-session');
-        } else {
-          (ctx as any).napcatBridgeTools?.registerTools?.(agentCtx);
-        }
+        await agentCtx.plugin(KujiraToolsPlugin);
       },
     });
-    const qqUserAgent = qqUserHandle.agent || qqUserHandle;
-    const asmUser = await ctx.systemPrompt.assemble({ scope: qqUserAgent, agent: qqUserAgent } as any);
+    const qqUserAgent = (qqUserHandle as any).agent || qqUserHandle;
+    const asmUser = await ctx.systemPrompt.assemble({
+      scope: qqUserAgent,
+      agent: qqUserAgent,
+    } as any);
     const userToolNames = (asmUser.tools as any[]).map((t) => t.name);
     expect(userToolNames).toContain('send_qq_message');
+    expect(userToolNames).toContain('recall_message');
+    expect(userToolNames).toContain('send_file');
+    expect(userToolNames).toContain('read_chat_history');
   });
 
-  it('1.3 真实装配下：WebUI 与 Review 沙箱会话均排除 send_qq_message 工具', async () => {
+  it('1.2 真实装配下：WebUI 与 Review 沙箱会话均排除 send_qq_message 工具', async () => {
     const ctx = booted.ctx;
     const webWs = path.join(tmpHome, 'web-ws');
     await fsp.mkdir(webWs, { recursive: true });
     const webHandle = await ctx.agents.create({
-      sessionId: 'web-session-8888',
+      sessionId: 'web-session-1000000001' as any,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: webWs },
     });
-    const webAgent = webHandle.agent || webHandle;
-    const asmWeb = await ctx.systemPrompt.assemble({ scope: webAgent, agent: webAgent } as any);
+    const webAgent = (webHandle as any).agent || webHandle;
+    const asmWeb = await ctx.systemPrompt.assemble({
+      scope: webAgent,
+      agent: webAgent,
+    } as any);
     const webToolNames = (asmWeb.tools as any[]).map((t) => t.name);
     expect(webToolNames).not.toContain('send_qq_message');
 
     const reviewWs = path.join(tmpHome, 'review-ws');
     await fsp.mkdir(reviewWs, { recursive: true });
     const reviewHandle = await ctx.agents.create({
-      sessionId: 'review-group_8888',
+      sessionId: `review-${TEST_PEER}` as any,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: reviewWs },
     });
-    const reviewAgent = reviewHandle.agent || reviewHandle;
-    const asmReview = await ctx.systemPrompt.assemble({ scope: reviewAgent, agent: reviewAgent } as any);
+    const reviewAgent = (reviewHandle as any).agent || reviewHandle;
+    const asmReview = await ctx.systemPrompt.assemble({
+      scope: reviewAgent,
+      agent: reviewAgent,
+    } as any);
     const reviewToolNames = (asmReview.tools as any[]).map((t) => t.name);
     expect(reviewToolNames).not.toContain('send_qq_message');
   });
 
-  it('1.4 send_qq_message 执行校验：空文本与非 QQ 会话安全拒绝', async () => {
-    // 空文本
-    const resEmpty = await sendQqMessage({ text: '   ' }, { peer: 'group_123' });
+  it('1.3 send_qq_message 执行校验：空文本、非单聊会话与群聊 peer 安全拒绝', async () => {
+    const resEmpty = await sendQqMessage({ text: '   ' }, { peer: TEST_PEER });
     expect(resEmpty.success).toBe(false);
     expect(resEmpty.error).toContain('不能为空');
+    assertNoUndefinedFields(resEmpty);
 
-    // 非 QQ 会话
     const resNonQQ = await sendQqMessage({ text: 'hello' }, { peer: 'web-session' });
     expect(resNonQQ.success).toBe(false);
     expect(resNonQQ.error).toContain('QQ 聊天会话');
+    assertNoUndefinedFields(resNonQQ);
+
+    const resGroupRejected = await sendQqMessage({ text: 'hello' }, { peer: 'group_3000000001' });
+    expect(resGroupRejected.success).toBe(false);
+    expect(resGroupRejected.error).toContain('单聊');
+    assertNoUndefinedFields(resGroupRejected);
   });
 
-  it('1.5 send_qq_message 弱类型容错：reply_to 支持数字字符串自动解析为数字引用', async () => {
-    let capturedPayload: any;
+  it('1.4 send_qq_message 通过 OutboundStreamBridge 支持 Markdown 分流、reply_to 换取 ref_idx 并返回 string ID', async () => {
+    const sentPayloads: any[] = [];
     const mockGateway: any = {
-      sendMsg: async (_peer: string, payload: any) => {
-        capturedPayload = payload;
-        return { status: 'ok', retcode: 0, data: { message_id: 99999 } };
-      },
+      sendC2CMessage: vi.fn(async (_openid: string, payload: any) => {
+        sentPayloads.push(payload);
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            id: 'ROBOT1.0_OUT_MSG_999',
+            ext_info: { ref_idx: 'REFIDX_OUT_999' },
+          },
+        };
+      }),
+      sendC2CStreamMessage: vi.fn(),
+      sendInputNotify: vi.fn(),
+      deleteC2CMessage: vi.fn(),
+      uploadC2CMedia: vi.fn(),
+      emitMessageSent: vi.fn(),
     };
 
-    const res = await sendQqMessage(
-      { text: '测试回复消息', reply_to: '12345' as any, at_user: '20001' },
-      { peer: 'group_8888', gateway: mockGateway }
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_INBOUND_123',
+      peer: TEST_PEER,
+      user_id: TEST_OPENID,
+      sender_name: '',
+      time: Date.now(),
+      type: 'text',
+      content: '原消息',
+      raw: '{}',
+      file_id: null,
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      ref_idx: 'REFIDX_INBOUND_123',
+      source: 'qq',
+    });
+
+    // 1. Markdown 模式（默认开启）+ 传本地库 msg_id 自动换取 REFIDX_...
+    const resMd = await sendQqMessage(
+      { text: '#标题测试\n测试回复消息', reply_to: 'ROBOT1.0_INBOUND_123' },
+      { peer: TEST_PEER, gateway: mockGateway, db }
     );
 
-    expect(res.success).toBe(true);
-    expect(capturedPayload).toEqual([
-      { type: 'reply', data: { id: 12345 } },
-      { type: 'at', data: { qq: '20001' } },
-      { type: 'text', data: { text: ' 测试回复消息' } },
-    ]);
+    expect(resMd.success).toBe(true);
+    expect(resMd.message_id).toBe('ROBOT1.0_OUT_MSG_999');
+    expect(resMd.ref_idx).toBe('REFIDX_OUT_999');
+    assertNoUndefinedFields(resMd);
+    expect(sentPayloads[0]).toMatchObject({
+      msg_type: QQ_MSG_TYPE_MARKDOWN,
+      markdown: { content: '# 标题测试\n测试回复消息' },
+      message_reference: { message_id: 'REFIDX_INBOUND_123' },
+    });
+
+    // 2. 纯文本模式（markdown: false）
+    const resPlain = await sendQqMessage(
+      { text: '**加粗文本**', markdown: false },
+      { peer: TEST_PEER, gateway: mockGateway, db }
+    );
+    expect(resPlain.success).toBe(true);
+    expect(sentPayloads[1]).toMatchObject({
+      msg_type: QQ_MSG_TYPE_TEXT,
+      content: '加粗文本',
+    });
   });
 
-  it('1.6 send_qq_message 工具描述包含多要点分条分段发送的软性引导', async () => {
+  it('1.5 send_qq_message 工具描述与参数规范：包含分段发送引导，禁止 XML/HTML 标签，且移除 at_user', async () => {
     const ctx = booted.ctx;
-    const presetsSvc: any = (ctx as any).agentPresets || ctx.get?.('agentPresets');
     const qqWs = path.join(tmpHome, 'qq-ws-desc');
     await fsp.mkdir(qqWs, { recursive: true });
 
-    const qqGroupHandle = await ctx.agents.create({
-      sessionId: 'qq-group-8888',
+    const qqHandle = await ctx.agents.create({
+      sessionId: TEST_SESSION_ID as any,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: qqWs },
       setup: async (agentCtx: any) => {
-        if (presetsSvc?.mount) {
-          await presetsSvc.mount(agentCtx, 'qq-session');
-        } else {
-          (ctx as any).napcatBridgeTools?.registerTools?.(agentCtx);
-        }
+        await agentCtx.plugin(KujiraToolsPlugin);
       },
     });
-    const qqGroupAgent = qqGroupHandle.agent || qqGroupHandle;
-    const asmGroup = await ctx.systemPrompt.assemble({ scope: qqGroupAgent, agent: qqGroupAgent } as any);
-    const sendTool = (asmGroup.tools as any[]).find((t) => t.name === 'send_qq_message');
+    const qqAgent = (qqHandle as any).agent || qqHandle;
+    const asm = await ctx.systemPrompt.assemble({ scope: qqAgent, agent: qqAgent } as any);
+    const sendTool = (asm.tools as any[]).find((t) => t.name === 'send_qq_message');
     expect(sendTool).toBeDefined();
     expect(sendTool.description).toContain(
       '若要发送的内容较长，或包含多个不同要点、转折与独立意思，可以拆分成多条简短消息，多次调用本工具分开发送。'
     );
-  });
-
-  it('1.7 send_qq_message text 参数描述包含禁止 XML/HTML 标签与闭合符的负面约束', async () => {
-    const ctx = booted.ctx;
-    const presetsSvc: any = (ctx as any).agentPresets || ctx.get?.('agentPresets');
-    const qqWs = path.join(tmpHome, 'qq-ws-text-desc');
-    await fsp.mkdir(qqWs, { recursive: true });
-
-    const qqGroupHandle = await ctx.agents.create({
-      sessionId: 'qq-group-8888',
-      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: qqWs },
-      setup: async (agentCtx: any) => {
-        if (presetsSvc?.mount) {
-          await presetsSvc.mount(agentCtx, 'qq-session');
-        } else {
-          (ctx as any).napcatBridgeTools?.registerTools?.(agentCtx);
-        }
-      },
-    });
-    const qqGroupAgent = qqGroupHandle.agent || qqGroupHandle;
-    const asmGroup = await ctx.systemPrompt.assemble({ scope: qqGroupAgent, agent: qqGroupAgent } as any);
-    const sendTool = (asmGroup.tools as any[]).find((t) => t.name === 'send_qq_message');
-    expect(sendTool).toBeDefined();
-    const textDesc = sendTool.parameters?.properties?.text?.description;
+    const props = sendTool.parameters?.properties;
+    expect(props?.at_user).toBeUndefined();
+    expect(props?.reply_to?.type).toBe('string');
+    const textDesc = props?.text?.description;
     expect(typeof textDesc).toBe('string');
     expect(textDesc).toContain('直接填写展示给用户的原始文本');
     expect(textDesc).toContain('禁止附加任何 XML/HTML 标签、标签闭合符或外层包裹标记');
   });
 });
 
-describe('契约 2: 文本分段工具函数 (splitMessageText)', () => {
+describe('契约 2: 文本按 UTF-8 字节安全分段工具函数 (splitMessageText)', () => {
   it('空文本返回空数组', () => {
     expect(splitMessageText('')).toEqual([]);
     expect(splitMessageText(null as any)).toEqual([]);
   });
 
-  it('短于最大长度的文本直接返回单元素数组', () => {
+  it('字节数未超限的文本直接返回单元素数组', () => {
     const shortText = '这是一段普通的简短消息文本。';
-    expect(splitMessageText(shortText, 1500)).toEqual([shortText]);
+    expect(splitMessageText(shortText, 1024)).toEqual([shortText]);
   });
 
-  it('超出限制时正确按换行符分段', () => {
-    const line1 = 'A'.repeat(800);
+  it('超出 UTF-8 字节上限时优先按换行边界切分且不丢字', () => {
+    const line1 = 'A'.repeat(800) + '\n';
     const line2 = 'B'.repeat(800);
-    const text = `${line1}\n${line2}`;
+    const text = `${line1}${line2}`;
     const chunks = splitMessageText(text, 1000);
     expect(chunks).toHaveLength(2);
     expect(chunks[0]).toBe(line1);
     expect(chunks[1]).toBe(line2);
+    expect(chunks.join('')).toBe(text);
   });
 
-  it('无换行符时按空格分段', () => {
-    const part1 = 'word'.repeat(150); // 600
-    const part2 = 'test'.repeat(150); // 600
+  it('无换行符时按空格边界切分且不超过字节上限', () => {
+    const part1 = 'word'.repeat(150); // 600 bytes
+    const part2 = 'test'.repeat(150); // 600 bytes
     const text = `${part1} ${part2}`;
     const chunks = splitMessageText(text, 800);
     expect(chunks).toHaveLength(2);
-    expect(chunks[0]).toBe(part1);
-    expect(chunks[1]).toBe(part2);
+    expect(chunks.join('')).toBe(text);
+    for (const c of chunks) {
+      expect(Buffer.byteLength(c, 'utf8')).toBeLessThanOrEqual(800);
+    }
   });
 
-  it('无换行符与空格时强制按最大长度硬截断', () => {
-    const text = 'X'.repeat(2500);
-    const chunks = splitMessageText(text, 1000);
-    expect(chunks).toHaveLength(3);
-    expect(chunks[0]).toHaveLength(1000);
-    expect(chunks[1]).toHaveLength(1000);
-    expect(chunks[2]).toHaveLength(500);
+  it('超长多字节 CJK 与 emoji 连续文本按码点边界切分，绝不切断多字节字符', () => {
+    const text = '鲸'.repeat(400) + '🐳'.repeat(100); // 400*3 + 100*4 = 1600 bytes
+    const chunks = splitMessageText(text, 500);
+    expect(chunks.length).toBeGreaterThan(3);
+    expect(chunks.join('')).toBe(text);
+    for (const c of chunks) {
+      expect(Buffer.byteLength(c, 'utf8')).toBeLessThanOrEqual(500);
+      expect(c).not.toContain('\uFFFD');
+    }
   });
 });

@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 模型与思考能力类型定义
+ * kujira: 模型与思考能力类型定义
  */
 
 export interface DiscoveredModelInfo {

@@ -1,18 +1,20 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
-import React from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
-
-vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
-  IconChevronDownOutlineRegular: () => null,
-  IconChevronDownOutlineMedium: () => null,
-}));
-
 import { SessionManager } from '../../src/gateway/session.js';
-import { NapCatSettingsCard, type CardProps, type CardController } from '../../src/client/card.js';
 import { DEFAULT_NEW_MESSAGE_BEHAVIOR } from '../../src/constants/index.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
+
+const OPENID_1 = '10000000000000000000000000000001';
+const OPENID_2 = '10000000000000000000000000000002';
+const OPENID_3 = '10000000000000000000000000000003';
+const PEER_1 = openidToPeer(OPENID_1);
+const PEER_2 = openidToPeer(OPENID_2);
+const PEER_3 = openidToPeer(OPENID_3);
+const SID_1 = openidToSessionBaseId(OPENID_1);
+const SID_2 = openidToSessionBaseId(OPENID_2);
+const SID_3 = openidToSessionBaseId(OPENID_3);
 
 describe('契约测试: 运行中新消息行为模式 (New Message Behavior: Steer vs Queue)', () => {
   let tmpHome: string;
@@ -34,7 +36,15 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
     };
   });
 
-  it('契约 1: 默认配置下 (new_message_behavior 为 steer)，dispatchWakeup 优先调用 agent.steer 进行及时插话', async () => {
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    } catch {}
+  });
+
+  it('契约 1: 默认配置下 (DEFAULT_NEW_MESSAGE_BEHAVIOR === steer)，dispatchWakeup 优先调用 agent.steer 进行及时插话', async () => {
+    expect(DEFAULT_NEW_MESSAGE_BEHAVIOR).toBe('steer');
+
     const steerSpy = vi.fn();
     const followupSpy = vi.fn();
 
@@ -42,7 +52,7 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
       status: 'running',
       steer: steerSpy,
       followup: followupSpy,
-      session: { id: 'qq-group-1000000001' },
+      session: { id: SID_1 },
     };
 
     mockCtx.get = vi.fn((key: string) => {
@@ -60,9 +70,9 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
 
     const userMsg = await sessionManager.dispatchWakeup({
       trigger: 'direct',
-      peer: 'group_1000000001',
-      from_user: '10001',
-      from_name: '测试用户',
+      peer: PEER_1,
+      from_user: OPENID_1,
+      from_name: '测试用户1',
       content: '请中途插话处理',
       timestamp: Date.now(),
     });
@@ -75,7 +85,7 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
     await sessionManager.dispose();
   });
 
-  it('契约 2: 当显式配置 new_message_behavior 为 queue 时，dispatchWakeup 调用 agent.followup 加入队列', async () => {
+  it('契约 2: 当通过 kujira-bridge-config 显式配置 new_message_behavior 为 queue 时，dispatchWakeup 调用 agent.followup 加入队列', async () => {
     const steerSpy = vi.fn();
     const followupSpy = vi.fn();
 
@@ -83,14 +93,13 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
       status: 'running',
       steer: steerSpy,
       followup: followupSpy,
-      session: { id: 'qq-group-1000000002' },
-    };
-
-    mockCtx.config = {
-      new_message_behavior: 'queue',
+      session: { id: SID_2 },
     };
 
     mockCtx.get = vi.fn((key: string) => {
+      if (key === 'kujira-bridge-config') {
+        return () => ({ new_message_behavior: 'queue' });
+      }
       if (key === 'agents') {
         return {
           get: () => mockAgent,
@@ -105,8 +114,8 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
 
     const userMsg = await sessionManager.dispatchWakeup({
       trigger: 'direct',
-      peer: 'group_1000000002',
-      from_user: '10002',
+      peer: PEER_2,
+      from_user: OPENID_2,
       from_name: '测试用户2',
       content: '排队等待处理',
       timestamp: Date.now(),
@@ -126,7 +135,7 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
     const mockAgentWithoutSteer: any = {
       status: 'running',
       followup: followupSpy,
-      session: { id: 'qq-group-1000000003' },
+      session: { id: SID_3 },
     };
 
     mockCtx.config = {
@@ -147,9 +156,9 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
     const sessionManager = new SessionManager(mockCtx, tmpHome);
 
     const userMsg = await sessionManager.dispatchWakeup({
-      trigger: 'direct',
-      peer: 'group_1000000003',
-      from_user: '10003',
+      trigger: 'quote',
+      peer: PEER_3,
+      from_user: OPENID_3,
       from_name: '测试用户3',
       content: '无 steer 方法降级测试',
       timestamp: Date.now(),
@@ -160,43 +169,5 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
     expect(followupSpy).toHaveBeenCalledWith(userMsg);
 
     await sessionManager.dispose();
-  });
-
-  it('契约 4: Card UI 回复配置面板在“滑动窗口保留条数”之下、“启用群聊主动回复”之上渲染新消息行为选择器', () => {
-    let captured: CardController | null = null;
-    const html = renderToStaticMarkup(
-      React.createElement(NapCatSettingsCard, {
-        initialExpanded: true,
-        initialTab: 'proactive',
-        initialConfig: {
-          new_message_behavior: 'steer',
-        },
-        controllerRef: (ctrl) => {
-          captured = ctrl;
-        },
-      })
-    );
-
-    expect(html).toContain('id="napcat-tabpanel-proactive"');
-    expect(html).toContain('id="napcat-new-message-behavior"');
-    expect(html).toContain('新消息行为 (new_message_behavior)');
-    expect(html).toContain('value="steer"');
-    expect(html).toContain('value="queue"');
-
-    // 位置断言：在 napcat-proactive-buffer-size 之下，且在 napcat-proactive-reply-enabled 之上
-    const bufferSizeIndex = html.indexOf('id="napcat-proactive-buffer-size"');
-    const behaviorIndex = html.indexOf('id="napcat-new-message-behavior"');
-    const replyEnabledIndex = html.indexOf('id="napcat-proactive-reply-enabled"');
-
-    expect(bufferSizeIndex).toBeGreaterThan(-1);
-    expect(behaviorIndex).toBeGreaterThan(bufferSizeIndex);
-    expect(replyEnabledIndex).toBeGreaterThan(behaviorIndex);
-
-    // 控制器双向绑定验证
-    expect(captured).not.toBeNull();
-    expect(captured!.model.getDraft().new_message_behavior).toBe(DEFAULT_NEW_MESSAGE_BEHAVIOR);
-
-    captured!.handleFieldChange('new_message_behavior', 'queue');
-    expect(captured!.model.getDraft().new_message_behavior).toBe('queue');
   });
 });

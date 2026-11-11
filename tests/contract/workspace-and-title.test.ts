@@ -1,11 +1,23 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
 import { Context } from '@deepseek-ai/cordis';
 import { SessionManager, formatSessionTitle } from '../../src/gateway/session.js';
+import { openidToPeer, openidToSessionBaseId, extractPeerHash } from '../../src/utils/peer.js';
 import type { WakeupPayload } from '../../src/types/index.js';
 
-describe('NapCat 顶层工作区与会话标题契约测试', () => {
-  const tmpHome = '/tmp/dsh-test-home';
+const OPENID = '10000000000000000000000000000001';
+const PEER = openidToPeer(OPENID);
+const HASH = extractPeerHash(PEER)!;
+const SID = openidToSessionBaseId(OPENID);
+
+const OPENID_B = '10000000000000000000000000000019';
+const PEER_B = openidToPeer(OPENID_B);
+const SID_B = openidToSessionBaseId(OPENID_B);
+
+describe('Kujira 顶层工作区与单聊会话标题契约测试', () => {
+  let tmpHome: string;
   let ctx: Context;
   let sessionManager: SessionManager;
   let mockWorkspace: any;
@@ -14,10 +26,11 @@ describe('NapCat 顶层工作区与会话标题契约测试', () => {
   let mockAgents: any;
 
   beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-ws-title-'));
     ctx = new Context();
     mockWorkspace = {
-      path: path.resolve(tmpHome, 'workspace/napcat'),
-      title: 'NapCat',
+      path: path.resolve(tmpHome, 'workspace/kujira'),
+      title: 'Kujira',
       attachSession: vi.fn().mockResolvedValue(undefined),
     };
     mockWorkspaceRegistry = {
@@ -49,117 +62,91 @@ describe('NapCat 顶层工作区与会话标题契约测试', () => {
     sessionManager = new SessionManager(ctx, tmpHome);
   });
 
-  describe('1. 会话标题格式化 (formatSessionTitle)', () => {
-    it('群聊带群名称 - 初始版本 #1', () => {
-      const title = formatSessionTitle('group_3000000001', 'qq-group-3000000001', '摸鱼交流群');
-      expect(title).toBe('群聊: 摸鱼交流群 3000000001 #1');
-    });
+  afterEach(async () => {
+    await sessionManager.dispose().catch(() => {});
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
 
-    it('群聊无群名称 - 初始版本 #1', () => {
-      const title = formatSessionTitle('group_3000000001', 'qq-group-3000000001');
-      expect(title).toBe('群聊: 3000000001 #1');
-    });
-
-    it('群聊带版本号 - /clear 后新会话 #2', () => {
-      const title = formatSessionTitle('group_3000000001', 'qq-group-3000000001-2', '摸鱼交流群');
-      expect(title).toBe('群聊: 摸鱼交流群 3000000001 #2');
-    });
-
+  describe('1. 单聊会话标题格式化 (formatSessionTitle)', () => {
     it('私聊带用户昵称 - 初始版本 #1', () => {
-      const title = formatSessionTitle('user_2000000001', 'qq-user-2000000001', 'TestUser');
-      expect(title).toBe('私聊: TestUser 2000000001 #1');
+      const title = formatSessionTitle(PEER, SID, 'TestUser');
+      expect(title).toBe(`私聊: TestUser ${HASH} #1`);
     });
 
     it('私聊无用户昵称 - 初始版本 #1', () => {
-      const title = formatSessionTitle('user_2000000001', 'qq-user-2000000001');
-      expect(title).toBe('私聊: 2000000001 #1');
+      const title = formatSessionTitle(PEER, SID);
+      expect(title).toBe(`私聊: ${HASH} #1`);
     });
 
     it('私聊带版本号 - /clear 后新会话 #3', () => {
-      const title = formatSessionTitle('user_2000000001', 'qq-user-2000000001-3', 'TestUser');
-      expect(title).toBe('私聊: TestUser 2000000001 #3');
+      const title = formatSessionTitle(PEER, `${SID}-3`, 'TestUser');
+      expect(title).toBe(`私聊: TestUser ${HASH} #3`);
     });
 
     it('多轮归档后 - 新轮次 1 初始版本 #1 (1)', () => {
-      const title = formatSessionTitle('user_2000000001', 'qq-user-2000000001-r1-1', 'TestUser');
-      expect(title).toBe('私聊: TestUser 2000000001 #1 (1)');
+      const title = formatSessionTitle(PEER, `${SID}-r1-1`, 'TestUser');
+      expect(title).toBe(`私聊: TestUser ${HASH} #1 (1)`);
     });
 
     it('多轮归档后 - 新轮次 1 清空后版本 #2 (1)', () => {
-      const title = formatSessionTitle('user_2000000001', 'qq-user-2000000001-r1-2', 'TestUser');
-      expect(title).toBe('私聊: TestUser 2000000001 #2 (1)');
+      const title = formatSessionTitle(PEER, `${SID}-r1-2`, 'TestUser');
+      expect(title).toBe(`私聊: TestUser ${HASH} #2 (1)`);
     });
 
     it('多轮归档后 - 新轮次 2 初始版本 #1 (2)', () => {
-      const title = formatSessionTitle('user_2000000001', 'qq-user-2000000001-r2-1', 'TestUser');
-      expect(title).toBe('私聊: TestUser 2000000001 #1 (2)');
-    });
-
-    it('群聊多轮归档后 - 新轮次 1 初始版本 #1 (1)', () => {
-      const title = formatSessionTitle('group_3000000001', 'qq-group-3000000001-r1-1', '摸鱼交流群');
-      expect(title).toBe('群聊: 摸鱼交流群 3000000001 #1 (1)');
+      const title = formatSessionTitle(PEER, `${SID}-r2-1`, 'TestUser');
+      expect(title).toBe(`私聊: TestUser ${HASH} #1 (2)`);
     });
   });
 
   describe('2. 工作区统一注册与 CWD 统一收敛', () => {
-    it('无论群聊还是私聊，resolveCwd 均统一返回 napcat 根工作区目录', () => {
-      const expectedCwd = path.resolve(tmpHome, 'workspace/napcat');
-      expect(sessionManager.resolveCwd('group_3000000001')).toBe(expectedCwd);
-      expect(sessionManager.resolveCwd('user_2000000001')).toBe(expectedCwd);
-      expect(sessionManager.resolveCwd('qq-group-3000000001-2')).toBe(expectedCwd);
+    it('resolveCwd 统一返回 kujira 根工作区目录', () => {
+      const expectedCwd = path.resolve(tmpHome, 'workspace/kujira');
+      expect(sessionManager.resolveCwd(PEER)).toBe(expectedCwd);
+      expect(sessionManager.resolveCwd(SID)).toBe(expectedCwd);
+      expect(sessionManager.resolveCwd(`${SID}-2`)).toBe(expectedCwd);
     });
 
-    it('注册工作区时统一创建标题为 NapCat 的顶级工作区，并 attachSession', async () => {
-      const cwd = sessionManager.resolveCwd('group_3000000001');
-      await sessionManager.registerWorkspace(cwd, 'qq-group-3000000001');
+    it('注册工作区时统一创建标题为 Kujira 的顶级工作区，并 attachSession', async () => {
+      const cwd = sessionManager.resolveCwd(PEER);
+      await sessionManager.registerWorkspace(cwd, SID);
 
-      expect(mockWorkspaceRegistry.create).toHaveBeenCalledWith(cwd, 'NapCat');
-      expect(mockWorkspace.attachSession).toHaveBeenCalledWith('qq-group-3000000001');
+      expect(mockWorkspaceRegistry.create).toHaveBeenCalledWith(cwd, 'Kujira');
+      expect(mockWorkspace.attachSession).toHaveBeenCalledWith(SID);
     });
   });
 
   describe('3. 会话创建时标题锁定与免 LLM 自动总结覆盖', () => {
-    it('创建群聊 Agent 时正确设置并锁定群聊标题', async () => {
-      sessionManager.setPeerName('group_3000000001', '核心研发群');
-      await sessionManager.getOrCreateAgent('group_3000000001');
+    it('创建单聊 Agent 时正确设置并锁定私聊标题与 Kujira 工作区', async () => {
+      sessionManager.setPeerName(PEER, '小明');
+      await sessionManager.getOrCreateAgent(PEER);
 
       expect(mockSessionTitle.rename).toHaveBeenCalledWith(
         expect.anything(),
-        '群聊: 核心研发群 3000000001 #1'
+        `私聊: 小明 ${HASH} #1`
       );
       expect(mockWorkspaceRegistry.create).toHaveBeenCalledWith(
-        path.resolve(tmpHome, 'workspace/napcat'),
-        'NapCat'
+        path.resolve(tmpHome, 'workspace/kujira'),
+        'Kujira'
       );
-      expect(mockWorkspace.attachSession).toHaveBeenCalledWith('qq-group-3000000001');
+      expect(mockWorkspace.attachSession).toHaveBeenCalledWith(SID);
     });
 
-    it('创建私聊 Agent 时正确设置并锁定私聊标题', async () => {
-      sessionManager.setPeerName('user_2000000001', '小明');
-      await sessionManager.getOrCreateAgent('user_2000000001');
-
-      expect(mockSessionTitle.rename).toHaveBeenCalledWith(
-        expect.anything(),
-        '私聊: 小明 2000000001 #1'
-      );
-      expect(mockWorkspace.attachSession).toHaveBeenCalledWith('qq-user-2000000001');
-    });
-
-    it('dispatchWakeup 收到带有昵称的消息时动态更新会话标题', async () => {
+    it('dispatchWakeup 收到带有昵称的真实单聊消息 (direct) 时动态更新会话标题', async () => {
       const payload: WakeupPayload = {
-        peer: 'user_2000000001',
-        trigger: 'private',
-        from_user: '2000000001',
+        peer: PEER,
+        trigger: 'direct',
+        from_user: OPENID,
         from_name: '张三丰',
         content: '你好呀',
-        timestamp: '2026-08-31 04:00:00',
+        timestamp: Date.now(),
       };
 
       await sessionManager.dispatchWakeup(payload);
 
       expect(mockSessionTitle.rename).toHaveBeenCalledWith(
         expect.anything(),
-        '私聊: 张三丰 2000000001 #1'
+        `私聊: 张三丰 ${HASH} #1`
       );
     });
   });
@@ -167,10 +154,10 @@ describe('NapCat 顶层工作区与会话标题契约测试', () => {
   describe('4. DSH 0.2.x 工作区 candidateMatches 契约与未分组防掉落', () => {
     it('契约: peerToSessionId 严禁主动从 wsRegistry.sessionPaths 中删除会话，避免触发 DSH mutate 剔除掉入未分组', () => {
       const sessionPaths = new Map<string, string>();
-      sessionPaths.set('qq-user-2000000019', path.resolve(tmpHome, 'workspace/napcat'));
+      sessionPaths.set(SID_B, path.resolve(tmpHome, 'workspace/kujira'));
       const wsRegistry = {
         headers: new Map<string, any>([
-          ['qq-user-2000000019', { id: 'qq-user-2000000019', cwd: path.resolve(tmpHome, 'workspace/napcat') }],
+          [SID_B, { id: SID_B, cwd: path.resolve(tmpHome, 'workspace/kujira') }],
         ]),
         sessionPaths,
         invalidSessionPaths: new Map<string, string>(),
@@ -178,17 +165,15 @@ describe('NapCat 顶层工作区与会话标题契约测试', () => {
       };
       (ctx as any).workspaceRegistry = wsRegistry;
 
-      // 模拟磁盘尚未落盘（尚未 flush）
-      sessionManager.peerToSessionId('user_2000000019');
+      sessionManager.peerToSessionId(PEER_B);
 
-      // 验证：绝对不能删除 wsRegistry.sessionPaths 中的该 sessionId！
-      expect(sessionPaths.has('qq-user-2000000019')).toBe(true);
+      expect(sessionPaths.has(SID_B)).toBe(true);
     });
 
     it('契约: 真实 DSH WorkspaceEntity 经历挂载与解绑操作后，父会话必须始终保留在 sessionIds 中', async () => {
-      const canonicalPath = path.resolve(tmpHome, 'workspace/napcat');
+      const canonicalPath = path.resolve(tmpHome, 'workspace/kujira');
       const sessionPaths = new Map<string, string>();
-      sessionPaths.set('qq-user-1000000001', canonicalPath);
+      sessionPaths.set(SID, canonicalPath);
 
       const candidateMatches = (id: string, p: string) =>
         sessionPaths.get(id) === p;
@@ -196,8 +181,8 @@ describe('NapCat 顶层工作区与会话标题契约测试', () => {
       const entity = {
         record: {
           path: canonicalPath,
-          title: 'NapCat',
-          sessionIds: ['qq-user-1000000001'],
+          title: 'Kujira',
+          sessionIds: [SID],
         },
         get path() {
           return this.record.path;
@@ -230,22 +215,17 @@ describe('NapCat 顶层工作区与会话标题契约测试', () => {
         },
       };
 
-      // 初始状态：父会话处于 NapCat 工作区中
-      expect(entity.sessionIds).toContain('qq-user-1000000001');
+      expect(entity.sessionIds).toContain(SID);
 
-      // 模拟后台回顾子会话挂载
-      const reviewSessionId = 'review-qq-user-1000000001-123456';
+      const reviewSessionId = `review-${SID}-123456`;
       await entity.attachSession(reviewSessionId);
-      expect(entity.sessionIds).toContain('qq-user-1000000001');
+      expect(entity.sessionIds).toContain(SID);
       expect(entity.sessionIds).toContain(reviewSessionId);
 
-      // 模拟后台回顾用完即焚解绑
       await entity.detachSession(reviewSessionId);
 
-      // 核心断言：父会话绝对不能掉入未分组，必须依旧在 sessionIds 中！
-      expect(entity.sessionIds).toContain('qq-user-1000000001');
+      expect(entity.sessionIds).toContain(SID);
       expect(entity.sessionIds).not.toContain(reviewSessionId);
     });
-
   });
 });

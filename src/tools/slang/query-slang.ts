@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 查询黑话工具 (query_slang)
+ * kujira: 查询黑话工具 (query_slang)
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -18,28 +18,28 @@ export async function querySlang(
 ): Promise<QuerySlangResult> {
   const cleanTerm = (params.term || '').trim();
   if (!cleanTerm) {
-    return {
+    return toLosslessJson({
       success: false,
       error: '查询黑话必须提供词条名称 (term)',
-    };
+    });
   }
 
   const entry = await storage.queryEntry(cleanTerm);
   if (!entry) {
-    return {
+    return toLosslessJson({
       success: false,
       error: `黑话知识库中未收录词条 "${cleanTerm}"，如需了解其含义可尝试联网搜索或向用户请教。`,
-    };
+    });
   }
 
   const tagsDesc = entry.tags ? ` [标签: ${entry.tags}]` : '';
   const exDesc = entry.example ? `\n- 典型例句: ${entry.example}` : '';
 
-  return {
+  return toLosslessJson({
     success: true,
     entry,
     message: `【${entry.term}】${tagsDesc}\n- 核心释义: ${entry.definition}${exDesc}`,
-  };
+  });
 }
 
 /**
@@ -49,7 +49,7 @@ export function createQuerySlangTool(storage: SlangStorage): ToolDefinition {
   return defineTool({
     name: 'query_slang',
     description:
-      '【日常聊天查梗专用】查询指定社群黑话、网络流行语或缩写的完整释义与典型使用例句。当在常驻黑话索引中看到对应词条或对话涉及该梗、且前文尚未查询掌握时应调用本工具，以获取权威社群释义与真实语境，严禁在未查明前仅凭索引或通用印象臆测。若前文已查询掌握则无需重复查询；若未收录可尝试联网搜索。',
+      '【日常聊天查梗专用】查询指定流行语、黑话或缩写的完整释义与典型使用例句。当在常驻黑话索引中看到对应词条或对话涉及该梗、且前文尚未查询掌握时应调用本工具，以获取准确释义与真实语境，严禁在未查明前仅凭索引或通用印象臆测。若前文已查询掌握则无需重复查询；若未收录可尝试联网搜索。',
     parameters: {
       term: {
         type: 'string',
@@ -62,7 +62,9 @@ export function createQuerySlangTool(storage: SlangStorage): ToolDefinition {
       render: (_args, value: any) => [
         {
           type: 'text',
-          text: value?.message || (value?.success ? '查询成功' : `查询失败: ${value?.error || '未知错误'}`),
+          text:
+            value?.message ||
+            (value?.success ? '查询成功' : `查询失败: ${value?.error || '未知错误'}`),
         },
       ],
     },

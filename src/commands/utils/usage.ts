@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: Token 与用量格式化工具
+ * kujira: Token 与用量格式化工具
  */
 
 import type { Context } from '@deepseek-ai/cordis';

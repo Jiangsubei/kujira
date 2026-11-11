@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 表情包管理类工具集
+ * kujira: 表情包管理类工具集
  */
 
 export * from './list-faces.js';

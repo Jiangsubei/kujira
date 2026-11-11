@@ -16,14 +16,14 @@ export class SectionErrorBoundary extends React.Component<{ children: React.Reac
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    console.error('[dsh-napcat-bridge] Section render error:', error, info);
+    console.error('[kujira] Section render error:', error, info);
   }
 
   render() {
     if (this.state.hasError) {
       return (
         <div style={{ padding: '24px', color: '#ff6b6b' }}>
-          <h3>QQ NapCat 设置加载异常</h3>
+          <h3>QQ Kujira 设置加载异常</h3>
           <pre style={{ whiteSpace: 'pre-wrap', fontSize: '12px' }}>
             {this.state.error?.stack || this.state.error?.message || String(this.state.error)}
           </pre>

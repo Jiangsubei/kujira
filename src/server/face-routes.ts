@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge 表情包管理 HTTP REST API 路由
+ * kujira 表情包管理 HTTP REST API 路由
  * 为 Web UI 设置卡提供真实的表情包列表获取、大图预览、手动上传、二次编辑与软删除。
  */
 
@@ -14,8 +14,8 @@ import { sendJson, parseJsonBody, assertHostAuthentication } from './routes.js';
 import { resolveDshPath } from '../utils/path.js';
 import { DEFAULT_FACE_STORE_DIR } from '../constants/index.js';
 
-export const FACES_API_PATH = '/plugins/dsh-napcat-bridge/faces';
-export const FACES_PREVIEW_API_PREFIX = '/plugins/dsh-napcat-bridge/faces/preview';
+export const FACES_API_PATH = '/plugins/kujira/faces';
+export const FACES_PREVIEW_API_PREFIX = '/plugins/kujira/faces/preview';
 
 /** 上传表情包允许的安全图片格式白名单 (杜绝路径穿越与非图片文件注入) */
 export const ALLOWED_FACE_FORMATS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
@@ -38,7 +38,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
   };
 
   /**
-   * 1. 列表与上传路由处理器 (GET / POST /plugins/dsh-napcat-bridge/faces)
+   * 1. 列表与上传路由处理器 (GET / POST /plugins/kujira/faces)
    */
   const facesCollectionHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
@@ -153,7 +153,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
   };
 
   /**
-   * 2. 编辑表情路由处理器 (POST /plugins/dsh-napcat-bridge/faces/edit)
+   * 2. 编辑表情路由处理器 (POST /plugins/kujira/faces/edit)
    */
   const editFaceHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
@@ -199,7 +199,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
   };
 
   /**
-   * 3. 删除表情路由处理器 (POST /plugins/dsh-napcat-bridge/faces/delete)
+   * 3. 删除表情路由处理器 (POST /plugins/kujira/faces/delete)
    */
   const deleteFaceHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
@@ -228,7 +228,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
   };
 
   /**
-   * 4. 大图与缩略图预览文件流路由处理器 (GET /plugins/dsh-napcat-bridge/faces/preview/:id)
+   * 4. 大图与缩略图预览文件流路由处理器 (GET /plugins/kujira/faces/preview/:id)
    */
   const previewImageHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
@@ -298,7 +298,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
     if (isDisposed || !server || typeof server.register !== 'function') return;
 
     try {
-      // 注册 /plugins/dsh-napcat-bridge/faces
+      // 注册 /plugins/kujira/faces
       const unreg1 = server.register({
         kind: 'exact',
         path: FACES_API_PATH,
@@ -306,7 +306,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
       });
       if (typeof unreg1 === 'function') unregisterList.push(unreg1);
 
-      // 注册 /plugins/dsh-napcat-bridge/faces/edit
+      // 注册 /plugins/kujira/faces/edit
       const unregEdit = server.register({
         kind: 'exact',
         path: `${FACES_API_PATH}/edit`,
@@ -314,7 +314,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
       });
       if (typeof unregEdit === 'function') unregisterList.push(unregEdit);
 
-      // 注册 /plugins/dsh-napcat-bridge/faces/delete
+      // 注册 /plugins/kujira/faces/delete
       const unregDel = server.register({
         kind: 'exact',
         path: `${FACES_API_PATH}/delete`,
@@ -322,7 +322,7 @@ export function registerFacesRoutes(options: FaceRoutesOptions): () => void {
       });
       if (typeof unregDel === 'function') unregisterList.push(unregDel);
 
-      // 注册 /plugins/dsh-napcat-bridge/faces/preview (前缀匹配)
+      // 注册 /plugins/kujira/faces/preview (前缀匹配)
       const unregPreview = server.register({
         kind: 'prefix',
         path: FACES_PREVIEW_API_PREFIX,

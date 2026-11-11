@@ -1,260 +1,325 @@
-import { describe, it, expect } from 'vitest';
+/**
+ * 契约测试: send_file 文件源归一化、四类媒体映射与四步分片上传下发契约
+ *
+ * 覆盖规范:
+ * - 支持 本地绝对路径 / file:// URI / http(s):// URL / base64:// & data:;base64 四种形态；
+ * - file_type 支持 'image' | 'file' | 'video' | 'voice'，映射到 QQMediaFileType (1/4/2/3)；
+ * - 经 OutboundStreamBridge.sendMediaReply 完成 uploadC2CMedia + msg_type=7 下发，返回 string message_id；
+ * - HTTP 拉取报错脱敏去 query 凭证，不泄漏 token / rkey；无 gateway/peer 或不存在文件绝不假成功。
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { sendFile } from '../../src/tools/index.js';
 import {
   classifySendFileSource,
   detectSendFileType,
 } from '../../src/tools/file-source.js';
+import { openidToPeer } from '../../src/utils/peer.js';
+import {
+  QQ_FILE_TYPE_AUDIO,
+  QQ_FILE_TYPE_FILE,
+  QQ_FILE_TYPE_IMAGE,
+  QQ_FILE_TYPE_VIDEO,
+  QQ_MSG_TYPE_MEDIA,
+} from '../../src/constants/index.js';
 
-/**
- * 契约测试: 出方向文件发送 (IS-S1/IS-S2/IS-S4)
- *
- * - IS-S1: send_file 支持 本地路径 / file:// URI / URL / Base64 四种形态 + WSL→Windows 路径翻译
- * - IS-S2: file_type 参数强制生效
- * - IS-S4: 发送前路径校验 + 无 gateway/peer 不假成功
- */
+const MOCK_OPENID = 'CCCCDDDDEEEEFFFF0000111122223333';
+const USER_PEER = openidToPeer(MOCK_OPENID);
 
-const GROUP_PEER = 'group_3000000001';
-
-/** WSL 共享盘 /mnt/c 是否可用（本机测试环境恒存在） */
-const MNT_C_AVAILABLE = fs.existsSync('/mnt/c');
-
-function stubGateway(overrides: Record<string, any> = {}) {
-  const calls: Array<Record<string, any>> = [];
-  const gateway = {
-    sendMsg: async (_peer: any, message: any) => {
-      calls.push({ action: 'sendMsg', message });
-      return { status: 'ok', retcode: 0, data: { message_id: 12345 } };
-    },
-    ...overrides,
-  };
-  return { gateway, calls };
+function assertNoUndefinedFields(obj: unknown, currentPath = ''): void {
+  if (obj === undefined) {
+    throw new Error(`Found undefined at "${currentPath}"`);
+  }
+  if (obj === null || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    obj.forEach((item, idx) => assertNoUndefinedFields(item, `${currentPath}[${idx}]`));
+    return;
+  }
+  for (const key of Object.keys(obj)) {
+    const val = (obj as Record<string, unknown>)[key];
+    if (val === undefined) {
+      throw new Error(`Found undefined key "${currentPath ? `${currentPath}.${key}` : key}"`);
+    }
+    assertNoUndefinedFields(val, currentPath ? `${currentPath}.${key}` : key);
+  }
 }
 
-describe('契约测试: send_file 四形态归一化与路径翻译 (SendFile Source Contract IS-S1)', () => {
-  it('IS-S1-契约 1: Base64 (base64://) 原样直传 NapCat', async () => {
-    const { gateway, calls } = stubGateway();
-    const res = await sendFile(
+function stubGateway(overrides: Record<string, any> = {}) {
+  const uploadCalls: Array<{ openid: string; size: number; options: any }> = [];
+  const sendCalls: Array<{ openid: string; payload: any; meta: any }> = [];
+
+  const gateway = {
+    uploadC2CMedia: vi.fn(async (openid: string, bytes: Uint8Array, options: any) => {
+      uploadCalls.push({ openid, size: bytes.length, options });
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          file_uuid: 'uuid_mock_001',
+          file_info: 'file_info_mock_001',
+          ttl: 86400,
+        },
+      };
+    }),
+    sendC2CMessage: vi.fn(async (openid: string, payload: any, meta: any) => {
+      sendCalls.push({ openid, payload, meta });
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          id: 'ROBOT1.0_MEDIA_OUT_12345',
+          ext_info: { ref_idx: 'REFIDX_MEDIA_12345' },
+        },
+      };
+    }),
+    sendC2CStreamMessage: vi.fn(),
+    sendInputNotify: vi.fn(),
+    deleteC2CMessage: vi.fn(),
+    emitMessageSent: vi.fn(),
+    ...overrides,
+  };
+
+  return { gateway, uploadCalls, sendCalls };
+}
+
+describe('契约测试: send_file 四形态归一化与四步上传下发', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-send-file-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('契约 1: base64:// 与 data:...;base64, 解码 Buffer 并上传下发', async () => {
+    const { gateway, uploadCalls, sendCalls } = stubGateway();
+
+    const resB64 = await sendFile(
       { file_path: 'base64://aGVsbG8=' },
-      { peer: GROUP_PEER, gateway }
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
     );
-    expect(res.success).toBe(true);
-    expect(calls[0].message).toEqual([{ type: 'file', data: { file: 'base64://aGVsbG8=' } }]);
+    expect(resB64.success).toBe(true);
+    expect(resB64.message_id).toBe('ROBOT1.0_MEDIA_OUT_12345');
+    expect(resB64.ref_idx).toBe('REFIDX_MEDIA_12345');
+    assertNoUndefinedFields(resB64);
+    expect(uploadCalls[0]!.options.fileType).toBe(QQ_FILE_TYPE_FILE);
+    expect(sendCalls[0]!.payload).toMatchObject({
+      msg_type: QQ_MSG_TYPE_MEDIA,
+      media: { file_info: 'file_info_mock_001' },
+    });
+
+    const pngHeaderB64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+    const resDataUri = await sendFile(
+      { file_path: `data:image/png;base64,${pngHeaderB64}` },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+    expect(resDataUri.success).toBe(true);
+    expect(uploadCalls[1]!.options.fileType).toBe(QQ_FILE_TYPE_IMAGE);
   });
 
-  it('IS-S1-契约 2: data:;base64 前缀归一化为 base64:// 交付', async () => {
-    const { gateway, calls } = stubGateway();
-    const res = await sendFile(
-      { file_path: 'data:application/octet-stream;base64,aGVsbG8=' },
-      { peer: GROUP_PEER, gateway }
-    );
-    expect(res.success).toBe(true);
-    expect(calls[0].message).toEqual([{ type: 'file', data: { file: 'base64://aGVsbG8=' } }]);
-  });
+  it('契约 2: 本地绝对路径与 file:// URI 校验读取并正确映射四类文件类型', async () => {
+    const imgPath = path.join(tmpDir, 'chart.png');
+    const vidPath = path.join(tmpDir, 'clip.mp4');
+    const wavPath = path.join(tmpDir, 'voice.wav');
+    const docPath = path.join(tmpDir, 'report.pdf');
+    fs.writeFileSync(imgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]));
+    fs.writeFileSync(vidPath, Buffer.from('fake-mp4-data'));
+    fs.writeFileSync(wavPath, Buffer.from('RIFF1234WAVE'));
+    fs.writeFileSync(docPath, Buffer.from('%PDF-1.4'));
 
-  it('IS-S1-契约 3: URL 原样直传，图片扩展名自动判定 image 段', async () => {
-    const { gateway, calls } = stubGateway();
-    const res = await sendFile(
-      { file_path: 'https://example.com/a.png?v=2' },
-      { peer: GROUP_PEER, gateway }
+    const { gateway, uploadCalls } = stubGateway();
+
+    const rImg = await sendFile(
+      { file_path: pathToFileURL(imgPath).href },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
     );
-    expect(res.success).toBe(true);
-    expect(calls[0].message).toEqual([
-      { type: 'image', data: { file: 'https://example.com/a.png?v=2' } },
+    const rVid = await sendFile(
+      { file_path: vidPath },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+    const rVoice = await sendFile(
+      { file_path: wavPath },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+    const rDoc = await sendFile(
+      { file_path: docPath },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+
+    expect(rImg.success).toBe(true);
+    expect(rVid.success).toBe(true);
+    expect(rVoice.success).toBe(true);
+    expect(rDoc.success).toBe(true);
+
+    expect(uploadCalls.map((c) => c.options.fileType)).toEqual([
+      QQ_FILE_TYPE_IMAGE,
+      QQ_FILE_TYPE_VIDEO,
+      QQ_FILE_TYPE_AUDIO,
+      QQ_FILE_TYPE_FILE,
     ]);
   });
 
-  it(
-    'IS-S1-契约 4: WSL /mnt/c 本地路径存在时翻译为 file:///C:/ 交付 NapCat',
-    { skip: !MNT_C_AVAILABLE },
-    async () => {
-      const tmpDir = fs.mkdtempSync('/mnt/c/Users/TestUser/AppData/Local/Temp/dsh-b1-');
-      try {
-        const file = path.join(tmpDir, 'report.pdf');
-        fs.writeFileSync(file, 'fake pdf');
-        const { gateway, calls } = stubGateway();
-        const res = await sendFile({ file_path: file }, { peer: GROUP_PEER, gateway });
-        expect(res.success).toBe(true);
-        const delivered = calls[0].message[0].data.file;
-        expect(delivered.startsWith('file:///C:/')).toBe(true);
-        expect(calls[0].message[0].type).toBe('file');
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+  it('契约 3: file_type 参数强制覆盖扩展名推导', async () => {
+    const docPath = path.join(tmpDir, 'report.pdf');
+    fs.writeFileSync(docPath, 'fake-content');
+    const { gateway, uploadCalls } = stubGateway();
+
+    const res = await sendFile(
+      { file_path: docPath, file_type: 'image' },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+    expect(res.success).toBe(true);
+    expect(uploadCalls[0]!.options.fileType).toBe(QQ_FILE_TYPE_IMAGE);
+
+    const pngPath = path.join(tmpDir, 'photo.png');
+    fs.writeFileSync(pngPath, 'fake-png');
+    const resAsFile = await sendFile(
+      { file_path: pngPath, file_type: 'file' },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+    expect(resAsFile.success).toBe(true);
+    expect(uploadCalls[1]!.options.fileType).toBe(QQ_FILE_TYPE_FILE);
+  });
+
+  it('契约 4: http(s):// URL 拉取字节流上传；拉取失败时报错脱敏去 query 凭证', async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url?.startsWith('/ok.png')) {
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]));
+        return;
       }
-    }
-  );
+      res.writeHead(404);
+      res.end('not found');
+    });
 
-  it('IS-S1-契约 5: file:// URI（指向 /mnt/c 共享文件）归一化为 file:///C:/ 交付', { skip: !MNT_C_AVAILABLE }, async () => {
-    const tmpDir = fs.mkdtempSync('/mnt/c/Users/TestUser/AppData/Local/Temp/dsh-b1f-');
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const addr = server.address() as { port: number };
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
     try {
-      const file = path.join(tmpDir, 'photo.png');
-      fs.writeFileSync(file, 'fake png');
-      const { gateway, calls } = stubGateway();
-      const res = await sendFile(
-        { file_path: `file://${file}` },
-        { peer: GROUP_PEER, gateway }
+      const { gateway, uploadCalls } = stubGateway();
+
+      // 1. 成功拉取并识别为 image
+      const okRes = await sendFile(
+        { file_path: `${baseUrl}/ok.png?rkey=SECRET_TOKEN_XYZ` },
+        { peer: USER_PEER, openid: MOCK_OPENID, gateway }
       );
-      expect(res.success).toBe(true);
-      expect(calls[0].message[0].data.file.startsWith('file:///C:/')).toBe(true);
-      expect(calls[0].message[0].type).toBe('image');
+      expect(okRes.success).toBe(true);
+      expect(uploadCalls[0]!.options.fileType).toBe(QQ_FILE_TYPE_IMAGE);
+
+      // 2. 404 错误必须剥离 query 凭证
+      const failRes = await sendFile(
+        { file_path: `${baseUrl}/missing.png?rkey=TOP_SECRET_CREDENTIAL` },
+        { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+      );
+      expect(failRes.success).toBe(false);
+      expect(failRes.error).toContain('404');
+      expect(failRes.error).not.toContain('TOP_SECRET_CREDENTIAL');
+      expect(failRes.error).not.toContain('rkey=');
+      assertNoUndefinedFields(failRes);
     } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
-  it('IS-S1-契约 6: Windows 绝对路径 (C:\\...) 输入归一化为 file:///C:/ 交付', { skip: !MNT_C_AVAILABLE }, async () => {
-    const tmpDir = fs.mkdtempSync('/mnt/c/Users/TestUser/AppData/Local/Temp/dsh-b1w-');
-    try {
-      const file = path.join(tmpDir, 'doc.txt');
-      fs.writeFileSync(file, 'fake doc');
-      // 转换为 Windows 侧路径 C:\Users\... 作为输入
-      const winPath = file.replace(/^\/mnt\/([a-z])\/(.*)$/, (_m, d, rest) => `${d.toUpperCase()}:\\${rest.replace(/\//g, '\\')}`);
-      const { gateway, calls } = stubGateway();
-      const res = await sendFile({ file_path: winPath }, { peer: GROUP_PEER, gateway });
-      expect(res.success).toBe(true);
-      expect(calls[0].message[0].data.file.startsWith('file:///C:/')).toBe(true);
-      expect(calls[0].message[0].data.file.endsWith('doc.txt')).toBe(true);
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
+  it('契约 5: 错误分层 —— 无 gateway/peer、本地路径不存在、上传/发送失败与缺少 body.id 绝不假成功', async () => {
+    // 1. 无 peer/gateway
+    const noCtx = await sendFile({ file_path: 'https://example.com/a.pdf' });
+    expect(noCtx.success).toBe(false);
+    expect(noCtx.message_id).toBeUndefined();
+    assertNoUndefinedFields(noCtx);
 
-  it('IS-S1-契约 7: WSL 内部路径（/home、/tmp 等非共享）明确报错并提示共享目录，绝不发假成功', async () => {
-    const file = `/tmp/dsh-napcat-b1-${Date.now()}.txt`;
-    fs.writeFileSync(file, 'x');
-    try {
-      const { gateway } = stubGateway();
-      const res = await sendFile({ file_path: file }, { peer: GROUP_PEER, gateway });
-      expect(res.success).toBe(false);
-      expect(res.error).toContain('无法访问');
-    } finally {
-      fs.rmSync(file, { force: true });
-    }
+    // 2. 拒绝群聊 peer
+    const { gateway } = stubGateway();
+    const groupRes = await sendFile(
+      { file_path: 'https://example.com/a.pdf' },
+      { peer: 'group_3000000001', gateway }
+    );
+    expect(groupRes.success).toBe(false);
+    assertNoUndefinedFields(groupRes);
+
+    // 3. 本地路径不存在
+    const missing = path.join(tmpDir, 'definitely-missing-98765.txt');
+    const missRes = await sendFile(
+      { file_path: missing },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway }
+    );
+    expect(missRes.success).toBe(false);
+    expect(missRes.error).toContain('本地路径不存在');
+    expect(gateway.uploadC2CMedia).not.toHaveBeenCalled();
+
+    // 4. 上传失败透传错误
+    const failUploadGw = stubGateway({
+      uploadC2CMedia: async () => ({
+        ok: false,
+        status: 400,
+        code: 850019,
+        message: '富媒体文件格式不支持',
+        body: null,
+      }),
+    }).gateway;
+    const realFile = path.join(tmpDir, 'test.bin');
+    fs.writeFileSync(realFile, 'abc');
+    const upFail = await sendFile(
+      { file_path: realFile },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway: failUploadGw }
+    );
+    expect(upFail.success).toBe(false);
+    expect(upFail.error).toContain('富媒体文件格式不支持');
+
+    // 5. 成功但缺少 body.id 绝不写死假 ID
+    const noIdGw = stubGateway({
+      sendC2CMessage: async () => ({ ok: true, status: 200, body: {} }),
+    }).gateway;
+    const noIdRes = await sendFile(
+      { file_path: realFile },
+      { peer: USER_PEER, openid: MOCK_OPENID, gateway: noIdGw }
+    );
+    expect(noIdRes.success).toBe(false);
+    expect(noIdRes.error).toContain('message_id');
   });
 });
 
-describe('契约测试: send_file 类型判定与错误分层 (SendFile Type & Error Contract IS-S2/IS-S4)', () => {
-  it('IS-S2-契约 1: file_type=image 强制 image 段（即使扩展名是 .pdf）', async () => {
-    const { gateway, calls } = stubGateway();
-    const res = await sendFile(
-      { file_path: 'https://example.com/report.pdf', file_type: 'image' },
-      { peer: GROUP_PEER, gateway }
-    );
-    expect(res.success).toBe(true);
-    expect(calls[0].message).toEqual([{ type: 'image', data: { file: 'https://example.com/report.pdf' } }]);
-  });
-
-  it('IS-S2-契约 2: file_type=file 强制 file 段（即使扩展名是 .png）', async () => {
-    const { gateway, calls } = stubGateway();
-    const res = await sendFile(
-      { file_path: 'https://example.com/photo.png', file_type: 'file' },
-      { peer: GROUP_PEER, gateway }
-    );
-    expect(res.success).toBe(true);
-    expect(calls[0].message).toEqual([{ type: 'file', data: { file: 'https://example.com/photo.png' } }]);
-  });
-
-  it('IS-S4-契约 3: 无 gateway/peer 返回 success:false 与清晰错误（不假成功、不写死 message_id）', async () => {
-    const res = await sendFile({ file_path: 'https://example.com/a.pdf' });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('NapCat 未连接');
-    expect(res.message_id).toBeUndefined();
-  });
-
-  it('IS-S4-契约 4: 本地路径不存在返回"本地路径不存在"，不做任何发送', async () => {
-    const missing = '/mnt/c/Users/TestUser/AppData/Local/Temp/definitely-missing-98765.txt';
-    const { gateway, calls } = stubGateway();
-    const res = await sendFile({ file_path: missing }, { peer: GROUP_PEER, gateway });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('本地路径不存在');
-    expect(calls).toHaveLength(0);
-  });
-
-  it('IS-S4-契约 5: NapCat 返回失败时透传 API 错误', async () => {
-    const { gateway } = stubGateway({
-      sendMsg: async () => ({ status: 'failed', retcode: 100, data: {}, wording: 'file 参数解析失败' }),
-    });
-    const res = await sendFile(
-      { file_path: 'https://example.com/a.pdf' },
-      { peer: GROUP_PEER, gateway }
-    );
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('file 参数解析失败');
-  });
-
-  it('IS-S4-契约 6: NapCat 成功但未返回 message_id 时按错误处理（不写死假 id）', async () => {
-    const { gateway } = stubGateway({
-      sendMsg: async () => ({ status: 'ok', retcode: 0, data: {} }),
-    });
-    const res = await sendFile(
-      { file_path: 'https://example.com/a.pdf' },
-      { peer: GROUP_PEER, gateway }
-    );
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('message_id');
-  });
-
-  it('IS-S4-契约 7: NapCat 返回真实 message_id 时成功', async () => {
-    const calls: Array<Record<string, any>> = [];
-    const gateway = {
-      sendMsg: async (_peer: any, message: any) => {
-        calls.push({ action: 'sendMsg', message });
-        return { status: 'ok', retcode: 0, data: { message_id: 8801 } };
-      },
-    } as any;
-    const res = await sendFile(
-      { file_path: 'https://example.com/a.pdf' },
-      { peer: GROUP_PEER, gateway }
-    );
-    expect(res.success).toBe(true);
-    expect(res.message_id).toBe(8801);
-    expect(calls[0].message[0].type).toBe('file');
-  });
-});
-
-describe('契约测试: classifySendFileSource 归一化单元 (SendFile Source Classification)', () => {
-  it('IS-S1-契约 8: 四形态识别与 WSL→Windows 路径翻译', () => {
-    // Base64
+describe('契约测试: classifySendFileSource 与 detectSendFileType 单元', () => {
+  it('四形态识别与四种媒体类型推导（无 WSL /mnt/ 翻译逻辑）', () => {
     const b64 = classifySendFileSource('base64://aGVsbG8=');
-    expect(b64.source).toMatchObject({ kind: 'base64', value: 'base64://aGVsbG8=' });
+    expect('source' in b64 && b64.source.kind).toBe('base64');
 
-    // data: URI → 归一为 base64://
-    const dataUri = classifySendFileSource('data:application/octet-stream;base64,aGVsbG8=');
-    expect(dataUri.source).toMatchObject({ kind: 'base64', value: 'base64://aGVsbG8=' });
+    const dataUri = classifySendFileSource('data:video/mp4;base64,aGVsbG8=');
+    expect('source' in dataUri && dataUri.source).toMatchObject({
+      kind: 'base64',
+      mimeType: 'video/mp4',
+    });
 
-    // URL
     const url = classifySendFileSource('https://example.com/a.png?x=1');
-    expect(url.source).toMatchObject({ kind: 'url', value: 'https://example.com/a.png?x=1' });
+    expect('source' in url && url.source).toMatchObject({
+      kind: 'url',
+      value: 'https://example.com/a.png?x=1',
+      fileName: 'a.png',
+    });
 
-    // /mnt/c → file:///C:/
-    const mnt = classifySendFileSource('/mnt/c/napcat_share/a.txt');
-    expect(mnt.source).toMatchObject({ kind: 'local', value: 'file:///C:/napcat_share/a.txt' });
-    expect(mnt.source?.localCheckPath).toBe('/mnt/c/napcat_share/a.txt');
+    const tmpFile = path.join(os.tmpdir(), 'kujira-classify-check.txt');
+    const fileUri = classifySendFileSource(pathToFileURL(tmpFile).href);
+    expect('source' in fileUri && fileUri.source).toMatchObject({
+      kind: 'file-uri',
+      localPath: path.resolve(tmpFile),
+    });
 
-    // file:// URI (Windows 形态) 保留
-    const winUri = classifySendFileSource('file:///C:/Users/TestUser/a.png');
-    expect(winUri.source).toMatchObject({ kind: 'file-uri', value: 'file:///C:/Users/TestUser/a.png' });
-
-    // Windows 路径 → 归一为 file:///C:/
-    const winPath = classifySendFileSource('C:\\napcat_share\\a.txt');
-    expect(winPath.source).toMatchObject({ kind: 'windows-path', value: 'file:///C:/napcat_share/a.txt' });
-
-    // 相对路径不可识别
     const rel = classifySendFileSource('relative/path.txt');
-    expect(rel.error).toBeDefined();
+    expect('error' in rel).toBe(true);
 
-    // WSL 内部路径（非 /mnt 共享）拒绝
-    const homePath = classifySendFileSource('/home/testuser/x.txt');
-    expect(homePath.error).toBeDefined();
-    expect(homePath.error).toContain('无法访问');
-  });
-
-  it('IS-S2-契约 3: detectSendFileType 强制与自动推导', () => {
-    expect(detectSendFileType('image', 'https://example.com/report.pdf')).toBe('image');
-    expect(detectSendFileType('file', 'https://example.com/photo.png')).toBe('file');
-    expect(detectSendFileType(undefined, 'https://example.com/photo.png')).toBe('image');
-    expect(detectSendFileType(undefined, '/tmp/report.pdf')).toBe('file');
-    expect(detectSendFileType(undefined, 'base64://aGVsbG8=')).toBe('file');
+    expect(detectSendFileType('voice', 'https://example.com/a.png')).toBe('voice');
+    expect(detectSendFileType('video', 'https://example.com/a.png')).toBe('video');
+    expect(detectSendFileType(undefined, 'https://example.com/a.png')).toBe('image');
+    expect(detectSendFileType(undefined, 'https://example.com/clip.mp4')).toBe('video');
+    expect(detectSendFileType(undefined, 'https://example.com/audio.wav')).toBe('voice');
+    expect(detectSendFileType(undefined, 'https://example.com/doc.pdf')).toBe('file');
   });
 });

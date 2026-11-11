@@ -1,8 +1,8 @@
 import type React from 'react';
-import type { BridgePluginConfig } from '../types/index.js';
-import type { NapCatFormModel } from './model.js';
+import type { BridgePluginConfig, CredentialStatusSummary } from '../types/index.js';
+import type { KujiraFormModel } from './model.js';
 
-export type SettingsTabId = 'connection' | 'persona' | 'proactive' | 'memory' | 'face' | 'slang' | 'security';
+export type SettingsTabId = 'connection' | 'persona' | 'memory' | 'face' | 'slang';
 
 export interface TabItem {
   id: SettingsTabId;
@@ -10,27 +10,43 @@ export interface TabItem {
 }
 
 export const SETTINGS_TABS: readonly TabItem[] = [
-  { id: 'connection', label: '连接设置' },
+  { id: 'connection', label: '连接与对话' },
   { id: 'persona', label: '人格与准则' },
-  { id: 'proactive', label: '回复配置' },
-  { id: 'security', label: '权限与安全' },
   { id: 'memory', label: '记忆' },
   { id: 'face', label: '表情包' },
   { id: 'slang', label: '黑话学习' },
 ] as const;
 
+export interface CredentialsInputPayload {
+  app_id?: string;
+  app_secret?: string;
+}
+
+export type SaveSettingsPayload = Partial<BridgePluginConfig> & {
+  credentials?: CredentialsInputPayload;
+  clear_credentials?: Array<'app_id' | 'app_secret'>;
+};
+
+export interface SaveSettingsResult {
+  revision?: number;
+  credentials?: CredentialStatusSummary;
+}
+
 export interface CardController {
   activeTab: SettingsTabId;
   setActiveTab: (tab: SettingsTabId) => void;
-  model: NapCatFormModel;
+  model: KujiraFormModel;
   expanded: boolean;
   setExpanded: (expanded: boolean) => void;
   isDirty: boolean;
   saving: boolean;
   errorMessage: string | null;
+  credentialsStatus: CredentialStatusSummary;
+  appIdInput: string;
+  appSecretInput: string;
+  handleAppIdChange: (val: string) => void;
+  handleAppSecretChange: (val: string) => void;
   handleFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
-  handleAdminsChange: (raw: string) => void;
-  handleAliasesChange: (raw: string) => void;
   handleResetField: (key: keyof BridgePluginConfig) => void;
   handleDiscard: () => void;
   handleSave: () => Promise<void>;
@@ -39,7 +55,7 @@ export interface CardController {
 export interface CardProps {
   layoutMode?: 'card' | 'section';
   initialConfig?: Partial<BridgePluginConfig>;
-  hasSecret?: boolean;
+  credentialsStatus?: CredentialStatusSummary;
   revision?: number;
   baseDefaults?: Partial<BridgePluginConfig>;
   initialExpanded?: boolean;
@@ -50,9 +66,9 @@ export interface CardProps {
     | React.MutableRefObject<CardController | null>
     | ((controller: CardController) => void);
   onSaveSettings?: (
-    values: Partial<BridgePluginConfig>,
+    values: SaveSettingsPayload,
     options: { expectedRevision: number }
-  ) => Promise<{ revision?: number } | void>;
+  ) => Promise<SaveSettingsResult | void>;
 }
 
 export interface SettingsSectionProps extends CardProps {

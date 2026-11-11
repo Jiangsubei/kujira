@@ -1,8 +1,20 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { NapCatFormModel, SettingsConflictError } from './model.js';
-import { formatArrayToString, parseStringToArray } from './utils.js';
-import type { BridgePluginConfig } from '../types/index.js';
-import type { CardProps, CardController, SettingsTabId } from './types.js';
+import { KujiraFormModel, SettingsConflictError } from './model.js';
+import type { BridgePluginConfig, CredentialStatusSummary } from '../types/index.js';
+import type {
+  CardProps,
+  CardController,
+  CredentialsInputPayload,
+  SettingsTabId,
+} from './types.js';
+
+const CONFIG_ENDPOINT = '/plugins/kujira/config';
+
+const DEFAULT_CREDENTIAL_STATUS: CredentialStatusSummary = {
+  appId: { configured: false, writable: true },
+  appSecret: { configured: false, writable: true },
+  ready: false,
+};
 
 export function useCardState(
   props: CardProps,
@@ -17,6 +29,7 @@ export function useCardState(
     },
     [isSection]
   );
+
   const [activeTabState, setActiveTabState] = useState<SettingsTabId>(
     props.initialTab ?? 'connection'
   );
@@ -24,6 +37,10 @@ export function useCardState(
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [, setRerenderKey] = useState(0);
+
+  // 只写凭据草稿（绝不从后端读取明文填充，提交成功后立即清空）
+  const [appIdInput, setAppIdInput] = useState('');
+  const [appSecretInput, setAppSecretInput] = useState('');
 
   const activeTabRef = useRef<SettingsTabId>(activeTab);
   activeTabRef.current = activeTab;
@@ -33,6 +50,10 @@ export function useCardState(
   savingRef.current = saving;
   const expandedRef = useRef<boolean>(expanded);
   expandedRef.current = expanded;
+  const appIdInputRef = useRef<string>(appIdInput);
+  appIdInputRef.current = appIdInput;
+  const appSecretInputRef = useRef<string>(appSecretInput);
+  appSecretInputRef.current = appSecretInput;
 
   const updateError = (msg: string | null) => {
     errRef.current = msg;
@@ -40,19 +61,12 @@ export function useCardState(
   };
 
   const model = useMemo(() => {
-    return new NapCatFormModel({
+    return new KujiraFormModel({
       initialValues: props.initialConfig || {},
       revision: props.revision ?? 0,
       baseDefaults: props.baseDefaults || fallbackBaseDefaults,
     });
   }, [props.initialConfig, props.baseDefaults, fallbackBaseDefaults]);
-
-  const [adminsInput, setAdminsInput] = useState<string>(() =>
-    formatArrayToString(props.initialConfig?.admins)
-  );
-  const [aliasesInput, setAliasesInput] = useState<string>(() =>
-    formatArrayToString(props.initialConfig?.aliases)
-  );
 
   useEffect(() => {
     if (props.revision !== undefined) {
@@ -60,54 +74,57 @@ export function useCardState(
     }
   }, [props.revision, model]);
 
-  useEffect(() => {
-    setAdminsInput(formatArrayToString(props.initialConfig?.admins));
-    setAliasesInput(formatArrayToString(props.initialConfig?.aliases));
-  }, [props.initialConfig]);
-
   const forceUpdate = useCallback(() => {
     setRerenderKey((k) => k + 1);
   }, []);
 
   const isExternalControlled = Boolean(
     (props.initialConfig && Object.keys(props.initialConfig).length > 0) ||
-      props.onSaveSettings
+      props.onSaveSettings ||
+      props.credentialsStatus
   );
 
   const [remoteLoaded, setRemoteLoaded] = useState(false);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteLoadError, setRemoteLoadError] = useState<string | null>(null);
-  const [remoteHasSecret, setRemoteHasSecret] = useState(false);
+  const [remoteCredentialsStatus, setRemoteCredentialsStatus] =
+    useState<CredentialStatusSummary | null>(null);
+  const remoteCredsRef = useRef<CredentialStatusSummary | null>(null);
+
+  const updateRemoteCredentialsStatus = useCallback((next: CredentialStatusSummary) => {
+    remoteCredsRef.current = next;
+    setRemoteCredentialsStatus(next);
+  }, []);
 
   const loadRemoteConfig = useCallback(async () => {
     setRemoteLoading(true);
     setRemoteLoadError(null);
     try {
-      const res = await fetch('/plugins/dsh-napcat-bridge/config');
+      const res = await fetch(CONFIG_ENDPOINT);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (data?.ok) {
         if (data.config) {
           model.setInitialValues(data.config);
-          setAdminsInput(formatArrayToString(data.config.admins));
-          setAliasesInput(formatArrayToString(data.config.aliases));
         }
         if (data.baseDefaults) {
           model.setBaseDefaults(data.baseDefaults);
         }
-        setRemoteHasSecret(Boolean(data.hasSecret));
+        if (data.credentials) {
+          updateRemoteCredentialsStatus(data.credentials);
+        }
         setRemoteLoaded(true);
         forceUpdate();
       } else {
         throw new Error(data?.error || 'Failed to load configuration');
       }
     } catch (err: any) {
-      console.warn('[dsh-napcat-bridge] Failed to fetch remote config:', err);
+      console.warn('[kujira] Failed to fetch remote config:', err);
       setRemoteLoadError(err?.message || '加载配置失败');
     } finally {
       setRemoteLoading(false);
     }
-  }, [model, forceUpdate]);
+  }, [model, forceUpdate, updateRemoteCredentialsStatus]);
 
   useEffect(() => {
     if (!isExternalControlled && !remoteLoaded) {
@@ -128,33 +145,40 @@ export function useCardState(
     forceUpdate();
   };
 
-  const handleAdminsChange = (raw: string) => {
-    setAdminsInput(raw);
-    model.setField('admins', parseStringToArray(raw));
+  const handleAppIdChange = (val: string) => {
+    appIdInputRef.current = val;
+    setAppIdInput(val);
     updateError(null);
     forceUpdate();
   };
 
-  const handleAliasesChange = (raw: string) => {
-    setAliasesInput(raw);
-    model.setField('aliases', parseStringToArray(raw));
+  const handleAppSecretChange = (val: string) => {
+    appSecretInputRef.current = val;
+    setAppSecretInput(val);
     updateError(null);
     forceUpdate();
   };
 
   const handleResetField = (key: keyof BridgePluginConfig) => {
     model.resetField(key);
-    if (key === 'admins') setAdminsInput(formatArrayToString(model.getDraft().admins));
-    if (key === 'aliases') setAliasesInput(formatArrayToString(model.getDraft().aliases));
     forceUpdate();
   };
 
   const handleDiscard = () => {
     model.discard();
-    setAdminsInput(formatArrayToString(model.getDraft().admins));
-    setAliasesInput(formatArrayToString(model.getDraft().aliases));
+    appIdInputRef.current = '';
+    appSecretInputRef.current = '';
+    setAppIdInput('');
+    setAppSecretInput('');
     updateError(null);
     forceUpdate();
+  };
+
+  const clearCredentialDrafts = () => {
+    appIdInputRef.current = '';
+    appSecretInputRef.current = '';
+    setAppIdInput('');
+    setAppSecretInput('');
   };
 
   const handleSave = async () => {
@@ -162,20 +186,49 @@ export function useCardState(
     setSaving(true);
     updateError(null);
     try {
+      const trimmedAppId = appIdInputRef.current.trim();
+      const trimmedAppSecret = appSecretInputRef.current.trim();
+      const credPayload: CredentialsInputPayload | undefined =
+        trimmedAppId || trimmedAppSecret
+          ? {
+              ...(trimmedAppId ? { app_id: trimmedAppId } : {}),
+              ...(trimmedAppSecret ? { app_secret: trimmedAppSecret } : {}),
+            }
+          : undefined;
+
       if (props.onSaveSettings) {
-        await model.save({ saveSettings: props.onSaveSettings });
+        const res = await model.save({
+          saveSettings: props.onSaveSettings,
+          ...(credPayload ? { extraPayload: { credentials: credPayload } } : {}),
+        });
+        if (res && res.credentials) {
+          updateRemoteCredentialsStatus(res.credentials);
+        }
+        clearCredentialDrafts();
       } else {
         const dirtyDraft = model.getDraft();
-        const res = await fetch('/plugins/dsh-napcat-bridge/config', {
+        const bodyPayload = credPayload
+          ? { ...dirtyDraft, credentials: credPayload }
+          : dirtyDraft;
+        const res = await fetch(CONFIG_ENDPOINT, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(dirtyDraft),
+          body: JSON.stringify(bodyPayload),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (!data?.ok) throw new Error(data?.error || '保存失败');
-        if (data.hasSecret !== undefined) setRemoteHasSecret(Boolean(data.hasSecret));
+        let data: any = null;
+        try {
+          data = await res.json();
+        } catch {
+          // 非 JSON 响应交由下方状态码兜底
+        }
+        if (!res.ok || !data?.ok) {
+          throw new Error(data?.error || `HTTP ${res.status}`);
+        }
+        if (data.credentials) {
+          updateRemoteCredentialsStatus(data.credentials);
+        }
         model.markClean();
+        clearCredentialDrafts();
       }
       forceUpdate();
     } catch (err: any) {
@@ -191,22 +244,52 @@ export function useCardState(
   };
 
   const draft = model.getDraft();
-  const isDirty = model.isDirty();
+  const hasCredDraft = Boolean(appIdInput.trim() || appSecretInput.trim());
+  const isDirty = model.isDirty() || hasCredDraft;
   const blocked = !isDirty || saving;
-  const hasSecret = Boolean(props.hasSecret ?? remoteHasSecret);
+  const credentialsStatus =
+    remoteCredentialsStatus ?? props.credentialsStatus ?? DEFAULT_CREDENTIAL_STATUS;
+
+  const propsCredStatusRef = useRef<CredentialStatusSummary | undefined>(props.credentialsStatus);
+  propsCredStatusRef.current = props.credentialsStatus;
 
   const controller: CardController = {
-    get activeTab() { return activeTabRef.current; },
+    get activeTab() {
+      return activeTabRef.current;
+    },
     setActiveTab: handleTabClick,
     model,
-    get expanded() { return expandedRef.current; },
-    setExpanded: (exp: boolean) => { expandedRef.current = exp; setExpanded(exp); },
-    get isDirty() { return model.isDirty(); },
-    get saving() { return savingRef.current; },
-    get errorMessage() { return errRef.current; },
+    get expanded() {
+      return expandedRef.current;
+    },
+    setExpanded: (exp: boolean) => {
+      expandedRef.current = exp;
+      setExpanded(exp);
+    },
+    get isDirty() {
+      return (
+        model.isDirty() ||
+        Boolean(appIdInputRef.current.trim() || appSecretInputRef.current.trim())
+      );
+    },
+    get saving() {
+      return savingRef.current;
+    },
+    get errorMessage() {
+      return errRef.current;
+    },
+    get credentialsStatus() {
+      return remoteCredsRef.current ?? propsCredStatusRef.current ?? DEFAULT_CREDENTIAL_STATUS;
+    },
+    get appIdInput() {
+      return appIdInputRef.current;
+    },
+    get appSecretInput() {
+      return appSecretInputRef.current;
+    },
+    handleAppIdChange,
+    handleAppSecretChange,
     handleFieldChange,
-    handleAdminsChange,
-    handleAliasesChange,
     handleResetField,
     handleDiscard,
     handleSave,
@@ -230,16 +313,16 @@ export function useCardState(
     saving,
     errorMessage,
     updateError,
-    adminsInput,
-    aliasesInput,
+    credentialsStatus,
+    appIdInput,
+    appSecretInput,
     isDirty,
     blocked,
-    hasSecret,
     remoteLoading,
     remoteLoadError,
+    handleAppIdChange,
+    handleAppSecretChange,
     handleFieldChange,
-    handleAdminsChange,
-    handleAliasesChange,
     handleResetField,
     handleDiscard,
     handleSave,

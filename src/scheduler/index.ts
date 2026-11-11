@@ -1,6 +1,6 @@
 /**
- * dsh-napcat-bridge: 定时任务与周期调度引擎 (Task Scheduler Engine)
- * 负责任务的 Fail-Fast 校验、夜间 DND 拦截、生命周期持久化与精准唤醒分发。
+ * kujira: QQ 官方 Bot 单聊定时任务与周期调度引擎 (Task Scheduler Engine)
+ * 负责任务的 Fail-Fast 校验、生命周期持久化与通过 SystemEventHub 精准唤醒分发。
  */
 
 import type { MessageDatabase } from '../storage/database.js';
@@ -66,7 +66,6 @@ export class TaskScheduler {
   private db: MessageDatabase;
   private dispatchWakeup?: (payload: WakeupPayload) => Promise<void>;
   private systemEventHub?: SystemEventHub;
-  private configGetter: () => BridgePluginConfig;
   private logger: any;
   private timers = new Map<string, NodeJS.Timeout>();
   private sweepTimer: NodeJS.Timeout | null = null;
@@ -76,7 +75,6 @@ export class TaskScheduler {
     this.db = options.db;
     this.dispatchWakeup = options.dispatchWakeup;
     this.systemEventHub = options.systemEventHub;
-    this.configGetter = options.configGetter || (() => ({}));
     this.logger = options.logger || console;
   }
 
@@ -105,15 +103,6 @@ export class TaskScheduler {
         this.armTimer(task);
       }
     }
-  }
-
-  /**
-   * 判断目标是否处于群聊夜间免打扰时段 (23:00 ~ 08:00)
-   */
-  private isNightDnd(timestamp: number): boolean {
-    const d = new Date(timestamp);
-    const hour = d.getHours();
-    return hour >= 23 || hour < 8;
   }
 
   /**
@@ -169,11 +158,10 @@ export class TaskScheduler {
   }
 
   /**
-   * 校验任务时间与夜间免打扰 Fail-Fast
+   * 校验任务时间 Fail-Fast（单次任务最小延迟 10 秒，周期任务下次时间须在当前之后）
    */
   private validateTaskTime(
     nextRunAt: number,
-    peer: string,
     isRecurring: boolean,
     now: number = Date.now()
   ): void {
@@ -185,19 +173,7 @@ export class TaskScheduler {
       }
     } else {
       if (deltaSeconds < 0) {
-        throw new Error(`周期任务下次执行时间必须在当前时间之后。`);
-      }
-    }
-
-    // 夜间免打扰 (DND) 拦截：仅针对群聊且开启配置生效
-    const isGroup = peer.startsWith('group_') || peer.startsWith('qq-group-');
-    const config = this.configGetter();
-    if (isGroup && config.proactive_night_dnd !== false) {
-      if (this.isNightDnd(nextRunAt)) {
-        const timeStr = formatDateTime(nextRunAt);
-        throw new Error(
-          `创建失败：目标执行时间 ${timeStr} 处于群聊夜间免打扰时段 (23:00 ~ 08:00)。请将执行时间调整在白天时段（08:00 之后），或向用户解释原因。`
-        );
+        throw new Error('周期任务下次执行时间必须在当前时间之后。');
       }
     }
   }
@@ -241,7 +217,7 @@ export class TaskScheduler {
       throw new Error('创建单次任务时，必须提供 delay_seconds 或 execute_at 之一。');
     }
 
-    this.validateTaskTime(nextRunAt, peer, isRecurring, now);
+    this.validateTaskTime(nextRunAt, isRecurring, now);
 
     const taskId = `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const taskRecord: ScheduledTaskRecord = {
@@ -350,7 +326,7 @@ export class TaskScheduler {
         nextRunAt = this.computeNextRunAt(params.recurring, now);
       }
 
-      this.validateTaskTime(nextRunAt, peer, isRecurring, now);
+      this.validateTaskTime(nextRunAt, isRecurring, now);
 
       const updates: Partial<ScheduledTaskRecord> = {};
       if (params.prompt) updates.prompt = params.prompt.trim();
@@ -445,8 +421,9 @@ export class TaskScheduler {
         const payload: WakeupPayload = {
           trigger: 'scheduled',
           peer: task.peer,
-          from_user: task.creator,
-          from_name: '系统定时任务',
+          from_user: '',
+          from_name: '',
+          is_system: true,
           content: task.prompt,
           task_id: task.id,
           task_type: task.type,

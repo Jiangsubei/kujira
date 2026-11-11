@@ -1,13 +1,14 @@
 /**
  * tests/contract/read-chat-history-sticker-path.test.ts
  *
- * 契约测试: read_chat_history 表情包路径补齐与格式归一化契约
+ * 契约测试: read_chat_history 新式表情记录存储与渲染契约（单聊版本）
  *
  * 覆盖规范:
- * 1. 库内表情新记录：含 [表情包: face_id (情绪: mood) 路径: <local_path>]，文本渲染带路径，下游可直接调用 read_image；
- * 2. 库内表情存量旧记录：content 仅含 face_id + 情绪、local_path 为 NULL，readHistory 自动查 faces 表兜底补齐路径；
- * 3. 普通表情存量旧记录：含 [表情包:[动画表情] 已保存: <path>]，自动清洗嵌套方括号为 [表情包: 动画表情 路径: <path>]；
- * 4. 真实工具装配闭环：通过 read_chat_history defineTool execute 与 output.render 验证 Markdown 文本与结构化结果。
+ * 1. 命中表情库记录：通过 attachment/render (`renderAttachments`) 与 `serializeAttachments` 标准入库，
+ *    `db.readHistory` 完整保留 `local_path` 与结构化 `attachments` JSON，渲染文本为 `[表情包: face_id (情绪: mood) 路径: <local_path>]`；
+ * 2. 普通表情记录：`renderAttachment` / `renderAttachments` 自动清洗嵌套方括号（如 `[动画表情]` → `动画表情`）并输出 `[表情包: 动画表情 路径: <path>]`；
+ * 3. 无本地路径兜底：`renderAttachments` 仅输出脱敏占位且绝不泄漏 URL query 凭证，同时 `attachments` 保留远端元数据；
+ * 4. 真实工具装配闭环：通过 `read_chat_history` `defineTool` `execute`（`kujira-user-<hash>` 会话绑定）与 `output.render` 验证 + Lossless JSON 无 `undefined`。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -16,19 +17,46 @@ import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { Context } from '@deepseek-ai/cordis';
 import { MessageDatabase } from '../../src/storage/database.js';
-import { registerAgentTools, renderChatHistoryText } from '../../src/tools/index.js';
+import {
+  registerAgentTools,
+  renderChatHistoryText,
+  resetGlobalToolContext,
+} from '../../src/tools/index.js';
+import { renderAttachment, renderAttachments } from '../../src/attachment/render.js';
+import { deserializeAttachments, serializeAttachments } from '../../src/attachment/store.js';
+import type { AttachmentDescriptor } from '../../src/attachment/types.js';
 import type { ReadChatHistoryResult } from '../../src/types/index.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
-const FRIEND_QQ = '1000000001';
-const GROUP_ID = '8000000001';
+const MOCK_OPENID = '22223333444455556666777788889999';
+const PEER = openidToPeer(MOCK_OPENID);
+const SESSION_ID = openidToSessionBaseId(MOCK_OPENID);
 
-describe('契约测试: read_chat_history 表情包路径补齐与历史回放', () => {
+function assertNoUndefinedFields(obj: unknown, currentPath = ''): void {
+  if (obj === undefined) {
+    throw new Error(`Found undefined at "${currentPath}"`);
+  }
+  if (obj === null || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    obj.forEach((item, idx) => assertNoUndefinedFields(item, `${currentPath}[${idx}]`));
+    return;
+  }
+  for (const key of Object.keys(obj)) {
+    const val = (obj as Record<string, unknown>)[key];
+    if (val === undefined) {
+      throw new Error(`Found undefined key "${currentPath ? `${currentPath}.${key}` : key}"`);
+    }
+    assertNoUndefinedFields(val, currentPath ? `${currentPath}.${key}` : key);
+  }
+}
+
+describe('契约测试: read_chat_history 新式表情记录存储与渲染契约', () => {
   let tmpDir: string;
   let db: MessageDatabase;
   let historyTool: any;
 
   beforeEach(async () => {
-    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-read-sticker-path-'));
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-read-sticker-path-'));
     db = new MessageDatabase(path.join(tmpDir, 'messages.sqlite'));
     db.init();
 
@@ -55,6 +83,7 @@ describe('契约测试: read_chat_history 表情包路径补齐与历史回放',
     });
     registerAgentTools(mockCtx, {
       db,
+      mediaManager: {} as any,
       dshHome: tmpDir,
       config: {},
     });
@@ -62,97 +91,101 @@ describe('契约测试: read_chat_history 表情包路径补齐与历史回放',
   });
 
   afterEach(async () => {
+    resetGlobalToolContext();
     if (db) db.close();
     if (tmpDir) {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   });
 
-  it('契约 1: 库内表情新记录入库后查询 → local_path 保留且 content 与渲染文本均带路径', () => {
+  it('契约 1: 库内表情新记录入库后查询 → local_path 与 attachments 完整保留且渲染带路径', () => {
     const filePath = path.join(tmpDir, 'cat.png');
+    const descriptor: AttachmentDescriptor = {
+      kind: 'sticker',
+      origin: 'inbound',
+      local: { path: filePath, format: 'png', md5: 'mock_cat_md5' },
+      face: { id: 'face_mock_cat', mood: '嘲讽', tags: ['猫猫'] },
+    };
+    const [renderedContent] = renderAttachments([descriptor]);
+    const serialized = serializeAttachments([descriptor]);
+
+    expect(renderedContent).toBe(`[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`);
+
     db.saveMessage({
-      msg_id: 101,
-      peer: `group_${GROUP_ID}`,
-      user_id: FRIEND_QQ,
-      sender_name: '群友 A',
+      msg_id: 'ROBOT1.0_STK_101',
+      peer: PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '好友A',
       time: 1793716500000,
       type: 'sticker',
-      content: `[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`,
+      content: renderedContent!,
       raw: '{}',
       file_id: null,
-      busid: null,
       local_path: filePath,
       fingerprint: null,
       recalled: 0,
       self: 0,
       reply_to: null,
+      source: 'qq',
+      attachments: serialized,
     });
 
-    const res = db.readHistory(`group_${GROUP_ID}`);
+    const res = db.readHistory(PEER);
     expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].local_path).toBe(filePath);
-    expect(res.messages[0].content).toContain(`路径: ${filePath}`);
+    expect(res.messages[0]!.local_path).toBe(filePath);
+    expect(res.messages[0]!.content).toBe(
+      `[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`
+    );
+
+    const parsedDescriptors = deserializeAttachments(res.messages[0]!.attachments);
+    expect(parsedDescriptors).toHaveLength(1);
+    expect(parsedDescriptors[0]!.face?.id).toBe('face_mock_cat');
+    expect(parsedDescriptors[0]!.local?.path).toBe(filePath);
 
     const rendered = renderChatHistoryText(res);
     expect(rendered).toContain(`[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`);
   });
 
-  it('契约 2: 库内表情存量旧记录（local_path 为空、content 无路径）→ 自动从 faces 表补齐路径', () => {
-    const expectedFilePath = path.join(tmpDir, 'cat.png');
-    // 模拟存量老数据：旧格式只写了语义，local_path 为 null
+  it('契约 2: 普通表情经 renderAttachments 统一清洗嵌套方括号与路径格式后入库检索', () => {
+    const stickerPath = path.join(tmpDir, 'sticker.gif');
+    const descriptor: AttachmentDescriptor = {
+      kind: 'sticker',
+      origin: 'inbound',
+      summary: '[动画表情]',
+      local: { path: stickerPath, format: 'gif' },
+    };
+
+    const content = renderAttachment(descriptor)!;
+    expect(content).toBe(`[表情包: 动画表情 路径: ${stickerPath}]`);
+
     db.saveMessage({
-      msg_id: 102,
-      peer: `group_${GROUP_ID}`,
-      user_id: FRIEND_QQ,
-      sender_name: '群友 B',
+      msg_id: 'ROBOT1.0_STK_102',
+      peer: PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '好友B',
       time: 1793716510000,
       type: 'sticker',
-      content: '[表情包: face_mock_cat (情绪: 嘲讽)]',
+      content,
       raw: '{}',
       file_id: null,
-      busid: null,
-      local_path: null,
-      fingerprint: null,
-      recalled: 0,
-      self: 0,
-      reply_to: null,
-    });
-
-    const res = db.readHistory(`group_${GROUP_ID}`);
-    expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].local_path).toBe(expectedFilePath);
-    expect(res.messages[0].content).toBe(`[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${expectedFilePath}]`);
-
-    const rendered = renderChatHistoryText(res);
-    expect(rendered).toContain(`[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${expectedFilePath}]`);
-  });
-
-  it('契约 3: 普通表情存量旧记录（带 [动画表情] 与 已保存:）→ 自动清洗为统一规范路径格式', () => {
-    const stickerPath = path.join(tmpDir, 'old_sticker.gif');
-    // 模拟 NapCat 原生旧格式：[表情包:[动画表情] 已保存: <path>]
-    db.saveMessage({
-      msg_id: 103,
-      peer: `user_${FRIEND_QQ}`,
-      user_id: FRIEND_QQ,
-      sender_name: '好友 C',
-      time: 1793716520000,
-      type: 'sticker',
-      content: `[表情包:[动画表情] 已保存: ${stickerPath}]`,
-      raw: '{}',
-      file_id: null,
-      busid: null,
       local_path: stickerPath,
       fingerprint: null,
       recalled: 0,
       self: 0,
       reply_to: null,
+      source: 'qq',
+      attachments: serializeAttachments([descriptor]),
     });
 
-    const res = db.readHistory(`user_${FRIEND_QQ}`);
+    const res = db.readHistory(PEER);
     expect(res.messages).toHaveLength(1);
-    expect(res.messages[0].local_path).toBe(stickerPath);
-    // 验证清洗：消灭嵌套方括号，消灭「已保存:」，替换为「路径:」
-    expect(res.messages[0].content).toBe(`[表情包: 动画表情 路径: ${stickerPath}]`);
+    expect(res.messages[0]!.local_path).toBe(stickerPath);
+    expect(res.messages[0]!.content).toBe(`[表情包: 动画表情 路径: ${stickerPath}]`);
+
+    const parsed = deserializeAttachments(res.messages[0]!.attachments);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]!.kind).toBe('sticker');
+    expect(parsed[0]!.local?.path).toBe(stickerPath);
 
     const rendered = renderChatHistoryText(res);
     expect(rendered).toContain(`[表情包: 动画表情 路径: ${stickerPath}]`);
@@ -160,38 +193,94 @@ describe('契约测试: read_chat_history 表情包路径补齐与历史回放',
     expect(rendered).not.toContain('已保存:');
   });
 
-  it('契约 4: 真实 read_chat_history 工具调用装配闭环', async () => {
-    const filePath = path.join(tmpDir, 'cat.png');
+  it('契约 3: 无 local.path 的表情描述符仅渲染脱敏占位且不泄漏 URL 凭证，同时保留 attachments', () => {
+    const descriptor: AttachmentDescriptor = {
+      kind: 'sticker',
+      origin: 'inbound',
+      summary: '[动画表情]',
+      remote: {
+        fileUuid: 'uuid_sticker_remote_01',
+        url: 'https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=SECRET_CREDENTIAL_XYZ',
+      },
+    };
+    const [safeContent] = renderAttachments([descriptor]);
+    expect(safeContent).toBe('[表情包: 动画表情]');
+    expect(safeContent).not.toContain('rkey=');
+    expect(safeContent).not.toContain('SECRET_CREDENTIAL_XYZ');
+
     db.saveMessage({
-      msg_id: 104,
-      peer: `group_${GROUP_ID}`,
-      user_id: FRIEND_QQ,
-      sender_name: '群友 A',
+      msg_id: 'ROBOT1.0_STK_103',
+      peer: PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '好友C',
+      time: 1793716520000,
+      type: 'sticker',
+      content: safeContent!,
+      raw: '{}',
+      file_id: 'uuid_sticker_remote_01',
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      source: 'qq',
+      attachments: serializeAttachments([descriptor]),
+    });
+
+    const res = db.readHistory(PEER);
+    expect(res.messages).toHaveLength(1);
+    expect(res.messages[0]!.local_path).toBeNull();
+    expect(res.messages[0]!.content).toBe('[表情包: 动画表情]');
+    const descriptors = deserializeAttachments(res.messages[0]!.attachments);
+    expect(descriptors).toHaveLength(1);
+    expect(descriptors[0]!.remote?.fileUuid).toBe('uuid_sticker_remote_01');
+  });
+
+  it('契约 4: 真实 read_chat_history 工具调用装配闭环与 Lossless JSON 合规性', async () => {
+    const filePath = path.join(tmpDir, 'cat.png');
+    const descriptor: AttachmentDescriptor = {
+      kind: 'sticker',
+      origin: 'inbound',
+      local: { path: filePath, format: 'png', md5: 'mock_cat_md5' },
+      face: { id: 'face_mock_cat', mood: '嘲讽' },
+    };
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_STK_104',
+      peer: PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '好友A',
       time: 1793716530000,
       type: 'sticker',
-      content: `[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`,
+      content: renderAttachments([descriptor])[0]!,
       raw: '{}',
       file_id: null,
-      busid: null,
       local_path: filePath,
       fingerprint: null,
       recalled: 0,
       self: 0,
       reply_to: null,
+      source: 'qq',
+      attachments: serializeAttachments([descriptor]),
     });
 
     expect(historyTool).toBeDefined();
     const result: ReadChatHistoryResult = await historyTool.execute(
-      { peer: `group_${GROUP_ID}` },
-      { agent: { session: { id: `group_${GROUP_ID}` } } }
+      {},
+      { agent: { session: { id: SESSION_ID } } }
     );
 
     expect(result.messages).toHaveLength(1);
-    expect(result.messages[0].local_path).toBe(filePath);
+    expect(result.messages[0]!.local_path).toBe(filePath);
+    expect(deserializeAttachments(result.messages[0]!.attachments)[0]!.face?.id).toBe(
+      'face_mock_cat'
+    );
+    assertNoUndefinedFields(result);
 
     const renderedOutput = historyTool.output.render({}, result);
     expect(renderedOutput).toHaveLength(1);
     expect(renderedOutput[0].type).toBe('text');
-    expect(renderedOutput[0].text).toContain(`[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`);
+    expect(renderedOutput[0].text).toContain(
+      `[表情包: face_mock_cat (情绪: 嘲讽) 路径: ${filePath}]`
+    );
   });
 });

@@ -1,33 +1,33 @@
 /**
- * dsh-napcat-bridge: NapCat 工具集 Cordis 插件
+ * kujira: QQ 官方 Bot 单聊工具集 Cordis 插件
  * 供 DSH 预设 (@deepseek-ai/dsh-agent-preset) 或 Agent 作用域作为独立 row 挂载。
  */
 
 import type { Context } from '@deepseek-ai/cordis';
 
-export const name = 'napcat-tools';
+export const name = 'kujira-tools';
 export const inject = ['tools'];
 
-export interface NapCatBridgeToolsProvider {
+export interface KujiraBridgeToolsProvider {
   registerTools(ctx: Context): () => void;
 }
 
-let globalBridgeToolsProvider: NapCatBridgeToolsProvider | undefined;
+let globalBridgeToolsProvider: KujiraBridgeToolsProvider | undefined;
 
-export function setGlobalBridgeToolsProvider(provider: NapCatBridgeToolsProvider | undefined): void {
+export function setGlobalBridgeToolsProvider(provider: KujiraBridgeToolsProvider | undefined): void {
   globalBridgeToolsProvider = provider;
 }
 
-export function getGlobalBridgeToolsProvider(): NapCatBridgeToolsProvider | undefined {
+export function getGlobalBridgeToolsProvider(): KujiraBridgeToolsProvider | undefined {
   return globalBridgeToolsProvider;
 }
 
 export function apply(ctx: Context): void {
-  const getProvider = (): NapCatBridgeToolsProvider | undefined => {
+  const getProvider = (): KujiraBridgeToolsProvider | undefined => {
     return (
-      (typeof (ctx as any).get === 'function' ? (ctx as any).get('napcatBridgeTools') : undefined) ||
-      (ctx as any).napcatBridgeTools ||
-      (ctx.root as any)?.napcatBridgeTools ||
+      (typeof (ctx as any).get === 'function' ? (ctx as any).get('kujiraBridgeTools') : undefined) ||
+      (ctx as any).kujiraBridgeTools ||
+      (ctx.root as any)?.kujiraBridgeTools ||
       globalBridgeToolsProvider
     );
   };
@@ -36,11 +36,14 @@ export function apply(ctx: Context): void {
   if (provider && typeof provider.registerTools === 'function') {
     const unregister = provider.registerTools(ctx);
     if (typeof (ctx as any).effect === 'function') {
-      (ctx as any).effect(() => () => {
-        try {
-          unregister();
-        } catch {}
-      }, 'napcat-tools.effect');
+      (ctx as any).effect(
+        () => () => {
+          try {
+            unregister();
+          } catch {}
+        },
+        'kujira-tools.effect'
+      );
     } else {
       (ctx as any).on?.('dispose', () => {
         try {

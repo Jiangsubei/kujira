@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 记录黑话工具 (record_slang)
+ * kujira: 记录黑话工具 (record_slang)
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -24,8 +24,10 @@ export async function recordSlang(
       example: params.example,
     });
 
-    const evictedNotice = res.evictedTerm ? ` (容量满额自动按查淘汰最冷门词条: "${res.evictedTerm}")` : '';
-    return {
+    const evictedNotice = res.evictedTerm
+      ? ` (容量满额自动按查淘汰最冷门词条: "${res.evictedTerm}")`
+      : '';
+    return toLosslessJson({
       success: true,
       action: res.action,
       entry: res.entry,
@@ -36,16 +38,16 @@ export async function recordSlang(
         res.action === 'created'
           ? `成功收录黑话词条 "${res.entry.term}" (当前总容量 ${res.total}/${res.maxEntries} 条)${evictedNotice}`
           : `成功更新黑话词条 "${res.entry.term}" (当前总容量 ${res.total}/${res.maxEntries} 条)`,
-    };
+    });
   } catch (err: any) {
     const stats = storage.getStats();
-    return {
+    return toLosslessJson({
       success: false,
       action: 'created',
       total: stats.total,
       max_entries: stats.maxEntries,
       error: err?.message || '收录黑话失败',
-    };
+    });
   }
 }
 
@@ -56,7 +58,7 @@ export function createRecordSlangTool(storage: SlangStorage): ToolDefinition {
   return defineTool({
     name: 'record_slang',
     description:
-      '记录并收录跨会话通用的网络梗、社群黑话、圈内缩写或特色代称。用户个人偏好或群专属规则请使用记忆工具，勿记入黑话。必须提供核心词条名称、触发情境与招牌句式、核心释义与典型例句四项参数；已收录词条若需修改请使用 manage_slang。',
+      '记录并收录跨会话通用的网络梗、黑话、圈内缩写或特色代称。用户个人偏好或单聊会话规则请使用记忆工具，勿记入黑话。必须提供核心词条名称、触发情境与招牌句式、核心释义与典型例句四项参数；已收录词条若需修改请使用 manage_slang。',
     parameters: {
       term: {
         type: 'string',
@@ -77,7 +79,8 @@ export function createRecordSlangTool(storage: SlangStorage): ToolDefinition {
       example: {
         type: 'string',
         required: true,
-        description: '典型的使用场景或代表性简短例句（必填，如在什么语境下说、如何造句，确保模型按需查 L2 时能准确掌握用法）',
+        description:
+          '典型的使用场景或代表性简短例句（必填，如在什么语境下说、如何造句，确保模型按需查 L2 时能准确掌握用法）',
       },
     },
     output: {
@@ -85,7 +88,9 @@ export function createRecordSlangTool(storage: SlangStorage): ToolDefinition {
       render: (_args, value: any) => [
         {
           type: 'text',
-          text: value?.message || (value?.success ? '操作成功' : `操作失败: ${value?.error || '未知错误'}`),
+          text:
+            value?.message ||
+            (value?.success ? '操作成功' : `操作失败: ${value?.error || '未知错误'}`),
         },
       ],
     },

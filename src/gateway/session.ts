@@ -1,7 +1,7 @@
 /**
- * dsh-napcat-bridge: Session 路由与 CWD 隔离映射模块 (Facade)
+ * kujira: Session 路由与 CWD 隔离映射模块 (Facade)
  * 组装子模块：IdResolver、WorkspaceManager、PersistenceManager、ModelSelector 与 AgentRunner。
- * 保持所有旧有导出与方法签名 100% 向后兼容。
+ * 保持与 Commands 等上层调用契约的清晰对齐，全面面向 `kujira-user-<hash16>` 单聊模型。
  */
 
 import type { Context } from '@deepseek-ai/cordis';
@@ -10,9 +10,15 @@ import type { MessageDatabase } from '../storage/database.js';
 import type { WakeupPayload } from '../types/index.js';
 import type { TurnInitiatorTracker } from '../approval/turn-initiator.js';
 import { encodeSegment } from '../utils/path.js';
+import { openidToPeer } from '../utils/peer.js';
 
 // 导出所有下沉子模块中的类型与异常
-export { RemoteError, SessionAlreadyOwnedError, type ParsedSessionId, type OutboundBridgeLike } from './session/types.js';
+export {
+  RemoteError,
+  SessionAlreadyOwnedError,
+  type ParsedSessionId,
+  type OutboundBridgeLike,
+} from './session/types.js';
 export {
   parseSessionId,
   generateSessionHash,
@@ -21,6 +27,7 @@ export {
   formatSessionTitle,
   extractNameFromSessionTitle,
   formatWakeupPrompt,
+  isKujiraSession,
   isQQSession,
 } from './session/id-resolver.js';
 export { encodeSegment };
@@ -39,7 +46,7 @@ import {
   buildSessionId,
   extractNameFromSessionTitle,
   formatWakeupPrompt,
-  isQQSession,
+  isKujiraSession,
   peerToBaseId,
   sessionIdToPeer,
 } from './session/id-resolver.js';
@@ -53,6 +60,8 @@ export class SessionManager {
   private clearedVersions = new Map<string, { round: number; version: number }>();
   private pendingClearedSessionId = new Map<string, string>();
   private deletedSessionIds = new Set<string>();
+  private isDisposed = false;
+  private unsubscribers: Array<() => void> = [];
 
   private readonly workspace: SessionWorkspaceManager;
   private readonly persistence: SessionPersistenceManager;
@@ -98,37 +107,50 @@ export class SessionManager {
     this.agentRunner.guardSessionController();
 
     if (typeof (this.ctx as any).on === 'function') {
-      (this.ctx as any).on('ready', () => {
-        this.agentRunner.guardSessionController();
-      });
+      const reg = (off: any) => {
+        if (typeof off === 'function') this.unsubscribers.push(off);
+      };
+
+      reg(
+        (this.ctx as any).on('ready', () => {
+          this.agentRunner.guardSessionController();
+        })
+      );
 
       // 实时响应 Archive Manager 插件发出的外部会话删除事件
-      (this.ctx as any).on('api-session/removed', (sessionId: any) => {
-        if (sessionId) {
-          this.handleExternalSessionRemoved(String(sessionId));
-        }
-      });
+      reg(
+        (this.ctx as any).on('api-session/removed', (sessionId: any) => {
+          if (sessionId) {
+            this.handleExternalSessionRemoved(String(sessionId));
+          }
+        })
+      );
 
       // 实时响应 DSH 原生 session teardown 事件
-      (this.ctx as any).on('session/disposed', (session: any) => {
-        const sid = session?.id ? String(session.id) : '';
-        if (sid) {
-          this.handleExternalSessionRemoved(sid);
-        }
-      });
+      reg(
+        (this.ctx as any).on('session/disposed', (session: any) => {
+          const sid = session?.id ? String(session.id) : '';
+          if (sid) {
+            this.handleExternalSessionRemoved(sid);
+          }
+        })
+      );
 
       // 实时感知任何会话的落盘事件，解除新建白名单保护并标记已持久化
-      (this.ctx as any).on('session/flush', (session: any) => {
-        const sid = session?.id ? String(session.id) : '';
-        if (sid) {
-          this.agentRunner.markSessionPersistedIfPresent(sid);
-        }
-      });
+      reg(
+        (this.ctx as any).on('session/flush', (session: any) => {
+          const sid = session?.id ? String(session.id) : '';
+          if (sid) {
+            this.agentRunner.markSessionPersistedIfPresent(sid);
+          }
+        })
+      );
     }
   }
 
   // --- 外部会话删除事件自愈处理 ---
   public handleExternalSessionRemoved(sessionId: string): void {
+    if (this.isDisposed) return;
     this.deletedSessionIds.add(sessionId);
 
     // 1. 释放并淘汰 AgentHandle 及新建待写白名单
@@ -188,7 +210,6 @@ export class SessionManager {
 
   public getTurnInitiatorTracker(): TurnInitiatorTracker | undefined {
     return this.agentRunner.getTurnInitiatorTracker();
-
   }
 
   // --- 系统事件与统一唤醒中枢 (SystemEventHub) ---
@@ -215,7 +236,7 @@ export class SessionManager {
     return this.workspace.resolveCwd(_peerOrSessionId);
   }
 
-  public async registerWorkspace(cwd: string, sessionId?: string, title = 'NapCat'): Promise<void> {
+  public async registerWorkspace(cwd: string, sessionId?: string, title = 'Kujira'): Promise<void> {
     return this.workspace.registerWorkspace(cwd, sessionId, title);
   }
 
@@ -270,16 +291,16 @@ export class SessionManager {
     return this.modelSelector.resolveDefaultEffort(provider, model);
   }
 
-  public getNapcatDefaultModel(): ModelSelection {
-    return this.modelSelector.getNapcatDefaultModel();
+  public getKujiraDefaultModel(): ModelSelection {
+    return this.modelSelector.getKujiraDefaultModel();
   }
 
-  public setNapcatDefaultModel(provider: string, model: string, reasoningEffort?: any): void {
-    this.modelSelector.setNapcatDefaultModel(
+  public setKujiraDefaultModel(provider: string, model: string, reasoningEffort?: any): void {
+    this.modelSelector.setKujiraDefaultModel(
       provider,
       model,
       reasoningEffort,
-      this.getAllQQSessionIds()
+      this.getAllKujiraSessionIds()
     );
   }
 
@@ -296,15 +317,16 @@ export class SessionManager {
     provider: string,
     model: string,
     reasoningEffort?: any,
+    peer?: string,
     persistDb = true
   ): void {
-    const peer = this.sessionIdToPeer(sessionId);
+    const peerKey = this.sessionIdToPeer(sessionId);
     this.modelSelector.setModelSelection(
       sessionId,
       provider,
       model,
       reasoningEffort,
-      peer,
+      peer || peerKey,
       persistDb
     );
   }
@@ -313,7 +335,7 @@ export class SessionManager {
     return this.modelSelector.getModelSelection(sessionId);
   }
 
-  public getAllQQSessionIds(): string[] {
+  public getAllKujiraSessionIds(): string[] {
     const candidateSids = new Set<string>();
 
     // 1. 内存中已记录的映射
@@ -353,7 +375,7 @@ export class SessionManager {
       try {
         for (const rawSid of Array.from(wsRegistry.headers.keys())) {
           const sid = String(rawSid);
-          if (this.isQQSession(sid)) {
+          if (this.isKujiraSession(sid)) {
             candidateSids.add(sid);
           }
         }
@@ -363,7 +385,7 @@ export class SessionManager {
       try {
         for (const rawSid of Array.from(wsRegistry.sessionPaths.keys())) {
           const sid = String(rawSid);
-          if (this.isQQSession(sid)) {
+          if (this.isKujiraSession(sid)) {
             candidateSids.add(sid);
           }
         }
@@ -376,7 +398,7 @@ export class SessionManager {
       try {
         for (const s of sessionsSvc.list()) {
           const sid = s?.id ? String(s.id) : '';
-          if (sid && this.isQQSession(sid)) {
+          if (sid && this.isKujiraSession(sid)) {
             candidateSids.add(sid);
           }
         }
@@ -386,15 +408,13 @@ export class SessionManager {
     // 7. 严格合法性与新鲜度过滤
     const validSids = new Set<string>();
     for (const sid of candidateSids) {
-      if (!this.isQQSession(sid)) continue;
+      if (!this.isKujiraSession(sid)) continue;
       if (this.isSessionArchived(sid)) continue;
       if (this.agentRunner.isSessionZombie(sid)) continue;
       if (this.deletedSessionIds.has(sid)) continue;
 
-      // 必须处于活跃或在磁盘物理存在状态
       if (!this.isSessionActiveOrPresent(sid)) continue;
 
-      // 必须为该 Peer 当前最新分配的会话，排除已被轮换淘汰的旧版本
       const peer = this.sessionIdToPeer(sid);
       const latestSid = this.peerToSessionId(peer);
       if (latestSid && latestSid !== sid) {
@@ -408,7 +428,7 @@ export class SessionManager {
   }
 
   public getActiveSessionIds(): string[] {
-    return this.getAllQQSessionIds();
+    return this.getAllKujiraSessionIds();
   }
 
   public getSessionDisplayName(sessionId: string): string | undefined {
@@ -416,8 +436,7 @@ export class SessionManager {
     const peerName = this.getPeerName(peer);
     if (peerName) return peerName;
 
-    // 私聊标题可能被旧版本的系统身份（如「系统定时任务」）污染，展示时直接忽略
-    const isUserPeer = peer.startsWith('user_') || peer.startsWith('qq-user-');
+    const isUserPeer = peer.startsWith('user_') || peer.startsWith('kujira-user-');
     const cleanName = (title: string | undefined): string | undefined => {
       const name = extractNameFromSessionTitle(title, peer);
       if (!name) return undefined;
@@ -425,7 +444,7 @@ export class SessionManager {
       return name;
     };
 
-    // 1. 从活跃 Agent 的会话标题（log-backed sessionTitle）反向提取
+    // 1. 从活跃 Agent 的会话标题反向提取
     const titleSvc = this.ctx.get?.('sessionTitle') || (this.ctx as any)?.sessionTitle;
     try {
       const agent = this.getAgent(sessionId);
@@ -487,14 +506,18 @@ export class SessionManager {
   }
 
   /**
-   * 确保 peer 的显示名称已解析（优先缓存/持久化，缺失时通过 NapCat 查询群信息或用户资料）。
+   * 确保 peer 的显示名称已解析（优先缓存/持久化，缺失时从历史记录/网关补充）。
    */
   public async ensurePeerName(peer: string): Promise<string | undefined> {
     return this.agentRunner.resolvePeerName(peer);
   }
 
+  public isKujiraSession(sessionId: string): boolean {
+    return isKujiraSession(sessionId);
+  }
+
   public isQQSession(sessionId: string): boolean {
-    return isQQSession(sessionId);
+    return isKujiraSession(sessionId);
   }
 
   public getAgent(peerOrSessionId: string): Agent | undefined {
@@ -514,9 +537,7 @@ export class SessionManager {
   }
 
   public formatWakeupPrompt(payload: WakeupPayload): string {
-    return formatWakeupPrompt(payload, {
-      bufferSize: this.agentRunner.getConfig()?.proactive_buffer_size,
-    });
+    return formatWakeupPrompt(payload);
   }
 
   public async dispatchWakeup(
@@ -534,11 +555,13 @@ export class SessionManager {
   }
 
   public peerToSessionId(peer: string): string {
-    if (peer.startsWith('qq-group-') || peer.startsWith('qq-user-')) {
+    if (peer.startsWith('kujira-user-')) {
       if (!this.isSessionArchived(peer)) {
         return peer;
       }
       peer = this.sessionIdToPeer(peer);
+    } else if (/^[0-9a-fA-F]{32}$/.test(peer)) {
+      peer = openidToPeer(peer);
     }
 
     const pending = this.pendingClearedSessionId.get(peer);
@@ -579,7 +602,7 @@ export class SessionManager {
         const sid = String(rawSid);
         const parsed = parseSessionId(sid);
         if (parsed) {
-          const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+          const expectedBase = `kujira-user-${parsed.id}`;
           if (expectedBase === baseId) {
             if (this.isSessionPhysicallyPresent(sid)) {
               known.set(sid, { round: parsed.round, version: parsed.version });
@@ -589,7 +612,7 @@ export class SessionManager {
       }
     }
 
-    // 补充内存中已存在、但尚未由 NapCat 持久化入库的 live sessions / agents
+    // 补充内存中已存在、但尚未持久化入库的 live sessions / agents
     const sessionsSvc = this.ctx.get?.('sessions') || (this.ctx as any).sessions;
     if (sessionsSvc?.list && typeof sessionsSvc.list === 'function') {
       try {
@@ -597,7 +620,7 @@ export class SessionManager {
           const sid = s?.id ? String(s.id) : '';
           const parsed = sid ? parseSessionId(sid) : null;
           if (parsed) {
-            const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+            const expectedBase = `kujira-user-${parsed.id}`;
             if (
               expectedBase === baseId &&
               (this.isSessionPhysicallyPresent(sid) || this.agentRunner.isPendingFirstTurn(sid))
@@ -714,7 +737,9 @@ export class SessionManager {
 
   public markSessionCleared(peerOrSessionId: string): string {
     const peer = this.sessionIdToPeer(peerOrSessionId);
-    const currentSid = this.peerCurrentSessionId.get(peer) || (peerOrSessionId.startsWith('qq-') ? peerOrSessionId : undefined);
+    const currentSid =
+      this.peerCurrentSessionId.get(peer) ||
+      (isKujiraSession(peerOrSessionId) ? peerOrSessionId : undefined);
     const baseId = peerToBaseId(peer);
 
     // 1. 扫描当前 peer 的未归档活跃会话
@@ -824,7 +849,7 @@ export class SessionManager {
         const sid = String(rawSid);
         const parsed = parseSessionId(sid);
         if (parsed) {
-          const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+          const expectedBase = `kujira-user-${parsed.id}`;
           if (expectedBase === baseId) {
             if (this.isSessionPhysicallyPresent(sid) && !this.isSessionArchived(sid)) {
               known.set(sid, { round: parsed.round, version: parsed.version });
@@ -864,7 +889,7 @@ export class SessionManager {
             if (!sid) continue;
             const parsed = parseSessionId(sid);
             if (parsed) {
-              const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+              const expectedBase = `kujira-user-${parsed.id}`;
               if (expectedBase === baseId) {
                 if (
                   (this.isSessionPhysicallyPresent(sid) || this.agentRunner.isPendingFirstTurn(sid)) &&
@@ -883,7 +908,7 @@ export class SessionManager {
             const sid = String(rawSid);
             const parsed = parseSessionId(sid);
             if (parsed) {
-              const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+              const expectedBase = `kujira-user-${parsed.id}`;
               if (expectedBase === baseId) {
                 if (
                   (this.isSessionPhysicallyPresent(sid) || this.agentRunner.isPendingFirstTurn(sid)) &&
@@ -901,7 +926,7 @@ export class SessionManager {
     for (const sid of this.modelSelector.getTrackedSessionIds()) {
       const parsed = parseSessionId(sid);
       if (parsed) {
-        const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+        const expectedBase = `kujira-user-${parsed.id}`;
         if (expectedBase === baseId) {
           if (
             (this.isSessionPhysicallyPresent(sid) || this.agentRunner.isPendingFirstTurn(sid)) &&
@@ -929,7 +954,7 @@ export class SessionManager {
     }
 
     const baseId = peerToBaseId(peer);
-    const expectedBase = parsed.isGroup ? `qq-group-${parsed.id}` : `qq-user-${parsed.id}`;
+    const expectedBase = `kujira-user-${parsed.id}`;
     if (expectedBase !== baseId) {
       return false;
     }
@@ -952,6 +977,13 @@ export class SessionManager {
   }
 
   public async dispose(): Promise<void> {
+    this.isDisposed = true;
+    for (const off of this.unsubscribers) {
+      try {
+        off();
+      } catch {}
+    }
+    this.unsubscribers = [];
     await this.agentRunner.dispose();
     this.peerCurrentSessionId.clear();
     this.clearedVersions.clear();

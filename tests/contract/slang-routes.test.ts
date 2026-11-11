@@ -1,6 +1,6 @@
 /**
  * tests/contract/slang-routes.test.ts
- * 契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)
+ * 契约测试: 黑话管理 HTTP REST 接口 (/plugins/kujira/slang*)
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -62,7 +62,7 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
   let mockCtx: any;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-slang-routes-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-slang-routes-'));
     testDbPath = path.join(tmpDir, 'test_messages.sqlite');
     db = new MessageDatabase(testDbPath);
     storage = new SlangStorage(db, 300, 'reject');
@@ -95,7 +95,9 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     } catch {}
   });
 
-  it('契约 1: 成功注册黑话管理路由至 webServer', () => {
+  it('契约 1: 成功注册 /plugins/kujira/slang* 路由至 webServer', () => {
+    expect(SLANG_API_PATH).toBe('/plugins/kujira/slang');
+
     const unregister = registerSlangRoutes({ ctx: mockCtx, storage });
     expect(mockServer.register).toHaveBeenCalled();
     expect(registeredRoutes.has(`exact:${SLANG_API_PATH}`)).toBe(true);
@@ -106,7 +108,7 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(registeredRoutes.size).toBe(0);
   });
 
-  it('契约 2: GET /plugins/dsh-napcat-bridge/slang 获取词条列表与容量统计', async () => {
+  it('契约 2: GET /plugins/kujira/slang 获取词条列表与容量统计', async () => {
     registerSlangRoutes({ ctx: mockCtx, storage });
     await storage.recordEntry({ term: '牢大', tags: '科比', definition: '科比梗', example: '想你了' });
     await storage.recordEntry({ term: '开香槟', tags: '反转', definition: '提前庆祝', example: '别开' });
@@ -126,13 +128,12 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(body.entries[0].tags).toBeDefined();
   });
 
-  it('契约 3: POST /plugins/dsh-napcat-bridge/slang/edit 编辑词条成功与失败校验', async () => {
+  it('契约 3: POST /plugins/kujira/slang/edit 编辑词条成功与失败校验', async () => {
     registerSlangRoutes({ ctx: mockCtx, storage });
     await storage.recordEntry({ term: '牢大', tags: '旧标', definition: '旧释义', example: '旧例句' });
 
     const handler = registeredRoutes.get(`exact:${SLANG_API_PATH}/edit`);
 
-    // 成功编辑 tags, definition, example
     const reqSuccess = createMockRequest('POST', `${SLANG_API_PATH}/edit`, {
       term: '牢大',
       tags: '新标',
@@ -149,13 +150,11 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(bodySuccess.entry.tags).toBe('新标');
     expect(bodySuccess.entry.example).toBe('新例句');
 
-    // 缺少 term
     const reqNoTerm = createMockRequest('POST', `${SLANG_API_PATH}/edit`, { definition: 'xxx' });
     const resNoTerm = new MockResponse();
     await handler(reqNoTerm, resNoTerm);
     expect(resNoTerm.statusCode).toBe(400);
 
-    // 词条不存在
     const reqNotFound = createMockRequest('POST', `${SLANG_API_PATH}/edit`, {
       term: '不存在的词',
       definition: 'xxx',
@@ -165,13 +164,12 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(resNotFound.statusCode).toBe(404);
   });
 
-  it('契约 4: POST /plugins/dsh-napcat-bridge/slang/delete 删除词条成功与失败校验', async () => {
+  it('契约 4: POST /plugins/kujira/slang/delete 删除词条成功与失败校验', async () => {
     registerSlangRoutes({ ctx: mockCtx, storage });
     await storage.recordEntry({ term: '牢大', tags: '科比', definition: '释义', example: '例句' });
 
     const handler = registeredRoutes.get(`exact:${SLANG_API_PATH}/delete`);
 
-    // 成功删除
     const reqSuccess = createMockRequest('POST', `${SLANG_API_PATH}/delete`, { term: '牢大' });
     const resSuccess = new MockResponse();
     await handler(reqSuccess, resSuccess);
@@ -181,18 +179,16 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(bodySuccess.ok).toBe(true);
     expect(bodySuccess.total).toBe(0);
 
-    // 删除不存在的词
     const reqNotFound = createMockRequest('POST', `${SLANG_API_PATH}/delete`, { term: '不存在' });
     const resNotFound = new MockResponse();
     await handler(reqNotFound, resNotFound);
     expect(resNotFound.statusCode).toBe(404);
   });
 
-  it('契约 5: POST /plugins/dsh-napcat-bridge/slang 添加新词条强制校验 4 个必填参数', async () => {
+  it('契约 5: POST /plugins/kujira/slang 添加新词条强制校验 4 个必填参数', async () => {
     registerSlangRoutes({ ctx: mockCtx, storage });
     const handler = registeredRoutes.get(`exact:${SLANG_API_PATH}`);
 
-    // 1. 成功添加完整词条 (4 项必填)
     const reqSuccess = createMockRequest('POST', SLANG_API_PATH, {
       term: '开香槟',
       tags: '提前庆祝、反转被打脸',
@@ -210,7 +206,6 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(bodySuccess.entry.definition).toBe('比分领先过早庆祝导致翻车');
     expect(bodySuccess.entry.example).toBe('还有一局呢，先别开香槟');
 
-    // 2. 缺少 tags 校验
     const reqNoTags = createMockRequest('POST', SLANG_API_PATH, {
       term: '缺标签词',
       definition: '释义',
@@ -221,7 +216,6 @@ describe('契约测试: 黑话管理 HTTP REST 接口 (Slang Routes Contract)', 
     expect(resNoTags.statusCode).toBe(400);
     expect(JSON.parse(resNoTags.body).error).toContain('缺少简要概述标签 (tags)');
 
-    // 3. 缺少 example 校验
     const reqNoEx = createMockRequest('POST', SLANG_API_PATH, {
       term: '缺例句词',
       tags: '标签',

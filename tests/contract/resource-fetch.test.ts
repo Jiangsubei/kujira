@@ -1,417 +1,368 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import * as fs from 'node:fs';
-import { fetchChatResource, expandForwardMessage } from '../../src/tools/index.js';
-import { clearGroupFileResolverCache } from '../../src/tools/group-file-resolve.js';
-
 /**
- * 契约测试: 群文件下载链路 (IS-F1/IS-F2)
+ * 契约测试: 单聊资源抓取 (fetch_chat_resource) 与官方合并转发展开 (expand_forward_message)
  *
- * 测试引用 src 真实模块，不造桩自测：
- * - IS-F1: 群文件判定依据上下文 peer/groupId（不再按 file_id 字符串猜）+ 真实下载路径 + 失败分级报错
- * - IS-F2: 群文件下载落盘带 sessionId (files/<peer>/)
+ * 覆盖规范:
+ * - fetch_chat_resource:
+ *   1. 移除 busid / group_id / group-file-resolve / private-file / SnowLuma / get_file；
+ *   2. db.getByFileId 一级去重命中 local_path 直接复用；
+ *   3. 未落盘时从 attachments JSON (deserializeAttachments) 查找 descriptor 的 local.path 或直链
+ *      (voice 优先 voiceWavUrl，其余取 remote.url) 裸 GET 落盘并写回 db.updateLocalPath；
+ *   4. 无可用直链时明确提示「资源直链不存在或已过期，QQ 官方 Bot API 不支持按 file_id 事后刷新旧资源链接」；
+ *   5. 报错与结果严禁泄漏带 query 凭证 (rkey/token/sig) 的完整 URL；
+ *   6. 批量 files[] 支持 Partial Success 与 inFlightDownloads 并发去重；
+ * - expand_forward_message:
+ *   7. 适配官方 message_type=102 已展开合并转发，按 msg_id / forward_id / content 解析 ForwardNode[]；
+ *   8. 调用 resolveEmbeddedForwardImages 限量落盘内嵌图片（上限 10 张）并将 URL 脱敏替换，绝不泄露 rkey。
  */
 
-const GROUP_PEER = 'group_3000000001';
-const REAL_UUID_FILE_ID = '/36315f46-af2a-490d-959c-4f37937d0095';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import {
+  fetchChatResource,
+  expandForwardMessage,
+  createFetchChatResourceTool,
+  inFlightDownloads,
+} from '../../src/tools/index.js';
+import { MessageDatabase } from '../../src/storage/database.js';
+import { MediaStorageManager } from '../../src/storage/media.js';
+import { serializeAttachments } from '../../src/attachment/store.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
-function stubGateway(overrides: Record<string, any> = {}) {
-  const calls: Array<Record<string, any>> = [];
-  const gateway = {
-    getGroupFileUrl: async (groupId: any, fileId: any, busid: any) => {
-      calls.push({ action: 'getGroupFileUrl', groupId, fileId, busid });
-      return { status: 'ok', retcode: 0, data: { url: 'https://example.com/dl/test.txt' } };
-    },
-    ...overrides,
-  };
-  return { gateway, calls };
+const MOCK_OPENID = 'DDDDEEEEFFFF00001111222233334444';
+const USER_PEER = openidToPeer(MOCK_OPENID);
+
+function assertNoUndefinedFields(obj: unknown, currentPath = ''): void {
+  if (obj === undefined) {
+    throw new Error(`Found undefined at "${currentPath}"`);
+  }
+  if (obj === null || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    obj.forEach((item, idx) => assertNoUndefinedFields(item, `${currentPath}[${idx}]`));
+    return;
+  }
+  for (const key of Object.keys(obj)) {
+    const val = (obj as Record<string, unknown>)[key];
+    if (val === undefined) {
+      throw new Error(`Found undefined key "${currentPath ? `${currentPath}.${key}` : key}"`);
+    }
+    assertNoUndefinedFields(val, currentPath ? `${currentPath}.${key}` : key);
+  }
 }
 
-function stubMedia() {
-  const mediaCalls: Array<Record<string, any>> = [];
-  const mediaManager = {
-    downloadAndSave: async (url: string, opts: any) => {
-      mediaCalls.push({ url, opts });
-      return {
-        localPath: `/tmp/downloads/files/${opts?.sessionId || 'common'}/test.txt`,
-        fingerprint: 'fp-123',
-        deduplicated: false,
-      };
-    },
-  };
-  return { mediaManager, mediaCalls };
-}
+describe('契约测试: fetch_chat_resource 与 expand_forward_message (QQ 官方 C2C 单聊)', () => {
+  let tmpDir: string;
+  let db: MessageDatabase;
 
-describe('契约测试: 群文件下载链路 (Group File Download Contract IS-F1/IS-F2)', () => {
   beforeEach(() => {
-    clearGroupFileResolverCache();
+    inFlightDownloads.clear();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-res-fetch-'));
+    db = new MessageDatabase(path.join(tmpDir, 'messages.sqlite'));
+    db.init();
   });
 
-  it('IS-F1-契约 1: group_ peer + 真 UUID file_id + busid 必须走真实下载路径（非按 file_id 字符串判定）', async () => {
-    const { gateway, calls } = stubGateway();
-    const { mediaManager } = stubMedia();
+  afterEach(() => {
+    inFlightDownloads.clear();
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
 
+  function stubMedia() {
+    const mediaCalls: Array<{ urlOrPath: string; opts: any }> = [];
+    const mediaManager = {
+      downloadAndSave: vi.fn(async (urlOrPath: string, opts: any) => {
+        mediaCalls.push({ urlOrPath, opts });
+        const ext = opts?.ext || 'dat';
+        const outDir = path.join(tmpDir, 'downloads', opts?.type || 'files');
+        fs.mkdirSync(outDir, { recursive: true });
+        const savedPath = path.join(outDir, opts?.filename || `dl_${mediaCalls.length}.${ext}`);
+        fs.writeFileSync(savedPath, 'mock-binary');
+        return {
+          localPath: savedPath,
+          fingerprint: `fp-${mediaCalls.length}`,
+          deduplicated: false,
+          md5: `md5-${mediaCalls.length}`,
+        };
+      }),
+    } as unknown as MediaStorageManager;
+    return { mediaManager, mediaCalls };
+  }
+
+  it('契约 1: createFetchChatResourceTool 参数表中彻底移除 busid', () => {
+    const tool = createFetchChatResourceTool();
+    const props = (tool.parameters as any)?.properties;
+    expect(props?.busid).toBeUndefined();
+    expect(props?.files?.items?.properties?.busid).toBeUndefined();
+    expect(props?.file_id).toBeDefined();
+    expect(props?.msg_id).toBeDefined();
+    expect(props?.url).toBeDefined();
+  });
+
+  it('契约 2: 一级缓存命中 —— db.getByFileId 已有 local_path 且文件存在时直接复用', async () => {
+    const cachedFile = path.join(tmpDir, 'cached.pdf');
+    fs.writeFileSync(cachedFile, 'cached-pdf');
+
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_CACHED_1',
+      peer: USER_PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '',
+      time: Date.now(),
+      type: 'file',
+      content: `[文件:cached.pdf 已保存: ${cachedFile}]`,
+      raw: '{}',
+      file_id: 'file_cached_001',
+      local_path: cachedFile,
+      fingerprint: 'fp_cached',
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      source: 'qq',
+    });
+
+    const { mediaManager, mediaCalls } = stubMedia();
     const res = await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID, busid: 102, file_name: 'test.txt' },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
+      { file_id: 'file_cached_001' },
+      { peer: USER_PEER, db, mediaManager }
+    );
+
+    expect(res.success).toBe(true);
+    expect(res.local_path).toBe(cachedFile);
+    expect(mediaCalls).toHaveLength(0);
+    assertNoUndefinedFields(res);
+  });
+
+  it('契约 3: 从 attachments JSON 提取直链裸 GET 落盘（语音优先 voiceWavUrl）并回写 db.updateLocalPath', async () => {
+    const attachmentsJson = serializeAttachments([
+      {
+        kind: 'record',
+        origin: 'inbound',
+        fileName: 'clip.amr',
+        remote: {
+          fileId: 'voice_file_001',
+          contentType: 'voice',
+          url: 'https://multimedia.nt.qq.com.cn/download?rkey=RAW_AMR_SECRET',
+          voiceWavUrl: 'https://qqbot.ugcimg.cn/voice/converted.wav?rkey=WAV_SECRET',
+          asrReferText: '你好呀',
+        },
+      },
+    ]);
+
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_VOICE_1',
+      peer: USER_PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '',
+      time: Date.now(),
+      type: 'record',
+      content: '[语音 (语音转文字: "你好呀")]',
+      raw: '{}',
+      file_id: 'voice_file_001',
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      source: 'qq',
+      attachments: attachmentsJson,
+    });
+
+    const { mediaManager, mediaCalls } = stubMedia();
+    const res = await fetchChatResource(
+      { file_id: 'voice_file_001' },
+      { peer: USER_PEER, db, mediaManager }
     );
 
     expect(res.success).toBe(true);
     expect(res.local_path).toBeDefined();
-    // get_group_file_url 参数契约: {group_id, file_id, busid}
-    expect(calls).toHaveLength(1);
-    expect(calls[0].action).toBe('getGroupFileUrl');
-    expect(calls[0].groupId).toBe(3000000001);
-    expect(calls[0].fileId).toBe(REAL_UUID_FILE_ID);
-    expect(calls[0].busid).toBe(102);
-  });
+    expect(fs.existsSync(res.local_path!)).toBe(true);
+    assertNoUndefinedFields(res);
 
-  it('IS-F2-契约 2: 群文件下载落盘必须携带 sessionId=peer，落 files/<peer>/ 而非 common', async () => {
-    const { gateway } = stubGateway();
-    const { mediaManager, mediaCalls } = stubMedia();
-
-    await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID, busid: 102, file_name: 'test.txt' },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
-    );
-
+    // 验证优先拉取 voiceWavUrl，且落盘 sessionId 为 user_<hash>
     expect(mediaCalls).toHaveLength(1);
-    expect(mediaCalls[0].url).toBe('https://example.com/dl/test.txt');
-    expect(mediaCalls[0].opts.sessionId).toBe(GROUP_PEER);
-    expect(mediaCalls[0].opts.type).toBe('files');
-    expect(mediaCalls[0].opts.fileId).toBe(REAL_UUID_FILE_ID);
+    expect(mediaCalls[0]!.urlOrPath).toBe('https://qqbot.ugcimg.cn/voice/converted.wav?rkey=WAV_SECRET');
+    expect(mediaCalls[0]!.opts.type).toBe('voice');
+    expect(mediaCalls[0]!.opts.sessionId).toBe(USER_PEER);
+
+    // 验证写回 db.local_path
+    const updated = db.getMessage('ROBOT1.0_VOICE_1');
+    expect(updated?.local_path).toBe(res.local_path);
+    expect(updated?.fingerprint).toBe('fp-1');
   });
 
-  it('IS-F1-契约 3: 群上下文缺少 busid 返回清晰错误（不猜测、不落占位）', async () => {
+  it('契约 4: 无可用直链时明确提示官方 Bot API 不支持按 file_id 事后刷新旧资源链接', async () => {
     const res = await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID },
-      { peer: GROUP_PEER, groupId: 3000000001 }
+      { file_id: 'expired_or_missing_id' },
+      { peer: USER_PEER, db }
     );
+
     expect(res.success).toBe(false);
-    expect(res.error).toContain('busid');
+    expect(res.error).toContain('QQ 官方 Bot API 不支持按 file_id 事后刷新旧资源链接');
+    assertNoUndefinedFields(res);
   });
 
-  it('IS-F1-契约 4: 群上下文 + 无 gateway 返回 success:false 与具体错误（NapCat 未连接）', async () => {
-    const res = await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID, busid: 102 },
-      { peer: GROUP_PEER, groupId: 3000000001 }
-    );
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('NapCat 未连接');
-    expect(res.local_path).toBeUndefined();
-  });
-
-  it('IS-F1-契约 5: gateway 未返回下载 URL 时报错并透传 NapCat wording', async () => {
-    const { gateway } = stubGateway({
-      getGroupFileUrl: async () => ({
-        status: 'failed',
-        retcode: 100,
-        data: {},
-        wording: '文件不存在或已被删除',
-      }),
-    });
+  it('契约 5: 下载异常时报错严格脱敏，绝不泄漏 query 凭证 (rkey / token / sig)', async () => {
     const { mediaManager } = stubMedia();
-
-    const res = await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID, busid: 102 },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
+    (mediaManager.downloadAndSave as any).mockRejectedValueOnce(
+      new Error('HTTP 下载失败 (status: 403): https://multimedia.nt.qq.com.cn/download?rkey=LEAK_FORBIDDEN_999&sig=SECRET_SIG')
     );
-
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('下载失败');
-    expect(res.error).toContain('文件不存在或已被删除');
-  });
-
-  it('IS-F1-契约 6: HTTP 下载抛错时返回下载失败而非笼统"资源不存在"', async () => {
-    const { gateway } = stubGateway({
-      getGroupFileUrl: async () => ({ status: 'ok', retcode: 0, data: { url: 'https://example.com/dl/x.txt' } }),
-    });
-    const { mediaManager } = stubMedia();
-    mediaManager.downloadAndSave = async () => {
-      throw new Error('HTTP 下载失败 (status: 404)');
-    };
-
-    const res = await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID, busid: 102 },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
-    );
-
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('HTTP 下载失败 (status: 404)');
-  });
-
-  it('IS-F1-契约 7: 私聊(user_)上下文不按群文件处理；无 gateway 报 NapCat 未连接', async () => {
-    const res = await fetchChatResource(
-      { file_id: REAL_UUID_FILE_ID, busid: 102 },
-      { peer: 'user_2000000001' }
-    );
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('NapCat 未连接');
-  });
-
-  it('一级去重: db 已有 local_path 且文件存在时直接复用', async () => {
-    const file = `/tmp/dsh-napcat-dedup-${Date.now()}.txt`;
-    fs.writeFileSync(file, 'x');
-    try {
-      const db = {
-        // MessageDatabase.getByFileId 为同步查询
-        getByFileId: () => ({
-          local_path: file,
-          fingerprint: 'fp',
-        }),
-      } as any;
-      const res = await fetchChatResource(
-        { file_id: 'some-cached-file' },
-        { peer: 'group_123', groupId: 123, db }
-      );
-      expect(res.success).toBe(true);
-      expect(res.local_path).toBe(file);
-    } finally {
-      fs.rmSync(file, { force: true });
-    }
-  });
-
-  it('expandForwardMessage 无 gateway 返回 success:false 与清晰错误', async () => {
-    const res = await expandForwardMessage({ forward_id: 'forward_abc' });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('NapCat 未连接');
-  });
-  it('方案A-契约 1: 批量传入 files 列表，单次调用依次拉取多个文件并返回结构化清单', async () => {
-    const { gateway, calls } = stubGateway();
-    const { mediaManager, mediaCalls } = stubMedia();
 
     const res = await fetchChatResource(
       {
-        files: [
-          { file_id: 'file-1', busid: 102, file_name: 'mod1.vpk' },
-          { file_id: 'file-2', busid: 104, file_name: 'mod2.vpk' },
-        ],
+        file_id: 'https://multimedia.nt.qq.com.cn/download?rkey=LEAK_FORBIDDEN_999&sig=SECRET_SIG',
       },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
+      { peer: USER_PEER, db, mediaManager }
     );
 
-    expect(res.success).toBe(true);
-    expect(res.total).toBe(2);
-    expect(res.downloaded_count).toBe(2);
-    expect(res.results).toHaveLength(2);
-    expect(res.results?.[0].file_id).toBe('file-1');
-    expect(res.results?.[0].success).toBe(true);
-    expect(res.results?.[0].local_path).toBeDefined();
-    expect(res.results?.[1].file_id).toBe('file-2');
-    expect(res.results?.[1].success).toBe(true);
-    expect(res.results?.[1].local_path).toBeDefined();
-
-    // 验证 gateway 和 mediaManager 依次被调用
-    expect(calls).toHaveLength(2);
-    expect(mediaCalls).toHaveLength(2);
-  });
-
-  it('方案A-契约 2: 批量下载遇到部分文件失败时（Partial Success），不阻断其他文件并返回明细', async () => {
-    const calls: any[] = [];
-    const gateway = {
-      getGroupFileUrl: async (groupId: any, fileId: any, busid: any) => {
-        calls.push({ groupId, fileId, busid });
-        if (fileId === 'file-fail') {
-          return { status: 'failed', retcode: 100, wording: '该文件已被管理员删除' };
-        }
-        return { status: 'ok', retcode: 0, data: { url: 'https://example.com/dl/success.vpk' } };
-      },
-    };
-    const { mediaManager } = stubMedia();
-
-    const res = await fetchChatResource(
-      {
-        files: [
-          { file_id: 'file-ok', busid: 102, file_name: 'ok.vpk' },
-          { file_id: 'file-fail', busid: 104, file_name: 'fail.vpk' },
-        ],
-      },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
-    );
-
-    // 存在部分成功时整体 success 为 true (Partial Success)
-    expect(res.success).toBe(true);
-    expect(res.total).toBe(2);
-    expect(res.downloaded_count).toBe(1);
-    expect(res.results).toHaveLength(2);
-    expect(res.results?.[0].success).toBe(true);
-    expect(res.results?.[1].success).toBe(false);
-    expect(res.results?.[1].error).toContain('已被管理员删除');
-  });
-
-  it('方案A-契约 3: 未提供 file_id 且未提供 files 返回清晰错误', async () => {
-    const res = await fetchChatResource({}, { peer: GROUP_PEER, groupId: 3000000001 });
     expect(res.success).toBe(false);
-    expect(res.error).toContain('file_id 或 files');
+    expect(res.error).not.toContain('LEAK_FORBIDDEN_999');
+    expect(res.error).not.toContain('SECRET_SIG');
+    expect(res.error).not.toContain('rkey=');
+    expect(res.results?.[0]?.file_id).not.toContain('LEAK_FORBIDDEN_999');
+    assertNoUndefinedFields(res);
   });
 
-  it('方案A-契约 4: 批量中已落盘的文件走一级去重，未落盘文件走真实下载', async () => {
-    const { gateway, calls } = stubGateway();
+  it('契约 6: 批量 files[] 支持部分成功 (Partial Success) 且并发同 file_id 共享 inFlightDownloads', async () => {
     const { mediaManager, mediaCalls } = stubMedia();
-
-    const cachedFile = `/tmp/dsh-test-cached-${Date.now()}.txt`;
-    fs.writeFileSync(cachedFile, 'already-downloaded');
-
-    try {
-      const db = {
-        getByFileId: (id: string) => {
-          if (id === 'cached-file') {
-            return { local_path: cachedFile, fingerprint: 'fp-cached' };
-          }
-          return null;
-        },
-      } as any;
-
-      const res = await fetchChatResource(
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_IMG_OK',
+      peer: USER_PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '',
+      time: Date.now(),
+      type: 'image',
+      content: '[图片]',
+      raw: '{}',
+      file_id: 'img_ok_1',
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      source: 'qq',
+      attachments: serializeAttachments([
         {
-          files: [
-            { file_id: 'cached-file', busid: 102, file_name: 'cached.txt' },
-            { file_id: 'new-file', busid: 104, file_name: 'new.vpk' },
-          ],
+          kind: 'image',
+          origin: 'inbound',
+          fileName: 'pic.png',
+          remote: {
+            fileId: 'img_ok_1',
+            url: 'https://multimedia.nt.qq.com.cn/download?rkey=IMG_OK_KEY',
+          },
         },
-        { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager, db }
-      );
+      ]),
+    });
 
-      expect(res.success).toBe(true);
-      expect(res.total).toBe(2);
-      expect(res.downloaded_count).toBe(2);
-      // cached-file 命中去重，未请求 gateway；new-file 请求 gateway
-      expect(calls).toHaveLength(1);
-      expect(calls[0].fileId).toBe('new-file');
-      expect(mediaCalls).toHaveLength(1);
-      expect(res.results?.[0].local_path).toBe(cachedFile);
-      expect(res.results?.[1].local_path).toContain('test.txt');
-    } finally {
-      fs.rmSync(cachedFile, { force: true });
-    }
-  });
-
-  /**
-   * SnowLuma 兼容：群文件 notice 事件落库的是 32 位 hex file_id，SnowLuma 的
-   * get_group_file_url 只接受消息段 /uuid。这里覆盖「本地兄弟记录优先」与
-   * 「群根目录列表兜底」两级解析，并确保成功路径不会多打协议端接口。
-   */
-  const HEX_NOTICE_ID = 'ae4d1ec67ebe8500b712d3d181e64b29';
-  const SEGMENT_FILE_ID = '/820dde00-d032-47a9-8726-dc5369c6a463';
-
-  function snowLumaGateway(rootFiles: any[] = []) {
-    const calls: Array<Record<string, any>> = [];
-    const rootCalls: any[] = [];
-    const gateway = {
-      getGroupFileUrl: async (groupId: any, fileId: any, busid: any) => {
-        calls.push({ groupId, fileId, busid });
-        if (String(fileId).startsWith('/')) {
-          return { status: 'ok', retcode: 0, data: { url: 'https://example.com/dl/resolved.txt' } };
-        }
-        return {
-          status: 'failed',
-          retcode: 100,
-          wording: 'group file url failed: code=4294966993 msg=文件 file_id 错误',
-        };
+    // 批量混合成功与无直链失败
+    const batchRes = await fetchChatResource(
+      {
+        files: [
+          { file_id: 'img_ok_1', file_name: 'pic.png' },
+          { file_id: 'img_missing_2', file_name: 'gone.png' },
+        ],
       },
-      getGroupRootFiles: async (groupId: any) => {
-        rootCalls.push(groupId);
-        return { status: 'ok', retcode: 0, data: { files: rootFiles, folders: [] } };
-      },
-      getGroupFilesByFolder: async () => ({ status: 'ok', retcode: 0, data: { files: [], folders: [] } }),
-    };
-    return { gateway, calls, rootCalls };
-  }
+      { peer: USER_PEER, db, mediaManager }
+    );
 
-  it('SnowLuma-契约 8: notice 32hex 首次失败后优先用本地兄弟消息段 /uuid 重试，不请求群根目录', async () => {
-    const { gateway, calls, rootCalls } = snowLumaGateway();
-    const { mediaManager } = stubMedia();
-    const db = {
-      getByFileId: (id: string) =>
-        id === HEX_NOTICE_ID
-          ? {
-              msg_id: 1001,
-              peer: GROUP_PEER,
-              time: 1793946745000,
-              type: 'group_file',
-              content: `[群文件:demo.mp4 (ID:${HEX_NOTICE_ID})]`,
-              raw: JSON.stringify({ post_type: 'notice', file: { id: HEX_NOTICE_ID, name: 'demo.mp4', size: 4096, busid: 102 } }),
-              file_id: HEX_NOTICE_ID,
-              busid: 102,
-              local_path: null,
-            }
-          : null,
-      findGroupFileSibling: () => ({ file_id: SEGMENT_FILE_ID, busid: 102, msg_id: 1002 }),
-    } as any;
+    expect(batchRes.success).toBe(true);
+    expect(batchRes.total).toBe(2);
+    expect(batchRes.downloaded_count).toBe(1);
+    expect(batchRes.results?.[0]?.success).toBe(true);
+    expect(batchRes.results?.[1]?.success).toBe(false);
+    assertNoUndefinedFields(batchRes);
 
-    const res = await fetchChatResource(
-      { file_id: HEX_NOTICE_ID, busid: 102, file_name: 'demo.mp4' },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager, db }
+    // Single-Flight 并发去重测试
+    let resolveDelayed!: (val: any) => void;
+    const delayedMedia = {
+      downloadAndSave: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveDelayed = resolve;
+          })
+      ),
+    } as unknown as MediaStorageManager;
+
+    const p1 = fetchChatResource(
+      { file_id: 'single_flight_1', url: 'https://example.com/a.bin' },
+      { peer: USER_PEER, mediaManager: delayedMedia }
+    );
+    const p2 = fetchChatResource(
+      { file_id: 'single_flight_1', url: 'https://example.com/a.bin' },
+      { peer: USER_PEER, mediaManager: delayedMedia }
+    );
+    expect((delayedMedia.downloadAndSave as any).mock.calls).toHaveLength(1);
+    resolveDelayed({ localPath: path.join(tmpDir, 'sf.bin'), fingerprint: 'fp-sf', deduplicated: false });
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1.local_path).toBe(r2.local_path);
+    expect(mediaCalls).toHaveLength(1);
+  });
+
+  it('契约 7: expand_forward_message 解析官方 message_type=102 合并转发、限量落盘内嵌图片并彻底剥离 rkey', async () => {
+    const forwardContent = [
+      '[群聊的聊天记录]',
+      '=== 消息 1 ===',
+      '[消息内容] 周五聚餐地点定了吗？',
+      '[发送者] 朋友A',
+      '',
+      '=== 消息 2 ===',
+      '[发送者] 朋友B',
+      '[附件1] 类型:图片 文件名:menu.jpg 尺寸:1080x1920 大小:256KB URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=TOP_SECRET_RKEY_123&spec=0',
+    ].join('\n');
+
+    db.saveMessage({
+      msg_id: 'ROBOT1.0_FWD_102',
+      peer: USER_PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '',
+      time: Date.now(),
+      type: 'forward',
+      content: forwardContent,
+      raw: JSON.stringify({ id: 'ROBOT1.0_FWD_102', message_type: 102, content: forwardContent }),
+      file_id: null,
+      local_path: null,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      source: 'qq',
+    });
+
+    const { mediaManager, mediaCalls } = stubMedia();
+    const res = await expandForwardMessage(
+      { msg_id: 'ROBOT1.0_FWD_102' },
+      { peer: USER_PEER, db, mediaManager }
     );
 
     expect(res.success).toBe(true);
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toMatchObject({ fileId: HEX_NOTICE_ID, busid: 102 });
-    expect(calls[1]).toMatchObject({ fileId: SEGMENT_FILE_ID, busid: 102 });
-    expect(rootCalls).toHaveLength(0);
-  });
+    expect(res.title).toBe('[群聊的聊天记录]');
+    expect(res.images_downloaded).toBe(1);
+    expect(res.messages).toHaveLength(2);
+    expect(res.messages?.[0]).toMatchObject({
+      index: 1,
+      sender_name: '朋友A',
+      content: '周五聚餐地点定了吗？',
+    });
+    expect(res.messages?.[1]?.sender_name).toBe('朋友B');
+    expect(res.messages?.[1]?.attachments?.[0]?.local_path).toBeDefined();
+    expect(res.content).toContain('[图片:');
+    expect(res.content).not.toContain('TOP_SECRET_RKEY_123');
+    expect(JSON.stringify(res)).not.toContain('rkey=');
+    expect(mediaCalls).toHaveLength(1);
+    assertNoUndefinedFields(res);
 
-  it('SnowLuma-契约 9: 本地无兄弟记录时，通过群根目录文件名匹配 /uuid 并重试下载', async () => {
-    const { gateway, calls, rootCalls } = snowLumaGateway([
-      { file_id: SEGMENT_FILE_ID, file_name: 'demo.mp4', busid: 102, file_size: 4096, upload_time: 1793946740 },
-    ]);
-    const { mediaManager } = stubMedia();
-    const db = {
-      getByFileId: (id: string) =>
-        id === HEX_NOTICE_ID
-          ? {
-              msg_id: 1001,
-              peer: GROUP_PEER,
-              time: 1793946745000,
-              type: 'group_file',
-              content: `[群文件:demo.mp4 (ID:${HEX_NOTICE_ID})]`,
-              raw: '{}',
-              file_id: HEX_NOTICE_ID,
-              busid: 102,
-              local_path: null,
-            }
-          : null,
-      findGroupFileSibling: () => null,
-    } as any;
-
-    const res = await fetchChatResource(
-      { file_id: HEX_NOTICE_ID, busid: 102, file_name: 'demo.mp4' },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager, db }
+    // 兼容 forward_id 别名且缺失记录清晰报错
+    const resAlias = await expandForwardMessage(
+      { forward_id: 'ROBOT1.0_FWD_102' },
+      { peer: USER_PEER, db, mediaManager }
     );
+    expect(resAlias.success).toBe(true);
 
-    expect(res.success).toBe(true);
-    expect(rootCalls).toEqual([3000000001]);
-    expect(calls).toHaveLength(2);
-    expect(calls[1]).toMatchObject({ fileId: SEGMENT_FILE_ID, busid: 102 });
-  });
-
-  it('SnowLuma-契约 10: 消息段 /uuid 首次成功时绝不触发根目录兜底（NapCat 主路径零回归）', async () => {
-    const { gateway, calls, rootCalls } = snowLumaGateway();
-    const { mediaManager } = stubMedia();
-
-    const res = await fetchChatResource(
-      { file_id: SEGMENT_FILE_ID, busid: 102, file_name: 'demo.mp4' },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager }
+    const resMissing = await expandForwardMessage(
+      { msg_id: 'ROBOT1.0_NOT_EXIST' },
+      { peer: USER_PEER, db }
     );
-
-    expect(res.success).toBe(true);
-    expect(calls).toHaveLength(1);
-    expect(rootCalls).toHaveLength(0);
-  });
-
-  it('SnowLuma-契约 11: 首次与兜底解析均失败时保留协议端原始报错', async () => {
-    const { gateway } = snowLumaGateway([]);
-    const { mediaManager } = stubMedia();
-    const db = {
-      getByFileId: () => null,
-      findGroupFileSibling: () => null,
-    } as any;
-
-    const res = await fetchChatResource(
-      { file_id: HEX_NOTICE_ID, busid: 102, file_name: 'demo.mp4' },
-      { peer: GROUP_PEER, groupId: 3000000001, gateway, mediaManager, db }
-    );
-
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('文件 file_id 错误');
+    expect(resMissing.success).toBe(false);
+    assertNoUndefinedFields(resMissing);
   });
 });

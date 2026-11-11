@@ -1,11 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-
-vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
-  IconChevronDownOutlineMedium: () => null,
-  IconChevronDownOutlineRegular: () => null,
-}));
+import { promises as fsp } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import {
   registerConfigRoute,
@@ -81,8 +79,18 @@ function createMockRes(): {
   return { res, getResult };
 }
 
-describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Authentication Fence - 严格 Fail-Closed)', () => {
-  it('当 ctx.connection 存在且 requestRejection 返回 401 时，GET 请求直接返回 401 Unauthorized，不读取配置', async () => {
+describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection Authentication Fence - 严格 Fail-Closed)', () => {
+  let tmpHome: string;
+
+  beforeEach(async () => {
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-auth-'));
+  });
+
+  afterEach(async () => {
+    await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('当 ctx.connection 存在且 requestRejection 返回 401 时，GET /plugins/kujira/config 直接返回 401 Unauthorized', async () => {
     let handler: any;
     const requestRejectionMock = vi.fn().mockReturnValue(401);
     const mockCtx: any = {
@@ -95,7 +103,7 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     };
 
     const cfgGetter = vi.fn(() => ({} as BridgePluginConfig));
-    registerConfigRoute(mockCtx, cfgGetter, async () => {});
+    registerConfigRoute(mockCtx, cfgGetter, async () => {}, { dshHome: tmpHome, cwd: tmpHome, env: {} });
 
     const req = createMockReq('GET');
     const { res, getResult } = createMockRes();
@@ -103,6 +111,7 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     await handler(req, res);
     const result = await getResult();
 
+    expect(CONFIG_ROUTE_PATH).toBe('/plugins/kujira/config');
     expect(requestRejectionMock).toHaveBeenCalledWith(req);
     expect(result.status).toBe(401);
     expect(result.body.ok).toBe(false);
@@ -110,7 +119,7 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     expect(cfgGetter).not.toHaveBeenCalled();
   });
 
-  it('当 ctx.connection 存在且 requestRejection 返回 403 时，POST 请求直接返回 403 Forbidden，不保存配置且不触发热对齐', async () => {
+  it('当 ctx.connection 存在且 requestRejection 返回 403 时，POST /plugins/kujira/config 直接返回 403 Forbidden', async () => {
     let handler: any;
     const requestRejectionMock = vi.fn().mockReturnValue(403);
     const mutateMock = vi.fn();
@@ -125,9 +134,13 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     };
 
     const queueReconcileMock = vi.fn();
-    registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), queueReconcileMock);
+    registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), queueReconcileMock, {
+      dshHome: tmpHome,
+      cwd: tmpHome,
+      env: {},
+    });
 
-    const req = createMockReq('POST', { ws_port: 9999 });
+    const req = createMockReq('POST', { image_ttl_days: 10 });
     const { res, getResult } = createMockRes();
 
     await handler(req, res);
@@ -156,9 +169,13 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     };
 
     const queueReconcileMock = vi.fn();
-    registerConfigRoute(mockCtx, () => ({ ws_port: 8080, ws_token: 'test-token' } as BridgePluginConfig), queueReconcileMock);
+    registerConfigRoute(
+      mockCtx,
+      () => ({ markdown_enabled: true } as BridgePluginConfig),
+      queueReconcileMock,
+      { dshHome: tmpHome, cwd: tmpHome, env: {} }
+    );
 
-    // 验证 GET 放行
     const reqGet = createMockReq('GET');
     const { res: resGet, getResult: getResultGet } = createMockRes();
     await handler(reqGet, resGet);
@@ -166,8 +183,7 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     expect(resGetResult.status).toBe(200);
     expect(resGetResult.body.ok).toBe(true);
 
-    // 验证 POST 放行
-    const reqPost = createMockReq('POST', { ws_port: 8081, ws_token: 'new-valid-token' });
+    const reqPost = createMockReq('POST', { markdown_enabled: false });
     const { res: resPost, getResult: getResultPost } = createMockRes();
     await handler(reqPost, resPost);
     const resPostResult = await getResultPost();
@@ -186,7 +202,11 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       inject: vi.fn(),
     };
 
-    registerConfigRoute(mockCtx, () => ({ ws_port: 8080 } as BridgePluginConfig), async () => {});
+    registerConfigRoute(mockCtx, () => ({ image_ttl_days: 7 } as BridgePluginConfig), async () => {}, {
+      dshHome: tmpHome,
+      cwd: tmpHome,
+      env: {},
+    });
 
     const req = createMockReq('GET');
     const { res, getResult } = createMockRes();
@@ -212,14 +232,17 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       }),
       inject: vi.fn(),
     };
-    // 模拟 Cordis Proxy 对未 inject 属性访问抛出异常的行为
     Object.defineProperty(mockCtx, 'connection', {
       get() {
         throw new Error('cannot get property "connection" without inject');
       },
     });
 
-    registerConfigRoute(mockCtx, () => ({ ws_port: 8080, ws_token: 'valid-token' } as BridgePluginConfig), async () => {});
+    registerConfigRoute(mockCtx, () => ({ markdown_enabled: true } as BridgePluginConfig), async () => {}, {
+      dshHome: tmpHome,
+      cwd: tmpHome,
+      env: {},
+    });
 
     const req = createMockReq('GET');
     const { res, getResult } = createMockRes();
@@ -232,41 +255,55 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
     expect(mockConnection.requestRejection).toHaveBeenCalled();
   });
 
-  describe('ws_token 必填非空与持久化强校验契约', () => {
-    it('Schema 兼容性: 缺失 ws_token 的历史老配置或空配置安全回退为默认空字符串，绝不抛出解析异常崩溃', () => {
+  describe('17 项 Schema 与可选凭据保存放行契约', () => {
+    it('Schema 兼容性: 空配置安全应用全部 17 项单聊默认值，绝不抛出解析异常或包含 ws_token/admins', () => {
       const parsed = BridgeConfigSchema({});
-      const tokenVal = typeof parsed.ws_token?.get === 'function' ? parsed.ws_token.get() : parsed.ws_token;
-      expect(tokenVal).toBe('');
+      const dict = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
+      const unwrap = (val: any) => (typeof val?.get === 'function' ? val.get() : val);
+      expect(Object.keys(dict)).toHaveLength(17);
+      expect(dict.ws_token).toBeUndefined();
+      expect(dict.admins).toBeUndefined();
+      expect(unwrap(parsed.markdown_enabled)).toBe(true);
+      expect(unwrap(parsed.input_notify_enabled)).toBe(true);
     });
 
-    it('POST /plugins/dsh-napcat-bridge/config: 提交空 ws_token 且现有无 token 时直接拒绝 (400 Bad Request)', async () => {
+    it('POST /plugins/kujira/config: 未配置凭据时仅修改普通配置项也正常放行并保存 (200 OK)', async () => {
       let handler: any;
+      const mutateMock = vi.fn().mockResolvedValue({ ok: true });
       const mockCtx: any = {
         get: vi.fn((name) => {
           if (name === 'webServer') return { register: (r: any) => { handler = r.handler; return () => {}; } };
           if (name === 'connection') return { requestRejection: () => undefined };
+          if (name === 'settings') return { mutate: mutateMock };
           return undefined;
         }),
         inject: vi.fn(),
       };
 
-      // 现有配置中无 ws_token
-      registerConfigRoute(mockCtx, () => ({ ws_port: 8080, ws_token: '' } as BridgePluginConfig), async () => {});
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
+        dshHome: tmpHome,
+        cwd: tmpHome,
+        env: {},
+      });
 
-      const req = createMockReq('POST', { ws_port: 8080, ws_token: '' });
+      const req = createMockReq('POST', { persona: '温和助手', markdown_enabled: true });
       const { res, getResult } = createMockRes();
 
       await handler(req, res);
       const result = await getResult();
 
-      expect(result.status).toBe(400);
-      expect(result.body.ok).toBe(false);
-      expect(result.body.error).toContain('不能为空');
+      expect(result.status).toBe(200);
+      expect(result.body.ok).toBe(true);
+      expect(result.body.credentials.ready).toBe(false);
+      expect(mutateMock).toHaveBeenCalled();
     });
   });
 
   describe('face-routes 宿主身份认证门控 (Face Routes Host Connection Fence)', () => {
-    it('当 ctx.connection 不存在时，所有 face 路由严格 Fail-Closed 返回 403 Forbidden', async () => {
+    it('当 ctx.connection 不存在时，所有 /plugins/kujira/faces* 路由严格 Fail-Closed 返回 403 Forbidden', async () => {
+      expect(FACES_API_PATH).toBe('/plugins/kujira/faces');
+      expect(FACES_PREVIEW_API_PREFIX).toBe('/plugins/kujira/faces/preview');
+
       const handlers = new Map<string, any>();
       const mockCtx: any = {
         get: vi.fn((name) => {
@@ -295,10 +332,9 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
         ctx: mockCtx,
         db: mockDb,
         getConfig: () => ({ face_enabled: true } as any),
-        dshHome: '/tmp/test',
+        dshHome: tmpHome,
       });
 
-      // 1. GET /faces
       const getHandler = handlers.get(FACES_API_PATH);
       expect(getHandler).toBeDefined();
       const reqGet = createMockReq('GET');
@@ -308,14 +344,12 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       expect(resGetResult.status).toBe(403);
       expect(resGetResult.body.error).toContain('Forbidden');
 
-      // 2. POST /faces
       const reqPost = createMockReq('POST', { data: 'xxx' });
       const { res: resPost, getResult: getResultPost } = createMockRes();
       await getHandler(reqPost, resPost);
       const resPostResult = await getResultPost();
       expect(resPostResult.status).toBe(403);
 
-      // 3. POST /faces/edit
       const editHandler = handlers.get(`${FACES_API_PATH}/edit`);
       expect(editHandler).toBeDefined();
       const reqEdit = createMockReq('POST', { id: 'face_123', tags: ['a'] });
@@ -324,7 +358,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       const resEditResult = await getResultEdit();
       expect(resEditResult.status).toBe(403);
 
-      // 4. POST /faces/delete
       const delHandler = handlers.get(`${FACES_API_PATH}/delete`);
       expect(delHandler).toBeDefined();
       const reqDel = createMockReq('POST', { id: 'face_123' });
@@ -333,7 +366,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       const resDelResult = await getResultDel();
       expect(resDelResult.status).toBe(403);
 
-      // 5. GET /faces/preview/:id
       const previewHandler = handlers.get(FACES_PREVIEW_API_PREFIX);
       expect(previewHandler).toBeDefined();
       const reqPreview = createMockReq('GET');
@@ -371,12 +403,11 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
         ctx: mockCtx,
         db: mockDb,
         getConfig: () => ({ face_enabled: true } as any),
-        dshHome: '/tmp/test',
+        dshHome: tmpHome,
       });
 
       const getHandler = handlers.get(FACES_API_PATH);
 
-      // 401 拦截
       const req401 = createMockReq('GET');
       const { res: res401, getResult: getResult401 } = createMockRes();
       await getHandler(req401, res401);
@@ -384,7 +415,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       expect(res401Result.status).toBe(401);
       expect(mockDb.queryFaces).not.toHaveBeenCalled();
 
-      // 放行
       rejectionCode = undefined;
       const reqPass = createMockReq('GET');
       const { res: resPass, getResult: getResultPass } = createMockRes();
@@ -424,13 +454,12 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
         ctx: mockCtx,
         db: mockDb,
         getConfig: () => ({ face_enabled: true, face_store_max: 10 } as any),
-        dshHome: '/tmp/test_white_ext',
+        dshHome: tmpHome,
       });
 
       const postHandler = handlers.get(FACES_API_PATH);
       const fakeBase64 = Buffer.from('hello-image-white').toString('base64');
 
-      // 尝试传入含路径穿越的恶意扩展名
       const reqMalicious = createMockReq('POST', {
         data: fakeBase64,
         format: '../../evil.sh',
@@ -441,7 +470,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
 
       expect(resResult.status).toBe(200);
       expect(insertedRecord).toBeDefined();
-      // 扩展名被严格收敛至合法白名单 (默认 png)，绝不包含路径穿越字符
       expect(insertedRecord.format).toBe('png');
       expect(insertedRecord.file_path).toMatch(/\.png$/);
       expect(insertedRecord.file_path).not.toContain('..');
@@ -449,7 +477,9 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
   });
 
   describe('slang-routes 宿主身份认证门控 (Slang Routes Host Connection Fence)', () => {
-    it('当 ctx.connection 不存在时，所有 slang 路由严格 Fail-Closed 返回 403 Forbidden', async () => {
+    it('当 ctx.connection 不存在时，所有 /plugins/kujira/slang* 路由严格 Fail-Closed 返回 403 Forbidden', async () => {
+      expect(SLANG_API_PATH).toBe('/plugins/kujira/slang');
+
       const handlers = new Map<string, any>();
       const mockCtx: any = {
         get: vi.fn((name) => {
@@ -476,7 +506,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
 
       registerSlangRoutes({ ctx: mockCtx, storage: mockStorage });
 
-      // 1. GET /slang
       const getHandler = handlers.get(SLANG_API_PATH);
       expect(getHandler).toBeDefined();
       const reqGet = createMockReq('GET');
@@ -486,14 +515,12 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       expect(resGetResult.status).toBe(403);
       expect(resGetResult.body.error).toContain('Forbidden');
 
-      // 2. POST /slang
       const reqPost = createMockReq('POST', { term: 'a', tags: 'b', definition: 'c', example: 'd' });
       const { res: resPost, getResult: getResultPost } = createMockRes();
       await getHandler(reqPost, resPost);
       const resPostResult = await getResultPost();
       expect(resPostResult.status).toBe(403);
 
-      // 3. POST /slang/edit
       const editHandler = handlers.get(`${SLANG_API_PATH}/edit`);
       expect(editHandler).toBeDefined();
       const reqEdit = createMockReq('POST', { term: 'a', definition: 'new' });
@@ -502,7 +529,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       const resEditResult = await getResultEdit();
       expect(resEditResult.status).toBe(403);
 
-      // 4. POST /slang/delete
       const delHandler = handlers.get(`${SLANG_API_PATH}/delete`);
       expect(delHandler).toBeDefined();
       const reqDel = createMockReq('POST', { term: 'a' });
@@ -540,7 +566,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
 
       const getHandler = handlers.get(SLANG_API_PATH);
 
-      // 403 拦截
       const req403 = createMockReq('GET');
       const { res: res403, getResult: getResult403 } = createMockRes();
       await getHandler(req403, res403);
@@ -548,7 +573,6 @@ describe('契约测试: 配置路由宿主身份认证门控 (Host Connection Au
       expect(res403Result.status).toBe(403);
       expect(mockStorage.getEntries).not.toHaveBeenCalled();
 
-      // 放行
       rejectionCode = undefined;
       const reqPass = createMockReq('GET');
       const { res: resPass, getResult: getResultPass } = createMockRes();

@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: Agent 工具集聚合门面
+ * kujira: Agent 工具集聚合门面
  *
  * 聚合导出所有领域工具工厂、执行逻辑及类型定义，
  * 并提供 registerAgentTools 统一装配管线。
@@ -8,7 +8,11 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { BridgePluginConfig } from '../types/index.js';
 import { resolveDshPath } from '../utils/path.js';
-import { DEFAULT_FACE_STORE_DIR } from '../constants/index.js';
+import {
+  DEFAULT_FACE_STORE_DIR,
+  DEFAULT_SLANG_EVICT_POLICY,
+  DEFAULT_SLANG_MAX_ENTRIES,
+} from '../constants/index.js';
 
 // 1. 公共基础设施
 export * from './common/context.js';
@@ -22,8 +26,6 @@ export * from './chat-history/index.js';
 export * from './face/index.js';
 export * from './resource/index.js';
 export * from './file-source.js';
-export * from './private-file.js';
-export * from './group-file-resolve.js';
 export * from './scheduler.js';
 export * from './memory/index.js';
 export * from './slang/index.js';
@@ -85,18 +87,18 @@ export function registerAgentTools(
 
   setGlobalToolContext({
     db: options.db,
+    outboundBridge: options.outboundBridge,
     gateway: options.gateway,
     mediaManager: options.mediaManager,
-    sender: options.sender,
+    sender: options.sender ?? options.outboundBridge?.getSender?.(),
     dshHome: options.dshHome,
     waitRegistry: options.waitRegistry,
     inboundMsgIdGetter: options.inboundMsgIdGetter,
     faceDir: resolveDshPath(options.dshHome, currentCfg.face_store_dir, DEFAULT_FACE_STORE_DIR),
-    faceSubType: currentCfg.face_sub_type,
     faceStoreMax: currentCfg.face_store_max,
     faceEvictPolicy: currentCfg.face_evict_policy,
     scheduler: options.scheduler,
-    config: options.config,
+    config: options.config ?? (options as any).configGetter,
   });
 
   const unregisters: Array<() => void> = [];
@@ -118,7 +120,7 @@ export function registerAgentTools(
     // 4. send_file
     unregisters.push(tools.register(createSendFileTool(options)));
 
-    // 5. wait_for_user_messages (EN-005)
+    // 5. wait_for_user_messages
     unregisters.push(tools.register(createWaitForUserMessagesTool(options)));
 
     // 6. send_qq_message
@@ -154,8 +156,8 @@ export function registerAgentTools(
         options.slangStorage ||
         new SlangStorage(
           options.db || getConfig().slang_storage_path,
-          () => getConfig().slang_max_entries ?? 300,
-          () => getConfig().slang_evict_policy ?? 'reject',
+          () => getConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
+          () => getConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
           options.dshHome
         );
       const slangDefs = createSlangToolDefinitions(storage);

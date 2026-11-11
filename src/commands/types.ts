@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 斜杠命令通用类型定义
+ * kujira: 斜杠命令通用类型定义
  */
 
 import type { Context } from '@deepseek-ai/cordis';
@@ -8,7 +8,6 @@ import type { SessionManager } from '../gateway/session.js';
 
 export interface CommandContext {
   userId: string;
-  admins: string[];
   session: Session;
   ctx: Context;
   /** 可选：当前会话对应的活体 Agent 实例 */

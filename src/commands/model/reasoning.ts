@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 思考深度探测与元数据解析模块
+ * kujira: 思考深度探测与元数据解析模块
  */
 
 import type { Context } from '@deepseek-ai/cordis';

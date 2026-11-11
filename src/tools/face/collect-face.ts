@@ -1,5 +1,10 @@
 /**
- * dsh-napcat-bridge: 偷表情/收藏工具 (collect_face)
+ * kujira: 偷表情/收藏工具 (collect_face)
+ *
+ * 适配 QQ 官方 Bot API v2 C2C 单聊：
+ * - msg_id 保持字符串（如 ROBOT1.0_...），严禁 Number() 强转；
+ * - 图片判定兼容 targetMsg.attachments 描述符 JSON（kind === 'image' || 'sticker'）与 type；
+ * - 使用 DEFAULT_FACE_STORE_DIR (.dsh/kujira/faces) 作为默认存储目录。
  */
 
 import * as fs from 'node:fs';
@@ -9,19 +14,57 @@ import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { CollectFaceParams, CollectFaceResult, MessageRecord } from '../../types/index.js';
 import { DEFAULT_FACE_STORE_DIR } from '../../constants/index.js';
 import { resolveDshPath } from '../../utils/path.js';
+import { isImageFileExt } from '../../attachment/classify.js';
+import { descriptorsFromRaw, deserializeAttachments } from '../../attachment/store.js';
+import { detectBufferExt } from '../../storage/media.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
   getGlobalToolContext,
   resolveToolContext,
   normalizePeer,
+  resolveSessionPeerFromExec,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 
 export type { CollectFaceParams, CollectFaceResult };
 
+function findImageLocalPathFromRecord(record: MessageRecord): {
+  hasImage: boolean;
+  localPath: string | null;
+} {
+  let descriptors = deserializeAttachments(record.attachments);
+  if (descriptors.length === 0 && record.raw) {
+    descriptors = descriptorsFromRaw(record.raw);
+  }
+
+  const imageDesc = descriptors.find(
+    (d) =>
+      d.kind === 'image' ||
+      d.kind === 'sticker' ||
+      (d.kind === 'file' && isImageFileExt(d.local?.path || d.fileName))
+  );
+
+  const hasImage =
+    record.type === 'image' ||
+    record.type === 'sticker' ||
+    Boolean(imageDesc) ||
+    (record.type === 'file' && isImageFileExt(record.local_path));
+
+  if (!hasImage) {
+    return { hasImage: false, localPath: null };
+  }
+
+  if (record.local_path && fs.existsSync(record.local_path)) {
+    return { hasImage: true, localPath: record.local_path };
+  }
+  if (imageDesc?.local?.path && fs.existsSync(imageDesc.local.path)) {
+    return { hasImage: true, localPath: imageDesc.local.path };
+  }
+  return { hasImage: true, localPath: record.local_path || imageDesc?.local?.path || null };
+}
+
 /**
- * 6.11 偷表情/收藏工具 (collect_face)
  * 从指定消息（或当前正在回复的入站消息）中提取图片并收录进本地表情库。
  * 修改已有表情标签或删除表情请使用 manage_faces。
  */
@@ -32,64 +75,74 @@ export async function collectFace(
   const ctx = { ...getGlobalToolContext(), ...context };
 
   if (!params || !params.tags || !Array.isArray(params.tags) || params.tags.length === 0) {
-    return { success: false, error: '缺少必填参数 tags (内容画面标签，如 ["猫猫", "叹气"])' };
+    return toLosslessJson({
+      success: false,
+      error: '缺少必填参数 tags (内容画面标签，如 ["猫猫", "叹气"])',
+    });
   }
   if (!params.mood || typeof params.mood !== 'string' || !params.mood.trim()) {
-    return { success: false, error: '缺少必填参数 mood (情绪语境意图，如 "嘲讽" / "卖萌" / "感谢")' };
+    return toLosslessJson({
+      success: false,
+      error: '缺少必填参数 mood (情绪语境意图，如 "嘲讽" / "卖萌" / "感谢")',
+    });
   }
   if (!ctx.db) {
-    return { success: false, error: '数据库不可用' };
+    return toLosslessJson({ success: false, error: '数据库不可用' });
   }
 
-  // 偷图/收藏新表情
-  const sessionPeer = ctx.peer || '';
-  let targetMsgId: number | undefined;
-  if (params.message_id !== undefined && params.message_id !== null && String(params.message_id).trim() !== '') {
-    const parsed = Number(params.message_id);
-    if (Number.isSafeInteger(parsed) && parsed !== 0) {
-      targetMsgId = parsed;
-    }
+  const sessionPeer = ctx.peer ? normalizePeer(ctx.peer) : '';
+  let targetMsgId: string | undefined;
+  if (typeof params.message_id === 'string' && params.message_id.trim() !== '') {
+    targetMsgId = params.message_id.trim();
   }
-  if (targetMsgId === undefined && ctx.inboundMsgIdGetter && sessionPeer) {
-    targetMsgId = ctx.inboundMsgIdGetter(sessionPeer);
+  if (!targetMsgId && ctx.inboundMsgIdGetter && sessionPeer) {
+    const inboundId = ctx.inboundMsgIdGetter(sessionPeer);
+    if (typeof inboundId === 'string' && inboundId.trim() !== '') {
+      targetMsgId = inboundId.trim();
+    }
   }
 
   let targetMsg: MessageRecord | null = null;
-  if (targetMsgId !== undefined) {
+  if (targetMsgId) {
     targetMsg = ctx.db.getMessage(targetMsgId);
   } else if (sessionPeer) {
     const recent = ctx.db.readHistory(sessionPeer, { has_file: true, limit: 1 });
     if (recent.messages.length > 0) {
-      targetMsg = ctx.db.getMessage(recent.messages[0].msg_id);
+      targetMsg = ctx.db.getMessage(recent.messages[0]!.msg_id);
     }
   }
 
   if (!targetMsg) {
-    return { success: false, error: '未找到指定的消息记录' };
+    return toLosslessJson({ success: false, error: '未找到指定的消息记录' });
   }
 
-  const hasImg =
-    targetMsg.type === 'image' ||
-    targetMsg.type === 'sticker' ||
-    (typeof targetMsg.raw === 'string' && (targetMsg.raw.includes('"image"') || targetMsg.raw.includes('CQ:image')));
-
-  if (!hasImg) {
-    return { success: false, error: '目标消息中未找到图片或表情附件' };
+  const { hasImage, localPath } = findImageLocalPathFromRecord(targetMsg);
+  if (!hasImage) {
+    return toLosslessJson({ success: false, error: '目标消息中未找到图片或表情附件' });
   }
 
-  let localPath = targetMsg.local_path;
   if (!localPath || !fs.existsSync(localPath)) {
-    return { success: false, error: '目标消息的图片本地缓存文件不存在，无法转存' };
+    return toLosslessJson({
+      success: false,
+      error: '目标消息的图片本地缓存文件不存在，无法转存',
+    });
   }
 
   try {
     const fileBuf = fs.readFileSync(localPath);
     const md5 = crypto.createHash('md5').update(fileBuf).digest('hex');
-    const ext = path.extname(localPath).replace(/^\./, '').toLowerCase() || 'png';
+    const ext =
+      detectBufferExt(fileBuf) ||
+      path.extname(localPath).replace(/^\./, '').toLowerCase() ||
+      'png';
     const size = fileBuf.length;
 
-    const rawStoreDir = context?.faceDir || ctx.faceDir || '.dsh/napcat/faces';
-    const storeDir = resolveDshPath(context?.dshHome || ctx.dshHome, rawStoreDir, DEFAULT_FACE_STORE_DIR);
+    const rawStoreDir = context?.faceDir || ctx.faceDir || DEFAULT_FACE_STORE_DIR;
+    const storeDir = resolveDshPath(
+      context?.dshHome || ctx.dshHome,
+      rawStoreDir,
+      DEFAULT_FACE_STORE_DIR
+    );
     fs.mkdirSync(storeDir, { recursive: true });
     const targetFile = path.resolve(storeDir, `${md5}.${ext}`);
 
@@ -134,7 +187,10 @@ export async function collectFace(
       message: `已成功收藏表情包，标签: [${safeTags.join(', ')}]，情绪: ${safeMood}`,
     });
   } catch (err: any) {
-    return toLosslessJson({ success: false, error: `表情入库失败: ${err?.message || '未知错误'}` });
+    return toLosslessJson({
+      success: false,
+      error: `表情入库失败: ${err?.message || '未知错误'}`,
+    });
   }
 }
 
@@ -156,8 +212,9 @@ export function createCollectFaceTool(context?: ContextSource): ToolDefinition {
         description: '情绪与语境意图（如 "嘲讽", "卖萌", "感谢", "无奈", "破防"，必填）',
       },
       message_id: {
-        oneOf: [{ type: 'number' }, { type: 'string' }],
-        description: '收藏新表情时的目标消息 ID（支持数字或数字字符串）。若省略则自动绑定当前回合正在回复的入站消息',
+        type: 'string',
+        description:
+          '收藏新表情时的目标消息 ID 字符串（如 ROBOT1.0_...）。若省略则自动绑定当前回合正在回复的入站消息',
       },
     },
     output: {
@@ -177,22 +234,18 @@ export function createCollectFaceTool(context?: ContextSource): ToolDefinition {
       },
     },
     async execute(args, exec) {
-      const session = (exec.agent as any)?.session;
-      const rawPeer = session?.id || '';
-      const peer = normalizePeer(rawPeer);
       const resolved = resolveToolContext(context);
-      const cfg = typeof (resolved as any).config === 'function'
-        ? (resolved as any).config()
-        : ((resolved as any).config || {});
-      const res = await collectFace(args, {
+      const peer = resolveSessionPeerFromExec(exec, resolved.peer);
+      const cfg =
+        typeof (resolved as any).config === 'function'
+          ? (resolved as any).config()
+          : (resolved as any).config || {};
+      const res = await collectFace(args as CollectFaceParams, {
         ...resolved,
-        db: resolved.db,
         peer,
-        inboundMsgIdGetter: resolved.inboundMsgIdGetter,
-        dshHome: resolved.dshHome,
         faceDir: resolveDshPath(resolved.dshHome, cfg.face_store_dir, DEFAULT_FACE_STORE_DIR),
-        faceStoreMax: cfg.face_store_max,
-        faceEvictPolicy: cfg.face_evict_policy,
+        faceStoreMax: cfg.face_store_max ?? resolved.faceStoreMax,
+        faceEvictPolicy: cfg.face_evict_policy ?? resolved.faceEvictPolicy,
       });
       return toLosslessJson(res) as any;
     },

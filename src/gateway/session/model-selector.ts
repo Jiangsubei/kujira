@@ -1,15 +1,17 @@
 /**
- * dsh-napcat-bridge: 模型选择与推理链深度 (reasoningEffort) 调度模块
- * 负责与 DSH LLM 服务交互、维护会话级 (Per-Session) 与 NapCat 插件默认模型选择。
+ * kujira: 模型选择与推理链深度 (reasoningEffort) 调度模块
+ * 负责与 DSH LLM 服务交互、维护会话级 (Per-Session) 与 Kujira 插件默认模型选择。
  */
 
 import type { Context } from '@deepseek-ai/cordis';
 import type { ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
 import type { SessionPersistenceManager } from './persistence.js';
 
+const KUJIRA_DEFAULT_MODEL_KEY = 'kujira_default_model';
+
 export class SessionModelSelector {
   private selectionMap = new Map<string, ModelSelectionRef>();
-  private napcatDefaultModel?: ModelSelection;
+  private kujiraDefaultModel?: ModelSelection;
 
   constructor(
     private readonly ctx?: Context,
@@ -19,10 +21,10 @@ export class SessionModelSelector {
   public loadState(records: any[]): void {
     if (!this.persistence) return;
     try {
-      const rawDefault = this.persistence.getPluginConfig('napcat_default_model');
+      const rawDefault = this.persistence.getPluginConfig(KUJIRA_DEFAULT_MODEL_KEY);
       if (rawDefault) {
         try {
-          this.napcatDefaultModel = JSON.parse(rawDefault);
+          this.kujiraDefaultModel = JSON.parse(rawDefault);
         } catch {}
       }
 
@@ -107,19 +109,19 @@ export class SessionModelSelector {
   }
 
   /**
-   * 获取 NapCat 插件全局默认模型 (优先使用插件配置，否则回退到宿主默认)
+   * 获取 Kujira 插件全局默认模型 (优先使用插件配置，否则回退到宿主默认)
    */
-  public getNapcatDefaultModel(): ModelSelection {
-    if (this.napcatDefaultModel?.provider && this.napcatDefaultModel?.model) {
-      return { ...this.napcatDefaultModel };
+  public getKujiraDefaultModel(): ModelSelection {
+    if (this.kujiraDefaultModel?.provider && this.kujiraDefaultModel?.model) {
+      return { ...this.kujiraDefaultModel };
     }
     return this.getHostDefaultModelSelection();
   }
 
   /**
-   * 设置 NapCat 插件全局默认模型，并批量联动同步已知的所有 QQ 会话
+   * 设置 Kujira 插件全局默认模型，并批量联动同步已知的所有 Kujira 单聊会话
    */
-  public setNapcatDefaultModel(
+  public setKujiraDefaultModel(
     provider: string,
     model: string,
     reasoningEffort?: any,
@@ -130,9 +132,9 @@ export class SessionModelSelector {
       model,
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     };
-    this.napcatDefaultModel = sel;
+    this.kujiraDefaultModel = sel;
     if (this.persistence) {
-      this.persistence.setPluginConfig('napcat_default_model', JSON.stringify(sel));
+      this.persistence.setPluginConfig(KUJIRA_DEFAULT_MODEL_KEY, JSON.stringify(sel));
     }
 
     // 1. 同步内存中所有已记录的会话 selection
@@ -155,7 +157,7 @@ export class SessionModelSelector {
   }
 
   public getDefaultModelSelection(): ModelSelection {
-    return this.getNapcatDefaultModel();
+    return this.getKujiraDefaultModel();
   }
 
   public getOrCreateSelectionRef(sessionId: string): ModelSelectionRef {

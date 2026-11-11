@@ -5,9 +5,9 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Session } from '@deepseek-ai/dsh-session';
 
 describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Commands Compact Contract)', () => {
-  const adminUser = '1000000001';
-  const normalUser = '1000000002';
-  const mockSession = { id: 'session-compact-test-1' } as unknown as Session;
+  const mockOpenidHash = 'a1b2c3d4e5f60001';
+  const mockPeer = `user_${mockOpenidHash}`;
+  const mockSession = { id: `kujira-user-${mockOpenidHash}` } as unknown as Session;
 
   function createMockContext(options?: {
     engine?: { compactNow: (...args: any[]) => Promise<any> };
@@ -29,7 +29,7 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
         }
         if (name === 'agentPresets') {
           return {
-            serviceFor: (agent: any, svcName: string) => {
+            serviceFor: (_agent: any, svcName: string) => {
               if (svcName === 'compaction') {
                 return options?.scopedEngine;
               }
@@ -65,8 +65,7 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
     } as unknown as Context;
 
     const cmdCtx: CommandContext = {
-      userId: adminUser,
-      admins: [adminUser],
+      userId: mockPeer,
       session: mockSession,
       ctx,
     };
@@ -95,14 +94,20 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
     });
   });
 
-  describe('契约 2: /压缩 门控与参数校验', () => {
-    it('非管理员执行 /压缩 应当被权限门控拒绝', async () => {
-      const { cmdCtx } = createMockContext();
-      const nonAdminCtx = { ...cmdCtx, userId: normalUser };
-      const res = await handleSlashCommand('/压缩', nonAdminCtx);
+  describe('契约 2: /压缩 无白名单拦截与参数校验', () => {
+    it('任意单聊用户执行 /压缩 不受 admins 白名单限制，可正常触发压缩流程', async () => {
+      const mockCompactNow = vi.fn(async () => ({
+        shadowedSeqs: [1],
+        shadowedTokenCount: 512,
+      }));
+      const { cmdCtx } = createMockContext({
+        scopedEngine: { compactNow: mockCompactNow },
+      });
+      const anotherFriendCtx: CommandContext = { ...cmdCtx, userId: 'user_deadbeef12345678' };
+      const res = await handleSlashCommand('/压缩', anotherFriendCtx);
       expect(res.handled).toBe(true);
-      expect(res.success).toBe(false);
-      expect(res.error).toBe('权限不足：仅管理员允许执行指令');
+      expect(res.success).toBe(true);
+      expect(res.reply).toBe('正在压缩会话历史…');
     });
 
     it('携带任何参数时应当直接返回不接受参数的错误提示', async () => {
@@ -144,7 +149,6 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
       expect(mockCompactNow).toHaveBeenCalledWith(mockAgent, expect.any(AbortSignal));
 
       expect(followUpText).toContain('已压缩 5 条历史（约 2.6K tokens）。');
-      // 方案 B 格式: 当前上下文：~3.2K / 128K (3%)
       expect(followUpText).toContain('当前上下文：~3.2K / 128K (3%)');
     });
 
@@ -241,10 +245,8 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
         engine: { compactNow: hostCompactNow },
       });
 
-      // agent 故意不提供 ctx（或者 serviceFor 抛出 TypeError）
       const brokenAgent = {
         session: cmdCtx.session,
-        // ctx 缺失
       };
 
       const customCmdCtx: CommandContext = {
@@ -272,7 +274,7 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
       };
 
       const mockSessionManager = {
-        sessionIdToPeer: vi.fn(() => 'user:1000000001'),
+        sessionIdToPeer: vi.fn(() => mockPeer),
         getOrCreateAgent: vi.fn(async () => fallbackAgent),
       };
 
@@ -281,7 +283,6 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
         sessionManager: mockSessionManager as any,
       };
 
-      // 覆盖 ctx.get('agents') 使其返回空
       (customCmdCtx.ctx as any).get = (name: string) => {
         if (name === 'agents') {
           return { get: () => undefined };
@@ -296,7 +297,7 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
       expect(res.handled).toBe(true);
       expect(res.success).toBe(true);
       await res.followUp!();
-      expect(mockSessionManager.getOrCreateAgent).toHaveBeenCalledWith('user:1000000001');
+      expect(mockSessionManager.getOrCreateAgent).toHaveBeenCalledWith(mockPeer);
       expect(hostCompactNow).toHaveBeenCalledWith(fallbackAgent, expect.any(AbortSignal));
     });
 
@@ -305,7 +306,7 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
       const mockAgent = { session: cmdCtx.session, ctx: {} };
       (cmdCtx.ctx as any).get = (name: string) => {
         if (name === 'agentPresets') return { serviceFor: () => undefined };
-        if (name === 'compaction') return undefined; // host 平面不可用
+        if (name === 'compaction') return undefined;
         if (name === 'agents') return { get: () => mockAgent };
         return undefined;
       };
@@ -339,14 +340,11 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
     });
   });
 
-  describe('契约 5: 网关两段式下发闭环验证 (Gateway Two-Stage Dispatch Contract)', () => {
-    it('当收到 /压缩 命令且存在 followUp 时，网关先发送正在压缩回执，随后异步追发完成消息', async () => {
+  describe('契约 5: 单聊网关两段式下发闭环验证 (C2C Two-Stage Dispatch Contract)', () => {
+    it('当收到 /压缩 命令且存在 followUp 时，先向单聊发送正在压缩回执，随后异步追发完成消息', async () => {
       const sentMessages: string[] = [];
-      const mockServer = {
-        sendPrivateMsg: vi.fn(async (_uid: any, msg: string) => {
-          sentMessages.push(msg);
-        }),
-        sendGroupMsg: vi.fn(async (_gid: any, msg: string) => {
+      const mockGateway = {
+        sendC2CMessage: vi.fn(async (_openid: string, msg: string) => {
           sentMessages.push(msg);
         }),
       };
@@ -360,18 +358,12 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
         scopedEngine: { compactNow: mockCompactNow },
       });
 
-      // 模拟网关事件分发闭环 (对齐 src/index.ts 870-910 装配逻辑)
-      const isGroup = false;
-      const event = { user_id: 1000000001 };
+      const mockOpenid = 'ABCDEF0123456789ABCDEF0123456789';
       const result = await handleSlashCommand('/压缩', cmdCtx);
 
       const replyText = result.reply || result.error;
       if (replyText) {
-        if (isGroup) {
-          await mockServer.sendGroupMsg(123456, replyText);
-        } else {
-          await mockServer.sendPrivateMsg(event.user_id, replyText);
-        }
+        await mockGateway.sendC2CMessage(mockOpenid, replyText);
       }
 
       expect(sentMessages).toEqual(['正在压缩会话历史…']);
@@ -379,11 +371,7 @@ describe('契约测试: /压缩 斜杠命令与 Compaction 预设规范 (Command
       if (typeof result.followUp === 'function') {
         const followUpText = await result.followUp();
         if (followUpText) {
-          if (isGroup) {
-            await mockServer.sendGroupMsg(123456, followUpText);
-          } else {
-            await mockServer.sendPrivateMsg(event.user_id, followUpText);
-          }
+          await mockGateway.sendC2CMessage(mockOpenid, followUpText);
         }
       }
 

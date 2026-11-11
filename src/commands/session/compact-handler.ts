@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: /压缩 命令处理器
+ * kujira: /压缩 命令处理器
  */
 
 import { safeGetService } from '../../gateway/session/agent-runner.js';
@@ -58,7 +58,7 @@ export async function handleCompactCommand(
     try {
       scopedEngine = agentPresets.serviceFor?.(agent, 'compaction');
     } catch (presetErr: any) {
-      context.ctx.logger?.('dsh-napcat-bridge')?.warn?.(
+      context.ctx.logger?.('kujira')?.warn?.(
         '[Command] 读取 agentPresets.serviceFor(agent, "compaction") 失败:',
         presetErr?.message || presetErr
       );

@@ -1,4 +1,5 @@
 import type { BridgePluginConfig } from '../types/index.js';
+import type { SaveSettingsPayload, SaveSettingsResult } from './types.js';
 
 export class SettingsConflictError extends Error {
   public code = 'SETTINGS_CONFLICT';
@@ -14,7 +15,7 @@ export interface FormModelOptions {
   baseDefaults?: Partial<BridgePluginConfig>;
 }
 
-export class NapCatFormModel {
+export class KujiraFormModel {
   private initialValues: Partial<BridgePluginConfig>;
   private draft: Partial<BridgePluginConfig>;
   private revision: number;
@@ -96,16 +97,22 @@ export class NapCatFormModel {
 
   async save(callbacks: {
     saveSettings: (
-      values: Partial<BridgePluginConfig>,
+      values: SaveSettingsPayload,
       options: { expectedRevision: number }
-    ) => Promise<{ revision?: number } | void>;
-  }): Promise<void> {
-    const res = await callbacks.saveSettings(this.draft, {
+    ) => Promise<SaveSettingsResult | void>;
+    extraPayload?: Omit<SaveSettingsPayload, keyof BridgePluginConfig>;
+  }): Promise<SaveSettingsResult | void> {
+    const payload: SaveSettingsPayload = {
+      ...this.draft,
+      ...(callbacks.extraPayload || {}),
+    };
+    const res = await callbacks.saveSettings(payload, {
       expectedRevision: this.revision,
     });
     if (res && typeof res.revision === 'number') {
       this.revision = res.revision;
     }
     this.initialValues = { ...this.draft };
+    return res;
   }
 }

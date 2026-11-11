@@ -1,109 +1,103 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { BridgeConfigSchema } from '../../src/config/schema.js';
-import { DEFAULT_BASE_CONFIG } from '../../src/server/routes.js';
-import { migrateLegacyConfig, readLegacyConfig } from '../../src/config/migrate.js';
 
-describe('阶段 2 契约测试：设置系统收尾与三方键一致性 (Settings Alignment Contract)', () => {
-  it('A8: Schema、服务端默认值、客户端默认值三方键严格一致，且旧记忆预算键彻底移除', () => {
-    // 1. 读取 Schema 键
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
+  IconChevronDownOutlineRegular: () => null,
+  IconChevronDownOutlineMedium: () => null,
+}));
+
+import { DEFAULT_BASE_CONFIG as CONSTANTS_DEFAULTS } from '../../src/constants/index.js';
+import { BridgeConfigSchema } from '../../src/config/schema.js';
+import { DEFAULT_BASE_CONFIG as SERVER_DEFAULTS } from '../../src/server/routes.js';
+import { DEFAULT_BASE_CONFIG as CLIENT_DEFAULTS } from '../../src/client/card.js';
+
+describe('契约测试：设置系统与三方 17 键单一真相源一致性 (Settings Alignment Contract)', () => {
+  it('Schema、Constants、服务端默认值、客户端默认值四方键严格一致（精确 17 项核心单聊配置）', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const schemaKeys = Object.keys(schemaShape).sort();
+    const constantsKeys = Object.keys(CONSTANTS_DEFAULTS).sort();
+    const serverKeys = Object.keys(SERVER_DEFAULTS).sort();
+    const clientKeys = Object.keys(CLIENT_DEFAULTS).sort();
 
-    // 2. 读取服务端默认值键
-    const serverKeys = Object.keys(DEFAULT_BASE_CONFIG).sort();
+    // 1. 精确 17 键
+    expect(schemaKeys).toHaveLength(17);
+    expect(constantsKeys).toHaveLength(17);
+    expect(serverKeys).toHaveLength(17);
+    expect(clientKeys).toHaveLength(17);
 
-    // 3. 读取客户端 card.tsx 源码中的 DEFAULT_BASE_CONFIG 键
-    const cardContent = fs.readFileSync(path.resolve(process.cwd(), 'src/client/card.tsx'), 'utf8');
-    const match = cardContent.match(/const DEFAULT_BASE_CONFIG: Partial<BridgePluginConfig> = \{([\s\S]*?)\};/);
-    expect(match).toBeTruthy();
-    const cardBlock = match![1];
-    const clientKeys = cardBlock
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith('//') && line.includes(':'))
-      .map((line) => line.split(':')[0].trim())
-      .sort();
+    // 2. 四方键集合完全恒等，且服务端与客户端直接复用 Constants SSOT
+    expect(schemaKeys).toEqual(constantsKeys);
+    expect(serverKeys).toEqual(constantsKeys);
+    expect(clientKeys).toEqual(constantsKeys);
+    expect(SERVER_DEFAULTS).toBe(CONSTANTS_DEFAULTS);
+    expect(CLIENT_DEFAULTS).toBe(CONSTANTS_DEFAULTS);
 
-    // 断言 1: 三方键数量均为 38
-    expect(schemaKeys.length).toBe(40);
-    expect(serverKeys.length).toBe(40);
-    expect(clientKeys.length).toBe(40);
-
-    // 断言 2: 三方键集合完全恒等
-    expect(schemaKeys).toEqual(serverKeys);
-    expect(clientKeys).toEqual(serverKeys);
-
-    // 断言 3: 废弃字段不存在于任何一方
+    // 3. 已下线字段与凭据字段（ws_*, admins, 群聊, 主动回复, 安全矩阵, app_id/app_secret）绝不存在
     const deadKeys = [
+      'app_id',
+      'app_secret',
+      'ws_port',
+      'ws_token',
+      'bot_qq',
+      'admins',
+      'aliases',
+      'proactive_reply_enabled',
+      'proactive_interval_mins',
+      'proactive_buffer_size',
+      'proactive_only_text',
+      'proactive_random_enabled',
+      'proactive_random_probability',
+      'proactive_idle_enabled',
+      'proactive_idle_timeout_mins',
+      'proactive_cooldown_mins',
+      'proactive_night_dnd',
+      'group_memory_total_budget_chars',
+      'face_sub_type',
+      'private_blacklist',
+      'group_blacklist',
+      'session_permission_private_default',
+      'session_permission_group_default',
+      'session_permission_overrides',
+      'coding_tools_private_default',
+      'coding_tools_group_default',
+      'coding_tools_overrides',
       'memory_budget_chars',
       'group_memory_budget_chars',
       'private_memory_budget_chars',
       'review_enabled',
-      'review_turns_interval',
-      'review_tool_calls_interval',
-      'review_model',
-      'face_auto_curate',
-      'face_curate_cron',
-      'face_curate_interval_mins',
-      'at_questioner',
-      'quote_original',
       'slang_budget_chars',
     ];
     for (const deadKey of deadKeys) {
-      expect(schemaKeys.includes(deadKey)).toBe(false);
-      expect(serverKeys.includes(deadKey)).toBe(false);
-      expect(clientKeys.includes(deadKey)).toBe(false);
+      expect(schemaKeys).not.toContain(deadKey);
+      expect(serverKeys).not.toContain(deadKey);
+      expect(clientKeys).not.toContain(deadKey);
     }
   });
 
-  it('A7: 运行时配置字段均标记为 .volatile()（包含 bot_qq），以支持 DSH 0.2.1 设置面板保存与热更新', () => {
+  it('全部 17 项运行时配置字段均标记为 .volatile()，以支持 DSH 设置面板保存与热更新', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const schemaKeys = Object.keys(schemaShape);
 
-    // 验证全量 38 项配置字段均必须带有 .volatile() 标记（包含 bot_qq）
-    expect(schemaKeys.length).toBe(40);
-    expect(schemaShape.bot_qq?.meta?.volatile).toBe(true);
-
+    expect(schemaKeys).toHaveLength(17);
     for (const field of schemaKeys) {
       expect(
         schemaShape[field]?.meta?.volatile,
         `field ${field} should be marked .volatile()`
       ).toBe(true);
     }
+
+    const parsed = BridgeConfigSchema({});
+    const unwrap = (val: any) => (typeof val?.get === 'function' ? val.get() : val);
+    expect(unwrap(parsed.memory_storage_dir)).toBe('.dsh/kujira/memory');
+    expect(unwrap(parsed.face_store_dir)).toBe('.dsh/kujira/faces');
+    expect(unwrap(parsed.slang_storage_path)).toBe('.dsh/kujira/slang/slang.md');
+    expect(unwrap(parsed.markdown_enabled)).toBe(true);
+    expect(unwrap(parsed.input_notify_enabled)).toBe(true);
+    expect(unwrap(parsed.new_message_behavior)).toBe('steer');
   });
 
-  it('A8: migrateLegacyConfig 旧配置单向迁移：旧记忆预算键映射至新键且不保留旧键', () => {
-    // 构造旧版 yaml 内容
-    const legacyYaml = `
-dsh-napcat-bridge:
-  bot_qq: "1000000024"
-  ws_port: 8099
-  memory_budget_chars: 3333
-  private_memory_budget_chars: 5555
-`;
-    const tmpDir = path.resolve(process.cwd(), 'tmp/test-migrate-legacy');
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const legacyPath = path.join(tmpDir, 'settings.yaml');
-    fs.writeFileSync(legacyPath, legacyYaml, 'utf8');
-
-    try {
-      const parsed = readLegacyConfig(tmpDir);
-      expect(parsed).toBeTruthy();
-      // memory_budget_chars 链式迁移到群聊画像总预算
-      expect(parsed!.group_memory_total_budget_chars).toBe(3333);
-      // 私聊旧预算映射到单个用户画像预算
-      expect(parsed!.user_profile_budget_chars).toBe(5555);
-      // 旧键必须被剔除，绝不保留在迁移结果字典中
-      expect((parsed as any).memory_budget_chars).toBeUndefined();
-      expect((parsed as any).private_memory_budget_chars).toBeUndefined();
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
-
-  it('A15: locale 多语言资源与 package.json 规范导出', () => {
+  it('locale 多语言资源与 package.json 规范导出对齐 kujira', () => {
     const enPath = path.resolve(process.cwd(), 'locale/en.json');
     const zhPath = path.resolve(process.cwd(), 'locale/zh.json');
     expect(fs.existsSync(enPath)).toBe(true);
@@ -112,13 +106,16 @@ dsh-napcat-bridge:
     const en = JSON.parse(fs.readFileSync(enPath, 'utf8'));
     const zh = JSON.parse(fs.readFileSync(zhPath, 'utf8'));
 
-    expect(en.title).toBeTruthy();
+    expect(en.title).toContain('Kujira');
     expect(en.description).toBeTruthy();
-    expect(zh.title).toBeTruthy();
+    expect(zh.title).toContain('Kujira');
     expect(zh.description).toBeTruthy();
 
     const pkg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8'));
+    expect(pkg.name).toBe('kujira');
     expect(pkg.exports?.['./locale/*']).toBe('./locale/*');
+    expect(pkg.exports?.['./client']).toBe('./dist/client.js');
+    expect(pkg.exports?.['./tools']?.default).toBe('./dist/tools/plugin.js');
     expect(pkg.files?.includes('locale')).toBe(true);
   });
 });

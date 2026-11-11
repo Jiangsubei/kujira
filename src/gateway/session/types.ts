@@ -1,6 +1,8 @@
 /**
- * dsh-napcat-bridge: Session 领域公共类型与异常定义
+ * kujira: Session 领域公共类型与异常定义
  */
+
+import type { BridgePluginConfig } from '../../types/index.js';
 
 /**
  * 结构化 RemoteError 类（对齐 DSH typert-protocol 远程调用失败契约）
@@ -49,8 +51,6 @@ export interface OutboundBridgeLike {
   trackInboundContext(peer: string, context: any): void;
   trackPendingMessage?(messageId: string, peer: string, context: any): void;
 }
-
-import type { BridgePluginConfig } from '../../types/index.js';
 
 export interface SessionManagerOptions {
   retryDelays?: number[];

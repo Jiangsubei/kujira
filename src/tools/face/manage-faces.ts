@@ -1,10 +1,11 @@
 /**
- * dsh-napcat-bridge: 表情管理工具 (manage_faces)
+ * kujira: 表情管理工具 (manage_faces)
  * 专职负责表情库生命周期治理：修改标签/情绪、按 ID 删除表情、查询存储配额占用、淘汰冷门表情。
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { ManageFacesParams, ManageFacesResult } from '../../types/index.js';
+import { DEFAULT_FACE_STORE_MAX } from '../../constants/index.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
@@ -36,21 +37,24 @@ export async function manageFaces(
     });
   }
 
-  // 1. query_quota: 查库统计当前表情总数、配额上限 faceStoreMax、占用字节数，返回 { total, max_quota, available }
+  // 1. query_quota: 查库统计当前表情总数、配额上限 faceStoreMax、占用字节数
   if (action === 'query_quota') {
-    const rawDb = typeof (ctx.db as any).ensureDb === 'function'
-      ? (ctx.db as any).ensureDb()
-      : (ctx.db as any).db;
+    const rawDb =
+      typeof (ctx.db as any).ensureDb === 'function'
+        ? (ctx.db as any).ensureDb()
+        : (ctx.db as any).db;
 
     let total = 0;
     let totalBytes = 0;
 
     if (rawDb && typeof rawDb.prepare === 'function') {
-      const row = rawDb.prepare(`
-        SELECT COUNT(*) as total, COALESCE(SUM(size), 0) as total_bytes
-        FROM faces
-        WHERE deleted_at IS NULL AND enabled = 1
-      `).get() as { total: number; total_bytes: number } | undefined;
+      const row = rawDb
+        .prepare(`
+          SELECT COUNT(*) as total, COALESCE(SUM(size), 0) as total_bytes
+          FROM faces
+          WHERE deleted_at IS NULL AND enabled = 1
+        `)
+        .get() as { total: number; total_bytes: number } | undefined;
       total = row ? Number(row.total) : 0;
       totalBytes = row ? Number(row.total_bytes) : 0;
     } else {
@@ -58,7 +62,7 @@ export async function manageFaces(
       total = q.total;
     }
 
-    const maxQuota = ctx.faceStoreMax ?? 100;
+    const maxQuota = ctx.faceStoreMax ?? DEFAULT_FACE_STORE_MAX;
     const available = Math.max(0, maxQuota - total);
 
     return toLosslessJson({
@@ -72,7 +76,7 @@ export async function manageFaces(
     });
   }
 
-  // 2. update: 根据 face_id 更新该表情的 tags 和 mood，返回 { success: true, face_id }；若 face_id 不存在返回错误
+  // 2. update: 根据 face_id 更新该表情的 tags 和 mood
   if (action === 'update') {
     const faceId = params.face_id?.trim();
     if (!faceId) {
@@ -98,8 +102,8 @@ export async function manageFaces(
     }
 
     const updated = ctx.db.updateFace(faceId, {
-      tags: params.tags,
-      mood: params.mood?.trim(),
+      ...(params.tags !== undefined ? { tags: params.tags } : {}),
+      ...(params.mood !== undefined ? { mood: params.mood.trim() } : {}),
     });
 
     return toLosslessJson({
@@ -110,7 +114,7 @@ export async function manageFaces(
     });
   }
 
-  // 3. delete: 根据 face_id 软删除该表情（设置 enabled = false, deleted_at = Date.now()），返回 { success: true, face_id }；若不存在返回错误
+  // 3. delete: 根据 face_id 软删除该表情
   if (action === 'delete') {
     const faceId = params.face_id?.trim();
     if (!faceId) {
@@ -144,33 +148,46 @@ export async function manageFaces(
     });
   }
 
-  // 4. evict: 当库容超限或按需淘汰时，根据 LRU 或创建时间淘汰最旧的 count（默认 10）张表情，返回 { success: true, evicted_count }
+  // 4. evict: 按 LRU 或创建时间淘汰最旧的 count（默认 10）张表情
   if (action === 'evict') {
-    const count = Math.max(1, typeof params.count === 'number' && Number.isFinite(params.count) ? Math.floor(params.count) : 10);
-    const rawDb = typeof (ctx.db as any).ensureDb === 'function'
-      ? (ctx.db as any).ensureDb()
-      : (ctx.db as any).db;
+    const count = Math.max(
+      1,
+      typeof params.count === 'number' && Number.isFinite(params.count)
+        ? Math.floor(params.count)
+        : 10
+    );
+    const rawDb =
+      typeof (ctx.db as any).ensureDb === 'function'
+        ? (ctx.db as any).ensureDb()
+        : (ctx.db as any).db;
 
     let candidateIds: string[] = [];
 
     if (rawDb && typeof rawDb.prepare === 'function') {
-      const nonManual = rawDb.prepare(`
-        SELECT id FROM faces
-        WHERE deleted_at IS NULL AND source != 'manual'
-        ORDER BY COALESCE(last_used_at, 0) ASC, added_at ASC
-        LIMIT ?
-      `).all(count) as Array<{ id: string }>;
+      const nonManual = rawDb
+        .prepare(`
+          SELECT id FROM faces
+          WHERE deleted_at IS NULL AND source != 'manual'
+          ORDER BY COALESCE(last_used_at, 0) ASC, added_at ASC
+          LIMIT ?
+        `)
+        .all(count) as Array<{ id: string }>;
       candidateIds = nonManual.map((r) => r.id);
 
       if (candidateIds.length < count) {
         const remaining = count - candidateIds.length;
-        const notIn = candidateIds.length > 0 ? `AND id NOT IN (${candidateIds.map(() => '?').join(', ')})` : '';
-        const fallback = rawDb.prepare(`
-          SELECT id FROM faces
-          WHERE deleted_at IS NULL ${notIn}
-          ORDER BY COALESCE(last_used_at, 0) ASC, added_at ASC
-          LIMIT ?
-        `).all(...candidateIds, remaining) as Array<{ id: string }>;
+        const notIn =
+          candidateIds.length > 0
+            ? `AND id NOT IN (${candidateIds.map(() => '?').join(', ')})`
+            : '';
+        const fallback = rawDb
+          .prepare(`
+            SELECT id FROM faces
+            WHERE deleted_at IS NULL ${notIn}
+            ORDER BY COALESCE(last_used_at, 0) ASC, added_at ASC
+            LIMIT ?
+          `)
+          .all(...candidateIds, remaining) as Array<{ id: string }>;
         candidateIds.push(...fallback.map((r) => r.id));
       }
     } else {
@@ -214,7 +231,8 @@ export function createManageFacesTool(context?: ContextSource): ToolDefinition {
         type: 'string',
         required: true,
         enum: ['update', 'delete', 'query_quota', 'evict'],
-        description: '操作类型: update (改标签/情绪), delete (删除表情), query_quota (查存储配额), evict (按 LRU 淘汰冷门表情)',
+        description:
+          '操作类型: update (改标签/情绪), delete (删除表情), query_quota (查存储配额), evict (按 LRU 淘汰冷门表情)',
       },
       face_id: {
         type: 'string',
@@ -247,10 +265,11 @@ export function createManageFacesTool(context?: ContextSource): ToolDefinition {
     },
     async execute(args, _exec) {
       const resolved = resolveToolContext(context);
-      const cfg = typeof (resolved as any).config === 'function'
-        ? (resolved as any).config()
-        : ((resolved as any).config || {});
-      const res = await manageFaces(args, {
+      const cfg =
+        typeof (resolved as any).config === 'function'
+          ? (resolved as any).config()
+          : (resolved as any).config || {};
+      const res = await manageFaces(args as ManageFacesParams, {
         ...resolved,
         db: resolved.db,
         dshHome: resolved.dshHome,

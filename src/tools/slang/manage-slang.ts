@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 管理黑话工具 (manage_slang)
+ * kujira: 管理黑话工具 (manage_slang)
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -51,7 +51,7 @@ export async function manageSlang(
             unit: '条黑话词条',
           });
 
-    return {
+    return toLosslessJson({
       success: true,
       action: 'list',
       entries: allEntries,
@@ -62,73 +62,73 @@ export async function manageSlang(
       has_more: offset + allEntries.length < totalMatched,
       max_entries: stats.maxEntries,
       ...(message ? { message } : {}),
-    };
+    });
   }
 
   if (action === 'edit') {
     if (!params.term || !params.term.trim()) {
-      return {
+      return toLosslessJson({
         success: false,
         action: 'edit',
         error: '执行 edit 操作必须提供目标黑话词条名称 (term)',
-      };
+      });
     }
     try {
       const updated = await storage.editEntry(params.term, {
-        new_term: params.new_term,
-        tags: params.tags,
-        definition: params.definition,
-        example: params.example,
+        ...(params.new_term !== undefined ? { new_term: params.new_term } : {}),
+        ...(params.tags !== undefined ? { tags: params.tags } : {}),
+        ...(params.definition !== undefined ? { definition: params.definition } : {}),
+        ...(params.example !== undefined ? { example: params.example } : {}),
       });
       const newStats = storage.getStats();
-      return {
+      return toLosslessJson({
         success: true,
         action: 'edit',
         entry: updated,
         total: newStats.total,
         max_entries: newStats.maxEntries,
         message: `成功更新黑话词条 "${updated.term}" (当前总容量 ${newStats.total}/${newStats.maxEntries} 条)`,
-      };
+      });
     } catch (err: any) {
-      return {
+      return toLosslessJson({
         success: false,
         action: 'edit',
         error: err?.message || '编辑黑话词条失败',
-      };
+      });
     }
   }
 
   if (action === 'delete') {
     if (!params.term || !params.term.trim()) {
-      return {
+      return toLosslessJson({
         success: false,
         action: 'delete',
         error: '执行 delete 操作必须提供目标黑话词条名称 (term)',
-      };
+      });
     }
     const deleted = await storage.deleteEntry(params.term);
     if (!deleted) {
-      return {
+      return toLosslessJson({
         success: false,
         action: 'delete',
         error: `未找到黑话词条 "${params.term}"，无法删除`,
-      };
+      });
     }
     const newStats = storage.getStats();
-    return {
+    return toLosslessJson({
       success: true,
       action: 'delete',
       total: newStats.total,
       max_entries: newStats.maxEntries,
       message: `成功删除黑话词条 "${params.term}" (当前总容量 ${newStats.total}/${newStats.maxEntries} 条)`,
-    };
+    });
   }
 
-  return {
+  return toLosslessJson({
     success: false,
     action: action as any,
     error: `不支持的操作类型 "${action}"`,
-  };
+  });
 }
 
 /**
@@ -144,11 +144,13 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
         type: 'string',
         required: true,
         enum: ['list', 'edit', 'delete'],
-        description: '操作类型：list (检索/列出已有黑话条目内容), edit (修改已有黑话的标签、释义或例句), delete (删除指定黑话)',
+        description:
+          '操作类型：list (检索/列出已有黑话条目内容), edit (修改已有黑话的标签、释义或例句), delete (删除指定黑话)',
       },
       term: {
         type: 'string',
-        description: '目标黑话词条名称（action 为 edit 或 delete 时必填；action 为 list 时可选填用于匹配特定词条）',
+        description:
+          '目标黑话词条名称（action 为 edit 或 delete 时必填；action 为 list 时可选填用于匹配特定词条）',
       },
       new_term: {
         type: 'string',
@@ -156,7 +158,8 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
       },
       tags: {
         type: 'string',
-        description: '修改或补齐后的触发情境与招牌句式（记录标志句式、口癖或触发情境，严禁写抽象分类）',
+        description:
+          '修改或补齐后的触发情境与招牌句式（记录标志句式、口癖或触发情境，严禁写抽象分类）',
       },
       definition: {
         type: 'string',
@@ -168,7 +171,8 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
       },
       keyword: {
         type: 'string',
-        description: '模糊搜索关键词（仅当 action 为 list 时生效，支持按标题、标签特征词或释义/例句关键词全文反查）',
+        description:
+          '模糊搜索关键词（仅当 action 为 list 时生效，支持按标题、标签特征词或释义/例句关键词全文反查）',
       },
       offset: {
         type: 'number',
@@ -186,7 +190,6 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
           return [{ type: 'text', text: `操作失败: ${value?.error || '未知错误'}` }];
         }
 
-        // 当 action 为 list 时，不仅返回统计，还要将条目的完整内容列表直接渲染给模型
         if (value?.action === 'list' && Array.isArray(value?.entries)) {
           if (value.entries.length === 0) {
             return [{ type: 'text', text: value?.message || '未查询到任何匹配的黑话词条' }];
@@ -200,10 +203,15 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
             const item = value.entries[i];
             const tagStr = item.tags ? ` [标签: ${item.tags}]` : '';
             const exStr = item.example ? `\n   - 例句: ${item.example}` : '';
-            lines.push(`${baseOffset + i + 1}. 【${item.term}】${tagStr}\n   - 释义: ${item.definition}${exStr}`);
+            lines.push(
+              `${baseOffset + i + 1}. 【${item.term}】${tagStr}\n   - 释义: ${item.definition}${exStr}`
+            );
           }
           if (value.has_more) {
-            const totalMatched = typeof value.total_matched === 'number' ? value.total_matched : value.entries.length;
+            const totalMatched =
+              typeof value.total_matched === 'number'
+                ? value.total_matched
+                : value.entries.length;
             lines.push(
               `\n> 还有 ${totalMatched - baseOffset - value.entries.length} 条未展示。继续浏览请传入 \`offset: ${baseOffset + value.entries.length}\`。`
             );
@@ -218,14 +226,14 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
       const res = await manageSlang(
         {
           action: args.action,
-          term: args.term ? String(args.term) : undefined,
-          new_term: args.new_term ? String(args.new_term) : undefined,
-          tags: args.tags ? String(args.tags) : undefined,
-          definition: args.definition ? String(args.definition) : undefined,
-          example: args.example ? String(args.example) : undefined,
-          keyword: args.keyword ? String(args.keyword) : undefined,
-          offset: typeof args.offset === 'number' ? args.offset : undefined,
-          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          ...(args.term !== undefined ? { term: String(args.term) } : {}),
+          ...(args.new_term !== undefined ? { new_term: String(args.new_term) } : {}),
+          ...(args.tags !== undefined ? { tags: String(args.tags) } : {}),
+          ...(args.definition !== undefined ? { definition: String(args.definition) } : {}),
+          ...(args.example !== undefined ? { example: String(args.example) } : {}),
+          ...(args.keyword !== undefined ? { keyword: String(args.keyword) } : {}),
+          ...(typeof args.offset === 'number' ? { offset: args.offset } : {}),
+          ...(typeof args.limit === 'number' ? { limit: args.limit } : {}),
         },
         storage
       );

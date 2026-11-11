@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: /思考 命令处理器
+ * kujira: /思考 命令处理器
  */
 
 import { safeGetService } from '../../gateway/session/agent-runner.js';
@@ -126,13 +126,13 @@ export async function handleThinkCommand(
 
   try {
     if (isGlobal) {
-      context.sessionManager?.setNapcatDefaultModel(curProv, curMod, targetEffort);
-      const allSids = context.sessionManager?.getAllQQSessionIds() || [context.session.id];
+      context.sessionManager?.setKujiraDefaultModel(curProv, curMod, targetEffort);
+      const allSids = context.sessionManager?.getAllKujiraSessionIds() || [context.session.id];
       for (const sid of allSids) {
         try {
           await safeSyncSessionModel(context.ctx, sid, curProv, curMod, targetEffort);
         } catch (syncErr: any) {
-          context.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
+          context.ctx.logger?.('kujira')?.debug?.(
             `[Command] 全局切换思考深度同步宿主会话 ${sid} 失败 (已跳过离线/失效会话):`,
             syncErr?.message || syncErr
           );
@@ -142,8 +142,8 @@ export async function handleThinkCommand(
         handled: true,
         success: true,
         reply: [
-          `QQ全局思考深度已切换为：${targetName}`,
-          '范围：已同步切换所有QQ会话，新建会话也将默认使用此思考深度。',
+          `Kujira 全局思考深度已切换为：${targetName}`,
+          '范围：已同步切换所有单聊会话，新建会话也将默认使用此思考深度。',
         ].join('\n'),
       };
     } else {

@@ -9,12 +9,16 @@ export interface ValueFieldProps {
   value: string;
   disabled?: boolean;
   numeric?: boolean;
+  inputType?: 'text' | 'password' | 'number';
+  autoComplete?: string;
   overridden?: boolean;
+  statusBadge?: React.ReactNode;
   onReset?: () => void;
   onChange: (value: string) => void;
 }
 
 export function ValueField(props: ValueFieldProps): React.JSX.Element {
+  const resolvedType = props.inputType ?? (props.numeric ? 'number' : 'text');
   return (
     <div className={fieldStyle.field}>
       <div className={fieldStyle.head}>
@@ -22,6 +26,7 @@ export function ValueField(props: ValueFieldProps): React.JSX.Element {
           {props.label}
         </label>
         <div className={fieldStyle.badges}>
+          {props.statusBadge}
           {props.overridden && (
             <>
               <span className={fieldStyle.badge}>已自定义</span>
@@ -41,7 +46,8 @@ export function ValueField(props: ValueFieldProps): React.JSX.Element {
       </div>
       <input
         id={props.id}
-        type={props.numeric ? 'number' : 'text'}
+        type={resolvedType}
+        autoComplete={props.autoComplete}
         className={fieldStyle.input}
         placeholder={props.placeholder}
         value={props.value}
@@ -116,7 +122,7 @@ export interface SwitchFieldProps {
 
 export function SwitchField(props: SwitchFieldProps): React.JSX.Element {
   return (
-    <div className={[fieldStyle.field, 'napcat_switchRow'].join(' ')}>
+    <div className={[fieldStyle.field, fieldStyle.switchRow].join(' ')}>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div className={fieldStyle.head}>
           <label htmlFor={props.id} className={fieldStyle.label}>
@@ -153,4 +159,3 @@ export function SwitchField(props: SwitchFieldProps): React.JSX.Element {
     </div>
   );
 }
-

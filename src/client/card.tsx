@@ -3,57 +3,28 @@ import { cardStyle, sectionStyle, injectCardStyles } from './card-styles.js';
 import { SafeIconChevronDown } from './icons.js';
 import { useCardState } from './use-card-state.js';
 import { SectionErrorBoundary } from './error-boundary.js';
-import { ConnectionTab, PersonaTab, ProactiveTab, SecurityTab, MemoryTab, FaceTab, SlangTab } from './tabs/index.js';
-import type { BridgePluginConfig } from '../types/index.js';
-import { DEFAULT_WS_PORT } from '../constants/index.js';
-import { SETTINGS_TABS, type SettingsTabId, type TabItem, type CardController, type CardProps, type SettingsSectionProps } from './types.js';
+import { ConnectionTab, PersonaTab, MemoryTab, FaceTab, SlangTab } from './tabs/index.js';
+import { DEFAULT_BASE_CONFIG } from '../constants/index.js';
+import {
+  SETTINGS_TABS,
+  type SettingsTabId,
+  type TabItem,
+  type CardController,
+  type CardProps,
+  type SettingsSectionProps,
+} from './types.js';
 
-export { DEFAULT_BASE_CONFIG, SETTINGS_TABS, type SettingsTabId, type TabItem, type CardController, type CardProps, type SettingsSectionProps };
-
-const DEFAULT_BASE_CONFIG: Partial<BridgePluginConfig> = {
-  ws_port: DEFAULT_WS_PORT,
-  ws_token: '',
-  bot_qq: '',
-  admins: [],
-  aliases: [],
-  image_ttl_days: 7,
-  persona: '',
-  behavior: '',
-  proactive_reply_enabled: false,
-  proactive_interval_mins: 3,
-  proactive_buffer_size: 10,
-  proactive_only_text: false,
-  proactive_random_enabled: false,
-  proactive_random_probability: 0.05,
-  proactive_idle_enabled: false,
-  proactive_idle_timeout_mins: 120,
-  proactive_cooldown_mins: 10,
-  proactive_night_dnd: true,
-  memory_storage_dir: '.dsh/napcat/napcat_memory',
-  user_profile_budget_chars: 2200,
-  session_memory_budget_chars: 2200,
-  group_memory_total_budget_chars: 8000,
-  face_enabled: false,
-  face_store_max: 100,
-  face_store_dir: '.dsh/napcat/faces',
-  face_sub_type: 1,
-  face_evict_policy: 'evict_lru',
-  slang_enabled: true,
-  slang_max_entries: 300,
-  slang_evict_policy: 'reject',
-  slang_storage_path: '.dsh/napcat/slang/slang.md',
-  private_blacklist: [],
-  group_blacklist: [],
-  session_permission_private_default: 'workspace-write',
-  session_permission_group_default: 'read-only',
-  session_permission_overrides: [],
-  coding_tools_private_default: true,
-  coding_tools_group_default: false,
-  coding_tools_overrides: [],
-  new_message_behavior: 'steer',
+export {
+  DEFAULT_BASE_CONFIG,
+  SETTINGS_TABS,
+  type SettingsTabId,
+  type TabItem,
+  type CardController,
+  type CardProps,
+  type SettingsSectionProps,
 };
 
-export function NapCatSettingsCard(props: CardProps): React.JSX.Element {
+export function KujiraSettingsCard(props: CardProps): React.JSX.Element {
   injectCardStyles();
   const isSection = props.layoutMode === 'section';
   const state = useCardState(props, DEFAULT_BASE_CONFIG);
@@ -75,10 +46,10 @@ export function NapCatSettingsCard(props: CardProps): React.JSX.Element {
               key={tab.id}
               type="button"
               role="tab"
-              id={`napcat-tab-${tab.id}`}
-              data-testid={`napcat-tab-${tab.id}`}
+              id={`kujira-tab-${tab.id}`}
+              data-testid={`kujira-tab-${tab.id}`}
               aria-selected={isSelected}
-              aria-controls={`napcat-tabpanel-${tab.id}`}
+              aria-controls={`kujira-tabpanel-${tab.id}`}
               tabIndex={isSelected ? 0 : -1}
               className={[cardStyle.tab, isSelected ? cardStyle.tabActive : ''].filter(Boolean).join(' ')}
               onClick={() => state.handleTabClick(tab.id)}
@@ -92,15 +63,13 @@ export function NapCatSettingsCard(props: CardProps): React.JSX.Element {
       <ConnectionTab
         {...commonTabProps}
         active={state.activeTab === 'connection'}
-        hasSecret={state.hasSecret}
-        adminsInput={state.adminsInput}
-        aliasesInput={state.aliasesInput}
-        onAdminsChange={state.handleAdminsChange}
-        onAliasesChange={state.handleAliasesChange}
+        credentialsStatus={state.credentialsStatus}
+        appIdInput={state.appIdInput}
+        appSecretInput={state.appSecretInput}
+        onAppIdChange={state.handleAppIdChange}
+        onAppSecretChange={state.handleAppSecretChange}
       />
       <PersonaTab {...commonTabProps} active={state.activeTab === 'persona'} />
-      <ProactiveTab {...commonTabProps} active={state.activeTab === 'proactive'} />
-      <SecurityTab {...commonTabProps} active={state.activeTab === 'security'} />
       <MemoryTab {...commonTabProps} active={state.activeTab === 'memory'} />
       <FaceTab {...commonTabProps} active={state.activeTab === 'face'} onError={state.updateError} />
       <SlangTab {...commonTabProps} active={state.activeTab === 'slang'} onError={state.updateError} />
@@ -119,15 +88,19 @@ export function NapCatSettingsCard(props: CardProps): React.JSX.Element {
 
   if (isSection) {
     return (
-      <div className={sectionStyle.section} data-testid="napcat-bridge-section">
+      <div className={sectionStyle.section} data-testid="kujira-bridge-section">
         <div className={sectionStyle.head}>
           <div className={sectionStyle.titleRow}>
-            <h2 className={sectionStyle.title}>QQ NapCat 机器人配置</h2>
+            <h2 className={sectionStyle.title}>QQ Kujira 机器人配置</h2>
             {state.isDirty && <span className={sectionStyle.badgePending}>未保存修改</span>}
             {state.remoteLoading && <span className={sectionStyle.badgePending}>加载中...</span>}
           </div>
-          <p className={sectionStyle.description}>NapCat (OneBot 11) 反向 WebSocket 接入、消息入库、Agent 工具与群聊/私聊对话桥接</p>
-          {state.remoteLoadError && <p className={cardStyle.failed} role="alert">配置加载异常：{state.remoteLoadError}</p>}
+          <p className={sectionStyle.description}>
+            QQ 官方 Bot API v2 合规单聊 (C2C) 接入、双层记忆、表情资产、黑话学习与 Agent 对话桥接
+          </p>
+          {state.remoteLoadError && (
+            <p className={cardStyle.failed} role="alert">配置加载异常：{state.remoteLoadError}</p>
+          )}
         </div>
         <div className={sectionStyle.body}>{formContent}</div>
       </div>
@@ -135,20 +108,27 @@ export function NapCatSettingsCard(props: CardProps): React.JSX.Element {
   }
 
   return (
-    <div className={[cardStyle.card, state.expanded ? cardStyle.cardOpen : ''].filter(Boolean).join(' ')} data-testid="napcat-bridge-card">
+    <div
+      className={[cardStyle.card, state.expanded ? cardStyle.cardOpen : ''].filter(Boolean).join(' ')}
+      data-testid="kujira-bridge-card"
+    >
       <button
         type="button"
         className={cardStyle.header}
         aria-expanded={state.expanded}
-        aria-label={`${state.expanded ? '收起' : '展开'}: QQ 机器人桥接 (dsh-napcat-bridge)`}
+        aria-label={`${state.expanded ? '收起' : '展开'}: QQ Kujira 机器人 (kujira)`}
         onClick={() => state.setExpanded(!state.expanded)}
       >
         <span className={cardStyle.headText}>
-          <span className={cardStyle.name}>QQ 机器人桥接 (dsh-napcat-bridge)</span>
-          <span className={cardStyle.description}>NapCat (OneBot 11) 反向 WebSocket 接入、消息入库、Agent 工具与群聊/私聊对话桥接</span>
+          <span className={cardStyle.name}>QQ Kujira 机器人 (kujira)</span>
+          <span className={cardStyle.description}>
+            QQ 官方 Bot API v2 合规单聊 (C2C) 接入、双层记忆、表情资产、黑话学习与 Agent 对话桥接
+          </span>
         </span>
         {state.isDirty && <span className={cardStyle.badgePending}>未保存修改</span>}
-        <SafeIconChevronDown className={[cardStyle.chevron, state.expanded ? cardStyle.chevronOpen : ''].filter(Boolean).join(' ')} />
+        <SafeIconChevronDown
+          className={[cardStyle.chevron, state.expanded ? cardStyle.chevronOpen : ''].filter(Boolean).join(' ')}
+        />
       </button>
 
       {state.expanded && <div className={cardStyle.body}>{formContent}</div>}
@@ -156,10 +136,10 @@ export function NapCatSettingsCard(props: CardProps): React.JSX.Element {
   );
 }
 
-export function NapCatSettingsSection(props: SettingsSectionProps): React.JSX.Element {
+export function KujiraSettingsSection(props: SettingsSectionProps): React.JSX.Element {
   return (
     <SectionErrorBoundary>
-      <NapCatSettingsCard {...props} layoutMode="section" initialExpanded={true} />
+      <KujiraSettingsCard {...props} layoutMode="section" initialExpanded={true} />
     </SectionErrorBoundary>
   );
 }

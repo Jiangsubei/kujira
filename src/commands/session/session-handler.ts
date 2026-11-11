@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: /会话 命令处理器
+ * kujira: /会话 命令处理器
  */
 
 import { formatSessionTitle } from '../../gateway/session.js';

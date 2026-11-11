@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 定时任务工具集定义与处理器
+ * kujira: 定时任务工具集定义与处理器
  * 包含 schedule_task 与 manage_scheduled_tasks 及其 DSH defineTool 声明。
  */
 
@@ -12,6 +12,9 @@ import type {
   ManageScheduledTasksParams,
   ManageScheduledTasksResult,
 } from '../types/index.js';
+import { isKujiraUserPeer, normalizePeer } from './common/context.js';
+
+export { normalizePeer };
 
 export interface SchedulerToolContext {
   scheduler?: TaskScheduler | null;
@@ -20,17 +23,22 @@ export interface SchedulerToolContext {
 }
 
 export const SCHEDULE_TASK_DESCRIPTION =
-  '为当前 QQ 会话创建并排期一个定时唤醒任务，支持相对延迟秒数、精确时间点或周期性循环（如每日、工作日、周末）。用于用户交代延迟提醒或未来备忘（如“半小时后提醒我出门”、“工作日早九点叫我打卡”），或者在群聊中发现有价值话题但当前发言节奏较慢、计划稍后主动回来看等需要跨回合自驱跟进的场景；排期成功后当前回合应正常结束，预定时间到达时系统会将你的任务说明作为提示词重新唤醒当前会话。切勿用于编程或本地开发流程中的短期命令执行与耗时等待（如等待构建、运行测试、拉取镜像或带 timeout 的 shell 脚本执行），该类短平快的命令与系统任务应使用具体的命令执行工具完成；亦切勿用于当前单轮内等待用户追加发言（等待用户补充输入请使用 wait_for_user_messages）。只有在当前会话回合可以彻底结束挂起、模型在此等待期间需要空闲出来正常响应其他用户消息、并在未来时刻由时钟重新唤醒你时，才应调用本工具。';
+  '为当前 QQ 会话创建并排期一个定时唤醒任务，支持相对延迟秒数、精确时间点或周期性循环（如每日、工作日、周末）。用于用户交代延迟提醒或未来备忘（如“半小时后提醒我出门”、“工作日早九点叫我打卡”），或计划稍后主动跟进任务进度并同步结果等需要跨回合自驱跟进的场景；排期成功后当前回合应正常结束，预定时间到达时系统会将你的任务说明作为提示词重新唤醒当前单聊会话。切勿用于编程或本地开发流程中的短期命令执行与耗时等待（如等待构建、运行测试、拉取镜像或带 timeout 的 shell 脚本执行），该类短平快的命令与系统任务应使用具体的命令执行工具完成；亦切勿用于当前单轮内等待用户追加发言（等待用户补充输入请使用 wait_for_user_messages）。只有在当前会话回合可以彻底结束挂起、模型在此等待期间需要空闲出来正常响应其他用户消息、并在未来时刻由时钟重新唤醒你时，才应调用本工具。';
 
 export const MANAGE_SCHEDULED_TASKS_DESCRIPTION =
   '查询、取消或修改当前 QQ 会话中已排期的定时任务。用于响应用户查询待执行备忘清单（如询问“晚点你有什么要提醒我的”时使用 list 动作）、用户明确取消某项提醒（如“刚才那个提醒不要了”时先 list 查出 task_id 再使用 cancel 动作），或调整原定提醒时间与要求（使用 update 动作）。切勿用于管理宿主操作系统底层的系统级计划任务（如 crontab 或系统守护服务），本工具仅用于维护当前 QQ 会话内由 schedule_task 创建的 Agent 业务定时任务；创建新的定时提醒请直接调用 schedule_task。';
 
-export function normalizePeer(peer: string): string {
-  const groupMatch = peer.match(/^qq-group-([^-]+)/);
-  if (groupMatch) return `group_${groupMatch[1]}`;
-  const userMatch = peer.match(/^qq-user-([^-]+)/);
-  if (userMatch) return `user_${userMatch[1]}`;
-  return peer;
+function resolveSchedulerPeer(ctx: SchedulerToolContext, exec?: any): string {
+  const fromCtx = ctx.peer ? normalizePeer(ctx.peer) : '';
+  if (fromCtx) return fromCtx;
+  if (exec) {
+    const session = (exec.agent as any)?.session;
+    const rawId = session?.id || (exec.agent as any)?.sessionId || '';
+    if (typeof rawId === 'string' && rawId.trim() !== '') {
+      return normalizePeer(rawId);
+    }
+  }
+  return '';
 }
 
 export function createScheduleTaskTool(contextGetter: () => SchedulerToolContext) {
@@ -92,21 +100,22 @@ export function createScheduleTaskTool(contextGetter: () => SchedulerToolContext
       if (!ctx.scheduler) {
         return toLosslessJson({ success: false, error: '调度引擎未初始化。' });
       }
-      let peer = ctx.peer;
-      if (!peer && exec) {
-        const session = (exec.agent as any)?.session;
-        if (session?.id) peer = normalizePeer(session.id);
-      }
-      if (!peer) {
-        return toLosslessJson({ success: false, error: '缺少当前会话 peer 上下文，无法创建定时任务。' });
+      const peer = resolveSchedulerPeer(ctx, exec);
+      if (!isKujiraUserPeer(peer)) {
+        return toLosslessJson({
+          success: false,
+          error: '缺少有效的当前单聊会话 peer 上下文，无法创建定时任务。',
+        });
       }
 
       try {
-        return toLosslessJson(await ctx.scheduler.scheduleTask({
-          ...args,
-          peer,
-          creator: ctx.userId || 'self',
-        }));
+        return toLosslessJson(
+          await ctx.scheduler.scheduleTask({
+            ...args,
+            peer,
+            creator: ctx.userId || 'self',
+          })
+        );
       } catch (err: any) {
         return toLosslessJson({
           success: false,
@@ -194,22 +203,28 @@ export function createManageScheduledTasksTool(contextGetter: () => SchedulerToo
     execute: async (args: ManageScheduledTasksParams, exec?: any): Promise<ManageScheduledTasksResult> => {
       const ctx = contextGetter();
       if (!ctx.scheduler) {
-        return toLosslessJson({ success: false, action: args.action, error: '调度引擎未初始化。' });
+        return toLosslessJson({
+          success: false,
+          action: args.action,
+          error: '调度引擎未初始化。',
+        });
       }
-      let peer = ctx.peer;
-      if (!peer && exec) {
-        const session = (exec.agent as any)?.session;
-        if (session?.id) peer = normalizePeer(session.id);
-      }
-      if (!peer) {
-        return toLosslessJson({ success: false, action: args.action, error: '缺少当前会话 peer 上下文。' });
+      const peer = resolveSchedulerPeer(ctx, exec);
+      if (!isKujiraUserPeer(peer)) {
+        return toLosslessJson({
+          success: false,
+          action: args.action,
+          error: '缺少有效的当前单聊会话 peer 上下文。',
+        });
       }
 
       try {
-        return toLosslessJson(await ctx.scheduler.manageTasks({
-          ...args,
-          peer,
-        }));
+        return toLosslessJson(
+          await ctx.scheduler.manageTasks({
+            ...args,
+            peer,
+          })
+        );
       } catch (err: any) {
         return toLosslessJson({
           success: false,

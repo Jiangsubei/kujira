@@ -1,6 +1,6 @@
 /**
  * 契约测试: TaskScheduler 调度引擎契约 (Task Scheduler Engine Contract)
- * 验证 Fail-Fast 校验、夜间 DND 拦截、时间范围限制、周期推演及唤醒分发契约。
+ * 验证 Fail-Fast 校验、无夜间免打扰全时段单聊放行、配额限制、周期推演及 SystemEventHub 唤醒分发契约。
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -9,7 +9,15 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { TaskScheduler } from '../../src/scheduler/index.js';
+import { SystemEventHub } from '../../src/gateway/system-event-hub.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 import type { WakeupPayload } from '../../src/types/index.js';
+
+const PEER_A = openidToPeer('10000000000000000000000000000001');
+const PEER_B = openidToPeer('10000000000000000000000000000002');
+const PEER_OVERFLOW = openidToPeer('10000000000000000000000000000003');
+const PEER_TRIGGER = openidToPeer('10000000000000000000000000000004');
+const PEER_REC = openidToPeer('10000000000000000000000000000005');
 
 describe('契约测试: TaskScheduler 调度引擎契约', () => {
   let tmpDir: string;
@@ -19,7 +27,7 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
   let scheduler: TaskScheduler;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-scheduler-test-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-scheduler-'));
     dbPath = path.join(tmpDir, 'test.db');
     db = new MessageDatabase(dbPath);
     dispatchedPayloads = [];
@@ -29,9 +37,6 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
       dispatchWakeup: async (payload: WakeupPayload) => {
         dispatchedPayloads.push(payload);
       },
-      configGetter: () => ({
-        proactive_night_dnd: true,
-      }),
     });
   });
 
@@ -46,24 +51,22 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
   it('契约 1: 单次任务时间下限 10 秒，小于 10 秒抛错拒绝', async () => {
     await expect(
       scheduler.scheduleTask({
-        peer: 'group_100',
-        creator: '12345',
+        peer: PEER_A,
+        creator: 'self',
         prompt: '测试快速任务',
         delay_seconds: 9,
       })
     ).rejects.toThrow(/不能少于 10 秒/);
   });
 
-  it('契约 2: 单次任务取消 48 小时上限，支持长延迟（如 7 天）与远期日程，且超长定时器防 32 位溢出', async () => {
-    // 假定基准时间在白天 12:00，避免群聊 DND
+  it('契约 2: 单次任务支持长延迟（7 天 / 30 天），且超长定时器防 32 位溢出', async () => {
     const baseDate = new Date();
     baseDate.setHours(12, 0, 0, 0);
     const now = baseDate.getTime();
 
-    // 1. 7 天后的相对延迟 (7 * 86400 = 604800 秒)，此前会被 48h 拦截，现在应成功创建
     const res7d = await scheduler.scheduleTask({
-      peer: 'user_100',
-      creator: '12345',
+      peer: PEER_A,
+      creator: 'self',
       prompt: '一周后提醒我交周报',
       delay_seconds: 7 * 86400,
       now,
@@ -72,13 +75,12 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
     expect(res7d.task_id).toBeDefined();
     expect(res7d.next_run_at).toBe(now + 7 * 86400 * 1000);
 
-    // 2. 远期精确时间日程（30 天后 14:00），应成功创建
     const targetDate = new Date(now + 30 * 86400 * 1000);
     targetDate.setHours(14, 0, 0, 0);
     const executeAtStr = `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, '0')}-${String(targetDate.getDate()).padStart(2, '0')} 14:00:00`;
     const res30d = await scheduler.scheduleTask({
-      peer: 'user_100',
-      creator: '12345',
+      peer: PEER_A,
+      creator: 'self',
       prompt: '一个月后的重要日程',
       execute_at: executeAtStr,
       now,
@@ -86,21 +88,18 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
     expect(res30d.success).toBe(true);
     expect(res30d.task_id).toBeDefined();
 
-    // 3. 验证超长延迟（> 24.85 天，即 delayMs > 2147483647）时不会因 Node.js 溢出而立即触发
-    // 30 天的 delay 约为 2,592,000,000 ms > 2,147,483,647 ms
     vi.useFakeTimers();
     try {
       vi.setSystemTime(now);
       const longRes = await scheduler.scheduleTask({
-        peer: 'user_overflow_guard',
-        creator: '12345',
+        peer: PEER_OVERFLOW,
+        creator: 'self',
         prompt: '防止32位整型溢出测试',
         delay_seconds: 30 * 86400,
         now,
       });
       expect(longRes.success).toBe(true);
 
-      // 仅前进 1 秒，若未做溢出防御，Node.js 溢出后 delay 会重置为 1ms 并在此被触发
       await vi.advanceTimersByTimeAsync(1000);
       expect(dispatchedPayloads.some((p) => p.task_id === longRes.task_id)).toBe(false);
       const taskInDb = db.getScheduledTask(longRes.task_id!);
@@ -110,92 +109,60 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
     }
   });
 
-  it('契约 3: 群聊夜间免打扰 (23:00~08:00) Fail-Fast 拦截，创建时直接拒绝并报错', async () => {
-    // 构造一个落在今天或明天凌晨 03:00 的精确时间
-    const targetDate = new Date();
-    targetDate.setHours(3, 0, 0, 0);
-    if (targetDate.getTime() < Date.now()) {
-      targetDate.setDate(targetDate.getDate() + 1);
+  it('契约 3: 已彻底移除夜间免打扰拦截，单聊凌晨时段 (03:00 / 23:30) 均正常放行创建', async () => {
+    const target3am = new Date();
+    target3am.setHours(3, 0, 0, 0);
+    if (target3am.getTime() <= Date.now()) {
+      target3am.setDate(target3am.getDate() + 1);
     }
-    const executeAtStr = `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, '0')}-${String(targetDate.getDate()).padStart(2, '0')} 03:00:00`;
+    const str3am = `${target3am.getFullYear()}-${String(target3am.getMonth() + 1).padStart(2, '0')}-${String(target3am.getDate()).padStart(2, '0')} 03:00:00`;
 
-    await expect(
-      scheduler.scheduleTask({
-        peer: 'group_100',
-        creator: '12345',
-        prompt: '半夜提醒',
-        execute_at: executeAtStr,
-      })
-    ).rejects.toThrow(/处于群聊夜间免打扰时段/);
-  });
-
-  it('契约 4: 私聊任务不受群聊夜间免打扰拦截，正常放行', async () => {
-    const targetDate = new Date();
-    targetDate.setHours(3, 0, 0, 0);
-    if (targetDate.getTime() < Date.now()) {
-      targetDate.setDate(targetDate.getDate() + 1);
-    }
-    const executeAtStr = `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, '0')}-${String(targetDate.getDate()).padStart(2, '0')} 03:00:00`;
-
-    const result = await scheduler.scheduleTask({
-      peer: 'user_200',
-      creator: '200',
-      prompt: '私聊熬夜提醒',
-      execute_at: executeAtStr,
+    const res1 = await scheduler.scheduleTask({
+      peer: PEER_A,
+      creator: 'self',
+      prompt: '凌晨提醒',
+      execute_at: str3am,
     });
+    expect(res1.success).toBe(true);
+    expect(res1.task_id).toBeDefined();
 
-    expect(result.success).toBe(true);
-    expect(result.task_id).toBeDefined();
+    const targetLate = new Date();
+    targetLate.setHours(23, 30, 0, 0);
+    if (targetLate.getTime() <= Date.now()) {
+      targetLate.setDate(targetLate.getDate() + 1);
+    }
+    const strLate = `${targetLate.getFullYear()}-${String(targetLate.getMonth() + 1).padStart(2, '0')}-${String(targetLate.getDate()).padStart(2, '0')} 23:30:00`;
+
+    const res2 = await scheduler.scheduleTask({
+      peer: PEER_B,
+      creator: 'self',
+      prompt: '深夜提醒',
+      execute_at: strLate,
+    });
+    expect(res2.success).toBe(true);
   });
 
-  it('契约 5: 群聊与私聊统一限制单个 peer 最多 5 个 pending 任务，超过限制拒绝创建', async () => {
-    // 假定当前时间是上午 10:00，避免命中 DND
-    const baseHour = 10;
-    const now = new Date();
-    now.setHours(baseHour, 0, 0, 0);
-    const fixedNow = now.getTime();
+  it('契约 4: 单聊单个 peer 最多 5 个 pending 任务，超过限制拒绝创建', async () => {
+    const now = Date.now();
     vi.useFakeTimers();
-    vi.setSystemTime(fixedNow);
+    vi.setSystemTime(now);
 
     try {
-      // 1. 群聊 peer 创建 5 个合法的 pending 任务（延迟 100s, 200s, ...）
       for (let i = 1; i <= 5; i++) {
         const res = await scheduler.scheduleTask({
-          peer: 'group_quota_test',
-          creator: '12345',
-          prompt: `群任务 ${i}`,
+          peer: PEER_A,
+          creator: 'self',
+          prompt: `单聊任务 ${i}`,
           delay_seconds: 100 * i,
         });
         expect(res.success).toBe(true);
       }
 
-      // 第 6 个应被配额拦截
       await expect(
         scheduler.scheduleTask({
-          peer: 'group_quota_test',
-          creator: '12345',
-          prompt: '第6个群任务',
-          delay_seconds: 600,
-        })
-      ).rejects.toThrow(/待执行任务数量已达上限/);
-
-      // 2. 私聊 peer 独立且统一同样限制 5 个
-      for (let i = 1; i <= 5; i++) {
-        const res = await scheduler.scheduleTask({
-          peer: 'user_quota_test',
-          creator: '20001',
-          prompt: `私聊任务 ${i}`,
-          delay_seconds: 100 * i,
-        });
-        expect(res.success).toBe(true);
-      }
-
-      // 私聊第 6 个同样被配额拦截
-      await expect(
-        scheduler.scheduleTask({
-          peer: 'user_quota_test',
-          creator: '20001',
-          prompt: '第6个私聊任务',
+          peer: PEER_A,
+          creator: 'self',
+          prompt: '第6个单聊任务',
           delay_seconds: 600,
         })
       ).rejects.toThrow(/待执行任务数量已达上限/);
@@ -204,12 +171,9 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
     }
   });
 
-  it('契约 6: 周期任务下一次时间计算 (daily, weekdays, weekends, custom)', () => {
-    // 假设当前基准时间是周一 (2026-10-26 10:00:00)
-    // 注意：2026-10-26 是周一
+  it('契约 5: 周期任务下一次时间计算 (daily, weekdays, weekends, custom)', () => {
     const mockMonday = new Date(2026, 9, 26, 10, 0, 0, 0).getTime();
 
-    // 1. daily 14:30 (今天尚未到达 14:30)
     const nextDailySameDay = scheduler.computeNextRunAt(
       { frequency: 'daily', time_of_day: '14:30' },
       mockMonday
@@ -221,7 +185,6 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
     expect(d1.getHours()).toBe(14);
     expect(d1.getMinutes()).toBe(30);
 
-    // 2. daily 08:30 (今天 08:30 已过，应安排在明天周二 08:30)
     const nextDailyNextDay = scheduler.computeNextRunAt(
       { frequency: 'daily', time_of_day: '08:30' },
       mockMonday
@@ -231,38 +194,50 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
     expect(d2.getHours()).toBe(8);
     expect(d2.getMinutes()).toBe(30);
 
-    // 3. weekdays (周一测试下一个工作日)
-    // 假设是周五 18:00 (2026-10-30 18:00:00)
     const mockFridayEvening = new Date(2026, 9, 30, 18, 0, 0, 0).getTime();
     const nextWeekday = scheduler.computeNextRunAt(
       { frequency: 'weekdays', time_of_day: '09:00' },
       mockFridayEvening
     );
     const d3 = new Date(nextWeekday);
-    // 周五之后的工作日应为下周一 (2026-11-02)
-    expect(d3.getMonth()).toBe(10); // 11月
+    expect(d3.getMonth()).toBe(10);
     expect(d3.getDate()).toBe(2);
-    expect(d3.getDay()).toBe(1); // 周一
+    expect(d3.getDay()).toBe(1);
 
-    // 4. weekends (周六周日)
-    // 假设是周日 20:00 (2026-11-01 20:00:00)
     const mockSundayEvening = new Date(2026, 10, 1, 20, 0, 0, 0).getTime();
     const nextWeekend = scheduler.computeNextRunAt(
       { frequency: 'weekends', time_of_day: '10:00' },
       mockSundayEvening
     );
     const d4 = new Date(nextWeekend);
-    // 应推迟到下周六 (2026-11-07)
     expect(d4.getDate()).toBe(7);
-    expect(d4.getDay()).toBe(6); // 周六
+    expect(d4.getDay()).toBe(6);
+
+    const nextCustom = scheduler.computeNextRunAt(
+      { frequency: 'custom', days_of_week: [3], time_of_day: '15:00' },
+      mockMonday
+    );
+    const d5 = new Date(nextCustom);
+    expect(d5.getDay()).toBe(3); // 周三
+    expect(d5.getHours()).toBe(15);
   });
 
-  it('契约 7: 定时触发后分发 dispatchWakeup 且单次任务标记 completed', async () => {
+  it('契约 6: 定时触发通过 SystemEventHub 唤醒且单次任务标记 completed', async () => {
     vi.useFakeTimers();
+    const hubPayloads: WakeupPayload[] = [];
+    const hub = new SystemEventHub({
+      sessionManager: {
+        dispatchWakeup: async (payload: WakeupPayload) => {
+          hubPayloads.push(payload);
+        },
+      },
+    });
+    const hubScheduler = new TaskScheduler({ db, systemEventHub: hub });
+
     try {
-      const res = await scheduler.scheduleTask({
-        peer: 'user_trigger_test',
-        creator: '8888',
+      const res = await hubScheduler.scheduleTask({
+        peer: PEER_TRIGGER,
+        creator: 'self',
         prompt: '到期提醒我测试',
         delay_seconds: 15,
       });
@@ -270,34 +245,34 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
       expect(res.success).toBe(true);
       const taskId = res.task_id!;
 
-      // 快进 15 秒
       await vi.advanceTimersByTimeAsync(15500);
 
-      // 断言 dispatchWakeup 被调用
-      expect(dispatchedPayloads.length).toBe(1);
-      const payload = dispatchedPayloads[0];
+      expect(hubPayloads.length).toBe(1);
+      const payload = hubPayloads[0]!;
       expect(payload.trigger).toBe('scheduled');
-      expect(payload.peer).toBe('user_trigger_test');
-      expect(payload.content).toBe('到期提醒我测试');
+      expect(payload.is_system).toBe(true);
+      expect(payload.from_user).toBe('');
+      expect(payload.from_name).toBe('');
+      expect(payload.peer).toBe(PEER_TRIGGER);
+      expect(payload.content).toContain('到期提醒我测试');
       expect(payload.task_id).toBe(taskId);
 
-      // 断言数据库状态已变成 completed
       const taskInDb = db.getScheduledTask(taskId);
       expect(taskInDb?.status).toBe('completed');
     } finally {
+      hubScheduler.dispose();
       vi.useRealTimers();
     }
   });
 
-  it('契约 8: 周期任务触发后，任务保持 pending 且自动计算并更新下次 next_run_at', async () => {
+  it('契约 7: 周期任务触发后，任务保持 pending 且自动计算并更新下次 next_run_at', async () => {
     vi.useFakeTimers();
     try {
-      // 设定一个 10 秒后触发的周期任务
       const now = Date.now();
       const firstRun = now + 10000;
       const res = await scheduler.scheduleTask({
-        peer: 'user_rec_test',
-        creator: '9999',
+        peer: PEER_REC,
+        creator: 'self',
         prompt: '每日循环任务',
         execute_at: new Date(firstRun).toISOString(),
         recurring: {
@@ -309,13 +284,13 @@ describe('契约测试: TaskScheduler 调度引擎契约', () => {
       expect(res.success).toBe(true);
       const taskId = res.task_id!;
 
-      // 快进 10.5 秒触发首次执行
       await vi.advanceTimersByTimeAsync(10500);
 
       expect(dispatchedPayloads.length).toBe(1);
+      expect(dispatchedPayloads[0]!.from_user).toBe('');
+      expect(dispatchedPayloads[0]!.from_name).toBe('');
       const taskInDb = db.getScheduledTask(taskId);
       expect(taskInDb?.status).toBe('pending');
-      // 下次执行时间应大于首次执行时间
       expect(taskInDb?.next_run_at).toBeGreaterThan(firstRun);
     } finally {
       vi.useRealTimers();

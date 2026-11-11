@@ -1,11 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-
-vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
-  IconChevronDownOutlineMedium: () => null,
-  IconChevronDownOutlineRegular: () => null,
-}));
+import * as fs from 'node:fs';
+import { promises as fsp } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import {
   registerConfigRoute,
@@ -14,6 +13,7 @@ import {
   sendJson,
   parseJsonBody,
 } from '../../src/server/routes.js';
+import { DEFAULT_BASE_CONFIG as CONSTANTS_BASE_CONFIG, SETTINGS_NAMESPACE } from '../../src/constants/index.js';
 import type { BridgePluginConfig } from '../../src/types/index.js';
 
 function createMockReq(method: string, body?: any): IncomingMessage {
@@ -77,18 +77,37 @@ function createMockRes(): {
   return { res, getResult };
 }
 
-describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bridge/config)', () => {
+describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+
+  beforeEach(async () => {
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-routes-home-'));
+    tmpCwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-routes-cwd-'));
+  });
+
+  afterEach(async () => {
+    await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(tmpCwd, { recursive: true, force: true }).catch(() => {});
+  });
+
   describe('1. 路由注册与生命周期反注册契约', () => {
-    it('正确向 ctx.webServer 注册 exact 路径 /plugins/dsh-napcat-bridge/config (直接获取模式)', () => {
+    it('正确向 ctx.webServer 注册 exact 路径 /plugins/kujira/config，且 DEFAULT_BASE_CONFIG 与常量同源', () => {
       const registerMock = vi.fn();
       const mockCtx: any = {
         get: vi.fn((name) => (name === 'webServer' ? { register: registerMock } : undefined)),
         inject: vi.fn(),
       };
 
-      expect(CONFIG_ROUTE_PATH).toBe('/plugins/dsh-napcat-bridge/config');
+      expect(CONFIG_ROUTE_PATH).toBe('/plugins/kujira/config');
+      expect(DEFAULT_BASE_CONFIG).toBe(CONSTANTS_BASE_CONFIG);
+      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(17);
 
-      registerConfigRoute(mockCtx, () => ({ ws_token: 'existing_token' } as BridgePluginConfig), async () => {});
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
       expect(registerMock).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -110,12 +129,15 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
         }),
       };
 
-      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {});
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
       expect(registerMock).not.toHaveBeenCalled();
       expect(mockCtx.inject).toHaveBeenCalled();
 
-      // 模拟 webServer 加载完成触发 inject 回调
       injectCallback?.({ webServer: { register: registerMock } });
       expect(registerMock).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -147,12 +169,24 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
     });
   });
 
-  describe('2. GET /plugins/dsh-napcat-bridge/config 配置读取与脱敏保护', () => {
-    it('返回 200 JSON，ws_token 存在时 hasSecret 为 true 且 ws_token 必须脱敏为空字符串', async () => {
+  describe('2. GET /plugins/kujira/config 配置读取与凭据零明文脱敏保护', () => {
+    it('返回 200 JSON，已配置凭据时仅返回脱敏元数据 (configured/source/writable)，绝不回显 AppID/AppSecret 明文', async () => {
       let handler: any;
+      const credStore = new Map<string, string>([
+        ['QQ_BOT_APP_ID', '1000000091'],
+        ['QQ_BOT_SECRET', 'super-secret-value-never-leak'],
+      ]);
       const mockCtx: any = {
         get: vi.fn((name) => {
           if (name === 'connection') return { requestRejection: () => undefined };
+          if (name === 'credentials') {
+            return {
+              describe: async (ref: string) =>
+                credStore.has(ref)
+                  ? { configured: true, source: 'file', writable: true }
+                  : { configured: false, writable: true },
+            };
+          }
           if (name === 'webServer') {
             return {
               register: (route: any) => {
@@ -166,16 +200,17 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
         inject: vi.fn(),
       };
 
-      const currentCfg: BridgePluginConfig = {
-        ws_port: 8080,
-        ws_token: 'secret-token-super-confidential',
-        bot_qq: '1000000021',
-        admins: ['10001', '10002'],
-        aliases: ['小助手'],
+      // 故意混入已下线的历史键以验证 GET 清洗
+      const currentCfg = {
+        markdown_enabled: true,
+        input_notify_enabled: false,
+        new_message_behavior: 'steer',
         image_ttl_days: 7,
         persona: '测试人格设定',
-        proactive_reply_enabled: true,
-      };
+        ws_port: 8080,
+        admins: ['1000000001'],
+        app_id: '1000000091',
+      } as unknown as BridgePluginConfig;
 
       registerConfigRoute(mockCtx, () => currentCfg, async () => {});
 
@@ -187,17 +222,26 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
 
       expect(result.status).toBe(200);
       expect(result.body.ok).toBe(true);
-      expect(result.body.hasSecret).toBe(true);
-      expect(result.body.config.ws_port).toBe(8080);
-      expect(result.body.config.ws_token).toBe(''); // 绝对脱敏保护，绝不向前端泄露明文
-      expect(result.body.config.bot_qq).toBe('1000000021');
-      expect(result.body.config.admins).toEqual(['10001', '10002']);
+      expect(result.body.credentials).toEqual({
+        appId: { configured: true, source: 'file', writable: true },
+        appSecret: { configured: true, source: 'file', writable: true },
+        ready: true,
+      });
+
+      const serialized = JSON.stringify(result.body);
+      expect(serialized).not.toContain('1000000091');
+      expect(serialized).not.toContain('super-secret-value-never-leak');
+
+      expect(result.body.config.markdown_enabled).toBe(true);
+      expect(result.body.config.input_notify_enabled).toBe(false);
       expect(result.body.config.image_ttl_days).toBe(7);
+      expect(result.body.config.ws_port).toBeUndefined();
+      expect(result.body.config.admins).toBeUndefined();
+      expect(result.body.config.app_id).toBeUndefined();
       expect(result.body.baseDefaults).toEqual(DEFAULT_BASE_CONFIG);
-      expect(result.body.baseDefaults.ws_port).toBe(8080);
     });
 
-    it('当 ws_token 为空或未设置时，hasSecret 为 false 且 ws_token 为空字符串', async () => {
+    it('未配置凭据时返回 ready: false 与明确的未配置元数据', async () => {
       let handler: any;
       const mockCtx: any = {
         get: vi.fn((name) => {
@@ -215,13 +259,12 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
         inject: vi.fn(),
       };
 
-      const currentCfg: BridgePluginConfig = {
-        ws_port: 8080,
-        ws_token: '',
-        bot_qq: '1000000021',
-      };
-
-      registerConfigRoute(mockCtx, () => currentCfg, async () => {});
+      registerConfigRoute(
+        mockCtx,
+        () => ({ markdown_enabled: true } as BridgePluginConfig),
+        async () => {},
+        { dshHome: tmpHome, cwd: tmpCwd, env: {} }
+      );
 
       const req = createMockReq('GET');
       const { res, getResult } = createMockRes();
@@ -231,18 +274,32 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
 
       expect(result.status).toBe(200);
       expect(result.body.ok).toBe(true);
-      expect(result.body.hasSecret).toBe(false);
-      expect(result.body.config.ws_token).toBe('');
+      expect(result.body.credentials.ready).toBe(false);
+      expect(result.body.credentials.appId.configured).toBe(false);
+      expect(result.body.credentials.appSecret.configured).toBe(false);
     });
   });
 
-  describe('3. POST /plugins/dsh-napcat-bridge/config 配置保存、防误清空与热对齐', () => {
-    it('接收更新 payload，在 ws_token 为空或未传时自动保留既有 Token，写入 settings 并触发热对齐', async () => {
+  describe('3. POST /plugins/kujira/config 配置保存、凭据安全写入与非 schema 字段剥离', () => {
+    it('提交凭据与 17 项配置时，凭据写入 ctx.credentials 且被完全剥离出 settings 与 queueReconcile', async () => {
       let handler: any;
       const mutateMock = vi.fn().mockResolvedValue({ ok: true });
+      const credStore = new Map<string, string>();
+      const setCredMock = vi.fn(async (ref: string, val: string) => {
+        credStore.set(ref, val);
+      });
       const mockCtx: any = {
         get: vi.fn((name) => {
           if (name === 'connection') return { requestRejection: () => undefined };
+          if (name === 'credentials') {
+            return {
+              set: setCredMock,
+              describe: async (ref: string) =>
+                credStore.has(ref)
+                  ? { configured: true, source: 'file', writable: true }
+                  : { configured: false, writable: true },
+            };
+          }
           if (name === 'webServer') {
             return {
               register: (route: any) => {
@@ -260,26 +317,29 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
       };
 
       let currentCfg: BridgePluginConfig = {
-        ws_port: 8080,
-        ws_token: 'existing_valuable_token_666',
-        bot_qq: '1000000021',
+        markdown_enabled: true,
+        input_notify_enabled: true,
+        image_ttl_days: 7,
       };
-
       const reconcileMock = vi.fn().mockImplementation(async (next) => {
-        if (next) currentCfg = { ...next };
+        if (next) currentCfg = { ...currentCfg, ...next };
       });
 
       registerConfigRoute(mockCtx, () => currentCfg, reconcileMock);
 
-      // 模拟前端保存：ws_token 留空（防误清空契约）
-      const updatePayload: Partial<BridgePluginConfig> = {
-        ws_port: 8081,
-        ws_token: '', // 前端留空，代表保留原 secret
-        bot_qq: '1000000026',
-        proactive_reply_enabled: true,
-      };
-
-      const req = createMockReq('POST', updatePayload);
+      const req = createMockReq('POST', {
+        markdown_enabled: false,
+        image_ttl_days: 14,
+        persona: 'Kujira 单聊助手',
+        credentials: {
+          app_id: '1000000055',
+          app_secret: 'mock-secret-new-55',
+        },
+        // 即使错误混入顶层凭据或老字段也必须被剥离
+        app_id: '1000000055',
+        app_secret: 'mock-secret-new-55',
+        admins: ['1000000001'],
+      });
       const { res, getResult } = createMockRes();
 
       await handler(req, res);
@@ -287,26 +347,60 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
 
       expect(result.status).toBe(200);
       expect(result.body.ok).toBe(true);
-      expect(result.body.hasSecret).toBe(true);
+      expect(result.body.credentials).toEqual({
+        appId: { configured: true, source: 'file', writable: true },
+        appSecret: { configured: true, source: 'file', writable: true },
+        ready: true,
+      });
+      expect(result.body.healedKeys).toEqual(['admins']);
 
-      // 验证热对齐回调被触发，且正确保留了既有 ws_token
-      expect(reconcileMock).toHaveBeenCalled();
+      // 响应中绝不回显明文凭据
+      const responseText = JSON.stringify(result.body);
+      expect(responseText).not.toContain('1000000055');
+      expect(responseText).not.toContain('mock-secret-new-55');
+
+      // 凭据持久化
+      expect(setCredMock).toHaveBeenCalledWith('QQ_BOT_APP_ID', '1000000055');
+      expect(setCredMock).toHaveBeenCalledWith('QQ_BOT_SECRET', 'mock-secret-new-55');
+
+      // settings.mutate 与 reconcile 仅接收干净 schema 字段
+      expect(mutateMock).toHaveBeenCalledTimes(1);
+      const [ns, ops] = mutateMock.mock.calls[0];
+      expect(ns).toBe(SETTINGS_NAMESPACE);
+      const persistedKeys = ops.map((op: any) => op.path[0]);
+      expect(persistedKeys).toEqual(['markdown_enabled', 'image_ttl_days', 'persona']);
+
+      expect(reconcileMock).toHaveBeenCalledTimes(1);
       const passedToReconcile = reconcileMock.mock.calls[0][0];
-      expect(passedToReconcile.ws_port).toBe(8081);
-      expect(passedToReconcile.ws_token).toBe('existing_valuable_token_666'); // 防误清空！
-      expect(passedToReconcile.bot_qq).toBe('1000000026');
-      expect(passedToReconcile.proactive_reply_enabled).toBe(true);
-
-      // 验证 settings.mutate 被调用以持久化
-      expect(mutateMock).toHaveBeenCalled();
+      expect(passedToReconcile).toEqual({
+        markdown_enabled: false,
+        image_ttl_days: 14,
+        persona: 'Kujira 单聊助手',
+      });
     });
 
-    it('当显式提交新的 ws_token 时，正确更新并持久化新 Token', async () => {
+    it('仅更新凭据且留空 app_secret 时保留既有密钥，并触发 queueReconcile 热重连而不误写 settings', async () => {
       let handler: any;
       const mutateMock = vi.fn().mockResolvedValue({ ok: true });
+      const credStore = new Map<string, string>([
+        ['QQ_BOT_APP_ID', '1000000011'],
+        ['QQ_BOT_SECRET', 'existing-secret-must-keep'],
+      ]);
+      const setCredMock = vi.fn(async (ref: string, val: string) => {
+        credStore.set(ref, val);
+      });
       const mockCtx: any = {
         get: vi.fn((name) => {
           if (name === 'connection') return { requestRejection: () => undefined };
+          if (name === 'credentials') {
+            return {
+              set: setCredMock,
+              describe: async (ref: string) =>
+                credStore.has(ref)
+                  ? { configured: true, source: 'file', writable: true }
+                  : { configured: false, writable: true },
+            };
+          }
           if (name === 'webServer') {
             return {
               register: (route: any) => {
@@ -323,23 +417,15 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
         inject: vi.fn(),
       };
 
-      let currentCfg: BridgePluginConfig = {
-        ws_port: 8080,
-        ws_token: 'old_token',
-      };
+      const reconcileMock = vi.fn().mockResolvedValue(undefined);
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), reconcileMock);
 
-      const reconcileMock = vi.fn().mockImplementation(async (next) => {
-        if (next) currentCfg = { ...next };
+      const req = createMockReq('POST', {
+        credentials: {
+          app_id: '1000000012',
+          app_secret: '',
+        },
       });
-
-      registerConfigRoute(mockCtx, () => currentCfg, reconcileMock);
-
-      const updatePayload: Partial<BridgePluginConfig> = {
-        ws_port: 8080,
-        ws_token: 'new_custom_token_999',
-      };
-
-      const req = createMockReq('POST', updatePayload);
       const { res, getResult } = createMockRes();
 
       await handler(req, res);
@@ -347,11 +433,60 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
 
       expect(result.status).toBe(200);
       expect(result.body.ok).toBe(true);
-      expect(result.body.hasSecret).toBe(true);
+      expect(setCredMock).toHaveBeenCalledTimes(1);
+      expect(setCredMock).toHaveBeenCalledWith('QQ_BOT_APP_ID', '1000000012');
+      expect(credStore.get('QQ_BOT_SECRET')).toBe('existing-secret-must-keep');
+      expect(mutateMock).not.toHaveBeenCalled();
+      expect(reconcileMock).toHaveBeenCalledTimes(1);
+    });
 
-      expect(reconcileMock).toHaveBeenCalled();
-      const passedToReconcile = reconcileMock.mock.calls[0][0];
-      expect(passedToReconcile.ws_token).toBe('new_custom_token_999');
+    it('支持 clear_credentials 清除持久化凭据并回退环境变量与触发热对齐', async () => {
+      let handler: any;
+      await fsp.writeFile(
+        path.join(tmpHome, '.credentials.yaml'),
+        'version: 1\nrefs:\n  QQ_BOT_APP_ID: "1000000088"\n  QQ_BOT_SECRET: "secret-yaml"\n',
+        'utf8'
+      );
+
+      const mockCtx: any = {
+        get: vi.fn((name) => {
+          if (name === 'connection') return { requestRejection: () => undefined };
+          if (name === 'webServer') {
+            return {
+              register: (route: any) => {
+                handler = route.handler;
+                return () => {};
+              },
+            };
+          }
+          return undefined;
+        }),
+        inject: vi.fn(),
+      };
+
+      const reconcileMock = vi.fn().mockResolvedValue(undefined);
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), reconcileMock, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
+
+      const req = createMockReq('POST', {
+        clear_credentials: ['app_secret'],
+      });
+      const { res, getResult } = createMockRes();
+      await handler(req, res);
+      const result = await getResult();
+
+      expect(result.status).toBe(200);
+      expect(result.body.ok).toBe(true);
+      expect(result.body.credentials.appId.configured).toBe(true);
+      expect(result.body.credentials.appSecret.configured).toBe(false);
+      expect(result.body.credentials.ready).toBe(false);
+      expect(reconcileMock).toHaveBeenCalledTimes(1);
+      const savedYaml = fs.readFileSync(path.join(tmpHome, '.credentials.yaml'), 'utf8');
+      expect(savedYaml).toContain('QQ_BOT_APP_ID');
+      expect(savedYaml).not.toContain('QQ_BOT_SECRET');
     });
 
     it('兼容支持 settings.update 持久化通道', async () => {
@@ -369,7 +504,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
             };
           }
           if (name === 'settings') {
-            return { update: updateMock }; // 仅有 update 方法
+            return { update: updateMock };
           }
           return undefined;
         }),
@@ -377,9 +512,13 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
       };
 
       const reconcileMock = vi.fn().mockResolvedValue(undefined);
-      registerConfigRoute(mockCtx, () => ({ ws_token: 'existing_token' } as BridgePluginConfig), reconcileMock);
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), reconcileMock, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
-      const req = createMockReq('POST', { ws_port: 9000 });
+      const req = createMockReq('POST', { image_ttl_days: 10 });
       const { res, getResult } = createMockRes();
 
       await handler(req, res);
@@ -387,7 +526,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
 
       expect(result.status).toBe(200);
       expect(result.body.ok).toBe(true);
-      expect(updateMock).toHaveBeenCalled();
+      expect(updateMock).toHaveBeenCalledWith(SETTINGS_NAMESPACE, { image_ttl_days: 10 });
     });
 
     it('当持久化 settings.mutate 抛出异常时，正确记录日志并返回 HTTP 500 与错误消息', async () => {
@@ -415,9 +554,13 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
         inject: vi.fn(),
       };
 
-      registerConfigRoute(mockCtx, () => ({ ws_token: 'existing_token_999' } as BridgePluginConfig), async () => {});
+      registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
-      const req = createMockReq('POST', { ws_port: 9000 });
+      const req = createMockReq('POST', { image_ttl_days: 15 });
       const { res, getResult } = createMockRes();
 
       await handler(req, res);
@@ -432,7 +575,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
       );
     });
 
-    it('保存包含 bot_qq 的配置后，后续 GET 请求能正确读取更新后的 bot_qq 与其他字段（防恢复默认值）', async () => {
+    it('保存包含 markdown_enabled 与 persona 的配置后，后续 GET 请求能正确读取更新后的配置（防恢复默认值）', async () => {
       let handler: any;
       let persistedSettings: Record<string, unknown> = {};
       const mutateMock = vi.fn().mockImplementation(async (_ns: string, ops: any[]) => {
@@ -445,9 +588,9 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
       });
 
       let currentConfig: BridgePluginConfig = {
-        ws_port: 8080,
-        ws_token: 'existing_token',
-        bot_qq: '',
+        markdown_enabled: true,
+        input_notify_enabled: true,
+        image_ttl_days: 7,
         persona: '',
       };
 
@@ -471,16 +614,19 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
       };
 
       const reconcileMock = vi.fn().mockImplementation(async (payload) => {
-        currentConfig = { ...currentConfig, ...payload };
+        if (payload) currentConfig = { ...currentConfig, ...payload };
       });
 
-      registerConfigRoute(mockCtx, () => currentConfig, reconcileMock);
+      registerConfigRoute(mockCtx, () => currentConfig, reconcileMock, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
 
-      // 1. 模拟保存包含 bot_qq、persona 与 ws_port 的修改
       const saveReq = createMockReq('POST', {
-        ws_port: 9876,
-        bot_qq: '1000000023',
-        persona: '猫娘助手',
+        markdown_enabled: false,
+        image_ttl_days: 21,
+        persona: '元气伙伴',
       });
       const { res: saveRes, getResult: getSaveResult } = createMockRes();
       await handler(saveReq, saveRes);
@@ -489,10 +635,9 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
       expect(saveResult.status).toBe(200);
       expect(saveResult.body.ok).toBe(true);
       expect(mutateMock).toHaveBeenCalled();
-      expect(persistedSettings.bot_qq).toBe('1000000023');
-      expect(persistedSettings.persona).toBe('猫娘助手');
+      expect(persistedSettings.markdown_enabled).toBe(false);
+      expect(persistedSettings.persona).toBe('元气伙伴');
 
-      // 2. 模拟面板关闭后重新打开发送 GET 请求读取配置
       const readReq = createMockReq('GET');
       const { res: readRes, getResult: getReadResult } = createMockRes();
       await handler(readReq, readRes);
@@ -500,9 +645,9 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/dsh-napcat-bri
 
       expect(readResult.status).toBe(200);
       expect(readResult.body.ok).toBe(true);
-      expect(readResult.body.config.bot_qq).toBe('1000000023');
-      expect(readResult.body.config.ws_port).toBe(9876);
-      expect(readResult.body.config.persona).toBe('猫娘助手');
+      expect(readResult.body.config.markdown_enabled).toBe(false);
+      expect(readResult.body.config.image_ttl_days).toBe(21);
+      expect(readResult.body.config.persona).toBe('元气伙伴');
     });
   });
 

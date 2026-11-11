@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 检索表情包工具 (list_faces)
+ * kujira: 检索表情包工具 (list_faces)
  */
 
 import * as path from 'node:path';
@@ -27,9 +27,9 @@ import {
 export type { ListFacesParams, ListFacesResult, FaceSummaryItem };
 
 /**
- * 6.9 检索表情包工具 (list_faces)
+ * 检索表情包工具 (list_faces)
  * 按情绪 (mood) 或内容标签 (tag) 检索本地可用表情包。
- * 强制分页，仅返回语义元数据 (id, tags, mood, format)，坚决不出 URL。
+ * 强制分页，返回语义元数据 (id, tags, mood, format, file_path)，严格符合 Lossless JSON。
  */
 export async function listFaces(
   params: ListFacesParams,
@@ -39,7 +39,7 @@ export async function listFaces(
   const limit = normalizeLimit(params?.limit, 100, 100);
   const ctx = { ...getGlobalToolContext(), ...context };
   if (!ctx.db) {
-    return {
+    return toLosslessJson({
       faces: [],
       total: 0,
       total_matched: 0,
@@ -47,7 +47,7 @@ export async function listFaces(
       limit,
       has_more: false,
       message: '数据库不可用，暂时无法检索表情包。',
-    };
+    });
   }
   const queryRes = ctx.db.queryFaces({
     query: params?.query,
@@ -77,19 +77,17 @@ export async function listFaces(
   });
 
   const hasMore = offset + faces.length < queryRes.total;
-  let message: string | undefined;
-  if (queryRes.total === 0) {
-    message = '未找到符合条件的表情包。';
-  } else {
-    message = buildOffsetMessage({
-      offset,
-      returned: faces.length,
-      totalMatched: queryRes.total,
-      hasMore,
-      ...(hasMore ? { nextOffset: offset + faces.length } : {}),
-      unit: '个表情',
-    });
-  }
+  const message =
+    queryRes.total === 0
+      ? '未找到符合条件的表情包。'
+      : buildOffsetMessage({
+          offset,
+          returned: faces.length,
+          totalMatched: queryRes.total,
+          hasMore,
+          ...(hasMore ? { nextOffset: offset + faces.length } : {}),
+          unit: '个表情',
+        });
 
   const res: ListFacesResult = {
     faces,
@@ -124,7 +122,7 @@ export function createListFacesTool(context?: ContextSource): ToolDefinition {
       },
       untagged: {
         type: 'boolean',
-        description: '是否只检索尚未打标的表情（默认 false）。设为 true 可配合读图查看并调用 collect_face 进行补标。',
+        description: '是否只检索尚未打标的表情（默认 false）。设为 true 可配合读图查看并调用 manage_faces 进行补标。',
       },
       offset: {
         type: 'number',
@@ -166,7 +164,10 @@ export function createListFacesTool(context?: ContextSource): ToolDefinition {
     },
     async execute(args, _exec) {
       const resolved = resolveToolContext(context);
-      const res = await listFaces(args, { db: resolved.db, dshHome: resolved.dshHome });
+      const res = await listFaces(args as ListFacesParams, {
+        db: resolved.db,
+        dshHome: resolved.dshHome,
+      });
       return toLosslessJson(res) as any;
     },
   });

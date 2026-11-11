@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 资源文件传输类工具集
+ * kujira: 资源文件收发工具集
  */
 
 export * from './fetch-resource.js';

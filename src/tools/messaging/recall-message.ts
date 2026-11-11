@@ -1,32 +1,41 @@
 /**
- * dsh-napcat-bridge: 撤回 QQ 消息工具 (recall_message)
+ * kujira: 撤回 QQ 单聊消息工具 (recall_message)
  */
 
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
+import type { RecallMessageParams, RecallMessageResult } from '../../types/index.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
   getGlobalToolContext,
   resolveToolContext,
   normalizePeer,
+  isKujiraUserPeer,
+  resolveSessionPeerFromExec,
+  resolveOutboundBridge,
 } from '../common/context.js';
 import { toLosslessJson } from '../../utils/lossless-json.js';
 
-export interface RecallMessageParams {
-  message_id: number | string;
-}
+export type { RecallMessageParams, RecallMessageResult };
 
-export interface RecallMessageResult {
-  success: boolean;
-  message?: string;
-  error?: string;
+function formatRecallFailure(code: string | number | undefined, fallbackMessage?: string): string {
+  const codeStr = code !== undefined ? String(code) : '';
+  if (codeStr === '40064004') {
+    return '撤回失败 (40064004): 已超出 QQ 官方单聊消息 2 分钟（120 秒）撤回硬时限，无法撤回该消息。';
+  }
+  if (codeStr === '40061002') {
+    return '撤回失败 (40061002): 请求参数 message_id 无效，仅可撤回机器人自身发出的出站消息 ID（不可撤回用户发来的入站消息 ID）。';
+  }
+  if (codeStr === '40061001') {
+    return '撤回失败 (40061001): 请求参数 message_id 非法或目标消息不存在。';
+  }
+  const codeTag = codeStr ? ` (${codeStr})` : '';
+  return `撤回失败${codeTag}: ${fallbackMessage || '可能消息已超过 2 分钟撤回时限或非本机出站消息。'}`;
 }
 
 /**
- * 6.13 撤回 QQ 消息工具 (recall_message)
- * 撤回当前 QQ 会话中的指定消息。
- * 依托 QQ / NapCat 原生时效（2分钟）与群管权限校验，如实反馈执行结果。
- * 执行时经由 per-peer 串行队列下发，确保出站时序严谨。
+ * 撤回 QQ 单聊出站消息 (recall_message)
+ * 调用 DELETE /v2/users/{openid}/messages/{message_id}（严格 120 秒时限，仅可撤回机器人自身出站消息 ID）。
  */
 export async function recallMessage(
   params: RecallMessageParams,
@@ -34,68 +43,56 @@ export async function recallMessage(
 ): Promise<RecallMessageResult> {
   const ctx = { ...getGlobalToolContext(), ...context };
 
-  // 1. 参数校验
-  if (
-    !params ||
-    params.message_id === undefined ||
-    params.message_id === null ||
-    String(params.message_id).trim() === ''
-  ) {
+  // 1. 参数校验：Official Bot 出站 ID 为非空字符串（如 ROBOT1.0_...），严禁强转整数
+  if (!params || typeof params.message_id !== 'string' || params.message_id.trim() === '') {
     return toLosslessJson({
       success: false,
-      error: '请提供需要撤回的消息 ID (message_id)。',
+      error: '请提供需要撤回的出站消息 ID 字符串 (message_id，如 ROBOT1.0_...)。',
     });
   }
+  const msgId = params.message_id.trim();
 
-  const rawId =
-    typeof params.message_id === 'number'
-      ? params.message_id
-      : Number(String(params.message_id).trim());
-
-  if (!Number.isSafeInteger(rawId) || rawId === 0) {
-    return toLosslessJson({
-      success: false,
-      error: `无效的消息 ID: ${params.message_id}，必须为非零有效整数。`,
-    });
-  }
-
-  // 2. 网关校验
-  if (!ctx.gateway) {
-    return toLosslessJson({
-      success: false,
-      error: 'NapCat Gateway 未连接',
-    });
-  }
-
-  // 3. 经由 per-peer 串行队列下发，保证发送与撤回的时序一致性
+  // 2. 单聊会话校验
   const peer = ctx.peer ? normalizePeer(ctx.peer) : '';
-  const sendTask = () => ctx.gateway!.deleteMsg(rawId);
+  if (!isKujiraUserPeer(peer)) {
+    return toLosslessJson({
+      success: false,
+      error: 'recall_message 需在 QQ 单聊会话中执行',
+    });
+  }
+
+  // 3. 解析 OutboundStreamBridge
+  const bridge = resolveOutboundBridge({ ...ctx, peer });
+  if (!bridge) {
+    return toLosslessJson({
+      success: false,
+      error: 'QQ Gateway 未连接',
+    });
+  }
+
+  // 4. 经由 per-peer 串行队列下发，确保与发送/媒体消息的出站时序一致
+  const serialSender = !ctx.outboundBridge && ctx.sender ? ctx.sender : bridge.getSender();
+  const task = () =>
+    bridge.recallMessage(peer, msgId, {
+      ...(ctx.openid ? { openid: ctx.openid } : {}),
+    });
 
   try {
-    const res =
-      peer && ctx.sender
-        ? await ctx.sender.enqueue(peer, sendTask)
-        : await sendTask();
-
-    if (res && (res.status === 'ok' || res.retcode === 0)) {
-      // 撤回成功立即标记本地记录：不依赖 NapCat 是否回流自身撤回 notice，
-      // 自身消息保留原文（markRecalled 内部按 self 区分）。
+    const res = await serialSender.enqueue(peer, task);
+    if (res.ok) {
+      // 幂等补记本地 db（当外层传入独立的 ctx.db 而 bridge 未绑定同一 db 时兜底）
       try {
-        ctx.db?.markRecalled(rawId);
+        ctx.db?.markRecalled?.(msgId);
       } catch {}
       return toLosslessJson({
         success: true,
-        message: `消息已成功撤回 (ID: ${rawId})。`,
+        message: `消息已成功撤回 (ID: ${msgId})。`,
       });
     }
 
-    const reason =
-      res?.wording ||
-      res?.message ||
-      '撤回失败，可能消息发送已超过 2 分钟或无权撤回该消息。';
     return toLosslessJson({
       success: false,
-      error: `撤回失败: ${reason}`,
+      error: formatRecallFailure(res.code, res.message),
     });
   } catch (err: any) {
     return toLosslessJson({
@@ -109,13 +106,13 @@ export function createRecallMessageTool(context?: ContextSource): ToolDefinition
   return defineTool({
     name: 'recall_message',
     description:
-      '撤回当前 QQ 会话中的指定消息。适用于：撤回自己发错/产生幻觉/格式错误的消息，或在具备管理员权限时撤回群友的违规发言。需要传入目标消息的数字 message_id（可来自 send_qq_message 的返回结果，或来自 read_chat_history 的消息头 [消息ID: xxx]）。受 QQ 平台客观限制（如普通消息仅 2 分钟内可撤回、撤回他人需群管权限等），若超过时限或无权撤回将如实报错。',
+      '撤回当前 QQ 单聊会话中机器人自身发出的指定消息。适用于撤回自己发错、产生幻觉或格式错误的消息。需要传入目标出站消息的完整字符串 message_id（如 ROBOT1.0_...，来自 send_qq_message / send_file / send_face 返回的 message_id 或 read_chat_history 中的 msg_id）。受 QQ 官方单聊硬性限制，仅支持在发送后 2 分钟（120 秒）内撤回机器人自身发出的消息，超时（40064004）或传入用户入站消息 ID（40061002）将如实报错。',
     parameters: {
       message_id: {
-        oneOf: [{ type: 'number' }, { type: 'string' }],
+        type: 'string',
         required: true,
         description:
-          '需要撤回的目标消息数字 ID（来自 send_qq_message 返回的 message_id 或 read_chat_history 中的消息头 [消息ID: xxx]）。',
+          '需要撤回的机器人自身出站消息 ID 字符串（如 ROBOT1.0_...，来自 send_qq_message 返回的 message_id 或 read_chat_history 中的 msg_id）。',
       },
     },
     output: {
@@ -139,19 +136,11 @@ export function createRecallMessageTool(context?: ContextSource): ToolDefinition
       },
     },
     async execute(args, exec) {
-      const session = (exec.agent as any)?.session;
-      const rawPeer =
-        session?.id ||
-        (exec.agent as any)?.sessionId ||
-        (exec.agent as any)?.id ||
-        '';
-      const peer = normalizePeer(rawPeer);
       const resolved = resolveToolContext(context);
-      const res = await recallMessage(args as any, {
+      const peer = resolveSessionPeerFromExec(exec, resolved.peer);
+      const res = await recallMessage(args as RecallMessageParams, {
         ...resolved,
-        gateway: resolved.gateway,
-        sender: resolved.sender,
-        peer: peer || resolved.peer,
+        peer,
       });
       return toLosslessJson(res) as any;
     },

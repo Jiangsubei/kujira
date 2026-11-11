@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 审批与提问模块公共导出入口
+ * kujira: 审批与提问模块公共导出入口
  */
 
 export * from './question-provider.js';

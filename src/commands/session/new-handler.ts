@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: /新建 命令处理器
+ * kujira: /新建 命令处理器
  */
 
 import type { CommandContext, CommandResult } from '../types.js';

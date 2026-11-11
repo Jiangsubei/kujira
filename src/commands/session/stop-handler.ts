@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: /停止 命令处理器
+ * kujira: /停止 命令处理器
  */
 
 import { safeGetService } from '../../gateway/session/agent-runner.js';

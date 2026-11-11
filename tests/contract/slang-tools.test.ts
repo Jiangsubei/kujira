@@ -48,6 +48,8 @@ describe('Slang Tools Contract Tests', () => {
       const queryDef = defs.find((d) => d.name === 'query_slang')!;
 
       expect(queryDef.description).not.toContain('#');
+      expect(queryDef.description).not.toContain('社群');
+      expect(queryDef.description).not.toContain('群专属规则');
       expect(queryDef.description).toContain('完整释义与典型使用例句');
       expect(queryDef.description).toContain('联网搜索');
 
@@ -61,6 +63,8 @@ describe('Slang Tools Contract Tests', () => {
       const recordDef = defs.find((d) => d.name === 'record_slang')!;
 
       expect(recordDef.description).not.toContain('#');
+      expect(recordDef.description).not.toContain('社群');
+      expect(recordDef.description).not.toContain('群专属规则');
       expect(recordDef.description).toContain('记录并收录跨会话通用的网络梗');
       expect(recordDef.description).toContain('manage_slang');
 
@@ -85,6 +89,8 @@ describe('Slang Tools Contract Tests', () => {
       const manageDef = defs.find((d) => d.name === 'manage_slang')!;
 
       expect(manageDef.description).not.toContain('#');
+      expect(manageDef.description).not.toContain('社群');
+      expect(manageDef.description).not.toContain('群专属规则');
       expect(manageDef.description).toContain('全局黑话知识库');
       expect(manageDef.description).toContain('record_slang');
 
@@ -372,7 +378,28 @@ describe('Slang Tools Contract Tests', () => {
   });
 
   describe('DSH Lossless JSON 契约测试 (Lossless JSON Compliance)', () => {
-    it('record_slang execute 输出严格符合 DSH Lossless JSON 约束 (无任何 undefined 键)', async () => {
+    function assertNoUndefinedFields(obj: unknown, currentPath = ''): void {
+      if (obj === undefined) {
+        throw new Error(`Found undefined at path: "${currentPath}"`);
+      }
+      if (obj === null) return;
+      if (Array.isArray(obj)) {
+        obj.forEach((item, idx) => assertNoUndefinedFields(item, `${currentPath}[${idx}]`));
+        return;
+      }
+      if (typeof obj === 'object') {
+        for (const key of Object.keys(obj as Record<string, unknown>)) {
+          const val = (obj as Record<string, unknown>)[key];
+          const nextPath = currentPath ? `${currentPath}.${key}` : key;
+          if (val === undefined) {
+            throw new Error(`Found undefined field: "${nextPath}"`);
+          }
+          assertNoUndefinedFields(val, nextPath);
+        }
+      }
+    }
+
+    it('record_slang execute 输出严格符合 DSH Lossless JSON 约束 (递归绝无 undefined)', async () => {
       const defs = createSlangToolDefinitions(storage);
       const recordDef = defs.find((d) => d.name === 'record_slang')!;
 
@@ -384,14 +411,20 @@ describe('Slang Tools Contract Tests', () => {
       });
 
       expect(result.success).toBe(true);
-      // 遍历所有顶层及嵌套属性，绝无 undefined
-      for (const [key, value] of Object.entries(result)) {
-        expect(value).not.toBeUndefined();
-      }
+      assertNoUndefinedFields(result);
       // 未触发淘汰时，evicted_term 经过清洗后绝不存在
-      expect(result.hasOwnProperty('evicted_term')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result, 'evicted_term')).toBe(false);
       // 无损 JSON 序列化幂等验证
       expect(JSON.stringify(result)).toBe(JSON.stringify(JSON.parse(JSON.stringify(result))));
+
+      const failResult = await (recordDef as any).execute({
+        term: '',
+        tags: '测试',
+        definition: '释义',
+        example: '例句',
+      });
+      expect(failResult.success).toBe(false);
+      assertNoUndefinedFields(failResult);
     });
 
     it('query_slang execute 输出严格符合 DSH Lossless JSON 约束', async () => {
@@ -403,35 +436,42 @@ describe('Slang Tools Contract Tests', () => {
       // 1. 成功查询
       const resSuccess = await (queryDef as any).execute({ term: '牢大' });
       expect(resSuccess.success).toBe(true);
-      for (const [_k, v] of Object.entries(resSuccess)) {
-        expect(v).not.toBeUndefined();
-      }
+      assertNoUndefinedFields(resSuccess);
 
       // 2. 失败查询
       const resFail = await (queryDef as any).execute({ term: '未收录词' });
       expect(resFail.success).toBe(false);
-      for (const [_k, v] of Object.entries(resFail)) {
-        expect(v).not.toBeUndefined();
-      }
+      assertNoUndefinedFields(resFail);
     });
 
-    it('manage_slang execute 输出严格符合 DSH Lossless JSON 约束', async () => {
+    it('manage_slang execute 输出严格符合 DSH Lossless JSON 约束 (list, edit, delete)', async () => {
       const defs = createSlangToolDefinitions(storage);
       const manageDef = defs.find((d) => d.name === 'manage_slang')!;
+
+      await recordSlang({ term: '开香槟', tags: '梗', definition: '提前庆祝', example: '别急' }, storage);
 
       // 1. list
       const resList = await (manageDef as any).execute({ action: 'list' });
       expect(resList.success).toBe(true);
-      for (const [_k, v] of Object.entries(resList)) {
-        expect(v).not.toBeUndefined();
-      }
+      assertNoUndefinedFields(resList);
 
-      // 2. delete
+      // 2. edit
+      const resEdit = await (manageDef as any).execute({
+        action: 'edit',
+        term: '开香槟',
+        definition: '提前庆祝结果翻车',
+      });
+      expect(resEdit.success).toBe(true);
+      assertNoUndefinedFields(resEdit);
+
+      // 3. delete 成功与失败
+      const resDelOk = await (manageDef as any).execute({ action: 'delete', term: '开香槟' });
+      expect(resDelOk.success).toBe(true);
+      assertNoUndefinedFields(resDelOk);
+
       const resDel = await (manageDef as any).execute({ action: 'delete', term: '不存在的词' });
       expect(resDel.success).toBe(false);
-      for (const [_k, v] of Object.entries(resDel)) {
-        expect(v).not.toBeUndefined();
-      }
+      assertNoUndefinedFields(resDel);
     });
   });
 });

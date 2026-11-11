@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 会话模型同步互斥链模块
+ * kujira: 会话模型同步互斥链模块
  */
 
 import type { Context } from '@deepseek-ai/cordis';

@@ -12,7 +12,9 @@ import { TaskScheduler } from '../../src/scheduler/index.js';
 import {
   createScheduleTaskTool,
   createManageScheduledTasksTool,
+  normalizePeer,
 } from '../../src/tools/scheduler.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
 /** 递归检查对象是否包含 undefined 字段 (DSH Lossless JSON 契约) */
 function assertNoUndefinedFields(obj: any, path = ''): void {
@@ -50,7 +52,7 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
     scheduler = new TaskScheduler({
       db,
       dispatchWakeup: async () => {},
-      configGetter: () => ({ proactive_night_dnd: false }),
+      configGetter: () => ({}),
     });
   });
 
@@ -62,16 +64,20 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('契约 1: 工具描述契约验证 (包含 When to use / When not to use，无标题一整段)', () => {
-    const scheduleTool = createScheduleTaskTool(() => ({ scheduler, peer: 'group_test' }));
-    const manageTool = createManageScheduledTasksTool(() => ({ scheduler, peer: 'group_test' }));
+  it('契约 1: 工具描述契约验证 (单聊语境、包含 When to use / When not to use、无群聊词、无标题)', () => {
+    const scheduleTool = createScheduleTaskTool(() => ({ scheduler, peer: 'user_test_1' }));
+    const manageTool = createManageScheduledTasksTool(() => ({ scheduler, peer: 'user_test_1' }));
 
     expect(scheduleTool.name).toBe('schedule_task');
+    expect(scheduleTool.description).not.toContain('#');
+    expect(scheduleTool.description).not.toContain('群聊');
     expect(scheduleTool.description).toContain('为当前 QQ 会话创建并排期一个定时唤醒任务');
     expect(scheduleTool.description).toContain('切勿用于编程或本地开发流程中的短期命令执行与耗时等待');
     expect(scheduleTool.description).toContain('wait_for_user_messages');
 
     expect(manageTool.name).toBe('manage_scheduled_tasks');
+    expect(manageTool.description).not.toContain('#');
+    expect(manageTool.description).not.toContain('群聊');
     expect(manageTool.description).toContain('查询、取消或修改当前 QQ 会话中已排期的定时任务');
     expect(manageTool.description).toContain('切勿用于管理宿主操作系统底层的系统级计划任务');
   });
@@ -79,9 +85,9 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
   it('契约 2: schedule_task 工具创建单次任务契约', async () => {
     const scheduleTool = createScheduleTaskTool(() => ({
       scheduler,
-      peer: 'group_contract_1',
-      userId: '10001',
-    }));
+      peer: 'user_contract_1',
+      userId: '1000000001',
+    })) as any;
 
     const result = await scheduleTool.execute({
       prompt: '半小时后提醒我出门',
@@ -96,20 +102,20 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
 
     // 检查数据库中已真实落盘
     const inDb = db.getScheduledTask(result.task_id!);
-    expect(inDb?.peer).toBe('group_contract_1');
+    expect(inDb?.peer).toBe('user_contract_1');
     expect(inDb?.prompt).toBe('半小时后提醒我出门');
   });
 
   it('契约 3: manage_scheduled_tasks 工具 list 契约', async () => {
     const scheduleTool = createScheduleTaskTool(() => ({
       scheduler,
-      peer: 'group_contract_2',
-      userId: '10001',
-    }));
+      peer: 'user_contract_2',
+      userId: '1000000001',
+    })) as any;
     const manageTool = createManageScheduledTasksTool(() => ({
       scheduler,
-      peer: 'group_contract_2',
-    }));
+      peer: 'user_contract_2',
+    })) as any;
 
     // 先创建一个任务
     await scheduleTool.execute({
@@ -133,13 +139,13 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
   it('契约 4: manage_scheduled_tasks 工具 update 与 cancel 契约', async () => {
     const scheduleTool = createScheduleTaskTool(() => ({
       scheduler,
-      peer: 'group_contract_3',
-      userId: '10001',
-    }));
+      peer: 'user_contract_3',
+      userId: '1000000001',
+    })) as any;
     const manageTool = createManageScheduledTasksTool(() => ({
       scheduler,
-      peer: 'group_contract_3',
-    }));
+      peer: 'user_contract_3',
+    })) as any;
 
     const createRes = await scheduleTool.execute({
       prompt: '最初任务',
@@ -172,14 +178,56 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
     expect(listAfterCancel.tasks?.length).toBe(0);
   });
 
+  it('契约 5: 单聊 peer 归一化 (kujira-user-<hash>-r1-2 / openid -> user_<hash>) 与非单聊 peer 拒绝契约', async () => {
+    const hash = 'a1b2c3d4e5f60718';
+    expect(normalizePeer(`kujira-user-${hash}-r1-2`)).toBe(`user_${hash}`);
+    const openid = '11112222333344445555666677778888';
+    expect(normalizePeer(openid)).toBe(openidToPeer(openid));
+
+    const sessionExec = {
+      agent: { session: { id: `kujira-user-${hash}-r1-2` } },
+    };
+    const scheduleTool = createScheduleTaskTool(() => ({ scheduler })) as any;
+    const manageTool = createManageScheduledTasksTool(() => ({ scheduler })) as any;
+
+    const res = await scheduleTool.execute(
+      { prompt: '单聊会话上下文定时提醒', delay_seconds: 120 },
+      sessionExec
+    );
+    expect(res.success).toBe(true);
+    assertNoUndefinedFields(res);
+    const inDb = db.getScheduledTask(res.task_id!);
+    expect(inDb?.peer).toBe(`user_${hash}`);
+
+    const listed = await manageTool.execute({ action: 'list' }, sessionExec);
+    expect(listed.success).toBe(true);
+    expect(listed.tasks).toHaveLength(1);
+
+    // 拒绝 group_* 与 web-* 等非单聊 peer
+    for (const badPeer of ['group_8000000001', 'web-session']) {
+      const badSchedule = createScheduleTaskTool(() => ({ scheduler, peer: badPeer })) as any;
+      const badManage = createManageScheduledTasksTool(() => ({ scheduler, peer: badPeer })) as any;
+
+      const r1 = await badSchedule.execute({ prompt: '不应创建', delay_seconds: 120 });
+      expect(r1.success).toBe(false);
+      expect(r1.error).toContain('缺少有效的当前单聊会话 peer 上下文');
+      assertNoUndefinedFields(r1);
+
+      const r2 = await badManage.execute({ action: 'list' });
+      expect(r2.success).toBe(false);
+      expect(r2.error).toContain('缺少有效的当前单聊会话 peer 上下文');
+      assertNoUndefinedFields(r2);
+    }
+  });
+
   describe('DSH Lossless JSON 契约验证 (Lossless JSON Compliance)', () => {
     it('schedule_task execute 输出严格符合 DSH Lossless JSON 约束 (成功分支与错误分支均绝无 undefined 字段)', async () => {
       // 1. 成功创建单次任务
       const scheduleTool = createScheduleTaskTool(() => ({
         scheduler,
-        peer: 'group_contract_lossless',
-        userId: '10001',
-      }));
+        peer: 'user_contract_lossless',
+        userId: '1000000001',
+      })) as any;
       const successRes = await scheduleTool.execute({
         prompt: '测试提醒',
         delay_seconds: 60,
@@ -192,7 +240,7 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
       const noPeerTool = createScheduleTaskTool(() => ({
         scheduler,
         peer: '',
-      }));
+      })) as any;
       const failRes = await noPeerTool.execute({
         prompt: '测试提醒',
         delay_seconds: 60,
@@ -203,8 +251,8 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
       // 3. 失败分支: 调度器未初始化
       const uninitTool = createScheduleTaskTool(() => ({
         scheduler: null,
-        peer: 'group_contract_lossless',
-      }));
+        peer: 'user_contract_lossless',
+      })) as any;
       const uninitRes = await uninitTool.execute({
         prompt: '测试提醒',
         delay_seconds: 60,
@@ -216,13 +264,13 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
     it('manage_scheduled_tasks execute 输出严格符合 DSH Lossless JSON 约束 (list, update, cancel 与异常分支均绝无 undefined 字段)', async () => {
       const scheduleTool = createScheduleTaskTool(() => ({
         scheduler,
-        peer: 'group_contract_lossless_manage',
-        userId: '10001',
-      }));
+        peer: 'user_contract_lossless_manage',
+        userId: '1000000001',
+      })) as any;
       const manageTool = createManageScheduledTasksTool(() => ({
         scheduler,
-        peer: 'group_contract_lossless_manage',
-      }));
+        peer: 'user_contract_lossless_manage',
+      })) as any;
 
       // 1. list 空列表
       const listEmptyRes = await manageTool.execute({ action: 'list' });
@@ -263,7 +311,7 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
       const noPeerTool = createManageScheduledTasksTool(() => ({
         scheduler,
         peer: '',
-      }));
+      })) as any;
       const noPeerRes = await noPeerTool.execute({ action: 'list' });
       expect(noPeerRes.success).toBe(false);
       assertNoUndefinedFields(noPeerRes);
@@ -271,8 +319,8 @@ describe('契约测试: 定时任务工具集 (Tools Contract)', () => {
       // 6. 错误分支: 调度器未初始化
       const uninitTool = createManageScheduledTasksTool(() => ({
         scheduler: null,
-        peer: 'group_contract_lossless_manage',
-      }));
+        peer: 'user_contract_lossless_manage',
+      })) as any;
       const uninitRes = await uninitTool.execute({ action: 'list' });
       expect(uninitRes.success).toBe(false);
       assertNoUndefinedFields(uninitRes);

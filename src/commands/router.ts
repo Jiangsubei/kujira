@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 斜杠命令分发路由模块
+ * kujira: 斜杠命令分发路由模块
  */
 
 import type { CommandContext, CommandHandler, CommandResult } from './types.js';

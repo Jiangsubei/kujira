@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 黑话管理 HTTP REST API 路由
+ * kujira: 黑话管理 HTTP REST API 路由
  * 为 Web UI 设置卡提供黑话列表获取、二次编辑与删除。
  * 遵循四参数体系：标题 (term) + 标签 (tags) + 释义 (definition) + 例句 (example)。
  */
@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { SlangStorage } from '../slang/storage.js';
 import { sendJson, parseJsonBody, assertHostAuthentication } from './routes.js';
 
-export const SLANG_API_PATH = '/plugins/dsh-napcat-bridge/slang';
+export const SLANG_API_PATH = '/plugins/kujira/slang';
 
 export interface SlangRoutesOptions {
   ctx: Context;
@@ -21,7 +21,7 @@ export function registerSlangRoutes(options: SlangRoutesOptions): () => void {
   let unregisterList: Array<() => void> = [];
   let isDisposed = false;
 
-  // 1. GET & POST /plugins/dsh-napcat-bridge/slang
+  // 1. GET & POST /plugins/kujira/slang
   const slangCollectionHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
     if (!assertHostAuthentication(ctx, req, res)) {
@@ -88,7 +88,7 @@ export function registerSlangRoutes(options: SlangRoutesOptions): () => void {
     sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
   };
 
-  // 2. POST /plugins/dsh-napcat-bridge/slang/edit
+  // 2. POST /plugins/kujira/slang/edit
   const editSlangHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
     if (!assertHostAuthentication(ctx, req, res)) {
@@ -134,7 +134,7 @@ export function registerSlangRoutes(options: SlangRoutesOptions): () => void {
     }
   };
 
-  // 3. POST /plugins/dsh-napcat-bridge/slang/delete
+  // 3. POST /plugins/kujira/slang/delete
   const deleteSlangHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // 宿主身份认证强门控 (Fail-Closed)
     if (!assertHostAuthentication(ctx, req, res)) {

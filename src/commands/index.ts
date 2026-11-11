@@ -1,6 +1,6 @@
 /**
- * dsh-napcat-bridge: 斜杠命令门面模块
- * 管理员白名单门控与命令调度对外入口。
+ * kujira: 斜杠命令门面模块
+ * 面向已接入的 QQ 官方单聊 (C2C) 会话提供全量指令路由分发入口（已移除 admins 白名单鉴权）。
  */
 
 import type { CommandContext, CommandResult } from './types.js';
@@ -24,7 +24,7 @@ export function isSlashCommand(text: string): boolean {
 }
 
 /**
- * 处理斜杠命令并执行管理员门控
+ * 处理单聊斜杠命令并分发至对应指令处理器
  */
 export async function handleSlashCommand(
   commandText: string,
@@ -43,19 +43,5 @@ export async function handleSlashCommand(
   const command = match[1];
   const args = (match[2] || '').trim();
 
-  // 1. 管理员白名单权限门控
-  const admins = (context.admins || []).map((a) => String(a).trim());
-  const user = String(context.userId || '').trim();
-  const isAdmin = admins.length > 0 && admins.includes(user);
-
-  if (!isAdmin) {
-    return {
-      handled: true,
-      success: false,
-      error: '权限不足：仅管理员允许执行指令',
-    };
-  }
-
-  // 2. 命令分发处理
   return await dispatchCommand(command, args, context);
 }

@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: /模型 命令处理器
+ * kujira: /模型 命令处理器
  */
 
 import { safeGetService } from '../../gateway/session/agent-runner.js';
@@ -44,7 +44,7 @@ export async function handleModelCommand(
   const curProv = curSel?.provider || (agent as any)?.options?.provider || 'deepseek-official';
   const curMod = curSel?.model || (agent as any)?.options?.model || 'deepseek-v4-flash';
   const curEffort = curSel?.reasoningEffort;
-  const napcatDefault = context.sessionManager?.getNapcatDefaultModel() || {
+  const kujiraDefault = context.sessionManager?.getKujiraDefaultModel() || {
     provider: curProv,
     model: curMod,
   };
@@ -72,7 +72,7 @@ export async function handleModelCommand(
 
     const reply = [
       `当前会话模型：${curProv} / ${curMod}`,
-      `QQ全局默认：${napcatDefault.provider} / ${napcatDefault.model}`,
+      `Kujira 全局默认：${kujiraDefault.provider} / ${kujiraDefault.model}`,
       `宿主全局默认：${hostDefault.provider} / ${hostDefault.model}`,
       '',
       '可用模型列表：',
@@ -224,18 +224,18 @@ export async function handleModelCommand(
 
   try {
     if (isGlobal) {
-      context.sessionManager?.setNapcatDefaultModel(
+      context.sessionManager?.setKujiraDefaultModel(
         targetProvider,
         targetModel,
         targetEffort
       );
 
-      const allSids = context.sessionManager?.getAllQQSessionIds() || [context.session.id];
+      const allSids = context.sessionManager?.getAllKujiraSessionIds() || [context.session.id];
       for (const sid of allSids) {
         try {
           await safeSyncApiProxy(sid, targetProvider, targetModel, targetEffort);
         } catch (syncErr: any) {
-          context.ctx.logger?.('dsh-napcat-bridge')?.debug?.(
+          context.ctx.logger?.('kujira')?.debug?.(
             `[Command] 全局切换模型同步宿主会话 ${sid} 失败 (已跳过离线/失效会话):`,
             syncErr?.message || syncErr
           );
@@ -246,9 +246,9 @@ export async function handleModelCommand(
         handled: true,
         success: true,
         reply: [
-          `QQ全局模型已切换为：${targetProvider} / ${targetModel}`,
+          `Kujira 全局模型已切换为：${targetProvider} / ${targetModel}`,
           effortDesc ? effortDesc.trim() : '',
-          '范围：已同步切换所有QQ会话，新建会话也将默认使用此模型。',
+          '范围：已同步切换所有单聊会话，新建会话也将默认使用此模型。',
         ].filter(Boolean).join('\n'),
       };
     } else {

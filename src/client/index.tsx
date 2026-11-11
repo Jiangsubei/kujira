@@ -1,11 +1,11 @@
 /**
- * dsh-napcat-bridge Client WebUI Plugin Entry Point
- * Injects NapCat settings card into the DSH Web UI settings.section extension slot.
+ * kujira Client WebUI Plugin Entry Point
+ * Injects Kujira settings section into the DSH Web UI settings.section extension slot.
  */
 
-import { NapCatSettingsSection, NapCatSettingsCard } from './card.js';
+import { KujiraSettingsSection, KujiraSettingsCard } from './card.js';
 
-export const name = 'dsh-napcat-bridge';
+export const name = 'kujira';
 export const inject = ['slots'];
 
 export function apply(ctx: any) {
@@ -16,13 +16,13 @@ export function apply(ctx: any) {
     yield ctx.slots.register(
       {
         name: 'settings.section',
-        id: 'napcat',
+        id: 'kujira',
         order: 55,
-        label: () => 'QQ NapCat',
+        label: () => 'QQ Kujira',
       },
-      NapCatSettingsSection
+      KujiraSettingsSection
     );
   });
 }
 
-export { NapCatSettingsSection, NapCatSettingsCard };
+export { KujiraSettingsSection, KujiraSettingsCard };
