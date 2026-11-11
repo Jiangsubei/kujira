@@ -17,6 +17,7 @@ import {
   classifyAttachment,
   describeAttachment,
   describeInboundAttachments,
+  extractFaceXmlTexts,
   hasFaceXmlTag,
   inferInboundMessageType,
   resolveLocalMediaPath,
@@ -451,5 +452,45 @@ describe('契约测试: <faceType=...> 标签剥离与表情包渲染', () => {
         summary: '动画表情',
       })
     ).toBe('[表情包]');
+  });
+
+  it('契约 16: extractFaceXmlTexts 提取并解码 ext.text，忽略空值与非法输入', () => {
+    expect(
+      extractFaceXmlTexts('<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ==">')
+    ).toEqual(['内有坏猫']);
+
+    // 空 ext 或无 ext
+    expect(extractFaceXmlTexts('<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=6,faceId="0",ext="">')).toEqual([]);
+    expect(extractFaceXmlTexts("<faceType=6,faceId='0',ext=''>")).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=6>')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="eyJ0ZXh0IjoiICAgIn0=">')).toEqual([]);
+
+    // 非法 Base64 / 非法 JSON / 非字符串 text
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="!!!not-base64!!!">')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="YWJj=">')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="YWJj">')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="e30=">')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="eyJ0ZXh0IjoxMjN9">')).toEqual([]);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="bnVsbA==">')).toEqual([]);
+    expect(extractFaceXmlTexts(undefined)).toEqual([]);
+    expect(extractFaceXmlTexts('')).toEqual([]);
+    expect(extractFaceXmlTexts('普通文本')).toEqual([]);
+
+    // 单引号、不带方括号、带空格方括号及多组方括号
+    expect(extractFaceXmlTexts("<faceType=4, ext='eyJ0ZXh0Ijoi5aSn56yRIn0='>")).toEqual(['大笑']);
+    expect(
+      extractFaceXmlTexts('<faceType=4,faceId="",ext="eyJ0ZXh0IjoiICBbIOWdj+eskSBdICAifQ==">')
+    ).toEqual(['坏笑']);
+    expect(extractFaceXmlTexts('<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW2FdW2JdIn0=">')).toEqual([
+      '[a][b]',
+    ]);
+
+    // 多标签混排（跳过空 ext，保留出现顺序）
+    expect(
+      extractFaceXmlTexts(
+        '<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ=="> 哈哈 <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="><faceType=4, ext=\'eyJ0ZXh0IjoiW+W8gOW/g10ifQ==\'>'
+      )
+    ).toEqual(['内有坏猫', '开心']);
   });
 });

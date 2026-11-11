@@ -352,4 +352,95 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
     expect(sanitized).not.toContain('TOP_SECRET_FORWARD_RKEY');
     expect(sanitized).not.toContain('https://multimedia.nt.qq.com.cn');
   });
+
+  it('契约 10: QQ 商城/官方表情 ext.text 兜底展示与自定义表情包附件优先级', async () => {
+    // 1. msg_13 风格无附件商城表情 -> [表情: 内有坏猫]
+    const storeFaceEvent = makeEvent({
+      id: 'ROBOT1.0_msg_13',
+      content: '<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ==">',
+    });
+    const storeFaceDecision = await shouldWakeup(storeFaceEvent, { shortId: 'msg_13' });
+    expect(storeFaceDecision.wakeup).toBe(true);
+    expect(storeFaceDecision.trigger).toBe('direct');
+    expect(storeFaceDecision.payload?.short_id).toBe('msg_13');
+    expect(storeFaceDecision.payload?.content).toBe('[表情: 内有坏猫]');
+
+    // 2. 无 ext 的纯表情仍兜底为 [表情]；空 ext 搭配文字不污染正文
+    expect(parseNormalizedContent(makeEvent({ content: '<faceType=4,faceId="14">' }), [])).toBe('[表情]');
+    expect(
+      parseNormalizedContent(
+        makeEvent({ content: '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 笑死' }),
+        []
+      )
+    ).toBe('笑死');
+
+    // 3. 商城表情搭配正文 / 多商城表情
+    expect(
+      parseNormalizedContent(
+        makeEvent({
+          content: '<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ=="> 哈哈哈',
+        }),
+        []
+      )
+    ).toBe('哈哈哈 [表情: 内有坏猫]');
+    expect(
+      parseNormalizedContent(
+        makeEvent({
+          content:
+            '<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ=="><faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+W8gOW/g10ifQ==">',
+        }),
+        []
+      )
+    ).toBe('[表情: 内有坏猫] [表情: 开心]');
+
+    // 4. 带 attachments[] 图片的 <faceType=6> 自定义表情包仍产出 [表情包:<local_path>] 且不重复追加 [表情: ...]
+    const stickerEvent = makeEvent({
+      id: 'ROBOT1.0_sticker_001',
+      content: '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">',
+      attachments: [
+        {
+          content_type: 'image/jpeg',
+          filename: 'custom_sticker.jpg',
+          url: 'https://multimedia.nt.qq.com.cn/download?rkey=SECRET',
+        },
+      ],
+    });
+    const stickerDescriptors: AttachmentDescriptor[] = [
+      {
+        kind: 'image',
+        origin: 'inbound',
+        fileName: 'custom_sticker.jpg',
+        local: {
+          path: '/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg',
+          format: 'jpg',
+        },
+      },
+    ];
+    const stickerDecision = await shouldWakeup(stickerEvent, {
+      descriptors: stickerDescriptors,
+    });
+    expect(stickerDecision.wakeup).toBe(true);
+    expect(stickerDecision.payload?.content).toBe(
+      '[表情包:/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg]'
+    );
+
+    // 即使同时存在非空 ext.text，有渲染附件时也不重复输出 [表情: ...]
+    const stickerWithTextExt = makeEvent({
+      content: '<faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ==">',
+      attachments: stickerEvent.attachments,
+    });
+    expect(
+      parseNormalizedContent(stickerWithTextExt, [
+        {
+          kind: 'image',
+          origin: 'inbound',
+          fileName: 'custom_sticker.jpg',
+          local: {
+            path: '/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg',
+            format: 'jpg',
+          },
+        },
+      ])
+    ).toBe('[表情包:/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg]');
+  });
 });

@@ -293,9 +293,13 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       expect(listRes.handled).toBe(true);
       expect(listRes.success).toBe(true);
       expect(listRes.reply).toContain('历史会话列表');
-      expect(listRes.reply).toContain(`3. [当前] 新会话 #3 [kujira-user-${hash}-3]`);
-      expect(listRes.reply).toContain(`2. 新会话 #2 [kujira-user-${hash}-2]`);
-      expect(listRes.reply).toContain(`1. 单聊调试主题 (#1) [kujira-user-${hash}]`);
+      expect(listRes.reply).toContain('3. [当前] 新会话 (#3)');
+      expect(listRes.reply).toContain('2. 新会话 (#2)');
+      expect(listRes.reply).toContain('1. 单聊调试主题');
+      expect(listRes.reply).not.toContain('单聊调试主题 (#1)');
+      expect(listRes.reply).not.toContain(`[kujira-user-${hash}`);
+      expect(listRes.reply).toContain('- 按标题切换：/会话 <标题或关键字>');
+      expect(listRes.reply).not.toContain('按标题或标识切换');
       expect(listRes.reply).not.toContain('私聊:');
       expect(listRes.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
 
@@ -307,10 +311,10 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
         sessionManager,
       });
       expect(resume1Res.success).toBe(true);
-      expect(resume1Res.reply).toContain(`已切换到会话：单聊调试主题 (#1) [kujira-user-${hash}]`);
+      expect(resume1Res.reply).toBe('已切换到会话：单聊调试主题');
       expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}`);
 
-      // 2. 按版本标签切换
+      // 2. 按版本标签切换（存在重名「新会话」时包含 (#2) 后缀）
       const resumeTagRes = await handleSlashCommand('/会话 #2', {
         userId: peer,
         session: s1,
@@ -318,7 +322,7 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
         sessionManager,
       });
       expect(resumeTagRes.success).toBe(true);
-      expect(resumeTagRes.reply).toContain(`已切换到会话：新会话 #2 [kujira-user-${hash}-2]`);
+      expect(resumeTagRes.reply).toBe('已切换到会话：新会话 (#2)');
       expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-2`);
 
       // 3. 按原生 AI 标题关键字模糊切换
@@ -329,10 +333,10 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
         sessionManager,
       });
       expect(resumeAiTitleRes.success).toBe(true);
-      expect(resumeAiTitleRes.reply).toContain(`已切换到会话：单聊调试主题 (#1) [kujira-user-${hash}]`);
+      expect(resumeAiTitleRes.reply).toBe('已切换到会话：单聊调试主题');
       expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}`);
 
-      // 4. 按 sessionId 关键字模糊切换
+      // 4. 按 sessionId 关键字模糊切换（兼容回退，但回执不暴露标识）
       const resumeSidRes = await handleSlashCommand(`/会话 ${hash}-3`, {
         userId: peer,
         session: s1,
@@ -340,7 +344,7 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
         sessionManager,
       });
       expect(resumeSidRes.success).toBe(true);
-      expect(resumeSidRes.reply).toContain(`已切换到会话：新会话 #3 [kujira-user-${hash}-3]`);
+      expect(resumeSidRes.reply).toBe('已切换到会话：新会话 (#3)');
       expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-3`);
 
       if (renameSpy) {
@@ -348,6 +352,135 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       }
     } finally {
       renameSpy?.mockRestore();
+      await sessionManager.dispose();
+    }
+  });
+
+  it('契约 7b: /会话 与 /状态 仅在存在同名会话时追加 (#N) 版本后缀，无重名不带 (#1)，且同名切换引导选择版本', async () => {
+    const sessionManager = new SessionManager(booted.ctx, tmpHome);
+    const hash = 'a1b2c3d4e5f60006';
+    const peer = `user_${hash}`;
+
+    try {
+      const a1 = await sessionManager.getOrCreateAgent(peer);
+      a1.session.append('session/title', {
+        title: '工作讨论',
+        messageSeqs: [],
+        source: { kind: 'fallback' },
+      });
+      await booted.ctx.sessions.flush(a1.session);
+
+      // 仅有一个无重名会话时：不展示 (#1)，且输入 #1 不误命中无后缀标题
+      const singleStatus = await handleSlashCommand('/状态', {
+        userId: peer,
+        session: a1.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(singleStatus.success).toBe(true);
+      expect(singleStatus.reply).toContain('当前会话：工作讨论');
+      expect(singleStatus.reply).not.toContain('工作讨论 (#1)');
+      expect(singleStatus.reply).not.toContain('会话标识');
+
+      const singleTagSwitch = await handleSlashCommand('/会话 #1', {
+        userId: peer,
+        session: a1.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(singleTagSwitch.success).toBe(false);
+      expect(singleTagSwitch.error).toContain('未找到匹配的会话');
+
+      // 创建第 2、第 3 个会话，形成两个同名「日常闲聊」和一个无重名「工作讨论」
+      sessionManager.markSessionCleared(peer);
+      const a2 = await sessionManager.getOrCreateAgent(peer);
+      a2.session.append('session/title', {
+        title: '日常闲聊',
+        messageSeqs: [],
+        source: { kind: 'fallback' },
+      });
+      await booted.ctx.sessions.flush(a2.session);
+
+      sessionManager.markSessionCleared(peer);
+      const a3 = await sessionManager.getOrCreateAgent(peer);
+      a3.session.append('session/title', {
+        title: '日常闲聊',
+        messageSeqs: [],
+        source: { kind: 'fallback' },
+      });
+      await booted.ctx.sessions.flush(a3.session);
+
+      const listRes = await handleSlashCommand('/会话', {
+        userId: peer,
+        session: a3.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(listRes.success).toBe(true);
+      expect(listRes.reply).toContain('3. [当前] 日常闲聊 (#3)');
+      expect(listRes.reply).toContain('2. 日常闲聊 (#2)');
+      expect(listRes.reply).toContain('1. 工作讨论');
+      expect(listRes.reply).not.toContain('工作讨论 (#1)');
+      expect(listRes.reply).not.toContain(`[kujira-user-${hash}`);
+
+      const dupStatus = await handleSlashCommand('/状态', {
+        userId: peer,
+        session: a2.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(dupStatus.success).toBe(true);
+      expect(dupStatus.reply).toContain('当前会话：日常闲聊 (#2)');
+      expect(dupStatus.reply).not.toContain('会话标识');
+
+      const uniqueStatus = await handleSlashCommand('/状态', {
+        userId: peer,
+        session: a1.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(uniqueStatus.success).toBe(true);
+      expect(uniqueStatus.reply).toContain('当前会话：工作讨论');
+      expect(uniqueStatus.reply).not.toContain('工作讨论 (#1)');
+      expect(uniqueStatus.reply).not.toContain('会话标识');
+
+      // 同名标题直接切换：返回多匹配候选列表，引导按序号或完整带版本标题切换
+      const ambiguousRes = await handleSlashCommand('/会话 日常闲聊', {
+        userId: peer,
+        session: a1.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(ambiguousRes.success).toBe(false);
+      expect(ambiguousRes.error).toContain('发现多个匹配的会话');
+      expect(ambiguousRes.error).toContain('/会话 <序号>');
+      expect(ambiguousRes.error).toContain('/会话 日常闲聊 (#3)');
+      expect(ambiguousRes.error).toContain('- 2. 日常闲聊 (#2)');
+      expect(ambiguousRes.error).toContain('- 3. 日常闲聊 (#3)');
+      expect(ambiguousRes.error).not.toContain(`[kujira-user-${hash}`);
+
+      // 输入完整带版本标题可直接命中切换
+      const exactDupRes = await handleSlashCommand('/会话 日常闲聊 (#2)', {
+        userId: peer,
+        session: a3.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(exactDupRes.success).toBe(true);
+      expect(exactDupRes.reply).toBe('已切换到会话：日常闲聊 (#2)');
+      expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-2`);
+
+      // 按序号也可直接切换
+      const byNumRes = await handleSlashCommand('/会话 3', {
+        userId: peer,
+        session: a2.session,
+        ctx: booted.ctx,
+        sessionManager,
+      });
+      expect(byNumRes.success).toBe(true);
+      expect(byNumRes.reply).toBe('已切换到会话：日常闲聊 (#3)');
+      expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-3`);
+    } finally {
       await sessionManager.dispose();
     }
   });
@@ -485,13 +618,14 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     const idleReply = idleRes.reply!;
     expect(idleReply).toContain('【当前会话状态】');
     expect(idleReply).toContain('网关状态：已连接 (KujiraBot (1000000001))');
-    expect(idleReply).toContain('当前会话：新会话 (#1)');
+    expect(idleReply).toContain('当前会话：新会话');
+    expect(idleReply).not.toContain('新会话 (#1)');
     expect(idleReply).toContain('运行状态：空闲');
     expect(idleReply).toContain('当前模型：deepseek-official / deepseek-v4-pro');
     expect(idleReply).toContain('思考等级：high');
     expect(idleReply).toContain('权限模式：完全');
     expect(idleReply).toContain('上下文用量：');
-    expect(idleReply).toContain('会话标识：kujira-user-a1b2c3d4e5f60020 (版本: 1)');
+    expect(idleReply).not.toContain('会话标识');
     expect(idleReply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
 
     gatewayConnected = false;

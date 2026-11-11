@@ -151,7 +151,7 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
       expect(sessionManager.getSessionDisplayName(SID)).toBe('QQ 单聊架构设计');
     });
 
-    it('/状态 与 /会话 分别展示 AI 标题、轮次标签并在无标题时回退「新会话」', async () => {
+    it('/状态 与 /会话 无重名时不展示 (#1) 与会话标识，并在无标题时回退「新会话」', async () => {
       await sessionManager.getOrCreateAgent(PEER);
       titleStore.set(SID, '排查 WebSocket 重连');
 
@@ -162,8 +162,9 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
         sessionManager,
       });
       expect(statusRes.success).toBe(true);
-      expect(statusRes.reply).toContain('当前会话：排查 WebSocket 重连 (#1)');
-      expect(statusRes.reply).toContain(`会话标识：${SID} (版本: 1)`);
+      expect(statusRes.reply).toContain('当前会话：排查 WebSocket 重连');
+      expect(statusRes.reply).not.toContain('(#1)');
+      expect(statusRes.reply).not.toContain('会话标识');
 
       const listRes = await handleSessionCommand('', {
         userId: PEER,
@@ -172,7 +173,9 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
         sessionManager,
       });
       expect(listRes.success).toBe(true);
-      expect(listRes.reply).toContain('排查 WebSocket 重连 (#1)');
+      expect(listRes.reply).toContain('1. [当前] 排查 WebSocket 重连');
+      expect(listRes.reply).not.toContain('(#1)');
+      expect(listRes.reply).not.toContain(`[${SID}]`);
       expect(listRes.reply).not.toContain('私聊:');
 
       titleStore.delete(SID);
@@ -182,7 +185,109 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
         ctx,
         sessionManager,
       });
-      expect(fallbackStatus.reply).toContain('当前会话：新会话 (#1)');
+      expect(fallbackStatus.reply).toContain('当前会话：新会话');
+      expect(fallbackStatus.reply).not.toContain('(#1)');
+      expect(fallbackStatus.reply).not.toContain('会话标识');
+    });
+
+    it('同一 peer 存在同名会话（含多个未命名「新会话」）时展示 (#N) 并支持按版本切换', async () => {
+      await sessionManager.getOrCreateAgent(PEER);
+      sessionManager.markSessionCleared(PEER);
+      await sessionManager.getOrCreateAgent(PEER);
+      sessionManager.markSessionCleared(PEER);
+      await sessionManager.getOrCreateAgent(PEER);
+
+      titleStore.set(`${SID}-3`, '代码审查');
+
+      // 两个未命名会话同为「新会话」，应展示 (#1)/(#2)，无重名的「代码审查」不带 (#3)
+      const untitledList = await handleSessionCommand('', {
+        userId: PEER,
+        session: { id: `${SID}-3` } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(untitledList.success).toBe(true);
+      expect(untitledList.reply).toContain('3. [当前] 代码审查');
+      expect(untitledList.reply).toContain('2. 新会话 (#2)');
+      expect(untitledList.reply).toContain('1. 新会话 (#1)');
+      expect(untitledList.reply).not.toContain('代码审查 (#3)');
+      expect(untitledList.reply).not.toContain(`[${SID}`);
+
+      // 为前两个会话赋予相同 AI 标题「日常闲聊」
+      titleStore.set(SID, '日常闲聊');
+      titleStore.set(`${SID}-2`, '日常闲聊');
+
+      const dupStatus = await handleStatusCommand('', {
+        userId: PEER,
+        session: { id: SID } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(dupStatus.success).toBe(true);
+      expect(dupStatus.reply).toContain('当前会话：日常闲聊 (#1)');
+      expect(dupStatus.reply).not.toContain('会话标识');
+
+      const uniqueStatus = await handleStatusCommand('', {
+        userId: PEER,
+        session: { id: `${SID}-3` } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(uniqueStatus.success).toBe(true);
+      expect(uniqueStatus.reply).toContain('当前会话：代码审查');
+      expect(uniqueStatus.reply).not.toContain('代码审查 (#3)');
+      expect(uniqueStatus.reply).not.toContain('会话标识');
+
+      const dupList = await handleSessionCommand('', {
+        userId: PEER,
+        session: { id: `${SID}-3` } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(dupList.success).toBe(true);
+      expect(dupList.reply).toContain('3. [当前] 代码审查');
+      expect(dupList.reply).toContain('2. 日常闲聊 (#2)');
+      expect(dupList.reply).toContain('1. 日常闲聊 (#1)');
+      expect(dupList.reply).not.toContain(`[${SID}`);
+
+      const multiMatch = await handleSessionCommand('日常闲聊', {
+        userId: PEER,
+        session: { id: `${SID}-3` } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(multiMatch.success).toBe(false);
+      expect(multiMatch.error).toContain('发现多个匹配的会话');
+      expect(multiMatch.error).toContain('- 1. 日常闲聊 (#1)');
+      expect(multiMatch.error).toContain('- 2. 日常闲聊 (#2)');
+
+      const resumeSpy = vi.spyOn(sessionManager, 'resumeSession').mockReturnValue(true);
+      try {
+        const switchDup2 = await handleSessionCommand('日常闲聊 (#2)', {
+          userId: PEER,
+          session: { id: `${SID}-3` } as any,
+          ctx,
+          sessionManager,
+        });
+        expect(switchDup2).toEqual({
+          handled: true,
+          success: true,
+          reply: '已切换到会话：日常闲聊 (#2)',
+        });
+        expect(resumeSpy).toHaveBeenLastCalledWith(PEER, `${SID}-2`);
+
+        const switchByNum1 = await handleSessionCommand('1', {
+          userId: PEER,
+          session: { id: `${SID}-2` } as any,
+          ctx,
+          sessionManager,
+        });
+        expect(switchByNum1.success).toBe(true);
+        expect(switchByNum1.reply).toBe('已切换到会话：日常闲聊 (#1)');
+        expect(resumeSpy).toHaveBeenLastCalledWith(PEER, SID);
+      } finally {
+        resumeSpy.mockRestore();
+      }
     });
   });
 
