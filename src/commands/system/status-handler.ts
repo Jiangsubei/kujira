@@ -2,7 +2,7 @@
  * kujira: /状态 命令处理器
  */
 
-import { formatSessionVersionTag, parseSessionId } from '../../gateway/session.js';
+import { resolveSessionDisplayLabel } from '../session/title-display.js';
 import { safeGetService } from '../../gateway/session/agent-runner.js';
 import type { GatewayStatus } from '../../gateway/server.js';
 import { formatTokens } from '../utils/usage.js';
@@ -105,22 +105,17 @@ export async function handleStatusCommand(
     } catch {}
   }
 
-  const sessionTitle = sm?.getSessionTitle?.(context.session.id);
-  const sessionTag = formatSessionVersionTag(context.session.id);
-  const parsed = parseSessionId(context.session.id);
-  const versionStr = parsed ? ` (版本: ${parsed.version})` : '';
-  const sessionIdent = `${context.session.id}${versionStr}`;
+  const sessionLabel = resolveSessionDisplayLabel(sm, peer, context.session.id);
 
   const lines = [
     '【当前会话状态】',
     ...(gatewayLine ? [gatewayLine] : []),
-    `当前会话：${sessionTitle || '新会话'} (${sessionTag})`,
+    `当前会话：${sessionLabel}`,
     `运行状态：${statusStr}`,
     `当前模型：${curProv} / ${curMod}`,
     `思考等级：${effortStr}`,
     `权限模式：${zhMode}`,
     `上下文用量：${ctxUsageStr}`,
-    `会话标识：${sessionIdent}`,
   ];
 
   return {

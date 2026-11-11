@@ -34,6 +34,9 @@ export interface MessageMediaFields {
 const IMAGE_FILE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
 const FACE_XML_TAG_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/;
 const FACE_XML_TAG_GLOBAL_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/g;
+const FACE_XML_EXT_ATTR_RE = /(?:^|[\s,])ext\s*=\s*(?:"([^"]*)"|'([^']*)')/;
+const BASE64_FORMAT_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const OUTER_BRACKETS_RE = /^\[([^\[\]\r\n]+)\]$/;
 
 /** 判断文本中是否包含 QQ 网关入站 `<faceType=...>` 原始 XML 标签。 */
 export function hasFaceXmlTag(content?: string): boolean {
@@ -58,6 +61,56 @@ export function stripFaceXmlTags(content?: string): { text: string; hadFaceTag: 
     text: stripped.replace(/[ \t]{2,}/g, ' ').trim(),
     hadFaceTag: true,
   };
+}
+
+function decodeFaceExtText(rawExt: string): string | undefined {
+  const b64 = rawExt.trim();
+  if (b64 === '' || b64.length % 4 === 1 || !BASE64_FORMAT_RE.test(b64)) {
+    return undefined;
+  }
+  if (b64.includes('=') && b64.length % 4 !== 0) {
+    return undefined;
+  }
+
+  try {
+    const decoded = Buffer.from(b64, 'base64').toString('utf8');
+    if (!decoded || decoded.includes('\uFFFD')) return undefined;
+    const parsed: unknown = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const rawText = (parsed as Record<string, unknown>).text;
+    if (typeof rawText !== 'string') return undefined;
+
+    const trimmed = rawText.trim();
+    if (trimmed === '') return undefined;
+    const bracketMatch = OUTER_BRACKETS_RE.exec(trimmed);
+    const unwrapped = (bracketMatch ? bracketMatch[1]! : trimmed).trim();
+    return unwrapped === '' ? undefined : unwrapped;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 从 `<faceType=...,ext="...">` 标签提取并解码 `ext.text` 语义文本（如商城/系统表情名称）。
+ */
+export function extractFaceXmlTexts(content?: string): string[] {
+  if (typeof content !== 'string' || content === '') return [];
+  const tags = content.match(FACE_XML_TAG_GLOBAL_RE);
+  if (!tags || tags.length === 0) return [];
+
+  const texts: string[] = [];
+  for (const tag of tags) {
+    const extMatch = FACE_XML_EXT_ATTR_RE.exec(tag);
+    if (!extMatch) continue;
+    const rawExt = extMatch[1] ?? extMatch[2] ?? '';
+    const extracted = decodeFaceExtText(rawExt);
+    if (extracted) {
+      texts.push(extracted);
+    }
+  }
+  return texts;
 }
 
 function nonEmptyString(value: unknown): string | undefined {

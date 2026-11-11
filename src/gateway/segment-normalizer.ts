@@ -10,7 +10,7 @@
 
 import type { FaceRecord, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
-import { hasFaceXmlTag, stripFaceXmlTags } from '../attachment/classify.js';
+import { extractFaceXmlTexts, hasFaceXmlTag, stripFaceXmlTags } from '../attachment/classify.js';
 import {
   formatFacePlaceholder as renderFacePlaceholder,
   renderAttachment,
@@ -20,7 +20,7 @@ import { computeFileMd5 } from '../storage/media.js';
 import { extractArkDataContent } from './card-parser.js';
 import { sanitizeForwardContentUrls } from './inbound-media.js';
 
-export { hasFaceXmlTag, stripFaceXmlTags };
+export { extractFaceXmlTexts, hasFaceXmlTag, stripFaceXmlTags };
 
 export interface MatchedFaceInfo {
   id: string;
@@ -197,6 +197,11 @@ export function parseNormalizedContent(
   }
   if (renderedAttachments.length > 0) {
     parts.push(...renderedAttachments);
+  } else if (hadFaceTag) {
+    const faceTexts = extractFaceXmlTexts(rawContent);
+    if (faceTexts.length > 0) {
+      parts.push(...faceTexts.map((t) => `[表情: ${t}]`));
+    }
   }
 
   if (parts.length === 0) {
