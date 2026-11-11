@@ -1,0 +1,191 @@
+{
+  "name": "dsh-napcat-bridge",
+  "version": "0.3.5",
+  "description": "DeepSeek Harness × OneBot 11 QQ 桥接套件：既是随叫随到的专业助手，也是懂梗斗图、能学黑话、主动冒泡的灵魂群友。群聊/私聊开箱即用，内置两层记忆、表情资产库与全 WebUI 可视化配置",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./tools": {
+      "types": "./dist/tools/plugin.d.ts",
+      "default": "./dist/tools/plugin.js"
+    },
+    "./client": "./dist/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*": "./locale/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "locale",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "immediately": true,
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-theme"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jiangsubei/dsh-napcat-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jiangsubei/dsh-napcat-bridge/issues"
+  },
+  "homepage": "https://github.com/Jiangsubei/dsh-napcat-bridge#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.12.0",
+    "dsh": ">=0.2.0"
+  },
+  "scripts": {
+    "build": "tsx scripts/sync-patch.ts && tsc && npm run build:client",
+    "build:client": "tsx scripts/build-client.ts",
+    "sync:patch": "tsx scripts/sync-patch.ts",
+    "dev": "pnpm run build && tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "pnpm run build && vitest run",
+    "test:quick": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "typecheck:all": "tsc -p tsconfig.test.json",
+    "check:privacy": "tsx scripts/privacy-guard.ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "napcat",
+    "onebot",
+    "qq",
+    "cordis"
+  ],
+  "author": "nyara",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "js-yaml": "^4.1.0",
+    "ws": "^8.21.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": ">=0.2.0-0",
+    "@deepseek-ai/dsh-agent-instructions": ">=0.2.0-0",
+    "@deepseek-ai/dsh-agent-preset": ">=0.2.0-0",
+    "@deepseek-ai/dsh-app-boot": ">=0.2.0-0",
+    "@deepseek-ai/dsh-base": ">=0.2.0-0",
+    "@deepseek-ai/dsh-commands": ">=0.2.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-0",
+    "@deepseek-ai/dsh-permission-presets": ">=0.2.0-0",
+    "@deepseek-ai/dsh-persona": ">=0.2.0-0",
+    "@deepseek-ai/dsh-session": ">=0.2.0-0",
+    "@deepseek-ai/dsh-settings": ">=0.2.0-0",
+    "@deepseek-ai/dsh-skill-filesystem": ">=0.2.0-0",
+    "@deepseek-ai/dsh-storage": ">=0.2.0-0",
+    "@deepseek-ai/dsh-storage-domain": ">=0.2.0-0",
+    "@deepseek-ai/dsh-storage-json": ">=0.2.0-0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-ask-user": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-bash": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-fs": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-pwsh": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-skill": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-web": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tool-working-directory": ">=0.2.1-0",
+    "@deepseek-ai/dsh-tool-workspace-dependencies": ">=0.2.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-0",
+    "@deepseek-ai/dsh-user-approval": ">=0.2.0-0",
+    "@deepseek-ai/dsh-user-questions": ">=0.2.0-0",
+    "@deepseek-ai/dsh-workspace": ">=0.2.0-0",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-agent-instructions": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent-preset": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-persona": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-skill-filesystem": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-bash": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-fs": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-pwsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-skill": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-web": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-working-directory": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-workspace-dependencies": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-base": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-permission-presets": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-settings": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-storage": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-storage-domain": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-storage-json": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tool-ask-user": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-user-approval": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-user-questions": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-workspace": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "~3.18.5",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.13.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.0"
+  }
+}

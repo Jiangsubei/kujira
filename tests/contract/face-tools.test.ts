@@ -1,0 +1,591 @@
+/**
+ * tests/contract/face-tools.test.ts
+ * 契约测试: Agent 表情工具集 (list_faces, send_face, collect_face) 与门控
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import * as crypto from 'node:crypto';
+import { MessageDatabase } from '../../src/storage/database.js';
+import { PerPeerSerialSender } from '../../src/outbound/queue.js';
+import {
+  listFaces,
+  sendFace,
+  collectFace,
+  registerAgentTools,
+} from '../../src/tools/index.js';
+import { manageFaces } from '../../src/tools/face/manage-faces.js';
+import type { FaceRecord } from '../../src/types/index.js';
+
+describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
+  let tmpDir: string;
+  let dbPath: string;
+  let db: MessageDatabase;
+  let faceDir: string;
+  let sender: PerPeerSerialSender;
+  let mockGateway: any;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-tools-'));
+    dbPath = path.join(tmpDir, 'messages.sqlite');
+    db = new MessageDatabase(dbPath);
+    faceDir = path.join(tmpDir, 'faces');
+    fs.mkdirSync(faceDir, { recursive: true });
+
+    sender = new PerPeerSerialSender();
+    mockGateway = {
+      sendGroupMsg: vi.fn().mockResolvedValue({ status: 'ok', retcode: 0, data: { message_id: 10001 } }),
+      sendPrivateMsg: vi.fn().mockResolvedValue({ status: 'ok', retcode: 0, data: { message_id: 10002 } }),
+    };
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('契约 1: list_faces 分页、标签筛选与绝对路径防泄露', async () => {
+    // 插入 3 张表情，其中 1 张停用
+    db.insertFace({
+      id: 'face_active_1',
+      file_path: '/secret/path/cat.png',
+      md5: 'md5_1',
+      source: 'manual',
+      tags: ['猫猫', '可爱'],
+      mood: '卖萌',
+      enabled: true,
+      size: 1024,
+      format: 'png',
+    });
+    db.insertFace({
+      id: 'face_active_2',
+      file_path: '/secret/path/panda.jpg',
+      md5: 'md5_2',
+      source: 'collect',
+      tags: ['熊猫头', '问号'],
+      mood: '疑惑',
+      enabled: true,
+      size: 2048,
+      format: 'jpg',
+    });
+    db.insertFace({
+      id: 'face_disabled',
+      file_path: '/secret/path/bad.png',
+      md5: 'md5_3',
+      source: 'manual',
+      tags: ['猫猫'],
+      mood: '卖萌',
+      enabled: false, // 停用
+      size: 1024,
+      format: 'png',
+    });
+
+    const res = await listFaces({ mood: '卖萌' }, { db });
+
+    expect(res.faces).toHaveLength(1);
+    expect(res.faces[0].id).toBe('face_active_1');
+    expect(res.faces[0].tags).toEqual(['猫猫', '可爱']);
+    expect(res.faces[0].mood).toBe('卖萌');
+    // 提供本地图片路径，供多模态 Agent 读图与补标
+    expect(res.faces[0].file_path).toBe('/secret/path/cat.png');
+  });
+
+  it('契约 1.1: list_faces 支持 query 综合模糊关键词与 tag/mood 模糊检索', async () => {
+    db.insertFace({
+      id: 'face_active_1',
+      file_path: '/secret/path/cat.png',
+      md5: 'md5_1',
+      source: 'manual',
+      tags: ['猫猫', '可爱'],
+      mood: '卖萌',
+      enabled: true,
+      size: 1024,
+      format: 'png',
+    });
+    db.insertFace({
+      id: 'face_active_2',
+      file_path: '/secret/path/panda.jpg',
+      md5: 'md5_2',
+      source: 'collect',
+      tags: ['熊猫头', '问号'],
+      mood: '疑惑',
+      enabled: true,
+      size: 2048,
+      format: 'jpg',
+    });
+
+    // 1. query 模糊匹配
+    const resQuery = await listFaces({ query: '问号' }, { db });
+    expect(resQuery.faces.map((f) => f.id)).toContain('face_active_2');
+    expect(resQuery.faces.map((f) => f.id)).not.toContain('face_active_1');
+
+    // 2. tag 模糊匹配 (搜 "猫" 可命中 "猫猫")
+    const resTag = await listFaces({ tag: '猫' }, { db });
+    expect(resTag.faces.map((f) => f.id)).toContain('face_active_1');
+
+    // 3. Lossless JSON 检验: 无 undefined，返回值序列化往返一致
+    const serialized = JSON.stringify(resQuery);
+    expect(JSON.parse(serialized)).toEqual(resQuery);
+  });
+
+  it('契约 1.2: list_faces 支持 offset 分页并给出翻页提示', async () => {
+    for (let i = 1; i <= 5; i++) {
+      db.insertFace({
+        id: `face_page_0${i}`,
+        file_path: `/secret/path/page_${i}.png`,
+        md5: `md5_page_${i}`,
+        source: 'manual',
+        tags: ['分页'],
+        enabled: true,
+        size: 100,
+        format: 'png',
+      });
+    }
+
+    const first = await listFaces({ offset: 0, limit: 2 }, { db });
+    expect(first.faces).toHaveLength(2);
+    expect(first.total).toBe(2);
+    expect(first.total_matched).toBe(5);
+    expect(first.offset).toBe(0);
+    expect(first.limit).toBe(2);
+    expect(first.has_more).toBe(true);
+    expect((first as any).next_offset).toBeUndefined();
+
+    const second = await listFaces({ offset: 2, limit: 2 }, { db });
+    expect(second.faces).toHaveLength(2);
+    expect(second.offset).toBe(2);
+    expect(second.has_more).toBe(true);
+    expect((second as any).next_offset).toBeUndefined();
+    expect(second.faces.map((f) => f.id)).not.toEqual(first.faces.map((f) => f.id));
+
+    const last = await listFaces({ offset: 4, limit: 2 }, { db });
+    expect(last.faces).toHaveLength(1);
+    expect(last.has_more).toBe(false);
+    expect((last as any).next_offset).toBeUndefined();
+
+    // 负 offset / 超限 limit 安全收敛
+    const clamped = await listFaces({ offset: -3, limit: 999 }, { db });
+    expect(clamped.offset).toBe(0);
+    expect(clamped.limit).toBe(100);
+    expect(clamped.faces).toHaveLength(5);
+  });
+
+  it('契约 1.3: list_faces Render 使用跨页连续的全局序号', async () => {
+    for (let i = 1; i <= 3; i++) {
+      db.insertFace({
+        id: `face_ordinal_0${i}`,
+        file_path: `/secret/path/ordinal_${i}.png`,
+        md5: `md5_ordinal_${i}`,
+        source: 'manual',
+        tags: [`序号${i}`],
+        enabled: true,
+        size: 100,
+        format: 'png',
+      });
+    }
+
+    const mockTools = { register: vi.fn() };
+    registerAgentTools({ tools: mockTools } as any, {
+      db,
+      mediaManager: {} as any,
+      config: () => ({ face_enabled: true } as any),
+    } as any);
+    const listTool = mockTools.register.mock.calls.map((c) => c[0]).find((t) => t.name === 'list_faces');
+
+    const res = await listFaces({ offset: 1, limit: 2 }, { db });
+    const text = (listTool as any).output.render({}, res)[0].text;
+    expect(text).toContain('2. ');
+    expect(text).toContain('3. ');
+    expect(text).not.toContain('1. ');
+  });
+
+  it('契约 2: send_face 构造 sub_type=1 并接入串行队列与更新使用频次', async () => {
+    const testImgPath = path.join(faceDir, 'doge.png');
+    fs.writeFileSync(testImgPath, 'fake-doge-image-binary');
+
+    db.insertFace({
+      id: 'face_doge',
+      file_path: testImgPath,
+      md5: 'md5_doge',
+      source: 'manual',
+      tags: ['狗头'],
+      mood: '调侃',
+      enabled: true,
+      size: 1024,
+      format: 'png',
+    });
+
+    const enqueueSpy = vi.spyOn(sender, 'enqueue');
+
+    const res = await sendFace(
+      { face_id: 'face_doge' },
+      {
+        db,
+        gateway: mockGateway,
+        sender,
+        peer: 'group_123456',
+        groupId: '123456',
+      }
+    );
+
+    expect(res.success).toBe(true);
+    expect(res.message_id).toBe(10001);
+
+    // 必须经由 sender.enqueue 串行发送
+    expect(enqueueSpy).toHaveBeenCalled();
+
+    // 验证 Gateway 调用参数包含 sub_type = 1 且为 file:// 路径；
+    // 第三个参数为旁路附件描述符（不进入发给 NapCat 的消息段）
+    expect(mockGateway.sendGroupMsg).toHaveBeenCalledWith(
+      '123456',
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'image',
+          data: expect.objectContaining({
+            file: expect.stringMatching(/^file:\/\/\//),
+            sub_type: 1,
+          }),
+        }),
+      ]),
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'sticker',
+          face: expect.objectContaining({ id: 'face_doge' }),
+        }),
+      ])
+    );
+
+    // 验证使用频次与时间被记录
+    const updated = db.getFaceById('face_doge');
+    expect(updated?.use_count).toBe(1);
+    expect(updated?.last_used_at).toBeGreaterThan(0);
+  });
+
+  it('契约 3: send_face 表情不存在或已禁用时返回清晰错误', async () => {
+    const resNotFound = await sendFace(
+      { face_id: 'non_existent' },
+      { db, gateway: mockGateway, sender, peer: 'user_123' }
+    );
+    expect(resNotFound.success).toBe(false);
+    expect(resNotFound.error).toMatch(/不存在/);
+
+    // 禁用表情
+    db.insertFace({
+      id: 'face_disabled',
+      file_path: '/path.png',
+      md5: 'md5_dis',
+      source: 'manual',
+      tags: ['禁用'],
+      enabled: false,
+      size: 100,
+      format: 'png',
+    });
+
+    const resDisabled = await sendFace(
+      { face_id: 'face_disabled' },
+      { db, gateway: mockGateway, sender, peer: 'user_123' }
+    );
+    expect(resDisabled.success).toBe(false);
+    expect(resDisabled.error).toMatch(/已禁用/);
+  });
+
+  it('契约 4: collect_face 提取消息附件、落盘至 face 目录并入库', async () => {
+    // 模拟消息数据库中有一条带图片的入站消息
+    const srcImgFile = path.join(tmpDir, 'downloaded_image.jpg');
+    fs.writeFileSync(srcImgFile, 'real-image-data-sample-12345');
+    const imgMd5 = crypto.createHash('md5').update('real-image-data-sample-12345').digest('hex');
+
+    db.saveMessage({
+      msg_id: 88881,
+      peer: 'group_123456',
+      user_id: '999999',
+      sender_name: '群友A',
+      time: Math.floor(Date.now() / 1000),
+      type: 'image',
+      content: '[图片]',
+      raw: JSON.stringify([{ type: 'image', data: { file: 'test.jpg' } }]),
+      local_path: srcImgFile,
+    });
+
+    const res = await collectFace(
+      {
+        message_id: 88881,
+        tags: ['猫猫', '喝水'],
+        mood: '搞笑',
+      },
+      {
+        db,
+        peer: 'group_123456',
+        faceDir,
+      }
+    );
+
+    expect(res.success).toBe(true);
+    expect(res.face_id).toBeDefined();
+
+    // 验证文件已成功转存至 faceDir
+    const storedFace = db.getFaceById(res.face_id!);
+    expect(storedFace).toBeDefined();
+    expect(storedFace?.md5).toBe(imgMd5);
+    expect(storedFace?.tags).toEqual(['猫猫', '喝水']);
+    expect(storedFace?.mood).toBe('搞笑');
+    expect(fs.existsSync(storedFace!.file_path)).toBe(true);
+  });
+
+  it('契约 5: collect_face 重复偷图时显式告知已存在与既有标签 (防上下文遗忘)', async () => {
+    const srcImgFile = path.join(tmpDir, 'dup_image.png');
+    fs.writeFileSync(srcImgFile, 'duplicate-content-xyz');
+    const imgMd5 = crypto.createHash('md5').update('duplicate-content-xyz').digest('hex');
+
+    // 预先入库此表情
+    db.insertFace({
+      id: 'existing_face_id',
+      file_path: '/already/stored.png',
+      md5: imgMd5,
+      source: 'collect',
+      tags: ['已有标签1', '已有标签2'],
+      mood: '已知情绪',
+      enabled: true,
+      size: 100,
+      format: 'png',
+    });
+
+    db.saveMessage({
+      msg_id: 88882,
+      peer: 'group_123456',
+      user_id: '999999',
+      sender_name: '群友B',
+      time: Math.floor(Date.now() / 1000),
+      type: 'image',
+      content: '[图片]',
+      raw: '',
+      local_path: srcImgFile,
+    });
+
+    const res = await collectFace(
+      {
+        message_id: 88882,
+        tags: ['新标签'],
+        mood: '新情绪',
+      },
+      {
+        db,
+        peer: 'group_123456',
+        faceDir,
+      }
+    );
+
+    expect(res.success).toBe(true);
+    expect(res.duplicated).toBe(true);
+    expect(res.face_id).toBe('existing_face_id');
+    // 明确提示已有表情及标签，解决上下文压缩遗忘
+    expect(res.message).toMatch(/已在你的表情库中存在/);
+    expect(res.message).toMatch(/已有标签1/);
+  });
+
+  it('契约 6: collect_face 参数校验 (缺少 tags/mood 或目标消息无图片时拒绝)', async () => {
+    // 缺少 tags
+    const resNoTags = await collectFace(
+      { mood: '卖萌' } as any,
+      { db, peer: 'group_123456', faceDir }
+    );
+    expect(resNoTags.success).toBe(false);
+    expect(resNoTags.error).toMatch(/tags/);
+
+    // 目标消息无图片
+    db.saveMessage({
+      msg_id: 88883,
+      peer: 'group_123456',
+      user_id: '999999',
+      sender_name: '群友C',
+      time: Math.floor(Date.now() / 1000),
+      type: 'text',
+      content: '纯文本消息',
+      raw: '纯文本消息',
+    });
+
+    const resNoImg = await collectFace(
+      {
+        message_id: 88883,
+        tags: ['标签'],
+        mood: '情绪',
+      },
+      { db, peer: 'group_123456', faceDir }
+    );
+    expect(resNoImg.success).toBe(false);
+    expect(resNoImg.error).toMatch(/未找到图片/);
+  });
+
+  it('契约 8: manage_faces 支持传入 face_id 为已有表情补全/更新 tags 与 mood', async () => {
+    // 预先存入一个无标签表情
+    db.insertFace({
+      id: 'face_to_edit',
+      file_path: '/path/to/img.png',
+      md5: 'md5_to_edit',
+      source: 'user_upload',
+      tags: [],
+      enabled: true,
+      size: 100,
+      format: 'png',
+    });
+
+    // 缺少 tags 与 mood 必须报错拒绝
+    const failNoTags = await manageFaces(
+      { action: 'update', face_id: 'face_to_edit' } as any,
+      { db }
+    );
+    expect(failNoTags.success).toBe(false);
+    expect(failNoTags.error).toMatch(/tags 或 mood/);
+
+    // 合法参数更新
+    const successEdit = await manageFaces(
+      {
+        action: 'update',
+        face_id: 'face_to_edit',
+        tags: ['新打标猫猫', '喝水'],
+        mood: '呆萌',
+      },
+      { db }
+    );
+    expect(successEdit.success).toBe(true);
+    expect(successEdit.face_id).toBe('face_to_edit');
+
+    const edited = db.getFaceById('face_to_edit');
+    expect(edited?.tags).toEqual(['新打标猫猫', '喝水']);
+    expect(edited?.mood).toBe('呆萌');
+  });
+
+  it('契约 7: 门控装配契约 (face_enabled 为 false 时不注册表情工具)', () => {
+    const mockTools = {
+      register: vi.fn(),
+    };
+    const mockCtx = {
+      tools: mockTools,
+    };
+
+    // 1. 关闭总开关 (face_enabled = false)
+    registerAgentTools(mockCtx as any, {
+      db,
+      mediaManager: {} as any,
+      config: () => ({ face_enabled: false } as any),
+    } as any);
+
+    const registeredNamesFalse = mockTools.register.mock.calls.map(call => call[0].name);
+    expect(registeredNamesFalse).not.toContain('list_faces');
+    expect(registeredNamesFalse).not.toContain('send_face');
+    expect(registeredNamesFalse).not.toContain('collect_face');
+    expect(registeredNamesFalse).not.toContain('manage_faces');
+
+    // 2. 开启总开关 (face_enabled = true)
+    mockTools.register.mockClear();
+    registerAgentTools(mockCtx as any, {
+      db,
+      mediaManager: {} as any,
+      config: () => ({ face_enabled: true } as any),
+    } as any);
+
+    const registeredNamesTrue = mockTools.register.mock.calls.map(call => call[0].name);
+    expect(registeredNamesTrue).toContain('list_faces');
+    expect(registeredNamesTrue).toContain('send_face');
+    expect(registeredNamesTrue).toContain('collect_face');
+    expect(registeredNamesTrue).toContain('manage_faces');
+  });
+
+  it('契约 9: 达到容量上限且为 reject 策略时，collect_face 友好返回错误对象而非崩溃抛错', async () => {
+    // 插入 2 张表情，设上限为 2
+    db.insertFace({
+      id: 'f1',
+      file_path: '/f1.png',
+      md5: 'md5_1',
+      source: 'manual',
+      tags: ['1'],
+      enabled: true,
+      size: 10,
+      format: 'png',
+    }, { max: 2, evictPolicy: 'reject' });
+
+    db.insertFace({
+      id: 'f2',
+      file_path: '/f2.png',
+      md5: 'md5_2',
+      source: 'manual',
+      tags: ['2'],
+      enabled: true,
+      size: 10,
+      format: 'png',
+    }, { max: 2, evictPolicy: 'reject' });
+
+    const newImg = path.join(tmpDir, 'new_img.png');
+    fs.writeFileSync(newImg, 'new-img-data');
+
+    db.saveMessage({
+      msg_id: 99901,
+      peer: 'group_123',
+      user_id: '123',
+      time: Math.floor(Date.now() / 1000),
+      type: 'image',
+      content: '[图片]',
+      raw: '',
+      local_path: newImg,
+    });
+
+    // 调用 collectFace，配额上限为 2，策略为 reject
+    const res = await collectFace(
+      {
+        message_id: 99901,
+        tags: ['新表情'],
+        mood: '开心',
+      },
+      {
+        db,
+        peer: 'group_123',
+        faceDir,
+        faceStoreMax: 2,
+        faceEvictPolicy: 'reject',
+      }
+    );
+
+    // 绝不抛出未捕获崩溃，而是友好返回带有明确原因的失败对象
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/配额容量上限/);
+  });
+
+  it('契约 10: list_faces 返回结果必须严格满足 DSH Lossless JSON 约束 (无 undefined 字段，isJsonValue / snapshotJsonValue 严格通过)', async () => {
+    // 插入未打标、无 mood 的表情
+    db.insertFace({
+      id: 'face_untagged_1',
+      file_path: '/path/untagged.png',
+      md5: 'md5_untagged',
+      source: 'manual',
+      tags: [],
+      // mood 缺省为 undefined / null
+      enabled: true,
+      size: 512,
+      format: 'png',
+    });
+
+    const res = await listFaces({}, { db });
+
+    // 1. 断言数据正确查出
+    expect(res.faces).toHaveLength(1);
+    expect(res.faces[0].id).toBe('face_untagged_1');
+
+    // 2. 核心红线契约：无任何 undefined 键，绝不破坏 Lossless JSON 契约
+    expect(Object.hasOwn(res, 'next_cursor')).toBe(false);
+    expect(Object.hasOwn(res.faces[0], 'mood')).toBe(false);
+
+    // 3. 校验 DSH 内核 isJsonValue / snapshotJsonValue 绝不返回 undefined
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    const dshToolsPkg = require.resolve('@deepseek-ai/dsh-tools/package.json');
+    const dshToolsRequire = createRequire(dshToolsPkg);
+    const { isJsonValue, snapshotJsonValue } = dshToolsRequire('@deepseek-ai/dsh-util-values');
+
+    expect(isJsonValue(res)).toBe(true);
+    const snapshot = snapshotJsonValue(res);
+    expect(snapshot).toBeDefined();
+    expect(snapshot).not.toBeUndefined();
+  });
+});

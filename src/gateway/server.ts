@@ -1,0 +1,820 @@
+/**
+ * dsh-napcat-bridge: NapCat WebSocket 网关服务端
+ * 作为 OneBot 11 反向 WebSocket 服务端，处理 NapCat 客户端连接、Token 鉴权、事件分发与 API Action 调用。
+ */
+
+import { WebSocketServer, WebSocket } from 'ws';
+import type { IncomingMessage } from 'node:http';
+import type {
+  OneBotActionResponse,
+  OneBotMessageEvent,
+  OneBotMetaEvent,
+  OneBotNoticeEvent,
+  OneBotRequestEvent,
+} from '../types/index.js';
+import type { AttachmentDescriptor } from '../attachment/types.js';
+
+/** 出站消息成功发送后的事件（供插件自记录落库，不依赖 reportSelfMessage） */
+export interface OutboundSentEvent {
+  action: 'send_group_msg' | 'send_private_msg' | 'send_msg';
+  /** 目标会话 peer (group_xxx / user_xxx) */
+  peer: string;
+  /** NapCat 返回的消息 ID（群聊可能为负数） */
+  msgId: number;
+  /** 发送时的 OneBot 消息段或纯文本 */
+  message: unknown;
+  /** 发送完成时间（毫秒时间戳） */
+  time: number;
+  /**
+   * 发送方旁路携带的附件描述符（不进入发给 NapCat 的消息段）。
+   * 适合携带仅本地可知的事实：face_id / 情绪 / 本地真实格式等。
+   */
+  attachments?: AttachmentDescriptor[];
+}
+
+export interface GatewayServerOptions {
+  host?: string;
+  port: number;
+  token?: string;
+  logger?: {
+    info?: (...args: any[]) => void;
+    warn?: (...args: any[]) => void;
+    error?: (...args: any[]) => void;
+    debug?: (...args: any[]) => void;
+  };
+  /**
+   * 出站消息发送成功且拿到有效 message_id 后的回调。
+   * 用于插件自身落库，避免完全依赖 NapCat 的 message_sent 上报。
+   */
+  onMessageSent?: (event: OutboundSentEvent) => void;
+}
+
+const OUTBOUND_SEND_ACTIONS = new Set(['send_group_msg', 'send_private_msg', 'send_msg']);
+
+export type MessageHandler = (event: OneBotMessageEvent) => void | Promise<void>;
+export type NoticeHandler = (event: OneBotNoticeEvent) => void | Promise<void>;
+export type RequestHandler = (event: OneBotRequestEvent) => void | Promise<void>;
+export type MetaHandler = (event: OneBotMetaEvent) => void | Promise<void>;
+
+interface PendingAction {
+  resolve: (res: OneBotActionResponse) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+export class NapCatGatewayServer {
+  private wss: WebSocketServer | null = null;
+  private activeSocket: WebSocket | null = null;
+  private echoCounter = 0;
+  private pendingActions = new Map<string, PendingAction>();
+
+  private messageHandlers: MessageHandler[] = [];
+  private noticeHandlers: NoticeHandler[] = [];
+  private requestHandlers: RequestHandler[] = [];
+  private metaHandlers: MetaHandler[] = [];
+  private connectHandlers: Array<() => void | Promise<void>> = [];
+
+  constructor(public readonly options: GatewayServerOptions) {}
+
+  get isConnected(): boolean {
+    return Boolean(this.activeSocket && this.activeSocket.readyState === WebSocket.OPEN);
+  }
+
+  onConnect(handler: () => void | Promise<void>): () => void {
+    this.connectHandlers.push(handler);
+    return () => {
+      this.connectHandlers = this.connectHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  onMessage(handler: MessageHandler): () => void {
+    this.messageHandlers.push(handler);
+    return () => {
+      this.messageHandlers = this.messageHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  onNotice(handler: NoticeHandler): () => void {
+    this.noticeHandlers.push(handler);
+    return () => {
+      this.noticeHandlers = this.noticeHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  onRequest(handler: RequestHandler): () => void {
+    this.requestHandlers.push(handler);
+    return () => {
+      this.requestHandlers = this.requestHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  onMeta(handler: MetaHandler): () => void {
+    this.metaHandlers.push(handler);
+    return () => {
+      this.metaHandlers = this.metaHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  private authenticate(req: IncomingMessage): boolean {
+    const expectedToken = (this.options.token || '').trim();
+    if (!expectedToken) return false; // 鉴权 Token 必填：未配置直接拒绝连接
+
+    let token = '';
+    const authHeader = req.headers['authorization'];
+    if (typeof authHeader === 'string') {
+      if (authHeader.startsWith('Bearer ')) {
+        token = authHeader.slice(7).trim();
+      } else if (authHeader.startsWith('Token ')) {
+        token = authHeader.slice(6).trim();
+      } else {
+        token = authHeader.trim();
+      }
+    } else if (typeof req.headers['access_token'] === 'string') {
+      token = req.headers['access_token'].trim();
+    }
+
+    if (!token) {
+      try {
+        const url = new URL(req.url || '/', 'http://localhost');
+        token = url.searchParams.get('access_token') || '';
+      } catch {}
+    }
+
+    return token === expectedToken;
+  }
+
+  async start(): Promise<void> {
+    if (this.wss) return;
+
+    return new Promise<void>((resolve, reject) => {
+      try {
+        const host = this.options.host || '127.0.0.1';
+        this.wss = new WebSocketServer({
+          host,
+          port: this.options.port,
+          verifyClient: (info, callback) => {
+            const authenticated = this.authenticate(info.req);
+            if (!authenticated) {
+              this.options.logger?.warn?.(`[GatewayServer] 鉴权失败: 来源 ${info.req.socket.remoteAddress}`);
+              callback(false, 401, 'Unauthorized');
+            } else {
+              callback(true);
+            }
+          },
+        });
+
+        this.wss.on('listening', () => {
+          this.options.logger?.info?.(`[GatewayServer] OneBot 11 反向 WS 服务端已监听 ${host}:${this.options.port}`);
+          resolve();
+        });
+
+        this.wss.on('error', (err) => {
+          this.options.logger?.error?.('[GatewayServer] WebSocket 服务端错误:', err);
+          reject(err);
+        });
+
+        this.wss.on('connection', (ws, req) => {
+          this.options.logger?.info?.(`[GatewayServer] NapCat 客户端已连接 (${req.socket.remoteAddress})`);
+          this.activeSocket = ws;
+
+          for (const h of this.connectHandlers) {
+            try {
+              const res = h();
+              if (res && typeof (res as Promise<any>).catch === 'function') {
+                (res as Promise<any>).catch((e) => {
+                  this.options.logger?.error?.('[GatewayServer] 异步连接处理器异常:', e);
+                });
+              }
+            } catch (e) {
+              this.options.logger?.error?.('[GatewayServer] 连接处理器异常:', e);
+            }
+          }
+
+          ws.on('message', (data) => {
+            this.handleIncomingRaw(data.toString());
+          });
+
+          ws.on('close', (code, reason) => {
+            this.options.logger?.warn?.(`[GatewayServer] NapCat 连接断开 (code: ${code}, reason: ${reason.toString()})`);
+            if (this.activeSocket === ws) {
+              this.activeSocket = null;
+            }
+          });
+
+          ws.on('error', (err) => {
+            this.options.logger?.error?.('[GatewayServer] 客户端 Socket 异常:', err);
+          });
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  private handleIncomingRaw(rawText: string): void {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (err) {
+      this.options.logger?.warn?.('[GatewayServer] 无法解析 JSON 载荷:', rawText);
+      return;
+    }
+
+    // 1. 如果带有 echo，则是 Action 调用的响应
+    if (parsed.echo && this.pendingActions.has(parsed.echo)) {
+      const pending = this.pendingActions.get(parsed.echo)!;
+      this.pendingActions.delete(parsed.echo);
+      clearTimeout(pending.timer);
+      pending.resolve(parsed as OneBotActionResponse);
+      return;
+    }
+
+    // 2. 根据 post_type 分发事件
+    const postType = parsed.post_type;
+    if (postType === 'message' || postType === 'message_sent') {
+      const msgEvent = parsed as OneBotMessageEvent;
+      for (const h of this.messageHandlers) {
+        try {
+          const res = h(msgEvent);
+          if (res && typeof (res as Promise<any>).catch === 'function') {
+            (res as Promise<any>).catch((e) => {
+              this.options.logger?.error?.('[GatewayServer] 异步消息处理器异常:', e);
+            });
+          }
+        } catch (e) {
+          this.options.logger?.error?.('[GatewayServer] 消息处理器异常:', e);
+        }
+      }
+    } else if (postType === 'notice') {
+      const noticeEvent = parsed as OneBotNoticeEvent;
+      for (const h of this.noticeHandlers) {
+        try {
+          const res = h(noticeEvent);
+          if (res && typeof (res as Promise<any>).catch === 'function') {
+            (res as Promise<any>).catch((e) => {
+              this.options.logger?.error?.('[GatewayServer] 异步通知处理器异常:', e);
+            });
+          }
+        } catch (e) {
+          this.options.logger?.error?.('[GatewayServer] 通知处理器异常:', e);
+        }
+      }
+    } else if (postType === 'request') {
+      const reqEvent = parsed as OneBotRequestEvent;
+      for (const h of this.requestHandlers) {
+        try {
+          const res = h(reqEvent);
+          if (res && typeof (res as Promise<any>).catch === 'function') {
+            (res as Promise<any>).catch((e) => {
+              this.options.logger?.error?.('[GatewayServer] 异步请求处理器异常:', e);
+            });
+          }
+        } catch (e) {
+          this.options.logger?.error?.('[GatewayServer] 请求处理器异常:', e);
+        }
+      }
+    } else if (postType === 'meta_event') {
+      const metaEvent = parsed as OneBotMetaEvent;
+      for (const h of this.metaHandlers) {
+        try {
+          const res = h(metaEvent);
+          if (res && typeof (res as Promise<any>).catch === 'function') {
+            (res as Promise<any>).catch((e) => {
+              this.options.logger?.error?.('[GatewayServer] 异步元事件处理器异常:', e);
+            });
+          }
+        } catch (e) {
+          this.options.logger?.error?.('[GatewayServer] 元事件处理器异常:', e);
+        }
+      }
+    }
+  }
+
+  async sendAction<T = any>(
+    action: string,
+    params: Record<string, any> = {},
+    timeoutMs = 15000,
+    attachments?: AttachmentDescriptor[]
+  ): Promise<OneBotActionResponse<T>> {
+    if (!this.activeSocket || this.activeSocket.readyState !== WebSocket.OPEN) {
+      throw new Error(`NapCat WebSocket 客户端未连接或连接已断开 (action: ${action})`);
+    }
+
+    const echo = `echo_${Date.now()}_${++this.echoCounter}`;
+    const payload = JSON.stringify({
+      action,
+      params,
+      echo,
+    });
+
+    const response = await new Promise<OneBotActionResponse<T>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingActions.has(echo)) {
+          this.pendingActions.delete(echo);
+          reject(new Error(`NapCat Action 调用超时 (${timeoutMs}ms, action: ${action})`));
+        }
+      }, timeoutMs);
+
+      this.pendingActions.set(echo, {
+        resolve: resolve as any,
+        reject,
+        timer,
+      });
+
+      this.activeSocket!.send(payload, (err) => {
+        if (err) {
+          this.pendingActions.delete(echo);
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+    });
+
+    // 出站消息成功发送后立即回调，供插件主动落库（不依赖 OneBot 自身消息上报）
+    this.notifyOutboundSent(action, params, response as OneBotActionResponse, attachments);
+    return response;
+  }
+
+  /**
+   * 出站发送成功（status ok / retcode 0 且有有效 message_id）时触发 onMessageSent。
+   * 失败或无 message_id 的应答一律不触发，避免写入无法寻址的记录。
+   */
+  private notifyOutboundSent(
+    action: string,
+    params: Record<string, any>,
+    response: OneBotActionResponse,
+    attachments?: AttachmentDescriptor[]
+  ): void {
+    if (!OUTBOUND_SEND_ACTIONS.has(action)) return;
+
+    const isSuccess =
+      (response as any).status === 'ok' || (response as any).retcode === 0;
+    if (!isSuccess) return;
+
+    const msgId = Number((response as any).data?.message_id);
+    if (!Number.isSafeInteger(msgId) || msgId === 0) return;
+
+    let peer = '';
+    if (action === 'send_group_msg') {
+      if (params.group_id === undefined || params.group_id === null) return;
+      peer = `group_${params.group_id}`;
+    } else if (action === 'send_private_msg') {
+      if (params.user_id === undefined || params.user_id === null) return;
+      peer = `user_${params.user_id}`;
+    } else {
+      if (params.group_id !== undefined && params.group_id !== null) {
+        peer = `group_${params.group_id}`;
+      } else if (params.user_id !== undefined && params.user_id !== null) {
+        peer = `user_${params.user_id}`;
+      } else {
+        return;
+      }
+    }
+
+    try {
+      this.options.onMessageSent?.({
+        action: action as OutboundSentEvent['action'],
+        peer,
+        msgId,
+        message: params.message,
+        time: Date.now(),
+        ...(attachments && attachments.length > 0 ? { attachments } : {}),
+      });
+    } catch (err) {
+      this.options.logger?.warn?.('[GatewayServer] onMessageSent 回调异常:', err);
+    }
+  }
+
+  async sendGroupMsg(
+    groupId: number | string,
+    message: any,
+    attachments?: AttachmentDescriptor[]
+  ): Promise<OneBotActionResponse> {
+    return this.sendAction(
+      'send_group_msg',
+      {
+        group_id: Number(groupId),
+        message,
+      },
+      15000,
+      attachments
+    );
+  }
+
+  async sendPrivateMsg(
+    userId: number | string,
+    message: any,
+    attachments?: AttachmentDescriptor[]
+  ): Promise<OneBotActionResponse> {
+    return this.sendAction(
+      'send_private_msg',
+      {
+        user_id: Number(userId),
+        message,
+      },
+      15000,
+      attachments
+    );
+  }
+
+  async sendMsg(
+    peer: string,
+    message: any,
+    attachments?: AttachmentDescriptor[]
+  ): Promise<OneBotActionResponse> {
+    if (peer.startsWith('group_')) {
+      const groupId = peer.slice(6).split('-')[0];
+      return this.sendGroupMsg(groupId, message, attachments);
+    }
+    if (peer.startsWith('user_')) {
+      const userId = peer.slice(5).split('-')[0];
+      return this.sendPrivateMsg(userId, message, attachments);
+    }
+    if (peer.startsWith('qq-group-')) {
+      const groupId = peer.slice(9).split('-')[0];
+      return this.sendGroupMsg(groupId, message, attachments);
+    }
+    if (peer.startsWith('qq-user-')) {
+      const userId = peer.slice(8).split('-')[0];
+      return this.sendPrivateMsg(userId, message, attachments);
+    }
+    throw new Error(`未知的 peer 格式: ${peer}`);
+  }
+
+  /**
+   * OneBot 11 get_msg: 根据 message_id 获取单条消息详情
+   */
+  async getMsg(messageId: number | string, timeoutMs = 15000): Promise<OneBotActionResponse> {
+    return this.sendAction('get_msg', {
+      message_id: Number(messageId),
+    }, timeoutMs);
+  }
+
+  /**
+   * OneBot 11 delete_msg: 撤回单条消息
+   */
+  async deleteMsg(messageId: number | string): Promise<OneBotActionResponse> {
+    return this.sendAction('delete_msg', {
+      message_id: Number(messageId),
+    });
+  }
+
+  /**
+   * OneBot 11 get_image: 取图片在 NapCat 侧的本机路径。
+   * NapCat 源码实证 (GetImage.ts): GetImagePayloadSchema {file}，返回 data.{file, url, file_size, file_name}，
+   * data.file 为 NapCat 本机原图路径 —— 入站图片四段式取图的首选段（QQ 直链对第三方进程不可用）。
+   */
+  async getImage(file: string, timeoutMs = 5000): Promise<OneBotActionResponse> {
+    return this.sendAction('get_image', {
+      file,
+    }, timeoutMs);
+  }
+
+  async getForwardMsg(forwardId: string): Promise<OneBotActionResponse> {
+    return this.sendAction('get_forward_msg', {
+      id: forwardId,
+      message_id: forwardId,
+    });
+  }
+
+  async getGroupFileUrl(groupId: number | string, fileId: string, busid?: number): Promise<OneBotActionResponse> {
+    const params: Record<string, any> = {
+      group_id: Number(groupId),
+      file_id: fileId,
+    };
+    // NapCat 不消费 busid；SnowLuma 缺省时会自行回退 102，但显式传 0 会报「参数错误」。
+    // 因此只有正数 busid 才透传，缺失 / null / 0 一律省略（见 devlog SnowLuma 兼容实测）。
+    const numericBusid = busid === undefined || busid === null ? NaN : Number(busid);
+    if (Number.isFinite(numericBusid) && numericBusid > 0) {
+      params.busid = numericBusid;
+    }
+    return this.sendAction('get_group_file_url', params);
+  }
+
+  /**
+   * OneBot 11 / NapCat / SnowLuma: 获取群根目录文件与文件夹列表。
+   * 用于 SnowLuma 兼容垫片：notice 事件只带 32 位 hex file_id，需换回消息段的 /uuid。
+   */
+  async getGroupRootFiles(
+    groupId: number | string,
+    timeoutMs = 20000
+  ): Promise<OneBotActionResponse<{ files?: any[]; folders?: any[] }>> {
+    return this.sendAction('get_group_root_files', {
+      group_id: Number(groupId),
+    }, timeoutMs);
+  }
+
+  /**
+   * OneBot 11 / NapCat / SnowLuma: 获取群子目录文件列表（垫片递归匹配用）。
+   */
+  async getGroupFilesByFolder(
+    groupId: number | string,
+    folderId: string,
+    timeoutMs = 20000
+  ): Promise<OneBotActionResponse<{ files?: any[]; folders?: any[] }>> {
+    return this.sendAction('get_group_files_by_folder', {
+      group_id: Number(groupId),
+      folder_id: folderId,
+    }, timeoutMs);
+  }
+
+  /**
+   * PF-001: OneBot 11 get_private_file_url —— 获取私聊文件下载直链。
+   * NapCat 源码实证 (GetPrivateFileUrl.ts): PayloadSchema 仅 {file_id}，返回 data.url (HTTP 直链)；
+   * 依赖 packet 后端 (GetPacketStatusDepends)，QQ 9.9.30-48762 起 packet 不可用会失败 ——
+   * 作为私聊文件入站落盘「首选」，失败由 downloadPrivateFile 回退 get_file（任务包 §3.1 用户拍板）。
+   */
+  async getPrivateFileUrl(fileId: string): Promise<OneBotActionResponse> {
+    return this.sendAction('get_private_file_url', {
+      file_id: fileId,
+    });
+  }
+
+  /**
+   * PF-001: OneBot 11 get_file —— 获取文件的 NapCat 侧本地路径（不依赖 packet 后端）。
+   * NapCat 源码实证 (GetFile.ts): GetFilePayloadSchema {file?, file_id?}（私聊消息标记以 file_id 传入），
+   * 返回 data.{file, url, file_size, file_name}，data.file 为 NapCat 本机本地路径 ——
+   * 作为私聊文件入站落盘「回退」路径（packet 不可用时仍可靠，任务包 §3.1）。
+   */
+  async getFile(fileId: string, timeoutMs = 5000): Promise<OneBotActionResponse> {
+    return this.sendAction('get_file', {
+      file_id: fileId,
+    }, timeoutMs);
+  }
+
+  /**
+   * OneBot 11 get_group_member_info (EN-001)：获取群成员信息（含 nickname/card），
+   * 用于 at 段被@者昵称归一化（NapCat at 段只有 qq）。
+   */
+  async getGroupMemberInfo(
+    groupId: number | string,
+    userId: number | string
+  ): Promise<OneBotActionResponse> {
+    return this.sendAction('get_group_member_info', {
+      group_id: Number(groupId),
+      user_id: Number(userId),
+    });
+  }
+
+  /**
+   * OneBot 11 get_group_member_list: 获取群全量成员列表
+   * @param groupId 群号
+   * @param noCache 是否强制穿透 NapCat 缓存 (默认 false)
+   */
+  async getGroupMemberList(
+    groupId: number | string,
+    noCache = false
+  ): Promise<OneBotActionResponse<any[]>> {
+    return this.sendAction('get_group_member_list', {
+      group_id: Number(groupId),
+      no_cache: Boolean(noCache),
+    });
+  }
+
+  /**
+   * OneBot 11 get_group_info: 获取群基础信息（群名称等）
+   */
+  async getGroupInfo(groupId: number | string): Promise<OneBotActionResponse> {
+    return this.sendAction('get_group_info', {
+      group_id: Number(groupId),
+    });
+  }
+
+  /**
+   * OneBot 11 / NapCat 扩展 get_group_detail_info: 获取群详细信息（建群时间、群介绍等）
+   */
+  async getGroupDetailInfo(groupId: number | string): Promise<OneBotActionResponse> {
+    return this.sendAction('get_group_detail_info', {
+      group_id: String(groupId),
+    });
+  }
+
+  /**
+   * OneBot 11 get_stranger_info: 获取陌生人/好友信息（昵称等）
+   */
+  async getStrangerInfo(userId: number | string): Promise<OneBotActionResponse> {
+    return this.sendAction('get_stranger_info', {
+      user_id: Number(userId),
+    });
+  }
+
+  /**
+   * OneBot 11 get_friend_list: 获取好友列表
+   */
+  async getFriendList(): Promise<OneBotActionResponse<any[]>> {
+    return this.sendAction('get_friend_list', {});
+  }
+
+  /**
+   * OneBot 11 get_group_list: 获取群列表
+   */
+  async getGroupList(noCache = false): Promise<OneBotActionResponse<any[]>> {
+    return this.sendAction('get_group_list', {
+      no_cache: Boolean(noCache),
+    });
+  }
+
+  /**
+   * OneBot 11 / NapCat _get_group_notice: 获取群公告列表
+   */
+  async getGroupNotice(groupId: number | string): Promise<OneBotActionResponse<any[]>> {
+    return this.sendAction('_get_group_notice', {
+      group_id: Number(groupId),
+    });
+  }
+
+  /**
+   * OneBot 11 / NapCat: 获取群历史消息记录 (get_group_msg_history)
+   */
+  async getGroupMsgHistory(
+    groupId: number | string,
+    count = 20,
+    messageSeq?: number | string
+  ): Promise<OneBotActionResponse<{ messages?: any[] }>> {
+    const params: Record<string, any> = {
+      group_id: Number(groupId),
+      count: Number(count),
+    };
+    if (messageSeq !== undefined && messageSeq !== null && messageSeq !== '') {
+      params.message_seq = Number(messageSeq);
+    }
+    return this.sendAction('get_group_msg_history', params);
+  }
+
+  /**
+   * OneBot 11 / NapCat: 获取好友历史消息记录 (get_friend_msg_history)
+   */
+  async getFriendMsgHistory(
+    userId: number | string,
+    count = 20,
+    messageSeq?: number | string
+  ): Promise<OneBotActionResponse<{ messages?: any[] }>> {
+    const params: Record<string, any> = {
+      user_id: Number(userId),
+      count: Number(count),
+    };
+    if (messageSeq !== undefined && messageSeq !== null && messageSeq !== '') {
+      params.message_seq = Number(messageSeq);
+    }
+    return this.sendAction('get_friend_msg_history', params);
+  }
+
+  /**
+   * NapCat 扩展 API: 获取最近活跃会话列表 (get_recent_contact)
+   */
+  async getRecentContact(count = 20): Promise<OneBotActionResponse<any[]>> {
+    return this.sendAction('get_recent_contact', {
+      count: Number(count),
+    });
+  }
+
+  /**
+   * IS-S3 (v2 预留)：上传文件到群文件系统 (upload_group_file)。
+   * v1 决策走消息附件（send_group_msg 带 file 段，Spec §6.2），本方法为 v2「上传到群文件
+   * 系统」预留接入点（NapCat 支持该 action），文档标注 v2 预留，当前未被 send_file 调用。
+   */
+  async uploadGroupFile(
+    groupId: number | string,
+    file: string,
+    name?: string,
+    folder?: string
+  ): Promise<OneBotActionResponse> {
+    const params: Record<string, any> = {
+      group_id: Number(groupId),
+      file,
+    };
+    if (name !== undefined) params.name = name;
+    if (folder !== undefined) params.folder = folder;
+    return this.sendAction('upload_group_file', params);
+  }
+
+  /**
+   * IS-S3 (v2 预留)：上传文件到私聊会话 (upload_private_file)。
+   * v1 走消息附件；本方法为 v2 预留接入点，当前未被 send_file 调用。
+   */
+  async uploadPrivateFile(
+    userId: number | string,
+    file: string,
+    name?: string
+  ): Promise<OneBotActionResponse> {
+    const params: Record<string, any> = {
+      user_id: Number(userId),
+      file,
+    };
+    if (name !== undefined) params.name = name;
+    return this.sendAction('upload_private_file', params);
+  }
+
+  async sendPoke(userId: string | number, groupId?: string | number): Promise<OneBotActionResponse> {
+    const numUserId = Number(userId);
+    const numGroupId = groupId ? Number(groupId) : undefined;
+
+    // 优先调用 NapCat 推荐的统一通用接口 send_poke
+    try {
+      const params: Record<string, any> = { user_id: numUserId };
+      if (numGroupId) {
+        params.group_id = numGroupId;
+      }
+      const res = await this.sendAction('send_poke', params);
+      if (res && res.status === 'ok' && res.retcode === 0) {
+        return res;
+      }
+
+      // 如果 send_poke 失败或未识别，尝试回退特定场景接口
+      if (numGroupId) {
+        const fallbackRes = await this.sendAction('group_poke', {
+          group_id: numGroupId,
+          user_id: numUserId,
+        });
+        if (fallbackRes && (fallbackRes.status === 'ok' || fallbackRes.retcode === 0)) {
+          return fallbackRes;
+        }
+      } else {
+        const fallbackRes = await this.sendAction('friend_poke', {
+          user_id: numUserId,
+        });
+        if (fallbackRes && (fallbackRes.status === 'ok' || fallbackRes.retcode === 0)) {
+          return fallbackRes;
+        }
+      }
+
+      return res;
+    } catch (err) {
+      if (numGroupId) {
+        return this.sendAction('group_poke', {
+          group_id: numGroupId,
+          user_id: numUserId,
+        });
+      }
+      return this.sendAction('friend_poke', {
+        user_id: numUserId,
+      });
+    }
+  }
+
+  /**
+   * OneBot 11 扩展 set_msg_emoji_like: 为消息贴表情回应
+   */
+  async setMsgEmojiLike(
+    messageId: number | string,
+    emojiId: string | number,
+    set = true
+  ): Promise<OneBotActionResponse> {
+    return this.sendAction('set_msg_emoji_like', {
+      message_id: Number(messageId),
+      emoji_id: String(emojiId),
+      set,
+    });
+  }
+
+  async restart(options?: Partial<GatewayServerOptions>): Promise<void> {
+    await this.stop();
+    if (options) {
+      if (options.host !== undefined) {
+        this.options.host = options.host;
+      }
+      if (options.port !== undefined) {
+        this.options.port = options.port;
+      }
+      if (options.token !== undefined) {
+        this.options.token = options.token;
+      }
+    }
+    await this.start();
+  }
+
+  async stop(): Promise<void> {
+    for (const pending of this.pendingActions.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('GatewayServer is closing'));
+    }
+    this.pendingActions.clear();
+
+    if (this.activeSocket) {
+      try {
+        this.activeSocket.terminate();
+      } catch {}
+      this.activeSocket = null;
+    }
+
+    if (this.wss) {
+      try {
+        for (const client of this.wss.clients) {
+          try {
+            client.terminate();
+          } catch {}
+        }
+      } catch {}
+
+      await new Promise<void>((resolve) => {
+        this.wss!.close(() => resolve());
+      });
+      this.wss = null;
+    }
+  }
+}
+
+export * from './wait-registry.js';
+
+
+export { NapCatGatewayServer as GatewayServer };
