@@ -1,226 +1,446 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import * as http from 'node:http';
 import Database from 'better-sqlite3';
-import WebSocket from 'ws';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
-import * as NapCatBridgePlugin from '../../src/index.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
+import type { SessionManager } from '../../src/gateway/session.js';
+import type { KujiraGatewayClient } from '../../src/gateway/server.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
 /**
  * 契约测试: 入站图片落盘真实装配闭环 (Inbound Image Assembly)
  *
- * 真实装配路径（非 mock 桩自测）：boot 挂载插件 → 真实 WS 网关 → 模拟 NapCat 客户端 →
- * 真实入站 message 事件 → 真实 resolver → 真实文件复制 → 真实 SQLite 入库。
- * mock 仅隔离 NapCat 应答与网络（外部依赖）。
+ * 真实装配路径: bootDshKujira({ mountPlugin: true }) -> Official Gateway WS (C2C_MESSAGE_CREATE) ->
+ * resolveInboundAttachments (裸 GET 无 Authorization 头) -> MediaStorageManager 落盘 -> SQLite messages。
  *
- * ASM-1: 直链不可用（死端口）→ get_image 返回 NapCat 本地路径 → 消息 local_path 指向
- *        我们自己的 downloads/<type>/<peer>/，content 替换为真实路径（不再只剩图名）。
- * ASM-2: 四段全失败 → 保持基线：local_path 为空、content 仍为 [图片:<QQ 伪名>]、消息照常入库。
+ * - ASM-1: attachments[] 带 ?rkey=mock_secret 裸 GET 下载落入 dshHome/kujira/downloads/image/<peer>/，
+ *          SQLite 写入 local_path 与 attachments JSON；
+ * - ASM-2: 死链 / HTTP 403 失败时 local_path 为 null，描述符 unavailable 与正文绝不泄漏 rkey query；
+ * - ASM-3: 魔数纠偏（响应头错报 image/jpeg、文件名 .jpg 但字节为 PNG → 实际落盘 .png 且 format='png'）；
+ * - ASM-4: 多图 attachments[] 并发裸 GET 下载并全部落盘记录至 attachments JSON 与正文。
  */
 
-const BOT_QQ = '1000000001';
-const GROUP_ID = '3000000001';
-const MEMBER_QQ = '2000000001';
-const WS_PORT = 18345;
-const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 3)]);
+const nativeFetch = globalThis.fetch;
+
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_APP_ID = 'app_kujira_mock';
+const MOCK_APP_SECRET = 'secret_kujira_mock';
+const MOCK_BOT_ID = 'bot_kujira_01';
+
+const PNG_BYTES = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(32, 3),
+]);
+const JPEG_BYTES = Buffer.concat([
+  Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+  Buffer.alloc(32, 7),
+]);
+
+class FakeWs {
+  static instances: FakeWs[] = [];
+  readyState = 0;
+  private listeners = new Map<string, Array<(ev: any) => void>>();
+  private seq = 1;
+
+  constructor(public readonly url: string) {
+    FakeWs.instances.push(this);
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.emit('open', {});
+      this.emit('message', {
+        data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }),
+      });
+    });
+  }
+
+  addEventListener(type: string, listener: (ev: any) => void): void {
+    const arr = this.listeners.get(type) ?? [];
+    arr.push(listener);
+    this.listeners.set(type, arr);
+  }
+
+  send(raw: string): void {
+    const frame = JSON.parse(raw);
+    if (frame.op === 2 || frame.op === 6) {
+      this.emit('message', {
+        data: JSON.stringify({
+          op: 0,
+          s: this.seq++,
+          t: 'READY',
+          d: {
+            version: 1,
+            session_id: 'sess-img-1',
+            user: { id: MOCK_BOT_ID, username: 'Kujira助手', bot: true },
+          },
+        }),
+      });
+    } else if (frame.op === 1) {
+      this.emit('message', { data: JSON.stringify({ op: 11 }) });
+    }
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.emit('close', { code: 1000, reason: '' });
+  }
+
+  emitDispatch(t: string, d: unknown): void {
+    this.emit('message', {
+      data: JSON.stringify({ op: 0, s: this.seq++, t, d }),
+    });
+  }
+
+  private emit(type: string, ev: any): void {
+    for (const fn of this.listeners.get(type) ?? []) {
+      fn(ev);
+    }
+  }
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000, label = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`等待超时: ${label}`);
+}
 
 describe('契约测试: 入站图片落盘真实装配闭环 (Inbound Image Assembly)', () => {
   let tmpHome: string;
   let booted: BootedDsh;
-  let client: WebSocket;
   let servers: http.Server[] = [];
-  let actions: string[] = [];
-  let reply: (action: string, frame: any) => any = () => null;
+  let capturedFollowups: Array<{ text: string }> = [];
 
-  function inboundImageMessage(fileName: string, url: string | undefined, messageId: number) {
-    const data: Record<string, any> = { file: fileName, sub_type: 0, file_size: String(PNG_BYTES.length) };
-    if (url) data.url = url;
+  function dbPath(): string {
+    return path.join(tmpHome, 'kujira', 'messages.sqlite');
+  }
+
+  async function startHttpServer(
+    handler: (
+      req: http.IncomingMessage,
+      res: http.ServerResponse
+    ) => void
+  ): Promise<{ baseUrl: string; requests: Array<{ method: string; url: string; authorization?: string }> }> {
+    const requests: Array<{ method: string; url: string; authorization?: string }> = [];
+    const srv = http.createServer((req, res) => {
+      requests.push({
+        method: req.method || 'GET',
+        url: req.url || '',
+        authorization: req.headers.authorization,
+      });
+      handler(req, res);
+    });
+    servers.push(srv);
+    await new Promise<void>((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = srv.address() as any;
     return {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: messageId,
-      user_id: MEMBER_QQ,
-      group_id: GROUP_ID,
-      sender: { user_id: MEMBER_QQ, nickname: '测试成员' },
-      message: [{ type: 'image', data }],
-      raw_message: '',
-      time: Math.floor(Date.now() / 1000),
-      self_id: BOT_QQ,
+      baseUrl: `http://127.0.0.1:${addr.port}`,
+      requests,
     };
   }
 
-  async function startLoopback(status: number, body: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const srv = http.createServer((_req, res) => {
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(body);
-      });
-      srv.on('error', reject);
-      servers.push(srv);
-      srv.listen(0, '127.0.0.1', () => {
-        resolve(`http://127.0.0.1:${(srv.address() as any).port}/image`);
-      });
-    });
-  }
-
-  async function waitForRow(fileId: string, timeoutMs = 5000): Promise<any> {
+  async function waitForDbRow(msgId: string, timeoutMs = 5000): Promise<any> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const db = new Database(path.join(tmpHome, 'napcat', 'messages.sqlite'), { readonly: true });
+      const db = new Database(dbPath(), { readonly: true });
       try {
-        const row = db.prepare('SELECT * FROM messages WHERE file_id = ?').get(fileId);
+        const row = db.prepare('SELECT * FROM messages WHERE msg_id = ?').get(msgId);
         if (row) return row;
       } finally {
         db.close();
       }
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 30));
     }
-    throw new Error(`等待消息记录超时 (file_id: ${fileId})`);
+    throw new Error(`等待消息记录超时 (msg_id: ${msgId})`);
   }
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-napcat-inbound-assembly-'));
-    actions = [];
+    FakeWs.instances = [];
     servers = [];
-    booted = await bootDshNapcatBridge({ dshHome: tmpHome, mountPlugin: false });
-    await booted.ctx.plugin(NapCatBridgePlugin, { bot_qq: BOT_QQ, ws_port: WS_PORT, ws_token: 'test-token' });
+    capturedFollowups = [];
 
-    client = new WebSocket(`ws://127.0.0.1:${WS_PORT}?access_token=test-token`);
-    await new Promise<void>((resolve, reject) => {
-      client.once('open', () => resolve());
-      client.once('error', reject);
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-inbound-img-'));
+    await fsp.writeFile(
+      path.join(tmpHome, '.credentials.yaml'),
+      [
+        'version: 1',
+        'refs:',
+        `  QQ_BOT_APP_ID: "${MOCK_APP_ID}"`,
+        `  QQ_BOT_SECRET: "${MOCK_APP_SECRET}"`,
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url === 'https://bots.qq.com/app/getAppAccessToken') {
+        return new Response(JSON.stringify({ access_token: 'mock_access_token', expires_in: 7200 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (url === 'https://api.sgroup.qq.com/gateway') {
+        return new Response(JSON.stringify({ url: 'wss://api.sgroup.qq.com/websocket' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (url.startsWith('https://api.sgroup.qq.com/')) {
+        return new Response(JSON.stringify({ id: 'ROBOT1.0_MOCK_ACK' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return nativeFetch(input, init);
+    };
+
+    vi.stubGlobal('WebSocket', FakeWs as unknown as typeof WebSocket);
+    vi.stubGlobal('fetch', mockFetch);
+
+    booted = await bootDshKujira({
+      dshHome: tmpHome,
+      mountPlugin: true,
+      config: {
+        input_notify_enabled: false,
+      },
     });
-    client.on('message', (data) => {
-      const frame = JSON.parse(data.toString());
-      const action = String(frame.action || '');
-      actions.push(action);
-      const payload = reply(action, frame);
-      client.send(JSON.stringify({ echo: frame.echo, retcode: payload?.status === 'ok' ? 0 : 1404, ...payload }));
-    });
+
+    const gateway = booted.ctx.get('kujira-gateway') as KujiraGatewayClient;
+    const presetsSvc: any = (booted.ctx as any).agentPresets || booted.ctx.get?.('agentPresets');
+    await waitUntil(async () => {
+      if (!gateway.getStatus().ready || FakeWs.instances.length === 0) return false;
+      if (presetsSvc?.list) {
+        const list = await presetsSvc.list();
+        return Array.isArray(list) && list.some((p: any) => p.id === 'kujira-session');
+      }
+      return true;
+    }, 5000, 'gateway ready and kujira-session registered');
+
+    const sm = booted.ctx.get('kujira-session') as SessionManager;
+    const agent = await sm.getOrCreateAgent(MOCK_PEER);
+    const capture = (msg: any) => {
+      const text = Array.isArray(msg?.content)
+        ? msg.content.map((c: any) => c?.text || '').join('')
+        : String(msg?.content || '');
+      capturedFollowups.push({ text });
+    };
+    (agent as any).followup = capture;
+    (agent as any).steer = capture;
   });
 
   afterEach(async () => {
-    delete process.env.NAPCAT_QQ_DATA_DIR;
-    if (client) client.terminate();
-    for (const s of servers) await new Promise<void>((r) => s.close(() => r())).catch(() => {});
-    if (booted) await booted.dispose().catch(() => {});
-    if (tmpHome) await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
+    vi.unstubAllGlobals();
+    for (const s of servers) {
+      await new Promise<void>((r) => s.close(() => r())).catch(() => {});
+    }
+    if (booted) {
+      await booted.dispose().catch(() => {});
+    }
+    if (tmpHome) {
+      await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
+    }
   });
 
-  it('ASM-1: get_image 本地路径 → local_path 落在 downloads/ 且 content 不再是裸图名', async () => {
-    const cached = path.join(tmpHome, 'qq-cache', 'origin.png');
-    await fsp.mkdir(path.dirname(cached), { recursive: true });
-    await fsp.writeFile(cached, PNG_BYTES);
+  it('ASM-1: C2C_MESSAGE_CREATE attachments[] 裸 GET 下载无 Authorization 头，落入 dshHome/kujira/downloads/image/<peer>/ 并写入 local_path 与 attachments JSON', async () => {
+    const srv = await startHttpServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
 
-    reply = (action) => {
-      if (action === 'get_image') {
-        return { status: 'ok', data: { file: cached, file_size: String(PNG_BYTES.length), file_name: 'origin.png' } };
-      }
-      return { status: 'failed', data: null, wording: 'unexpected action' };
-    };
-    // 死端口直链：万一退化回「直链优先」会立刻连接失败，不会误判本用例通过
-    // eslint-disable-next-line
-    const deadUrl = 'http://127.0.0.1:1/x.png';
-    client.send(JSON.stringify(inboundImageMessage('972D03EAEE2FCEAAB0C6378255A2F6BD.png', deadUrl, 61001)));
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_IMG_1',
+      content: '',
+      timestamp: '2026-11-11T12:00:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_IN_IMG_1'] },
+      attachments: [
+        {
+          content_type: 'image/png',
+          filename: 'photo.png',
+          size: PNG_BYTES.length,
+          width: 100,
+          height: 100,
+          url: `${srv.baseUrl}/img/photo.png?rkey=mock_secret`,
+        },
+      ],
+    });
 
-    const row = await waitForRow('972D03EAEE2FCEAAB0C6378255A2F6BD.png');
+    const row = await waitForDbRow('ROBOT1.0_IN_IMG_1');
+    await waitUntil(() => capturedFollowups.length === 1, 3000, 'followup captured');
+
+    // 验证裸 GET 请求无 Authorization 头且携带完整 rkey query
+    expect(srv.requests).toHaveLength(1);
+    expect(srv.requests[0]!.method).toBe('GET');
+    expect(srv.requests[0]!.url).toBe('/img/photo.png?rkey=mock_secret');
+    expect(srv.requests[0]!.authorization).toBeUndefined();
+
+    // 验证落盘路径位于 dshHome/kujira/downloads/image/<peer>/
+    const expectedDir = path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER);
+    expect(row.type).toBe('image');
+    expect(row.peer).toBe(MOCK_PEER);
+    expect(row.ref_idx).toBe('REFIDX_IN_IMG_1');
     expect(row.local_path).toBeTruthy();
-    expect(String(row.local_path).startsWith(path.join(tmpHome, 'napcat', 'downloads', 'image', `group_${GROUP_ID}`))).toBe(true);
+    expect(path.resolve(row.local_path).startsWith(expectedDir)).toBe(true);
     expect(fs.existsSync(row.local_path)).toBe(true);
     expect(Buffer.compare(fs.readFileSync(row.local_path), PNG_BYTES)).toBe(0);
-    expect(String(row.content)).toContain('downloads');
-    expect(String(row.content)).not.toBe('[图片:972D03EAEE2FCEAAB0C6378255A2F6BD.png]');
-    expect(actions).toContain('get_image');
+
+    // 验证 SQLite attachments JSON
+    const parsedAtts = JSON.parse(row.attachments);
+    expect(parsedAtts).toHaveLength(1);
+    expect(parsedAtts[0].kind).toBe('image');
+    expect(parsedAtts[0].origin).toBe('inbound');
+    expect(parsedAtts[0].local?.path).toBe(row.local_path);
+    expect(parsedAtts[0].local?.format).toBe('png');
+    expect(parsedAtts[0].local?.fingerprint).toBeTruthy();
+    expect(parsedAtts[0].local?.md5).toBeTruthy();
+
+    // 正文与唤醒提示词只展示本地 OS 路径，绝不泄露 rkey query
+    expect(row.content).toBe(`[图片:${row.local_path}]`);
+    expect(row.content).not.toContain('rkey');
+    expect(row.content).not.toContain('mock_secret');
+    expect(capturedFollowups[0]!.text).toContain(`[图片:${row.local_path}]`);
+    expect(capturedFollowups[0]!.text).not.toContain('rkey');
+    expect(capturedFollowups[0]!.text).not.toContain('mock_secret');
   });
 
-  it('ASM-2: 四段全失败 → local_path 为空、content 回落可下载直链、消息照常入库', async () => {
-    const deadUrl = await startLoopback(400, '{"retcode":-5503007,"retmsg":"download url has expired"}');
-    reply = () => ({ status: 'failed', data: null, wording: 'not available' });
+  it('ASM-2: 死链或 HTTP 403 失败时 local_path = null，描述符 unavailable 与正文绝不泄漏 rkey query', async () => {
+    const srv = await startHttpServer((_req, res) => {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ message: 'rkey expired' }));
+    });
 
-    client.send(JSON.stringify(inboundImageMessage('0123456789ABCDEF0123456789ABCDEF.png', deadUrl, 61002)));
-
-    const row = await waitForRow('0123456789ABCDEF0123456789ABCDEF.png');
-    expect(row.local_path).toBeNull();
-    // 统一渲染：无本地文件时优先展示可下载直链，而不是 QQ 伪文件名
-    expect(row.content).toBe(`[图片:${deadUrl}]`);
-    expect(actions).toEqual(expect.arrayContaining(['get_image', 'get_file', 'get_msg']));
-  });
-
-  it('ASM-3: 同机 NTQQ 缓存直读装配：消息命中本地缓存时，local_path 正确落盘且完全不调用 NapCat Action', async () => {
-    const ntqqRoot = path.join(tmpHome, 'mock-ntqq-data');
-    const oriDir = path.join(ntqqRoot, BOT_QQ, 'nt_qq', 'nt_data', 'Pic', '2026-10', 'Ori');
-    await fsp.mkdir(oriDir, { recursive: true });
-    const cached = path.join(oriDir, 'DIRECTHIT01020304DIRECTHIT010203.jpg');
-    await fsp.writeFile(cached, PNG_BYTES);
-
-    process.env.NAPCAT_QQ_DATA_DIR = ntqqRoot;
-
-    reply = () => ({ status: 'failed', data: null, wording: 'should not be called' });
-
-    client.send(JSON.stringify(inboundImageMessage('DIRECTHIT01020304DIRECTHIT010203.image', undefined, 61003)));
-
-    const row = await waitForRow('DIRECTHIT01020304DIRECTHIT010203.image');
-    expect(row.local_path).toBeTruthy();
-    expect(String(row.local_path).startsWith(path.join(tmpHome, 'napcat', 'downloads', 'image', `group_${GROUP_ID}`))).toBe(true);
-    expect(fs.existsSync(row.local_path)).toBe(true);
-    expect(actions).not.toContain('get_image');
-    expect(actions).not.toContain('get_file');
-  });
-
-  it('ASM-4: 多图并发解析装配：包含多张图片的入站消息，通过 Promise.all 并发解析且全部成功落盘', async () => {
-    const cached1 = path.join(tmpHome, 'qq-cache', 'multi1.png');
-    const cached2 = path.join(tmpHome, 'qq-cache', 'multi2.png');
-    await fsp.mkdir(path.dirname(cached1), { recursive: true });
-    await fsp.writeFile(cached1, PNG_BYTES);
-    await fsp.writeFile(cached2, PNG_BYTES);
-
-    reply = (action, frame) => {
-      if (action === 'get_image') {
-        const fileParam = String(frame.params?.file || '');
-        if (fileParam.includes('MULTI_A')) {
-          return { status: 'ok', data: { file: cached1, file_size: String(PNG_BYTES.length) } };
-        }
-        if (fileParam.includes('MULTI_B')) {
-          return { status: 'ok', data: { file: cached2, file_size: String(PNG_BYTES.length) } };
-        }
-      }
-      return { status: 'failed', data: null, wording: 'unexpected action' };
-    };
-
-    const multiMsg = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 61004,
-      user_id: MEMBER_QQ,
-      group_id: GROUP_ID,
-      sender: { user_id: MEMBER_QQ, nickname: '测试成员' },
-      message: [
-        { type: 'image', data: { file: 'MULTI_A.png', sub_type: 0 } },
-        { type: 'image', data: { file: 'MULTI_B.png', sub_type: 0 } },
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_IMG_DEAD',
+      content: '看看这张失效图',
+      timestamp: '2026-11-11T12:01:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_IN_IMG_DEAD'] },
+      attachments: [
+        {
+          content_type: 'image/png',
+          filename: 'expired.png',
+          size: 128,
+          url: `${srv.baseUrl}/expired/expired.png?rkey=mock_secret`,
+        },
       ],
-      raw_message: '',
-      time: Math.floor(Date.now() / 1000),
-      self_id: BOT_QQ,
-    };
+    });
 
-    client.send(JSON.stringify(multiMsg));
+    const row = await waitForDbRow('ROBOT1.0_IN_IMG_DEAD');
+    await waitUntil(() => capturedFollowups.length === 1, 3000, 'followup captured for dead link');
 
-    const row = await waitForRow('MULTI_A.png');
+    expect(row.local_path).toBeNull();
+    expect(row.content).toContain('(入站落盘失败)');
+    expect(row.content).not.toContain('rkey');
+    expect(row.content).not.toContain('mock_secret');
+    expect(capturedFollowups[0]!.text).not.toContain('rkey');
+    expect(capturedFollowups[0]!.text).not.toContain('mock_secret');
+
+    const parsedAtts = JSON.parse(row.attachments);
+    expect(parsedAtts).toHaveLength(1);
+    expect(parsedAtts[0].local).toBeUndefined();
+    expect(parsedAtts[0].unavailable).toBeTruthy();
+    expect(String(parsedAtts[0].unavailable)).toContain('403');
+    expect(String(parsedAtts[0].unavailable)).not.toContain('rkey');
+    expect(String(parsedAtts[0].unavailable)).not.toContain('mock_secret');
+  });
+
+  it('ASM-3: 响应头错报与伪扩展名纠偏 — 以真实字节魔数落盘 .png 且 format="png"', async () => {
+    const srv = await startHttpServer((_req, res) => {
+      // 模拟服务端响应头错报为 image/jpeg
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(PNG_BYTES);
+    });
+
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_IMG_MAGIC',
+      content: '',
+      timestamp: '2026-11-11T12:02:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+      attachments: [
+        {
+          content_type: 'image/jpeg',
+          filename: 'misnamed.jpg',
+          size: PNG_BYTES.length,
+          url: `${srv.baseUrl}/img/misnamed.jpg?rkey=mock_secret`,
+        },
+      ],
+    });
+
+    const row = await waitForDbRow('ROBOT1.0_IN_IMG_MAGIC');
     expect(row.local_path).toBeTruthy();
+    expect(String(row.local_path).endsWith('.png')).toBe(true);
     expect(fs.existsSync(row.local_path)).toBe(true);
 
-    const parsedRaw = JSON.parse(row.raw);
-    expect(parsedRaw).toHaveLength(2);
-    expect(parsedRaw[0].data.local_path).toBeTruthy();
-    expect(fs.existsSync(parsedRaw[0].data.local_path)).toBe(true);
-    expect(parsedRaw[1].data.local_path).toBeTruthy();
-    expect(fs.existsSync(parsedRaw[1].data.local_path)).toBe(true);
-    expect(row.content).toContain(parsedRaw[0].data.local_path);
-    expect(row.content).toContain(parsedRaw[1].data.local_path);
+    const parsedAtts = JSON.parse(row.attachments);
+    expect(parsedAtts[0].local?.format).toBe('png');
+  });
+
+  it('ASM-4: 多图 attachments[] 并发裸 GET 下载落盘并写入完整 attachments JSON', async () => {
+    const srv = await startHttpServer((req, res) => {
+      if (req.url?.includes('first')) {
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        res.end(PNG_BYTES);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(JPEG_BYTES);
+    });
+
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_IMG_MULTI',
+      content: '两张图对比下',
+      timestamp: '2026-11-11T12:03:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+      attachments: [
+        {
+          content_type: 'image/png',
+          filename: 'first.png',
+          size: PNG_BYTES.length,
+          url: `${srv.baseUrl}/img/first.png?rkey=mock_secret`,
+        },
+        {
+          content_type: 'image/jpeg',
+          filename: 'second.jpg',
+          size: JPEG_BYTES.length,
+          url: `${srv.baseUrl}/img/second.jpg?rkey=mock_secret`,
+        },
+      ],
+    });
+
+    const row = await waitForDbRow('ROBOT1.0_IN_IMG_MULTI');
+    expect(srv.requests).toHaveLength(2);
+    expect(srv.requests.every((r) => r.authorization === undefined)).toBe(true);
+
+    const parsedAtts = JSON.parse(row.attachments);
+    expect(parsedAtts).toHaveLength(2);
+    expect(parsedAtts[0].local?.path).toBeTruthy();
+    expect(parsedAtts[1].local?.path).toBeTruthy();
+    expect(fs.existsSync(parsedAtts[0].local.path)).toBe(true);
+    expect(fs.existsSync(parsedAtts[1].local.path)).toBe(true);
+    expect(Buffer.compare(fs.readFileSync(parsedAtts[0].local.path), PNG_BYTES)).toBe(0);
+    expect(Buffer.compare(fs.readFileSync(parsedAtts[1].local.path), JPEG_BYTES)).toBe(0);
+    expect(row.content).toContain(`[图片:${parsedAtts[0].local.path}]`);
+    expect(row.content).toContain(`[图片:${parsedAtts[1].local.path}]`);
   });
 });

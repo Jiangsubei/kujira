@@ -3,37 +3,40 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import { SessionManager } from '../../src/gateway/session.js';
-import * as NapCatBridgePlugin from '../../src/index.js';
-import { QQ_PRESET_PERSONA_PREFIX } from '../../src/constants/preset.js';
+import * as KujiraPlugin from '../../src/index.js';
+import {
+  QQ_PRESET_ID,
+  QQ_PRESET_NAME,
+  QQ_PRESET_PERSONA_PREFIX,
+} from '../../src/constants/preset.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
-describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session Preset Contract)', () => {
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_SESSION_ID = openidToSessionBaseId(MOCK_OPENID);
+
+describe('契约测试: Kujira 单聊会话专属预设装配与工具隔离 (QQ Session Preset Contract)', () => {
   let tmpHome: string;
   let booted: BootedDsh;
 
   beforeEach(async () => {
     tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-preset-contract-'));
-    booted = await bootDshNapcatBridge({
+    booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: false,
       extraPatches: [
         {
-          insert: [
-            {
-              id: 'agent-preset-registry',
-              name: '@deepseek-ai/dsh-agent-preset-registry',
-              config: { default: 'qq-session' },
-            },
-          ],
+          id: 'agent-preset-registry',
+          config: { default: QQ_PRESET_ID },
         },
       ],
     });
 
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29998,
+    await booted.ctx.plugin(KujiraPlugin, {
       face_enabled: true,
-      memory_enabled: true,
+      slang_enabled: true,
     });
   });
 
@@ -46,28 +49,28 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     }
   });
 
-  it('契约 1: 运行时 agentPresets 存在时，qq-session 预设必须成功注册', async () => {
+  it('契约 1: 运行时 agentPresets 存在时，kujira-session 预设必须成功注册', async () => {
     const presetsSvc: any = (booted.ctx as any).agentPresets || (booted.ctx as any).get?.('agentPresets');
     expect(presetsSvc).toBeDefined();
 
     // 等待异步注册完成
     const list = await presetsSvc.list();
-    const qqPreset = list.find((p: any) => p.id === 'qq-session');
+    const qqPreset = list.find((p: any) => p.id === QQ_PRESET_ID);
     expect(qqPreset).toBeDefined();
-    expect(qqPreset.name).toBe('QQ 智能助手');
+    expect(qqPreset.name).toBe(QQ_PRESET_NAME);
   });
 
-  it('契约 2: 挂载 qq-session 预设的 Agent，Prompt 必须被 complete: true 完全覆盖为专属轻量提示词', async () => {
+  it('契约 2: 挂载 kujira-session 预设的 Agent，Prompt 必须被 complete: true 完全覆盖为单聊专属轻量提示词', async () => {
     const presetsSvc: any = (booted.ctx as any).agentPresets || (booted.ctx as any).get?.('agentPresets');
     const qqWs = path.join(tmpHome, 'qq-ws');
     fs.mkdirSync(qqWs, { recursive: true });
 
     const qqHandle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-8000000002',
+      sessionId: MOCK_SESSION_ID,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: qqWs },
       setup: async (agentCtx: any) => {
-        await presetsSvc.mount(agentCtx, 'qq-session');
+        await presetsSvc.mount(agentCtx, QQ_PRESET_ID);
       },
     });
 
@@ -78,24 +81,25 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
 
     // 专属 Prompt 验证：包含目标指令且完全不包含默认 coding 提示词
     expect(fullPrompt).toContain(QQ_PRESET_PERSONA_PREFIX);
-    expect(fullPrompt).toContain('收到用户消息时，你需要先分析发言者的情绪和意图');
+    expect(fullPrompt).toContain('当前会话是 QQ 官方 Bot 单聊（C2C）会话');
+    expect(fullPrompt).toContain('收到用户消息时，你需要先分析对方的情绪和意图');
     expect(fullPrompt).toContain('即使是简短闲聊，也不可跳过这个流程。');
     expect(fullPrompt).toContain('当用户提出一个具体的请求时，你需要是一个有帮助的助手。');
     expect(fullPrompt).not.toContain('You are a coding agent');
     expect(fullPrompt).not.toContain('git commit');
   });
 
-  it('契约 3: 挂载 qq-session 预设的 Agent，工具集合必须包含基础文件/Shell/Web及全量 NapCat 专属工具', async () => {
+  it('契约 3: 挂载 kujira-session 预设的 Agent，工具集合必须包含基础文件/Shell/Web及全量 Kujira 单聊专属工具', async () => {
     const presetsSvc: any = (booted.ctx as any).agentPresets || (booted.ctx as any).get?.('agentPresets');
     const qqWs = path.join(tmpHome, 'qq-ws-tools');
     fs.mkdirSync(qqWs, { recursive: true });
 
     const qqHandle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-8000000002',
+      sessionId: MOCK_SESSION_ID,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: qqWs },
       setup: async (agentCtx: any) => {
-        await presetsSvc.mount(agentCtx, 'qq-session');
+        await presetsSvc.mount(agentCtx, QQ_PRESET_ID);
       },
     });
 
@@ -127,7 +131,7 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(toolNames.has('skill')).toBe(true);
     expect(toolNames.has('ask_user_question')).toBe(true);
 
-    // 5. 保留的专属工具
+    // 5. 保留的 Kujira 单聊专属工具
     expect(toolNames.has('send_qq_message')).toBe(true);
     expect(toolNames.has('recall_message')).toBe(true);
     expect(toolNames.has('read_chat_history')).toBe(true);
@@ -142,8 +146,13 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(toolNames.has('read_memory')).toBe(true);
     expect(toolNames.has('create_memory')).toBe(true);
     expect(toolNames.has('edit_memory')).toBe(true);
+    expect(toolNames.has('query_slang')).toBe(true);
+    expect(toolNames.has('record_slang')).toBe(true);
+    expect(toolNames.has('manage_slang')).toBe(true);
+    expect(toolNames.has('schedule_task')).toBe(true);
+    expect(toolNames.has('manage_scheduled_tasks')).toBe(true);
 
-    // 6. 已移除工具绝不能在预设中注册
+    // 6. 已移除的旧群聊/空间/多代理工具绝不能在预设中注册
     for (const removed of [
       'read_qzone_feeds',
       'publish_qzone_feed',
@@ -166,14 +175,14 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     }
   });
 
-  it('契约 4: 通过 SessionAgentRunner 创建的 QQ Agent 会话自动挂载 qq-session 预设', async () => {
+  it('契约 4: 通过 SessionManager 创建的 Kujira 单聊 Agent 会话自动挂载 kujira-session 预设', async () => {
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
-    const agent = await sessionManager.getOrCreateAgent('group:8000000002');
+    const agent = await sessionManager.getOrCreateAgent(MOCK_PEER);
     expect(agent).toBeDefined();
 
     const presetsSvc: any = (booted.ctx as any).agentPresets || (booted.ctx as any).get?.('agentPresets');
     const composedPreset = presetsSvc.composedPreset(agent.ctx);
-    expect(composedPreset).toBe('qq-session');
+    expect(composedPreset).toBe(QQ_PRESET_ID);
 
     // 验证其 assemble 结果
     const asm = await booted.ctx.systemPrompt.assemble({ scope: agent, agent } as any);
@@ -182,9 +191,9 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(fullPrompt).not.toContain('You are a coding agent');
   });
 
-  it('契约 5: 挂载 qq-session 预设的 Agent，运行时上下文 napcat:memory 未被抑制并正常注入', async () => {
+  it('契约 5: 挂载 kujira-session 预设的 Agent，运行时上下文未被抑制并正常注入', async () => {
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
-    const agent = await sessionManager.getOrCreateAgent('group:8000000002');
+    const agent = await sessionManager.getOrCreateAgent(MOCK_PEER);
 
     const asm = await booted.ctx.systemPrompt.assemble({ scope: agent, agent } as any);
     const contextNames = (asm.contexts as any[]).map((c) => c.name);
@@ -193,9 +202,9 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(contextNames.some((n: string) => n.startsWith('working-directory'))).toBe(true);
   });
 
-  it('契约 6: qq-session 预设配置必须完整包含 agent-instructions、skill-filesystem 与 tool-skill 插件定义', async () => {
+  it('契约 6: kujira-session 预设配置必须完整包含 agent-instructions、skill-filesystem、tool-skill 与 kujira-tools 插件定义', async () => {
     const presetsSvc: any = (booted.ctx as any).agentPresets || (booted.ctx as any).get?.('agentPresets');
-    const qqDef = presetsSvc.definitions?.get?.('qq-session');
+    const qqDef = presetsSvc.definitions?.get?.(QQ_PRESET_ID);
     expect(qqDef).toBeDefined();
 
     const plugins = qqDef.config.plugins;
@@ -204,6 +213,10 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(pluginIds).toContain('skill-filesystem');
     expect(pluginIds).toContain('tool-skill');
     expect(pluginIds).toContain('tool-ask-user');
+    expect(pluginIds).toContain('kujira-tools');
+
+    const toolsPlugin = plugins.find((p: any) => p.id === 'kujira-tools');
+    expect(toolsPlugin?.name).toBe('kujira/tools');
 
     const instructionsPlugin = plugins.find((p: any) => p.id === 'agent-instructions');
     expect(instructionsPlugin.config?.maxBytes).toBe(65536);

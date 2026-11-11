@@ -1,114 +1,231 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import WebSocket from 'ws';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
-import * as NapCatBridgePlugin from '../../src/index.js';
-import { MessageDatabase } from '../../src/storage/database.js';
+import * as http from 'node:http';
+import Database from 'better-sqlite3';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
+import type { SessionManager } from '../../src/gateway/session.js';
+import type { KujiraGatewayClient } from '../../src/gateway/server.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
 /**
- * 契约测试: 引用消息真实生产装配闭环 (Quote Assembly Contract)
+ * 契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
  *
- * 真实装配路径验证（非 mock 桩自测）：boot 挂载插件 → 真实 WS 网关 → 模拟 NapCat 客户端：
- * - 场景 1: 前置图片消息入库 → 后续引用该图片并 @机器人 → 唤醒包 Prompt 完整渲染 [引用回复 ...] + 文本；
- * - 场景 2: 引用机器人启动前历史消息（本地 DB 未命中） → NapCat get_msg API 实时反查成功 → 自动回填入库 + 唤醒包注入引用内容；
- * - 场景 3: 本地与 NapCat 均查无此消息 → 优雅降级为占位提示，不中断唤醒。
+ * (a) 出站 reply_to（REFIDX_... 或本地带 ref_idx 的 msg_id）发送 message_reference: { message_id: 'REFIDX_...' }；
+ * (b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原 quoted（含入站图与出站自身消息）；
+ * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（含 URL 凭证脱敏）；
+ * (d) 双未命中时优雅降级占位，不中断唤醒。
  */
 
-const GROUP_ID = 3000000001;
-const BOT_QQ = '1000000001';
-const USER_QQ = '2000000001';
-const WS_PORT = 18335;
+const nativeFetch = globalThis.fetch;
 
-describe('契约测试: 引用消息真实生产装配闭环 (Quote Assembly Contract)', () => {
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_APP_ID = 'app_kujira_mock';
+const MOCK_APP_SECRET = 'secret_kujira_mock';
+const MOCK_BOT_ID = 'bot_kujira_01';
+
+const PNG_BYTES = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(24, 4),
+]);
+
+class FakeWs {
+  static instances: FakeWs[] = [];
+  readyState = 0;
+  private listeners = new Map<string, Array<(ev: any) => void>>();
+  private seq = 1;
+
+  constructor(public readonly url: string) {
+    FakeWs.instances.push(this);
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.emit('open', {});
+      this.emit('message', {
+        data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }),
+      });
+    });
+  }
+
+  addEventListener(type: string, listener: (ev: any) => void): void {
+    const arr = this.listeners.get(type) ?? [];
+    arr.push(listener);
+    this.listeners.set(type, arr);
+  }
+
+  send(raw: string): void {
+    const frame = JSON.parse(raw);
+    if (frame.op === 2 || frame.op === 6) {
+      this.emit('message', {
+        data: JSON.stringify({
+          op: 0,
+          s: this.seq++,
+          t: 'READY',
+          d: {
+            version: 1,
+            session_id: 'sess-quote-1',
+            user: { id: MOCK_BOT_ID, username: 'Kujira助手', bot: true },
+          },
+        }),
+      });
+    } else if (frame.op === 1) {
+      this.emit('message', { data: JSON.stringify({ op: 11 }) });
+    }
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.emit('close', { code: 1000, reason: '' });
+  }
+
+  emitDispatch(t: string, d: unknown): void {
+    this.emit('message', {
+      data: JSON.stringify({ op: 0, s: this.seq++, t, d }),
+    });
+  }
+
+  private emit(type: string, ev: any): void {
+    for (const fn of this.listeners.get(type) ?? []) {
+      fn(ev);
+    }
+  }
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000, label = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`等待超时: ${label}`);
+}
+
+describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)', () => {
   let tmpHome: string;
   let booted: BootedDsh;
-  let client: WebSocket;
-  let frames: Array<Record<string, any>> = [];
-  let frameWaiters: Array<{
-    action: string;
-    resolve: (f: Record<string, any>) => void;
-    timer: NodeJS.Timeout;
-  }> = [];
-  let capturedFollowups: Array<{ content: string }> = [];
-  let capturedUserMsgs: any[] = [];
-  let agent: any;
+  let servers: http.Server[] = [];
+  let capturedFollowups: Array<{ content: string }>;
+  let sentBodies: any[];
+  let outSeq: number;
+
+  function dbPath(): string {
+    return path.join(tmpHome, 'kujira', 'messages.sqlite');
+  }
+
+  async function startImageServer(): Promise<string> {
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+    servers.push(srv);
+    await new Promise<void>((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = srv.address() as any;
+    return `http://127.0.0.1:${addr.port}`;
+  }
+
+  async function waitForDbRow(msgId: string, timeoutMs = 5000): Promise<any> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const db = new Database(dbPath(), { readonly: true });
+      try {
+        const row = db.prepare('SELECT * FROM messages WHERE msg_id = ?').get(msgId);
+        if (row) return row;
+      } finally {
+        db.close();
+      }
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    throw new Error(`等待消息记录超时 (msg_id: ${msgId})`);
+  }
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-napcat-quote-asm-'));
+    FakeWs.instances = [];
+    servers = [];
     capturedFollowups = [];
-    capturedUserMsgs = [];
-    frames = [];
-    frameWaiters = [];
+    sentBodies = [];
+    outSeq = 0;
 
-    booted = await bootDshNapcatBridge({ dshHome: tmpHome, mountPlugin: false });
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      bot_qq: BOT_QQ,
-      ws_token: 'test-token',
-      ws_port: WS_PORT,
-    });
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-quote-'));
+    await fsp.writeFile(
+      path.join(tmpHome, '.credentials.yaml'),
+      [
+        'version: 1',
+        'refs:',
+        `  QQ_BOT_APP_ID: "${MOCK_APP_ID}"`,
+        `  QQ_BOT_SECRET: "${MOCK_APP_SECRET}"`,
+        '',
+      ].join('\n'),
+      'utf8'
+    );
 
-    // 预创建群聊 Agent 并接管 followup 捕获 Wakeup Prompt
-    const agents: any = booted.ctx.get('agents');
-    const handle = await agents.create({
-      sessionId: `qq-group-${GROUP_ID}`,
-      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: path.join(tmpHome, 'agent-cwd') },
-    });
-    agent = handle.agent || handle;
-    agent.followup = (msg: any) => {
-      capturedUserMsgs.push(msg);
-      const text = Array.isArray(msg?.content)
-        ? msg.content.map((c: any) => c?.text || '').join('')
-        : String(msg?.content || '');
-      capturedFollowups.push({ content: text });
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+
+      if (url === 'https://bots.qq.com/app/getAppAccessToken') {
+        return new Response(JSON.stringify({ access_token: 'mock_access_token', expires_in: 7200 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === 'https://api.sgroup.qq.com/gateway') {
+        return new Response(JSON.stringify({ url: 'wss://api.sgroup.qq.com/websocket' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.startsWith('https://api.sgroup.qq.com/')) {
+        const parsed = new URL(url);
+        if (method === 'POST' && parsed.pathname === `/v2/users/${MOCK_OPENID}/messages`) {
+          const body = typeof init?.body === 'string' && init.body ? JSON.parse(init.body) : {};
+          if (body.msg_type !== 6) {
+            sentBodies.push(body);
+          }
+          outSeq += 1;
+          return new Response(
+            JSON.stringify({
+              id: `ROBOT1.0_Q_OUT_${outSeq}`,
+              timestamp: '2026-11-11T12:05:00+08:00',
+              ext_info: { ref_idx: `REFIDX_Q_OUT_${outSeq}` },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+      return nativeFetch(input, init);
     };
 
-    client = new WebSocket(`ws://127.0.0.1:${WS_PORT}?access_token=test-token`);
-    await new Promise<void>((resolve, reject) => {
-      client.once('open', () => resolve());
-      client.once('error', reject);
+    vi.stubGlobal('WebSocket', FakeWs as unknown as typeof WebSocket);
+    vi.stubGlobal('fetch', mockFetch);
+
+    booted = await bootDshKujira({
+      dshHome: tmpHome,
+      mountPlugin: true,
+      config: {
+        input_notify_enabled: false,
+      },
     });
 
-    client.on('message', (data) => {
-      const frame = JSON.parse(data.toString());
-      if (frame.action === 'get_group_member_info') {
-        client.send(
-          JSON.stringify({
-            echo: frame.echo,
-            status: 'ok',
-            retcode: 0,
-            data: { nickname: 'BotNickname', card: 'BotNickname' },
-          })
-        );
-        return;
+    const gateway = booted.ctx.get('kujira-gateway') as KujiraGatewayClient;
+    const presetsSvc: any = (booted.ctx as any).agentPresets || booted.ctx.get?.('agentPresets');
+    await waitUntil(async () => {
+      if (!gateway.getStatus().ready || FakeWs.instances.length === 0) return false;
+      if (presetsSvc?.list) {
+        const list = await presetsSvc.list();
+        return Array.isArray(list) && list.some((p: any) => p.id === 'kujira-session');
       }
-      if (frame.action === 'get_group_info') {
-        client.send(
-          JSON.stringify({
-            echo: frame.echo,
-            status: 'ok',
-            retcode: 0,
-            data: { group_name: '测试群' },
-          })
-        );
-        return;
-      }
-      const w = frameWaiters.find((x) => x.action === frame.action);
-      if (w) {
-        clearTimeout(w.timer);
-        frameWaiters = frameWaiters.filter((x) => x !== w);
-        w.resolve(frame);
-      } else {
-        frames.push(frame);
-      }
-    });
+      return true;
+    }, 5000, 'gateway ready and kujira-session registered');
   });
 
   afterEach(async () => {
-    if (client) {
-      client.terminate();
+    vi.unstubAllGlobals();
+    for (const s of servers) {
+      await new Promise<void>((r) => s.close(() => r())).catch(() => {});
     }
     if (booted) {
       await booted.dispose().catch(() => {});
@@ -118,383 +235,200 @@ describe('契约测试: 引用消息真实生产装配闭环 (Quote Assembly Con
     }
   });
 
-  function waitForAction(action: string, timeoutMs = 2000): Promise<Record<string, any>> {
-    const queuedIdx = frames.findIndex((f) => f.action === action);
-    if (queuedIdx >= 0) {
-      return Promise.resolve(frames.splice(queuedIdx, 1)[0]);
-    }
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        frameWaiters = frameWaiters.filter((x) => x !== waiter);
-        reject(new Error(`等待 action ${action} 超时`));
-      }, timeoutMs);
-      const waiter = { action, resolve, timer };
-      frameWaiters.push(waiter as any);
-    });
+  async function preparePeerAgent() {
+    const sm = booted.ctx.get('kujira-session') as SessionManager;
+    const agent = await sm.getOrCreateAgent(MOCK_PEER);
+    const capture = (msg: any) => {
+      const text = Array.isArray(msg?.content)
+        ? msg.content.map((c: any) => c?.text || '').join('')
+        : String(msg?.content || '');
+      capturedFollowups.push({ content: text });
+    };
+    (agent as any).followup = capture;
+    (agent as any).steer = capture;
+    return agent;
   }
 
-  it('场景 1: 本地命中 — 前置图片入库后，引用该图片并 @机器人，Prompt 必须包含 [引用回复 ...]', async () => {
-    // 1. 下发前置图片消息 (msg_id: 88888)
-    const prevMsg = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 88888,
-      group_id: GROUP_ID,
-      user_id: 1000000011,
-      time: 1788045800,
-      self_id: BOT_QQ,
-      sender: { user_id: 1000000011, nickname: '测试用户A', card: '测试用户A' },
-      message: [
+  it('(a) 出站 reply_to 支持直接传 REFIDX_... 或本地带 ref_idx 的 msg_id，并在首片发送 message_reference', async () => {
+    const agent = await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_IN_1',
+      content: '帮我看一下这条',
+      timestamp: '2026-11-11T12:00:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_IN_1'] },
+    });
+    await waitUntil(() => capturedFollowups.length === 1, 3000, 'inbound 1');
+
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_NO_REF',
+      content: '这条没有 ref_idx',
+      timestamp: '2026-11-11T12:00:10+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+    });
+    await waitUntil(() => capturedFollowups.length === 2, 3000, 'inbound 2');
+
+    const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
+    const sendTool = toolsSvc.get('send_qq_message', agent);
+
+    // 1. 直接传入 REFIDX_...
+    const r1 = await sendTool.execute({ text: '直接引用索引', reply_to: 'REFIDX_Q_IN_1' }, { agent });
+    expect(r1.success).toBe(true);
+    expect(sentBodies[0].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
+
+    // 2. 传入本地入站 msg_id（SQLite 中存有 ref_idx=REFIDX_Q_IN_1）
+    const r2 = await sendTool.execute({ text: '通过本地 msg_id 反查引用', reply_to: 'ROBOT1.0_Q_IN_1' }, { agent });
+    expect(r2.success).toBe(true);
+    expect(sentBodies[1].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
+
+    // 3. 超长分片回复仅首片附 message_reference，后续分片不重复携带
+    const longText = 'A'.repeat(20_000);
+    const r3 = await sendTool.execute({ text: longText, reply_to: 'REFIDX_Q_IN_1' }, { agent });
+    expect(r3.success).toBe(true);
+    expect(sentBodies.length).toBeGreaterThanOrEqual(4);
+    expect(sentBodies[2].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
+    expect(sentBodies[3].message_reference).toBeUndefined();
+
+    // 4. 目标消息无 ref_idx 时不伪造 message_reference
+    const beforeIdx = sentBodies.length;
+    const r4 = await sendTool.execute({ text: '无索引兜底', reply_to: 'ROBOT1.0_Q_NO_REF' }, { agent });
+    expect(r4.success).toBe(true);
+    expect(sentBodies[beforeIdx].message_reference).toBeUndefined();
+  });
+
+  it('(b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原 quoted（含图片与自身出站）', async () => {
+    const agent = await preparePeerAgent();
+    const baseUrl = await startImageServer();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    // 1. 前置入站图片消息（带 msg_idx=REFIDX_Q_IMG_1）
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_IMG_1',
+      content: '',
+      timestamp: '2026-11-11T12:01:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户A' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_IMG_1'] },
+      attachments: [
         {
-          type: 'image',
-          data: {
-            file: 'test.jpg',
-            local_path: '/dsh/workspace/napcat_download/image/common/test.jpg',
-          },
+          content_type: 'image/png',
+          filename: 'chart.png',
+          size: PNG_BYTES.length,
+          url: `${baseUrl}/chart.png?rkey=mock_secret`,
         },
       ],
-      raw_message: '[CQ:image,file=test.jpg]',
-    };
-    client.send(JSON.stringify(prevMsg));
+    });
+    const imgRow = await waitForDbRow('ROBOT1.0_Q_IMG_1');
+    expect(imgRow.local_path).toBeTruthy();
+    expect(imgRow.ref_idx).toBe('REFIDX_Q_IMG_1');
 
-    await new Promise((r) => setTimeout(r, 100));
+    // 2. 用户引用该图片发起 message_type=103
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_REPLY_IMG',
+      content: '说的就是这张图',
+      timestamp: '2026-11-11T12:01:10+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户A' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_REPLY_IMG', 'ref_msg_idx=REFIDX_Q_IMG_1'] },
+      msg_elements: [{ content: '兜底占位文本', message_type: 0, msg_idx: 'REFIDX_Q_IMG_1' }],
+    });
 
-    // 2. 下发引用消息 (msg_id: 99999) 引用 88888 并 @机器人
-    const msgEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 99999,
-      group_id: GROUP_ID,
-      user_id: USER_QQ,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: USER_QQ, nickname: '测试用户C', card: '测试用户C' },
-      message: [
-        { type: 'reply', data: { id: 88888 } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 说的这个图' } },
-      ],
-      raw_message: `[CQ:reply,id=88888][CQ:at,qq=${BOT_QQ}] 说的这个图`,
-    };
-    client.send(JSON.stringify(msgEvent));
+    const replyRow = await waitForDbRow('ROBOT1.0_Q_REPLY_IMG');
+    await waitUntil(() => capturedFollowups.length >= 2, 3000, 'quote image followup');
 
-    await new Promise((r) => setTimeout(r, 200));
+    expect(replyRow.type).toBe('reply');
+    expect(replyRow.reply_to).toBe('REFIDX_Q_IMG_1');
+    expect(replyRow.ref_idx).toBe('REFIDX_Q_REPLY_IMG');
+    const prompt1 = capturedFollowups[1]!.content;
+    expect(prompt1).toContain(`[引用回复 测试用户A (${MOCK_OPENID}): "[图片:${imgRow.local_path}]"]`);
+    expect(prompt1).toContain('说的就是这张图');
+    expect(prompt1).not.toContain('兜底占位文本');
 
-    expect(capturedFollowups).toHaveLength(1);
-    const prompt = capturedFollowups[0].content;
-    expect(prompt).toContain(`[QQ群聊: ${GROUP_ID}]`);
-    expect(prompt).toContain('[测试用户C (QQ: 2000000001)]：[引用回复');
-    expect(prompt).toContain('[引用回复 测试用户A (QQ: 1000000011): "[图片:/dsh/workspace/napcat_download/image/common/test.jpg]"]');
-    expect(prompt).toContain('说的这个图');
+    // 3. 机器人发出出站消息（返回 ext_info.ref_idx=REFIDX_Q_OUT_1），随后用户引用该出站消息
+    const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
+    const sendTool = toolsSvc.get('send_qq_message', agent);
+    const sent = await sendTool.execute({ text: '这是机器人之前发的话' }, { agent });
+    expect(sent.ref_idx).toBe('REFIDX_Q_OUT_1');
+    await waitForDbRow('ROBOT1.0_Q_OUT_1');
+
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_REPLY_SELF',
+      content: '你刚才说的这句很对',
+      timestamp: '2026-11-11T12:01:20+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户A' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_REPLY_SELF', 'ref_msg_idx=REFIDX_Q_OUT_1'] },
+    });
+
+    await waitUntil(() => capturedFollowups.length >= 3, 3000, 'quote self followup');
+    const prompt2 = capturedFollowups[2]!.content;
+    expect(prompt2).toContain(`[引用回复 Kujira助手 (${MOCK_BOT_ID}): "这是机器人之前发的话"]`);
+    expect(prompt2).toContain('你刚才说的这句很对');
   });
 
-  it('场景 2: 本地未命中 — 引用启动前历史消息时触发 get_msg API 二级兜底并回填入库', async () => {
-    // 下发引用未在本地出现过的消息 (msg_id: 77777)
-    const msgEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 99998,
-      group_id: GROUP_ID,
-      user_id: USER_QQ,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: USER_QQ, nickname: '提问者', card: '提问者' },
-      message: [
-        { type: 'reply', data: { id: 77777 } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 这句话什么意思' } },
+  it('(c) TMP_... 临时索引或未命中本地 SQLite 时回退解析 msg_elements[] 并脱敏 URL', async () => {
+    await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    // 1. TMP_... 临时索引不查 DB，直接解析 msg_elements[] 且剥离含 rkey URL
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_TMP_1',
+      content: '针对这段复合引用回复一下',
+      timestamp: '2026-11-11T12:02:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_TMP_1', 'ref_msg_idx=TMP_COMPOSITE_1'] },
+      msg_elements: [
+        { content: '复合引用第一段', message_type: 0, msg_idx: 'TMP_COMPOSITE_1' },
+        { content: 'URL:https://example.com/pic.png?rkey=mock_secret', message_type: 0 },
       ],
-      raw_message: `[CQ:reply,id=77777][CQ:at,qq=${BOT_QQ}] 这句话什么意思`,
-    };
-    client.send(JSON.stringify(msgEvent));
+    });
 
-    // 网关检测到本地未命中，向 NapCat 发送 get_msg 请求
-    const getMsgFrame = await waitForAction('get_msg');
-    expect(getMsgFrame.params.message_id).toBe(77777);
+    await waitUntil(() => capturedFollowups.length >= 1, 3000, 'tmp quote followup');
+    const promptTmp = capturedFollowups[0]!.content;
+    expect(promptTmp).toContain('[引用回复 消息ID: TMP_COMPOSITE_1:');
+    expect(promptTmp).toContain('复合引用第一段');
+    expect(promptTmp).toContain('[图片(链接已脱敏)]');
+    expect(promptTmp).not.toContain('rkey');
+    expect(promptTmp).not.toContain('mock_secret');
 
-    // 客户端应答 get_msg
-    client.send(
-      JSON.stringify({
-        echo: getMsgFrame.echo,
-        status: 'ok',
-        retcode: 0,
-        data: {
-          message_id: 77777,
-          time: 1788045700,
-          user_id: 1000000014,
-          sender: { user_id: 1000000014, nickname: '历史用户', card: '历史用户' },
-          message: [{ type: 'text', data: { text: '这是历史上一条重要消息' } }],
-          raw_message: '这是历史上一条重要消息',
-        },
-      })
-    );
+    // 2. REFIDX_... 未命中本地库，回退 msg_elements[]
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_MISS_FB',
+      content: '这句话什么意思',
+      timestamp: '2026-11-11T12:02:10+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_MISS_FB', 'ref_msg_idx=REFIDX_NOT_IN_DB'] },
+      msg_elements: [{ content: '启动前的历史重要消息', message_type: 0, msg_idx: 'REFIDX_NOT_IN_DB' }],
+    });
 
-    await new Promise((r) => setTimeout(r, 200));
-
-    expect(capturedFollowups).toHaveLength(1);
-    const prompt = capturedFollowups[0].content;
-    expect(prompt).toContain('[引用回复 历史用户 (QQ: 1000000014): "这是历史上一条重要消息"]');
-    expect(prompt).toContain('这句话什么意思');
+    await waitUntil(() => capturedFollowups.length >= 2, 3000, 'miss fallback followup');
+    const promptMiss = capturedFollowups[1]!.content;
+    expect(promptMiss).toContain('[引用回复 消息ID: REFIDX_NOT_IN_DB: "启动前的历史重要消息"]');
+    expect(promptMiss).toContain('这句话什么意思');
   });
 
-  it('场景 3: 双失败 — 历史消息拉取失败时优雅降级为占位提示，唤醒不中断', async () => {
-    // 下发引用不存在的消息 (msg_id: 66666)
-    const msgEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 99997,
-      group_id: GROUP_ID,
-      user_id: USER_QQ,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: USER_QQ, nickname: '提问者', card: '提问者' },
-      message: [
-        { type: 'reply', data: { id: 66666 } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 之前的结论是什么' } },
-      ],
-      raw_message: `[CQ:reply,id=66666][CQ:at,qq=${BOT_QQ}] 之前的结论是什么`,
-    };
-    client.send(JSON.stringify(msgEvent));
+  it('(d) 本地库与 msg_elements[] 均未命中时优雅降级占位，唤醒不中断', async () => {
+    await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
 
-    // 网关尝试 get_msg
-    const getMsgFrame = await waitForAction('get_msg');
-    expect(getMsgFrame.params.message_id).toBe(66666);
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_EXPIRED',
+      content: '之前的结论是什么',
+      timestamp: '2026-11-11T12:03:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_EXPIRED', 'ref_msg_idx=REFIDX_EXPIRED_NONE'] },
+    });
 
-    // 客户端应答 404 / 失败
-    client.send(
-      JSON.stringify({
-        echo: getMsgFrame.echo,
-        status: 'failed',
-        retcode: 1404,
-        message: 'Message not found or expired',
-      })
-    );
-
-    await new Promise((r) => setTimeout(r, 200));
-
-    expect(capturedFollowups).toHaveLength(1);
-    const prompt = capturedFollowups[0].content;
-    expect(prompt).toContain('[引用回复 消息ID: 66666: "〔历史引用消息：内容已过期或无法获取〕"]');
+    await waitUntil(() => capturedFollowups.length >= 1, 3000, 'degraded quote followup');
+    const prompt = capturedFollowups[0]!.content;
+    expect(prompt).toContain('[引用回复 消息ID: REFIDX_EXPIRED_NONE: "〔历史引用消息：内容已过期或无法获取〕"]');
     expect(prompt).toContain('之前的结论是什么');
   });
-
-  it('场景 4: 引用本地历史卡片消息 — cached.raw 动态重解析升级，完整提取直链与封面图', async () => {
-    // 1. 模拟历史旧数据在 SQLite 中（保存时只有老格式无链接 content，但有 raw）
-    const dbPath = path.join(tmpHome, 'napcat', 'messages.sqlite');
-    const db = new MessageDatabase(dbPath);
-    db.init();
-    db.saveMessage({
-      msg_id: 1684979878,
-      peer: `group_${GROUP_ID}`,
-      user_id: '1000000003',
-      sender_name: '在这',
-      time: 1788246335000,
-      type: 'json',
-      content: '[卡片消息:[QQ小程序]我讨厌黑色，却选择了墨岩]', // 老格式无链接
-      raw: JSON.stringify([
-        {
-          type: 'json',
-          data: {
-            data: JSON.stringify({
-              ver: '1.0.0.19',
-              prompt: '[QQ小程序]我讨厌黑色，却选择了墨岩',
-              app: 'com.tencent.miniapp_01',
-              meta: {
-                detail_1: {
-                  appid: '1000000005',
-                  title: '哔哩哔哩',
-                  desc: '我讨厌黑色，却选择了墨岩',
-                  icon: 'https://open.gtimg.cn/open/app_icon/00/95/17/76/100951776_100_m.png?t=1787736665',
-                  preview: 'https://qq.ugcimg.cn/v1/08du1gpgshmqa998g5mlbujmlkihsgd9vu9u6p9j5bn4oidqqmvdvugn2t6ml1rtfb7sj0cgm9hj5ur7vp0oaj09op7kdinskflecr3akp7rkl4q05o5rmvabpqq7bnesngql8egougd5r0fupvhe3tl04/e9vf2tsqr6j29hl2kodb3vahlc',
-                  url: 'm.q.qq.com/a/s/3b0f15c1f5e3bb76a5439fd09397295e',
-                  qqdocurl: 'https://b23.tv/qSGBhv4?share_medium=android&share_source=qq&bbid=XXD8605D2B9502CF7816EC606686E7F683D68&ts=1788246331916',
-                },
-              },
-            }),
-          },
-        },
-      ]),
-      file_id: null,
-      busid: null,
-      local_path: null,
-      fingerprint: null,
-      recalled: 0,
-      self: 0,
-      reply_to: null,
-    });
-
-    // 2. 用户发送引用该卡片的消息并 @机器人
-    const msgEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 99998,
-      group_id: GROUP_ID,
-      user_id: USER_QQ,
-      time: 1788246400,
-      self_id: BOT_QQ,
-      sender: { user_id: USER_QQ, nickname: '测试用户C', card: '测试用户C' },
-      message: [
-        { type: 'reply', data: { id: 1684979878 } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 看看这个' } },
-      ],
-      raw_message: `[CQ:reply,id=1684979878][CQ:at,qq=${BOT_QQ}] 看看这个`,
-    };
-    client.send(JSON.stringify(msgEvent));
-
-    await new Promise((r) => setTimeout(r, 200));
-
-    expect(capturedFollowups).toHaveLength(1);
-    const prompt = capturedFollowups[0].content;
-    // 验证：动态重解析生效，成功注入了直达链接与封面图！
-    expect(prompt).toContain(
-      '[引用回复 在这 (QQ: 1000000003): "[卡片消息:[QQ小程序]我讨厌黑色，却选择了墨岩](https://b23.tv/qSGBhv4?share_medium=android&share_source=qq&bbid=XXD8605D2B9502CF7816EC606686E7F683D68&ts=1788246331916) [封面:https://qq.ugcimg.cn/v1/08du1gpgshmqa998g5mlbujmlkihsgd9vu9u6p9j5bn4oidqqmvdvugn2t6ml1rtfb7sj0cgm9hj5ur7vp0oaj09op7kdinskflecr3akp7rkl4q05o5rmvabpqq7bnesngql8egougd5r0fupvhe3tl04/e9vf2tsqr6j29hl2kodb3vahlc]"]'
-    );
-    expect(prompt).toContain('看看这个');
-  });
-
-  it('场景 5: 真实装配下连续两条入站消息排队，出站回复精准引用各自对应的入站消息（Turn 级精准绑定装配闭环）', async () => {
-    // 监听客户端向 NapCat 发送的 send_group_msg action
-    const sentGroupMessages: Array<Record<string, any>> = [];
-    client.on('message', (data) => {
-      const frame = JSON.parse(data.toString());
-      if (frame.action === 'send_group_msg') {
-        sentGroupMessages.push(frame);
-        // 回包模拟 NapCat 成功
-        client.send(
-          JSON.stringify({
-            echo: frame.echo,
-            status: 'ok',
-            retcode: 0,
-            data: { message_id: Math.floor(Math.random() * 100000) },
-          })
-        );
-      }
-    });
-
-    // 1. 用户发送第一条入站消息 88801 并 @机器人
-    const msgEvent1 = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 88801,
-      group_id: GROUP_ID,
-      user_id: USER_QQ,
-      time: 1788246500,
-      self_id: BOT_QQ,
-      sender: { user_id: USER_QQ, nickname: '提问者A', card: '提问者A' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 轮次A问题' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}] 轮次A问题`,
-    };
-    client.send(JSON.stringify(msgEvent1));
-
-    // 等待消息 1 流转并被 agent 捕获
-    await new Promise((r) => setTimeout(r, 150));
-    expect(capturedUserMsgs).toHaveLength(1);
-
-    // 2. 轮次 A 尚未结束（未出站）时，用户又发送了第二条消息 88802（排队）
-    const msgEvent2 = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 88802,
-      group_id: GROUP_ID,
-      user_id: '1000000015',
-      time: 1788246505,
-      self_id: BOT_QQ,
-      sender: { user_id: '1000000015', nickname: '提问者B', card: '提问者B' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 轮次B问题' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}] 轮次B问题`,
-    };
-    client.send(JSON.stringify(msgEvent2));
-
-    // 等待消息 2 流转并被 agent 捕获
-    await new Promise((r) => setTimeout(r, 150));
-    expect(capturedUserMsgs).toHaveLength(2);
-
-    const session = agent.session;
-
-    // 3. 驱动轮次 1 (Turn 1): 模拟 DSH 驱动器消费消息 1
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 0,
-      type: 'turn/start',
-      data: { turn: 1 },
-    });
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 1,
-      type: 'user/message',
-      data: capturedUserMsgs[0],
-    });
-    // 轮次 1 产生模型回复
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 2,
-      type: 'assistant/message',
-      data: {
-        turn: 1,
-        step: 1,
-        stream: [],
-        message: { content: [{ type: 'text', text: '轮次 1 最终答复' }] },
-      },
-    });
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 3,
-      type: 'turn/end',
-      data: { turn: 1, reason: { kind: 'completed' } },
-    });
-
-    // 等待出站串行发送
-    await new Promise((r) => setTimeout(r, 150));
-
-    // 4. 驱动轮次 2 (Turn 2): 模拟 DSH 驱动器消费排队的消息 2
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 4,
-      type: 'turn/start',
-      data: { turn: 2 },
-    });
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 5,
-      type: 'user/message',
-      data: capturedUserMsgs[1],
-    });
-    // 轮次 2 产生模型回复
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 6,
-      type: 'assistant/message',
-      data: {
-        turn: 2,
-        step: 1,
-        stream: [],
-        message: { content: [{ type: 'text', text: '轮次 2 最终答复' }] },
-      },
-    });
-    (booted.ctx as any).emit('session/event', session, {
-      seq: 7,
-      type: 'turn/end',
-      data: { turn: 2, reason: { kind: 'completed' } },
-    });
-
-    // 等待出站串行发送
-    await new Promise((r) => setTimeout(r, 150));
-
-    // 5. 核心契约：贯彻用户侧静默原则，废除 assistant/message 自动直发（0条出站）
-    expect(sentGroupMessages).toHaveLength(0);
-    const prompt1 = capturedFollowups[0].content;
-    const prompt2 = capturedFollowups[1].content;
-    expect(prompt1).toContain('[消息ID: 88801]');
-    expect(prompt2).toContain('[消息ID: 88802]');
-    
-  });
 });
-

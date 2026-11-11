@@ -1,14 +1,60 @@
 /**
  * tests/contract/face-assembly.test.ts
- * 契约测试: 表情包模块真实装配闭环 (Real Assembly via bootDshNapcatBridge)
+ * 契约测试: 表情包模块真实装配闭环 (Real Assembly via bootDshKujira)
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
-import * as NapCatBridgePlugin from '../../src/index.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
+import * as KujiraPlugin from '../../src/index.js';
+import * as KujiraToolsPlugin from '../../src/tools/plugin.js';
+import {
+  DEFAULT_DATABASE_PATH,
+  DEFAULT_FACE_STORE_DIR,
+} from '../../src/constants/index.js';
+import { resolveDshPath } from '../../src/utils/path.js';
+import {
+  computeOpenidHash16,
+  openidToPeer,
+  openidToSessionBaseId,
+} from '../../src/utils/peer.js';
+import { MessageDatabase } from '../../src/storage/database.js';
+
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_HASH = computeOpenidHash16(MOCK_OPENID);
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_SESSION_ID = openidToSessionBaseId(MOCK_OPENID);
+
+const FACE_TOOL_NAMES = ['list_faces', 'send_face', 'collect_face', 'manage_faces'] as const;
+
+function expectLosslessJson(value: unknown, trail = 'root'): void {
+  if (value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach((item, idx) => expectLosslessJson(item, `${trail}[${idx}]`));
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      expect(v, `${trail}.${k} must not be undefined`).not.toBeUndefined();
+      expectLosslessJson(v, `${trail}.${k}`);
+    }
+  }
+}
+
+async function waitForPreset(ctx: any, presetId: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const presetsSvc = ctx.get?.('agentPresets') || ctx.agentPresets;
+  while (Date.now() < deadline) {
+    const list = await presetsSvc?.list?.();
+    if (Array.isArray(list) && list.some((p: any) => p.id === presetId)) {
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  throw new Error(`预设 ${presetId} 注册超时`);
+}
 
 describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contract)', () => {
   let booted: BootedDsh | null = null;
@@ -16,7 +62,7 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
 
   afterEach(async () => {
     if (booted) {
-      await booted.dispose();
+      await booted.dispose().catch(() => {});
       booted = null;
     }
     if (tmpHome && fs.existsSync(tmpHome)) {
@@ -27,47 +73,53 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     }
   });
 
-  it('装配 1: 默认状态 (face_enabled=false) 真实装配下绝不暴露表情工具', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-asm-off-'));
-    booted = await bootDshNapcatBridge({
+  it('装配 1: 默认状态 (face_enabled=false) 真实装配下绝不暴露 4 个表情工具，kujira:face_summary 保持静默', async () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-off-'));
+    booted = await bootDshKujira({
       dshHome: tmpHome,
-      mountPlugin: false,
+      mountPlugin: true,
     });
 
-    // 以默认配置 (face_enabled: false) 挂载插件
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29991,
-      face_enabled: false,
-    });
+    const provider = (booted.ctx.get('kujiraBridgeTools') || (booted.ctx as any).kujiraBridgeTools) as any;
+    expect(provider).toBeDefined();
+
+    // 挂载 kujira-tools 插件（即使配置默认 face_enabled=false，常规单聊工具应注册，4 个表情工具绝不挂载）
+    await booted.ctx.plugin(KujiraToolsPlugin);
 
     const toolsService = (booted.ctx.get('tools') || (booted.ctx as any).tools) as any;
     expect(toolsService).toBeDefined();
+    expect(toolsService.get('send_qq_message')).toBeDefined();
 
-    expect(toolsService.get('list_faces')).toBeUndefined();
-    expect(toolsService.get('send_face')).toBeUndefined();
-    expect(toolsService.get('collect_face')).toBeUndefined();
+    for (const name of FACE_TOOL_NAMES) {
+      expect(toolsService.get(name)).toBeUndefined();
+    }
+
+    const snapshotManager = (booted.ctx as any).snapshotManager;
+    expect(snapshotManager).toBeDefined();
+    const faceProvider = snapshotManager.getProvider('kujira:face_summary');
+    expect(faceProvider).toBeDefined();
+    expect(
+      faceProvider.provide(
+        { peer: MOCK_PEER, userId: MOCK_HASH },
+        { agent: { session: { id: MOCK_SESSION_ID } } }
+      )
+    ).toBe('');
   });
 
-  it('装配 2: 开启总开关 (face_enabled=true) 真实装配下完整挂载表情工具并可执行', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-asm-on-'));
-    booted = await bootDshNapcatBridge({
+  it('装配 2: 开启总开关 (face_enabled=true) 真实装配下完整挂载 4 个表情工具并可执行与遵循 Lossless JSON', async () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-on-'));
+    booted = await bootDshKujira({
       dshHome: tmpHome,
-      mountPlugin: false,
+      mountPlugin: true,
+      config: {
+        face_enabled: true,
+        face_store_max: 50,
+      },
     });
 
-    // 开启表情总开关挂载插件
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29992,
-      face_enabled: true,
-      face_store_max: 50,
-      face_sub_type: 1,
-    });
-
-    const provider = (booted.ctx.get('napcatBridgeTools') || (booted.ctx as any).napcatBridgeTools) as any;
+    const provider = (booted.ctx.get('kujiraBridgeTools') || (booted.ctx as any).kujiraBridgeTools) as any;
     expect(provider).toBeDefined();
-
-    // 挂载到测试上下文获取注册工具
-    provider.registerTools(booted.ctx);
+    await booted.ctx.plugin(KujiraToolsPlugin);
 
     const toolsService = (booted.ctx.get('tools') || (booted.ctx as any).tools) as any;
     expect(toolsService).toBeDefined();
@@ -75,25 +127,25 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     const listFacesTool = toolsService.get('list_faces');
     const sendFaceTool = toolsService.get('send_face');
     const collectFaceTool = toolsService.get('collect_face');
+    const manageFacesTool = toolsService.get('manage_faces');
 
     expect(listFacesTool).toBeDefined();
     expect(sendFaceTool).toBeDefined();
     expect(collectFaceTool).toBeDefined();
+    expect(manageFacesTool).toBeDefined();
 
-    // 验证真实工具可执行且返回结构符合契约
-    const res = await listFacesTool.execute({}, { agent: { session: { id: 'qq-group-8000000002' } } });
-    expect(res).toBeDefined();
+    const res = await listFacesTool.execute({}, { agent: { session: { id: MOCK_SESSION_ID } } });
+    expectLosslessJson(res);
     expect(res.faces).toEqual([]);
     expect(res.total).toBe(0);
 
-    // 验证插入未打标表情后执行 list_faces 返回结果严格满足 Lossless JSON
-    const dbPath = path.join(tmpHome, 'napcat', 'messages.sqlite');
-    const { MessageDatabase } = await import('../../src/storage/database.js');
+    // 验证插入未打标表情后执行 list_faces 与 manage_faces 返回严格满足 Lossless JSON
+    const dbPath = resolveDshPath(tmpHome, undefined, DEFAULT_DATABASE_PATH);
     const db = new MessageDatabase(dbPath);
     db.init();
     db.insertFace({
       id: 'face_test_lossless',
-      file_path: '/fake/path/lossless.png',
+      file_path: path.join(resolveDshPath(tmpHome, undefined, DEFAULT_FACE_STORE_DIR), 'lossless.png'),
       md5: 'md5_lossless_test',
       source: 'manual',
       tags: [],
@@ -102,33 +154,43 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     });
     db.close();
 
-    const res2 = await listFacesTool.execute({}, { agent: { session: { id: 'qq-group-8000000002' } } });
+    const res2 = await listFacesTool.execute({}, { agent: { session: { id: MOCK_SESSION_ID } } });
+    expectLosslessJson(res2);
     expect(res2.faces).toHaveLength(1);
     expect(res2.faces[0].id).toBe('face_test_lossless');
     expect(Object.hasOwn(res2.faces[0], 'mood')).toBe(false);
     expect(Object.hasOwn(res2, 'next_cursor')).toBe(false);
+
+    const quotaRes = await manageFacesTool.execute(
+      { action: 'query_quota' },
+      { agent: { session: { id: MOCK_SESSION_ID } } }
+    );
+    expectLosslessJson(quotaRes);
+    expect(quotaRes.success).toBe(true);
+    expect(quotaRes.total).toBe(1);
+    expect(quotaRes.max_quota).toBe(50);
+    expect(quotaRes.available).toBe(49);
   });
 
-  it('装配 3: 表情工具仅限 QQ 会话呈现与执行 — WebUI 隔离且从 assemble 中剔除，QQ 会话放行', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-asm-guard-'));
-    booted = await bootDshNapcatBridge({
+  it('装配 3: 表情工具仅限 Kujira 单聊会话呈现与执行 — WebUI 隔离剔除，kujira-user-<hash16> 挂载 kujira-session 放行', async () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-guard-'));
+    booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: false,
     });
 
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29993,
+    await booted.ctx.plugin(KujiraPlugin, {
       face_enabled: true,
     });
+    await waitForPreset(booted.ctx, 'kujira-session');
 
-    const FACE_TOOL_NAMES = new Set(['list_faces', 'send_face', 'collect_face']);
-
+    const faceNameSet = new Set<string>(FACE_TOOL_NAMES);
     const webWs = path.join(tmpHome, 'web-ws');
-    const qqWs = path.join(tmpHome, 'qq-ws');
+    const qqWs = path.join(tmpHome, 'kujira-ws');
     fs.mkdirSync(webWs, { recursive: true });
     fs.mkdirSync(qqWs, { recursive: true });
 
-    // 1. Web 会话 Agent: assemble 中不能包含表情工具
+    // 1. Web 会话 Agent: assemble 中不包含表情工具，调用被 DSH 拦截拒绝
     const webHandle = await booted.ctx.agents.create({
       sessionId: 'web-session-face',
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
@@ -136,10 +198,9 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     });
     const webAgent = webHandle.agent || webHandle;
     const asmWeb = await booted.ctx.systemPrompt.assemble({ scope: webAgent, agent: webAgent } as any);
-    const webFaces = (asmWeb.tools as any[]).filter((t) => FACE_TOOL_NAMES.has(t.name));
+    const webFaces = (asmWeb.tools as any[]).filter((t) => faceNameSet.has(t.name));
     expect(webFaces).toHaveLength(0);
 
-    // 2. Web 会话 Agent: 调用未在预设中的表情工具被 DSH 拦截拒绝
     const tools: any = booted.ctx.get('tools');
     const denied = await tools.execute({
       name: 'list_faces',
@@ -149,18 +210,18 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     });
     expect(denied.isError).toBe(true);
 
-    // 3. QQ 会话 Agent: 挂载 qq-session 预设，assemble 中包含全量表情工具，调用放行
+    // 2. Kujira 单聊会话 Agent: 挂载 kujira-session 预设 (含 kujira/tools)，assemble 包含全量 4 个表情工具，调用放行
     const qqHandle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-8000000002',
+      sessionId: MOCK_SESSION_ID,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: qqWs },
       setup: async (agentCtx: any) => {
-        await (booted.ctx as any).agentPresets.mount(agentCtx, 'qq-session');
+        await (booted!.ctx as any).agentPresets.mount(agentCtx, 'kujira-session');
       },
     });
     const qqAgent = qqHandle.agent || qqHandle;
     const asmQq = await booted.ctx.systemPrompt.assemble({ scope: qqAgent, agent: qqAgent } as any);
-    const qqFaces = (asmQq.tools as any[]).filter((t) => FACE_TOOL_NAMES.has(t.name));
+    const qqFaces = (asmQq.tools as any[]).filter((t) => faceNameSet.has(t.name));
     expect(qqFaces.map((t) => t.name).sort()).toEqual([...FACE_TOOL_NAMES].sort());
 
     const allowed = await tools.execute({
@@ -172,148 +233,87 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     expect(allowed.isError).toBe(false);
   });
 
-  it('装配 4: collect_face 收集表情包必须使用绝对路径规范落盘至 canonicalFaceStoreDir，绝不受 process.cwd 漂移影响', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-asm-path-'));
-    booted = await bootDshNapcatBridge({
+  it('装配 4: collect_face 默认落盘目录为 .dsh/kujira/faces（规范绝对路径），绝不受 cwd 漂移影响', async () => {
+    expect(DEFAULT_FACE_STORE_DIR).toBe('.dsh/kujira/faces');
+
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-path-'));
+    booted = await bootDshKujira({
       dshHome: tmpHome,
-      mountPlugin: false,
+      mountPlugin: true,
+      config: {
+        face_enabled: true,
+      },
     });
 
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29994,
-      face_enabled: true,
-    });
-
-    const provider = (booted.ctx.get('napcatBridgeTools') || (booted.ctx as any).napcatBridgeTools) as any;
-    provider.registerTools(booted.ctx);
-
+    await booted.ctx.plugin(KujiraToolsPlugin);
     const toolsService = (booted.ctx.get('tools') || (booted.ctx as any).tools) as any;
     const collectFaceTool = toolsService.get('collect_face');
 
-    // 准备一条包含本地图片的模拟消息
-    const dbPath = path.join(tmpHome, 'napcat', 'messages.sqlite');
-    const { MessageDatabase } = await import('../../src/storage/database.js');
+    const dbPath = resolveDshPath(tmpHome, undefined, DEFAULT_DATABASE_PATH);
     const db = new MessageDatabase(dbPath);
     db.init();
 
     const sampleImgPath = path.join(tmpHome, 'sample_meme.png');
-    fs.writeFileSync(sampleImgPath, 'dummy-meme-content');
+    fs.writeFileSync(sampleImgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]));
 
     db.saveMessage({
-      msg_id: 8888,
-      peer: 'group_1001',
-      user_id: '12345',
+      msg_id: 'ROBOT1.0_IN_FACE_1',
+      peer: MOCK_PEER,
+      user_id: MOCK_OPENID,
       sender_name: 'TestUser',
       time: Date.now(),
       type: 'image',
       content: '[图片]',
       local_path: sampleImgPath,
-      raw: {},
+      raw: '{}',
     });
 
-    // 执行 collect_face
     const res = await collectFaceTool.execute(
       {
-        message_id: 8888,
+        message_id: 'ROBOT1.0_IN_FACE_1',
         tags: ['测试猫猫'],
         mood: '搞笑',
       },
       {
-        agent: { session: { id: 'qq-group-1001' } },
+        agent: { session: { id: MOCK_SESSION_ID } },
       }
     );
 
+    expectLosslessJson(res);
     expect(res.success).toBe(true);
     expect(res.face_id).toBeDefined();
 
-    // 验证落盘文件路径为绝对路径，且在 tmpHome/napcat/faces 下
     const faceRecord = db.getFaceById(res.face_id);
     expect(faceRecord).toBeDefined();
     expect(path.isAbsolute(faceRecord!.file_path)).toBe(true);
-    const expectedDir = path.resolve(tmpHome, 'napcat', 'faces');
+    const expectedDir = resolveDshPath(tmpHome, undefined, DEFAULT_FACE_STORE_DIR);
+    expect(expectedDir).toBe(path.resolve(tmpHome, 'kujira', 'faces'));
     expect(faceRecord!.file_path.startsWith(expectedDir)).toBe(true);
     expect(fs.existsSync(faceRecord!.file_path)).toBe(true);
     db.close();
   });
 
-  it('装配 5: 启动自愈迁移：若 faces 表中存在存量相对路径记录，启动时自动修复为绝对路径并从 profiles 目录找回物理文件', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-asm-mig-'));
+  it('装配 5: 真实装配下 kujira:face_summary 严格遵循 face_store_max 配置且对非 Kujira 会话 Fail-Closed', async () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-quota-'));
+    booted = await bootDshKujira({
+      dshHome: tmpHome,
+      mountPlugin: true,
+      config: {
+        face_enabled: true,
+        face_store_max: 3,
+      },
+    });
+    await waitForPreset(booted.ctx, 'kujira-session');
 
-    // 在插件挂载前，预置一个具有存量相对路径记录的 messages.sqlite
-    const dbPath = path.join(tmpHome, 'napcat', 'messages.sqlite');
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    const { MessageDatabase } = await import('../../src/storage/database.js');
+    const dbPath = resolveDshPath(tmpHome, undefined, DEFAULT_DATABASE_PATH);
+    const faceDir = resolveDshPath(tmpHome, undefined, DEFAULT_FACE_STORE_DIR);
     const db = new MessageDatabase(dbPath);
     db.init();
 
-    const md5 = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
-    // 物理文件掉入 profiles/desktop/.dsh/napcat/faces 中
-    const orphanDir = path.join(tmpHome, 'profiles', 'desktop', '.dsh', 'napcat', 'faces');
-    fs.mkdirSync(orphanDir, { recursive: true });
-    const orphanFile = path.join(orphanDir, `${md5}.jpg`);
-    fs.writeFileSync(orphanFile, 'orphaned-meme-image-bytes');
-
-    // 数据库存的是相对路径
-    db.insertFace({
-      id: 'face_orphan_1',
-      file_path: `.dsh\\napcat\\faces\\${md5}.jpg`,
-      md5,
-      source: 'collect',
-      tags: ['孤儿表情'],
-      mood: '无奈',
-      size: 100,
-      format: 'jpg',
-    });
-    db.close();
-
-    // 挂载插件，触发启动时自动迁移与自愈
-    booted = await bootDshNapcatBridge({
-      dshHome: tmpHome,
-      mountPlugin: false,
-    });
-
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29995,
-      face_enabled: true,
-    });
-
-    // 检查数据库记录已自愈为标准绝对路径
-    const checkDb = new MessageDatabase(dbPath);
-    checkDb.init();
-    const migrated = checkDb.getFaceById('face_orphan_1');
-    expect(migrated).toBeDefined();
-    expect(path.isAbsolute(migrated!.file_path)).toBe(true);
-    const canonicalExpected = path.join(tmpHome, 'napcat', 'faces', `${md5}.jpg`);
-    expect(migrated!.file_path).toBe(canonicalExpected);
-    // 物理文件已安全迁移到标准目录
-    expect(fs.existsSync(canonicalExpected)).toBe(true);
-    checkDb.close();
-  });
-
-  it('装配 6: 真实装配下 SystemPrompt napcat:face_summary 的表情包注入上限严格遵循 face_store_max 配置', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-asm-quota-'));
-    booted = await bootDshNapcatBridge({
-      dshHome: tmpHome,
-      mountPlugin: false,
-    });
-
-    // 挂载插件，配置 face_store_max 为 3
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      ws_port: 29996,
-      face_enabled: true,
-      face_store_max: 3,
-    });
-
-    const dbPath = path.join(tmpHome, 'napcat', 'messages.sqlite');
-    const { MessageDatabase } = await import('../../src/storage/database.js');
-    const db = new MessageDatabase(dbPath);
-    db.init();
-
-    // 插入 5 张表情
     for (let i = 1; i <= 5; i++) {
       db.insertFace({
         id: `face_quota_${i}`,
-        file_path: path.join(tmpHome, 'napcat', 'faces', `quota_${i}.png`),
+        file_path: path.join(faceDir, `quota_${i}.png`),
         md5: `md5_quota_${i}`,
         source: 'manual',
         tags: [`配额${i}`],
@@ -324,27 +324,40 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     }
     db.close();
 
-    const qqWs = path.join(tmpHome, 'qq-ws');
+    const qqWs = path.join(tmpHome, 'kujira-ws');
     fs.mkdirSync(qqWs, { recursive: true });
     const qqHandle = await booted.ctx.agents.create({
-      sessionId: 'qq-group-3000000014',
+      sessionId: MOCK_SESSION_ID,
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: qqWs },
       setup: async (agentCtx: any) => {
-        await (booted.ctx as any).agentPresets.mount(agentCtx, 'qq-session');
+        await (booted!.ctx as any).agentPresets.mount(agentCtx, 'kujira-session');
       },
     });
     const qqAgent = qqHandle.agent || qqHandle;
+
     const snapshotManager = (booted.ctx as any).snapshotManager;
     expect(snapshotManager).toBeDefined();
-    const faceProvider = snapshotManager.getProvider('napcat:face_summary');
+    const faceProvider = snapshotManager.getProvider('kujira:face_summary');
     expect(faceProvider).toBeDefined();
+    expect(faceProvider.order).toBe(48);
 
-    const faceText = faceProvider.provide({ peer: 'group_3000000014', qq: 'default' }, { scope: qqAgent, agent: qqAgent });
+    const faceText = faceProvider.provide(
+      { peer: MOCK_PEER, userId: MOCK_HASH },
+      { scope: qqAgent, agent: qqAgent }
+    );
     expect(faceText).toContain('当前本地库共 5 张可用表情包（当前已列出前 3 张');
     expect(faceText).toContain('face_quota_5');
     expect(faceText).toContain('face_quota_4');
     expect(faceText).toContain('face_quota_3');
     expect(faceText).not.toContain('face_quota_1');
+
+    // Web 会话下 Fail-Closed 绝不返回或注入表情库摘要
+    expect(faceProvider.text({ agent: { session: { id: 'web-session-face' } } })).toBe('');
+    const webPre = await snapshotManager.handlePreStep({
+      agent: { session: { id: 'web-session-face' } },
+      messages: [],
+    });
+    expect(webPre.messages).toHaveLength(0);
   });
 });

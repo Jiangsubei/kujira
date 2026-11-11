@@ -1,17 +1,17 @@
 /**
  * tests/contract/path-anchoring.test.ts
  *
- * 契约测试: 修复 Memory 存储目录与 Workspace 工作区路径的绝对路径锚定缺陷
+ * 契约测试: Memory 存储目录、媒体下载与 Workspace 工作区路径的绝对路径锚定
  *
  * 核心契约:
  * 1. 当 process.cwd() 位于任意与 dshHome 毫无关系的临时工作目录时，
  *    MemoryStorage 的 getBaseDir() 必须严格基于 dshHome 展开，绝不污染当前进程 cwd；
- * 2. 相对路径（如 .dsh/napcat/napcat_memory 或 napcat/napcat_memory）传入时，
+ * 2. 相对路径（如 .dsh/kujira/memory 或 kujira/memory）传入时，
  *    必须正确剥离前导 .dsh/ 并以 dshHome 为基准展开；绝对路径传入时保留；
  * 3. SessionManager 的 resolveCwd() 与工作区注册逻辑必须严格锚定在 dshHome 内，
  *    绝对不使用 process.cwd()；
- * 4. 真实生产装配闭环 (bootDshNapcatBridge):
- *    在模拟的非 dshHome 目录启动时，挂载插件后能正确从 dshHome/napcat/napcat_memory
+ * 4. 真实生产装配闭环 (bootDshKujira):
+ *    在模拟的非 dshHome 目录启动时，挂载插件后能正确从 dshHome/kujira/memory
  *    读取既有的 Session 记忆与 User Profile 并注入动态 Prompt，且当前进程工作目录下绝不产生 .dsh 污染。
  */
 
@@ -22,11 +22,16 @@ import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { MemoryStorage } from '../../src/memory/storage.js';
 import { setupMemoryService } from '../../src/memory/index.js';
-import { resolveDshPath, encodeSegment } from '../../src/utils/path.js';
+import { encodeSegment } from '../../src/utils/path.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 import { SessionManager } from '../../src/gateway/session.js';
-import { bootDshNapcatBridge, resolveDshHome, type BootedDsh } from '../../src/boot.js';
+import { bootDshKujira, resolveDshHome, type BootedDsh } from '../../src/boot.js';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { MediaStorageManager } from '../../src/storage/media.js';
+
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_SESSION_ID = openidToSessionBaseId(MOCK_OPENID);
 
 describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring Contract)', () => {
   let originalCwd: string;
@@ -68,26 +73,26 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
   });
 
   describe('契约 1: MemoryStorage 路径绝对锚定', () => {
-    it('无参构造函数必须默认锚定在 dshHome/napcat/napcat_memory，绝不指向 process.cwd()', () => {
+    it('无参构造函数必须默认锚定在 dshHome/kujira/memory，绝不指向 process.cwd()', () => {
       const storage = new MemoryStorage();
-      const expectedDir = path.resolve(customDshHome, 'napcat/napcat_memory');
+      const expectedDir = path.resolve(customDshHome, 'kujira/memory');
 
       expect(storage.getBaseDir()).toBe(expectedDir);
       expect(storage.getBaseDir().startsWith(arbitraryCwd)).toBe(false);
       expect(path.isAbsolute(storage.getBaseDir())).toBe(true);
     });
 
-    it('传入相对路径 .dsh/napcat/napcat_memory 时正确剥离前导并锚定在 dshHome 下', () => {
-      const storage = new MemoryStorage('.dsh/napcat/napcat_memory', customDshHome);
-      const expectedDir = path.resolve(customDshHome, 'napcat/napcat_memory');
+    it('传入相对路径 .dsh/kujira/memory 时正确剥离前导并锚定在 dshHome 下', () => {
+      const storage = new MemoryStorage('.dsh/kujira/memory', customDshHome);
+      const expectedDir = path.resolve(customDshHome, 'kujira/memory');
 
       expect(storage.getBaseDir()).toBe(expectedDir);
       expect(storage.getBaseDir().startsWith(arbitraryCwd)).toBe(false);
     });
 
-    it('传入相对路径 napcat/napcat_memory 时正确锚定在 dshHome 下', () => {
-      const storage = new MemoryStorage('napcat/napcat_memory', customDshHome);
-      const expectedDir = path.resolve(customDshHome, 'napcat/napcat_memory');
+    it('传入相对路径 kujira/memory 时正确锚定在 dshHome 下', () => {
+      const storage = new MemoryStorage('kujira/memory', customDshHome);
+      const expectedDir = path.resolve(customDshHome, 'kujira/memory');
 
       expect(storage.getBaseDir()).toBe(expectedDir);
       expect(storage.getBaseDir().startsWith(arbitraryCwd)).toBe(false);
@@ -111,14 +116,14 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
   });
 
   describe('契约 2: SessionManager Workspace 路径绝对锚定', () => {
-    it('SessionManager.resolveCwd() 始终锚定在 dshHome/workspace/napcat，绝不污染 process.cwd()', () => {
+    it('SessionManager.resolveCwd() 始终锚定在 dshHome/workspace/kujira，绝不污染 process.cwd()', () => {
       const mockCtx: any = {
         get: () => undefined,
         logger: () => ({ debug: () => {}, warn: () => {}, error: () => {} }),
       };
       const sessionManager = new SessionManager(mockCtx, customDshHome);
-      const resolvedCwd = sessionManager.resolveCwd('group_8000000001');
-      const expectedCwd = path.resolve(customDshHome, 'workspace/napcat');
+      const resolvedCwd = sessionManager.resolveCwd(MOCK_PEER);
+      const expectedCwd = path.resolve(customDshHome, 'workspace/kujira');
 
       expect(resolvedCwd).toBe(expectedCwd);
       expect(resolvedCwd.startsWith(arbitraryCwd)).toBe(false);
@@ -141,59 +146,56 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
       const sessionManager = new SessionManager(mockCtx, customDshHome);
       await sessionManager.registerWorkspace(sessionManager.resolveCwd());
 
-      expect(createdPath).toBe(path.resolve(customDshHome, 'workspace/napcat'));
-      expect(fs.existsSync(path.resolve(customDshHome, 'workspace/napcat'))).toBe(true);
+      expect(createdPath).toBe(path.resolve(customDshHome, 'workspace/kujira'));
+      expect(fs.existsSync(path.resolve(customDshHome, 'workspace/kujira'))).toBe(true);
       expect(fs.existsSync(path.resolve(arbitraryCwd, '.dsh'))).toBe(false);
     });
   });
 
-  describe('契约 3: 真实装配闭环 - bootDshNapcatBridge 下 Memory 动态注入与零工作区污染', () => {
+  describe('契约 3: 真实装配闭环 - bootDshKujira 下 Memory 动态注入与零工作区污染', () => {
     it('在独立进程 cwd 启动时，插件正确从 dshHome 读取记忆并注入 Prompt，cwd 绝无 .dsh 污染', async () => {
       // 1. 在 customDshHome 下准备真实的记忆目录与文件
-      const memSessionDir = path.resolve(customDshHome, 'napcat/napcat_memory/session');
-      const memUserDir = path.resolve(customDshHome, 'napcat/napcat_memory/user');
+      const memSessionDir = path.resolve(customDshHome, 'kujira/memory/session');
+      const memUserDir = path.resolve(customDshHome, 'kujira/memory/user');
       await fsp.mkdir(memSessionDir, { recursive: true });
       await fsp.mkdir(memUserDir, { recursive: true });
 
       const testSessionContent =
-        '# Session 记忆（group_8000000001）\n\n### 群聊规则\n- 本群是技术研发交流群，严禁灌水';
+        `# Session 记忆（${MOCK_PEER}）\n\n### 单聊规则\n- 本会话是技术研发交流，严禁灌水`;
       const testUserProfile =
-        '# 用户画像（2000000001）\n\n### 特征\n- 资深架构师，关注绝对路径与安全性';
+        `# 用户画像（${MOCK_PEER}）\n\n### 特征\n- 资深架构师，关注绝对路径与安全性`;
 
-      await fsp.writeFile(path.join(memSessionDir, 'group_8000000001.md'), testSessionContent, 'utf-8');
-      await fsp.writeFile(path.join(memUserDir, '2000000001.md'), testUserProfile, 'utf-8');
+      await fsp.writeFile(path.join(memSessionDir, `${MOCK_PEER}.md`), testSessionContent, 'utf-8');
+      await fsp.writeFile(path.join(memUserDir, `${MOCK_PEER}.md`), testUserProfile, 'utf-8');
 
-      // 2. 在 customDshHome 的 SQLite 数据库中写入发言活跃记录
-      const dbDir = path.resolve(customDshHome, 'napcat');
+      // 2. 在 customDshHome 的 SQLite 数据库中写入消息记录
+      const dbDir = path.resolve(customDshHome, 'kujira');
       await fsp.mkdir(dbDir, { recursive: true });
       const db = new MessageDatabase(path.join(dbDir, 'messages.sqlite'));
       db.init();
       db.saveMessage({
-        msg_id: 1001,
-        peer: 'group_8000000001',
-        user_id: '2000000001',
+        msg_id: 'msg-anchor-001',
+        peer: MOCK_PEER,
+        user_id: MOCK_OPENID,
         sender_name: '架构师小张',
         time: Date.now() - 5000,
         type: 'text',
         content: '路径锚定测试消息',
         raw: '{}',
         file_id: null,
-        busid: null,
         local_path: null,
         fingerprint: null,
         recalled: 0,
         self: 0,
         reply_to: null,
       });
+      db.close();
 
-      // 3. 启动 DSH 装配并挂载 NapCat 插件 (使用独立端口 8095 避免并发冲突)
-      booted = await bootDshNapcatBridge({
+      // 3. 启动 DSH 装配并挂载 Kujira 插件
+      booted = await bootDshKujira({
         dshHome: customDshHome,
         mountPlugin: true,
-        config: {
-          bot_qq: '1000000001',
-          ws_port: 8095,
-        },
+        config: {},
       });
 
       const ctx = booted.ctx;
@@ -205,18 +207,18 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
       expect(snapshotManager).toBeDefined();
 
       const preStepResult = await snapshotManager.handlePreStep({
-        agent: { session: { id: 'qq-group-8000000001' } },
+        agent: { session: { id: MOCK_SESSION_ID } },
       });
       const injectedTexts = (preStepResult?.messages || [])
         .map((m: any) => m.content?.[0]?.text || '')
         .join('\n');
 
-      expect(injectedTexts).toContain('本群是技术研发交流群，严禁灌水');
+      expect(injectedTexts).toContain('本会话是技术研发交流，严禁灌水');
       expect(injectedTexts).toContain('资深架构师，关注绝对路径与安全性');
 
-      // 5. 验证真实装配下，messages.sqlite 位于 customDshHome/napcat 下，绝不在 workspace/napcat 下
-      expect(fs.existsSync(path.resolve(customDshHome, 'napcat/messages.sqlite'))).toBe(true);
-      expect(fs.existsSync(path.resolve(customDshHome, 'workspace/napcat/messages.sqlite'))).toBe(false);
+      // 5. 验证真实装配下，messages.sqlite 位于 customDshHome/kujira 下，绝不在 workspace/kujira 下
+      expect(fs.existsSync(path.resolve(customDshHome, 'kujira/messages.sqlite'))).toBe(true);
+      expect(fs.existsSync(path.resolve(customDshHome, 'workspace/kujira/messages.sqlite'))).toBe(false);
 
       // 6. 严格验证 arbitraryCwd 绝无任何 .dsh 目录生成或被污染
       const arbitraryDshDir = path.resolve(arbitraryCwd, '.dsh');
@@ -227,7 +229,7 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
   describe('契约 4: MediaStorageManager 路径绝对锚定与隔离验证', () => {
     it('显式传入 dshHome 时 downloadRoot 必须严格基于 dshHome 展开，绝不使用 process.cwd()', () => {
       const media = new MediaStorageManager({ dshHome: customDshHome });
-      const expectedDir = path.resolve(customDshHome, 'napcat/downloads');
+      const expectedDir = path.resolve(customDshHome, 'kujira/downloads');
 
       expect(media.downloadRoot).toBe(expectedDir);
       expect(media.downloadRoot.startsWith(arbitraryCwd)).toBe(false);
@@ -236,7 +238,7 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
 
     it('未显式传参时根据 process.env.DSH_HOME 自动锚定在 customDshHome 下', () => {
       const media = new MediaStorageManager();
-      const expectedDir = path.resolve(customDshHome, 'napcat/downloads');
+      const expectedDir = path.resolve(customDshHome, 'kujira/downloads');
 
       expect(media.downloadRoot).toBe(expectedDir);
       expect(media.downloadRoot.startsWith(arbitraryCwd)).toBe(false);
@@ -264,7 +266,7 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
       const testBuffer = Buffer.from('path-anchoring-test-image-content');
       const result = await media.saveBuffer(testBuffer, {
         type: 'image',
-        sessionId: 'group_test_anchor',
+        sessionId: MOCK_PEER,
         filename: 'test.png',
       });
 
@@ -298,7 +300,7 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
     });
 
     it('传入 customDshHome 下的路径并初始化，物理数据库严格在 dshHome 内', () => {
-      const dbPath = path.resolve(customDshHome, 'napcat/messages.sqlite');
+      const dbPath = path.resolve(customDshHome, 'kujira/messages.sqlite');
       const db = new MessageDatabase(dbPath);
       expect(db.dbPath).toBe(dbPath);
 
@@ -323,7 +325,7 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
     });
   });
 
-  describe('契约 8: encodeSegment 路径转义契约（对齐 DSH 0.1.5 规范）', () => {
+  describe('契约 8: encodeSegment 路径转义契约（对齐 DSH 0.2.x 规范）', () => {
     it('空字符串抛出异常', () => {
       expect(() => encodeSegment('')).toThrow('cannot encode an empty path segment');
     });
@@ -338,9 +340,8 @@ describe('契约测试: Memory 与 Workspace 绝对路径锚定 (Path Anchoring 
     });
 
     it('特殊字符与波浪号正确转义为 ~XXXX', () => {
-      expect(encodeSegment('qq-group-123:456')).toBe('qq-group-123~003A456');
+      expect(encodeSegment('kujira-user-abc:456')).toBe('kujira-user-abc~003A456');
       expect(encodeSegment('user@host~1')).toBe('user~0040host~007E1');
     });
   });
 });
-

@@ -1,54 +1,86 @@
 /**
  * tests/contract/wait-for-messages.test.ts
  *
- * 契约测试: EN-005 wait_for_user_messages 等待用户消息工具
+ * 契约测试: EN-005 wait_for_user_messages 等待用户消息工具 (Kujira 单聊适配版)
  *
  * 覆盖场景:
  * 1. MessageWaitRegistry 收集命中消息并在窗口结束返回完整字段
- * 2. 超时无消息 → 状态层报错 'No messages received within the specified timeout'（不给建议）
- * 3. user_id 过滤（群聊）：仅指定用户消息被收集，他人消息被抑制不收集
- * 4. 同 peer 重复等待 → wait-active 状态层拒绝
- * 5. AbortSignal 取消 → cancelled 结算，Promise 不悬挂
- * 6. 工具参数校验（timeout 缺失/非法 → 状态层；user_id 格式非法 → 依赖层原文）
- * 7. 私聊 user_id 与会话对象不符 → 依赖层原文；工具经真实 registry 收集私聊消息
- * 8. 装配: bootDshNapcatBridge 挂载后 tools 注册表包含 wait_for_user_messages，
- *    且注册工具经 execute 可按 session.id 解析 peer 并返回状态层报错原文
- * 9. 装配闭环: 真实 WS 网关入站消息 → 等待门控收集 → 工具返回 {messages,total}
- * 10. 装配闭环: user_id 过滤 + 超时状态层报错（真实装配路径）
+ * 2. 超时无消息 → 状态层报错 'No messages received within the specified timeout'
+ * 3. 同 peer 重复等待 → wait-active 状态层拒绝
+ * 4. AbortSignal 取消 → cancelled 结算，Promise 不悬挂
+ * 5. 工具参数校验（timeout 缺失/非法 → 状态层；非单聊 peer → 状态层拦截）
+ * 6. 单聊 string msg_id / ref_idx 收集与 renderWaitResultText 引用渲染（无 QQ: 前缀）
+ * 7. 真实装配闭环 (bootDshKujira({ mountPlugin: true }) + FakeWs + mockFetch):
+ *    - tools 注册表包含 wait_for_user_messages 并经 execute 解析 kujira-user-<hash16>
+ *    - 等待期间同 peer 入站 C2C_MESSAGE_CREATE → 门控收集、更新活跃锚点、并抑制同轮额外唤醒
+ *    - 异用户入站消息绝不混入当前单聊等待队列
+ *    - 等待期间入站引用回复 (message_type=103) → 还原 quoted 并正确渲染
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import WebSocket from 'ws';
-import { MessageWaitRegistry, type WaitCollectedMessage } from '../../src/gateway/server.js';
+import { MessageWaitRegistry } from '../../src/gateway/server.js';
 import { waitForUserMessages, renderWaitResultText } from '../../src/tools/index.js';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
-import * as NapCatBridgePlugin from '../../src/index.js';
+import { resetGlobalToolContext } from '../../src/tools/common/context.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
+import { QQ_API_BASE, QQ_BOT_TOKEN_URL } from '../../src/constants/index.js';
+import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
+import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
-const GROUP_ID = 3000000001;
-const BOT_QQ = '1000000001';
-const USER_QQ = '2000000001';
-const OTHER_QQ = '1000000002';
-const GROUP_PEER = `group_${GROUP_ID}`;
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const OTHER_OPENID = 'B1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_SESSION_ID = openidToSessionBaseId(MOCK_OPENID);
+const MOCK_APP_ID = '100001';
+const MOCK_SECRET = 'mock-qq-bot-secret';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+function expectLosslessJson(value: unknown, trail = 'root'): void {
+  if (value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach((item, idx) => expectLosslessJson(item, `${trail}[${idx}]`));
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      expect(v, `${trail}.${k} must not be undefined`).not.toBeUndefined();
+      expectLosslessJson(v, `${trail}.${k}`);
+    }
+  }
+}
+
 describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数单元契约）', () => {
+  afterEach(() => {
+    resetGlobalToolContext();
+  });
+
   it('契约 1: MessageWaitRegistry 收集命中消息并在窗口结束返回完整字段', async () => {
     const reg = new MessageWaitRegistry();
-    const waitPromise = reg.wait(GROUP_PEER, { timeoutMs: 60 });
-    expect(reg.isWaiting(GROUP_PEER)).toBe(true);
+    const waitPromise = reg.wait(MOCK_PEER, { timeoutMs: 60 });
+    expect(reg.isWaiting(MOCK_PEER)).toBe(true);
 
     // 异 peer 投递不命中、不收集
-    expect(reg.tryDeliver('group_999', { from: '甲', user_id: '1', content: 'x', time: 1 })).toBe(false);
+    expect(
+      reg.tryDeliver(openidToPeer(OTHER_OPENID), {
+        msg_id: 'ROBOT1.0_OTHER',
+        from: '他人',
+        user_id: OTHER_OPENID,
+        content: 'x',
+        time: 1,
+      })
+    ).toBe(false);
 
-    const delivered = reg.tryDeliver(GROUP_PEER, {
+    const ts = Date.parse('2026-06-01T12:00:00.000Z');
+    const delivered = reg.tryDeliver(MOCK_PEER, {
+      msg_id: 'ROBOT1.0_WAIT_1',
+      ref_idx: 'REFIDX_WAIT_1',
       from: '张三',
-      user_id: USER_QQ,
+      user_id: MOCK_OPENID,
       content: '补充: 改成周三上线',
-      time: 1725200000000,
+      time: ts,
     });
     expect(delivered).toBe(true);
 
@@ -57,65 +89,36 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
     if (result.ok) {
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0]).toEqual({
+        msg_id: 'ROBOT1.0_WAIT_1',
+        ref_idx: 'REFIDX_WAIT_1',
         from: '张三',
-        user_id: USER_QQ,
+        user_id: MOCK_OPENID,
         content: '补充: 改成周三上线',
-        time: 1725200000000,
+        time: ts,
       });
     }
-    // 结算后一次性收集器移除
-    expect(reg.isWaiting(GROUP_PEER)).toBe(false);
-    expect(reg.tryDeliver(GROUP_PEER, { from: '乙', user_id: '2', content: 'y', time: 2 })).toBe(false);
+    expect(reg.isWaiting(MOCK_PEER)).toBe(false);
+    expect(
+      reg.tryDeliver(MOCK_PEER, { from: '乙', user_id: MOCK_OPENID, content: 'y', time: 2 })
+    ).toBe(false);
   });
 
-  it('契约 2: 超时无消息 → 状态层报错原文，不给建议', async () => {
+  it('契约 2: 超时无消息 → 状态层报错原文', async () => {
     const reg = new MessageWaitRegistry();
-    const waitPromise = reg.wait(GROUP_PEER, { timeoutMs: 40 });
-    const result = await waitPromise;
+    const result = await reg.wait(MOCK_PEER, { timeoutMs: 40 });
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toBe('timeout');
       expect(result.message).toBe('No messages received within the specified timeout');
     }
-    expect(reg.isWaiting(GROUP_PEER)).toBe(false);
+    expect(reg.isWaiting(MOCK_PEER)).toBe(false);
   });
 
-  it('契约 3: user_id 过滤（群聊）——仅指定用户消息被收集', async () => {
+  it('契约 3: 同 peer 已有活动等待 → 第二次 wait 返回 wait-active 状态层拒绝', async () => {
     const reg = new MessageWaitRegistry();
-    const waitPromise = reg.wait(GROUP_PEER, { userId: OTHER_QQ, timeoutMs: 50 });
-
-    // 他人消息：不命中、不收集
-    const otherDelivered = reg.tryDeliver(GROUP_PEER, {
-      from: 'BotNickname',
-      user_id: USER_QQ,
-      content: '不是我',
-      time: 1725200001000,
-    });
-    expect(otherDelivered).toBe(false);
-
-    // 目标用户消息：命中收集
-    const targetDelivered = reg.tryDeliver(GROUP_PEER, {
-      from: '李四',
-      user_id: OTHER_QQ,
-      content: '是我',
-      time: 1725200002000,
-    });
-    expect(targetDelivered).toBe(true);
-
-    const result = await waitPromise;
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.messages).toHaveLength(1);
-      expect(result.messages[0].user_id).toBe(OTHER_QQ);
-      expect(result.messages[0].content).toBe('是我');
-    }
-  });
-
-  it('契约 4: 同 peer 已有活动等待 → 第二次 wait 返回 wait-active 状态层拒绝', async () => {
-    const reg = new MessageWaitRegistry();
-    const first = reg.wait(GROUP_PEER, { timeoutMs: 80 });
-    const second = reg.wait(GROUP_PEER, { timeoutMs: 80 });
+    const first = reg.wait(MOCK_PEER, { timeoutMs: 80 });
+    const second = reg.wait(MOCK_PEER, { timeoutMs: 80 });
 
     const result = await second;
     expect(result.ok).toBe(false);
@@ -124,15 +127,14 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
       expect(result.message).toContain('已有');
     }
 
-    // 第一个等待不受影响，正常超时结算
     const firstResult = await first;
     expect(firstResult.ok).toBe(false);
   });
 
-  it('契约 5: AbortSignal 取消 → cancelled 结算，Promise 不悬挂', async () => {
+  it('契约 4: AbortSignal 取消 → cancelled 结算，Promise 不悬挂', async () => {
     const reg = new MessageWaitRegistry();
     const ac = new AbortController();
-    const waitPromise = reg.wait(GROUP_PEER, { timeoutMs: 5000, signal: ac.signal });
+    const waitPromise = reg.wait(MOCK_PEER, { timeoutMs: 5000, signal: ac.signal });
 
     ac.abort();
 
@@ -142,84 +144,79 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
       expect(result.error).toBe('cancelled');
       expect(result.message).toContain('中断');
     }
-    expect(reg.isWaiting(GROUP_PEER)).toBe(false);
+    expect(reg.isWaiting(MOCK_PEER)).toBe(false);
   });
 
-  it('契约 6: 工具参数校验——timeout 缺失/非法 → 状态层；user_id 格式非法 → 依赖层原文', async () => {
-    // timeout 缺失
-    const r1 = await waitForUserMessages({} as any, { peer: GROUP_PEER, waitRegistry: null });
+  it('契约 5: 工具参数与单聊上下文校验（timeout 缺失/非法、非单聊会话、waitRegistry 未装配）', async () => {
+    const r1 = await waitForUserMessages({} as any, { peer: MOCK_PEER, waitRegistry: null });
+    expectLosslessJson(r1);
     expect(r1).toHaveProperty('success', false);
     expect((r1 as any).error).toContain('timeout');
 
-    // timeout 非法（负数）
-    const r2 = await waitForUserMessages({ timeout: -1 } as any, { peer: GROUP_PEER, waitRegistry: null });
+    const r2 = await waitForUserMessages({ timeout: -1 } as any, { peer: MOCK_PEER, waitRegistry: null });
+    expectLosslessJson(r2);
     expect(r2).toHaveProperty('success', false);
     expect((r2 as any).error).toContain('timeout');
 
-    // user_id 格式非法 → 依赖层报错原文
-    const r3 = await waitForUserMessages({ timeout: 5, user_id: 'not-a-qq' } as any, {
-      peer: GROUP_PEER,
-      waitRegistry: null,
-    });
+    // 非 QQ 单聊会话（common / web-session）→ 状态层拒绝
+    const r3 = await waitForUserMessages({ timeout: 5 } as any, { peer: 'web-session-1', waitRegistry: null });
+    expectLosslessJson(r3);
     expect(r3).toHaveProperty('success', false);
-    expect((r3 as any).error).toBe('Unknown user_id, cannot wait for messages');
+    expect((r3 as any).error).toBe('当前会话不是 QQ 单聊会话，无法等待用户消息');
 
-    // 非 QQ 会话（common）→ 状态层
-    const r4 = await waitForUserMessages({ timeout: 5 } as any, { peer: 'common', waitRegistry: null });
+    // waitRegistry 未装配 → 明确报错
+    const r4 = await waitForUserMessages({ timeout: 5 } as any, { peer: MOCK_PEER, waitRegistry: null });
+    expectLosslessJson(r4);
     expect(r4).toHaveProperty('success', false);
-    expect((r4 as any).error).toBe('当前会话不是 QQ 会话，无法等待用户消息');
-
-    // waitRegistry 未装配 → 状态层明确报错（不悬挂、不走等待）
-    const r5 = await waitForUserMessages({ timeout: 5 } as any, { peer: GROUP_PEER, waitRegistry: null });
-    expect(r5).toHaveProperty('success', false);
-    expect((r5 as any).error).toContain('waitRegistry');
+    expect((r4 as any).error).toContain('waitRegistry');
   });
 
-  it('契约 7: 私聊 user_id 会话对象不符 → 依赖层原文；工具经真实 registry 收集私聊消息', async () => {
-    // 私聊传入与会话对象不符的 user_id → 依赖层原文
-    const mismatch = await waitForUserMessages({ timeout: 5, user_id: '123456' } as any, {
-      peer: `user_${USER_QQ}`,
-      waitRegistry: null,
-    });
-    expect(mismatch).toHaveProperty('success', false);
-    expect((mismatch as any).error).toBe('Unknown user_id, cannot wait for messages');
-
-    // 私聊不传 user_id → 经真实 registry 收集会话对象消息 → {messages,total}
+  it('契约 6: 工具经真实 registry 收集单聊消息并遵循 Lossless JSON', async () => {
     const reg = new MessageWaitRegistry();
-    const waitPromise = waitForUserMessages({ timeout: 1 } as any, {
-      peer: `user_${USER_QQ}`,
+    const waitPromise = waitForUserMessages({ timeout: 0.12 } as any, {
+      peer: MOCK_PEER,
       waitRegistry: reg,
     });
 
-    const delivered = reg.tryDeliver(`user_${USER_QQ}`, {
-      from: 'BotNickname',
-      user_id: USER_QQ,
+    const delivered = reg.tryDeliver(MOCK_PEER, {
+      msg_id: 'ROBOT1.0_DM_1',
+      ref_idx: 'REFIDX_DM_1',
+      from: '测试好友',
+      user_id: MOCK_OPENID,
       content: '继续说',
       time: Date.now(),
     });
     expect(delivered).toBe(true);
 
     const result = await waitPromise;
+    expectLosslessJson(result);
     expect(result).toHaveProperty('total', 1);
-    expect((result as any).messages[0]).toMatchObject({ user_id: USER_QQ, content: '继续说' });
+    expect((result as any).messages[0]).toMatchObject({
+      msg_id: 'ROBOT1.0_DM_1',
+      ref_idx: 'REFIDX_DM_1',
+      user_id: MOCK_OPENID,
+      content: '继续说',
+    });
   });
 
-  it('契约 8: renderWaitResultText 正确渲染带 msg_id 与 quoted 引用回复的消息', () => {
+  it('契约 7: renderWaitResultText 正确渲染带 string msg_id、ref_idx 与 quoted 引用回复的消息（无 QQ: 前缀）', () => {
     const text = renderWaitResultText({
       total: 1,
       messages: [
         {
-          msg_id: 88888,
+          msg_id: 'ROBOT1.0_MSG_88',
+          ref_idx: 'REFIDX_MSG_88',
           from: '测试用户',
-          user_id: USER_QQ,
-          content: '@雪梨',
-          time: 1725200000000,
-          reply_to: 77777,
+          user_id: MOCK_OPENID,
+          content: '收到请回复',
+          time: Date.parse('2026-06-01T12:00:00.000Z'),
+          reply_to: 'REFIDX_HIST_77',
           quoted: {
-            msg_id: 77777,
-            user_id: OTHER_QQ,
+            msg_id: 'ROBOT1.0_HIST_77',
+            ref_idx: 'REFIDX_HIST_77',
+            user_id: MOCK_OPENID,
             from_name: '历史用户',
-            text: '你是硬梨吗',
+            text: '你是谁',
           },
         },
       ],
@@ -227,178 +224,316 @@ describe('契约测试: EN-005 wait_for_user_messages（registry + 工具函数�
 
     expect(text).toContain('已收集 1 条新消息:');
     expect(text).toContain('测试用户');
-    expect(text).toContain('[消息ID: 88888]');
-    expect(text).toContain('[引用回复 历史用户 (QQ: 1000000002): "你是硬梨吗"]');
-    expect(text).toContain('@雪梨');
+    expect(text).toContain('[消息ID: ROBOT1.0_MSG_88]');
+    expect(text).toContain('[ref_idx: REFIDX_MSG_88]');
+    expect(text).toContain(`[引用回复 历史用户 (${MOCK_OPENID}): "你是谁"]`);
+    expect(text).toContain('收到请回复');
   });
 });
 
-describe('契约测试: EN-005 wait_for_user_messages 装配闭环（真实装配 + 真实 WS 入站）', () => {
+class FakeWs {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  static instances: FakeWs[] = [];
+
+  readyState = 0;
+  private listeners = new Map<string, Set<(ev: any) => void>>();
+  private seq = 0;
+
+  constructor(public readonly url: string) {
+    FakeWs.instances.push(this);
+    queueMicrotask(() => {
+      if (this.readyState !== 0) return;
+      this.readyState = 1;
+      this.dispatch('open', {});
+      this.dispatch('message', {
+        data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }),
+      });
+    });
+  }
+
+  addEventListener(type: string, listener: (ev: any) => void): void {
+    let set = this.listeners.get(type);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(type, set);
+    }
+    set.add(listener);
+  }
+
+  send(data: string): void {
+    const frame = JSON.parse(data);
+    if (frame.op === 2) {
+      queueMicrotask(() => {
+        if (this.readyState !== 1) return;
+        this.seq += 1;
+        this.dispatch('message', {
+          data: JSON.stringify({
+            op: 0,
+            s: this.seq,
+            t: 'READY',
+            d: {
+              session_id: 'mock-ws-session-wait',
+              user: { id: MOCK_APP_ID, username: 'KujiraBot', bot: true },
+            },
+          }),
+        });
+      });
+    } else if (frame.op === 1) {
+      this.dispatch('message', { data: JSON.stringify({ op: 11 }) });
+    }
+  }
+
+  close(): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.dispatch('close', { code: 1000, reason: 'closed' });
+  }
+
+  emitC2CMessage(event: QQC2CMessageCreateEvent): void {
+    this.seq += 1;
+    this.dispatch('message', {
+      data: JSON.stringify({
+        op: 0,
+        s: this.seq,
+        t: 'C2C_MESSAGE_CREATE',
+        d: event,
+      }),
+    });
+  }
+
+  private dispatch(type: string, ev: any): void {
+    const set = this.listeners.get(type);
+    if (!set) return;
+    for (const fn of set) {
+      fn(ev);
+    }
+  }
+}
+
+async function waitForGatewayReady(gateway: any, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (gateway?.getStatus?.().ready) {
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  throw new Error('KujiraGatewayClient READY 超时');
+}
+
+describe('契约测试: EN-005 wait_for_user_messages 真实装配闭环 (bootDshKujira + FakeWs + mockFetch)', () => {
   let tmpHome: string;
-  let booted: BootedDsh;
-  let client: WebSocket;
-  const WS_PORT = 18341;
+  let booted: BootedDsh | null = null;
+  let notifyRequests: Array<Record<string, any>> = [];
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-napcat-wait-'));
-    booted = await bootDshNapcatBridge({ dshHome: tmpHome, mountPlugin: false });
-    await booted.ctx.plugin(NapCatBridgePlugin, {
-      bot_qq: BOT_QQ,
-      ws_token: 'test-token',
-      ws_port: WS_PORT,
-    });
+    FakeWs.instances = [];
+    notifyRequests = [];
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-wait-'));
+    await fsp.writeFile(
+      path.join(tmpHome, '.credentials.yaml'),
+      `version: 1\nrefs:\n  QQ_BOT_APP_ID: "${MOCK_APP_ID}"\n  QQ_BOT_SECRET: "${MOCK_SECRET}"\n`,
+      'utf8'
+    );
 
-    client = new WebSocket(`ws://127.0.0.1:${WS_PORT}?access_token=test-token`);
-    await new Promise<void>((resolve, reject) => {
-      client.once('open', () => resolve());
-      client.once('error', reject);
+    const realFetch = globalThis.fetch;
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const parsed = new URL(url);
+      if (parsed.hostname !== 'bots.qq.com' && parsed.hostname !== 'api.sgroup.qq.com') {
+        return realFetch(input, init);
+      }
+      if (url === QQ_BOT_TOKEN_URL) {
+        return new Response(JSON.stringify({ access_token: 'mock-wait-tok', expires_in: 7200 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === `${QQ_API_BASE}/gateway`) {
+        return new Response(JSON.stringify({ url: 'wss://api.sgroup.qq.com/mock-ws' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (/\/v2\/users\/[^/]+\/messages$/.test(parsed.pathname) && (init?.method || 'GET').toUpperCase() === 'POST') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        notifyRequests.push(body);
+        return new Response(JSON.stringify({ id: 'ROBOT1.0_NOTIFY_1', timestamp: new Date().toISOString() }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    };
+
+    vi.stubGlobal('fetch', mockFetch);
+    vi.stubGlobal('WebSocket', FakeWs as any);
+
+    booted = await bootDshKujira({
+      dshHome: tmpHome,
+      mountPlugin: true,
     });
+    const gateway = booted.ctx.get('kujira-gateway') as any;
+    await waitForGatewayReady(gateway);
   });
 
   afterEach(async () => {
-    if (client) {
-      client.terminate();
-    }
+    resetGlobalToolContext();
     if (booted) {
       await booted.dispose().catch(() => {});
+      booted = null;
     }
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     if (tmpHome) {
       await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
     }
   });
 
-  /** 构造 NapCat 入站群消息事件 */
-  function inboundGroupMessage(
-    text: string,
-    opts: { messageId?: number; fromUserId?: string; fromName?: string } = {}
-  ): Record<string, any> {
-    const fromUserId = opts.fromUserId ?? USER_QQ;
+  function buildC2CEvent(
+    id: string,
+    content: string,
+    opts: { openid?: string; username?: string; refIdx?: string; refMsgIdx?: string; messageType?: number } = {}
+  ): QQC2CMessageCreateEvent {
+    const ext: string[] = [`msg_idx=${opts.refIdx ?? `REFIDX_${id}`}`];
+    if (opts.refMsgIdx) {
+      ext.push(`ref_msg_idx=${opts.refMsgIdx}`);
+    }
     return {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: opts.messageId ?? Math.floor(Math.random() * 1e6),
-      user_id: fromUserId,
-      group_id: GROUP_ID,
-      sender: { user_id: fromUserId, nickname: opts.fromName ?? '测试用户', card: opts.fromName ?? '测试用户' },
-      message: [{ type: 'text', data: { text } }],
-      raw_message: text,
-      time: Math.floor(Date.now() / 1000),
-      self_id: BOT_QQ,
+      id,
+      content,
+      timestamp: new Date().toISOString(),
+      author: { user_openid: opts.openid ?? MOCK_OPENID, username: opts.username ?? '测试用户' },
+      message_type: opts.messageType ?? 0,
+      message_scene: { ext },
     };
   }
 
-  it('装配: tools 注册表包含 wait_for_user_messages，注册工具经 execute 按 session.id 解析 peer 并返回状态层报错原文', async () => {
-    const provider = (booted.ctx.get('napcatBridgeTools') || (booted.ctx as any).napcatBridgeTools) as any;
+  it('装配: tools 注册表包含 wait_for_user_messages，经 execute 按 kujira-user-<hash16> 超时返回状态层原文', async () => {
+    const provider = booted!.ctx.get('kujiraBridgeTools') as any;
     expect(provider).toBeDefined();
-    provider.registerTools(booted.ctx);
-    const tools = (booted.ctx.get('tools') || (booted.ctx as any).tools) as any;
-    expect(tools).toBeDefined();
+    provider.registerTools(booted!.ctx);
+
+    const tools = booted!.ctx.get('tools') as any;
     const toolDef = tools.get('wait_for_user_messages');
     expect(toolDef).toBeDefined();
     expect(toolDef.name).toBe('wait_for_user_messages');
     expect(toolDef.description).toContain('等待');
 
-    // 直调注册工具的 execute：qq-group- 会话 → 窗口（100ms）超时无消息 → 状态层报错原文
     const result = await toolDef.execute(
-      { timeout: 0.1 },
-      { agent: { session: { id: `qq-group-${GROUP_ID}` } }, signal: new AbortController().signal }
+      { timeout: 0.08 },
+      { agent: { session: { id: MOCK_SESSION_ID } }, signal: new AbortController().signal }
     );
+    expectLosslessJson(result);
     expect(result).toHaveProperty('success', false);
     expect((result as any).error).toBe('No messages received within the specified timeout');
   });
 
-  it('装配: 等待期间同 peer 入站消息经真实 WS → 门控收集 → 工具返回 {messages,total}', async () => {
-    const waitPromise = waitForUserMessages({ timeout: 2 } as any, { peer: GROUP_PEER });
+  it('装配: 等待期间同 peer 入站 C2C 消息被门控收集、更新入站锚点、抑制同轮额外唤醒，且隔离其他用户消息', async () => {
+    const sessionManager = booted!.ctx.get('kujira-session') as any;
+    const dispatchSpy = vi.spyOn(sessionManager, 'dispatchWakeup').mockResolvedValue(undefined as any);
+    const provider = booted!.ctx.get('kujiraBridgeTools') as any;
+    provider.registerTools(booted!.ctx);
+    const toolDef = (booted!.ctx.get('tools') as any).get('wait_for_user_messages');
+    const fakeWs = FakeWs.instances[FakeWs.instances.length - 1]!;
 
-    client.send(JSON.stringify(inboundGroupMessage('补充: 改成周三上线', { messageId: 7001 })));
+    const waitPromise = toolDef.execute(
+      { timeout: 0.25 },
+      { agent: { session: { id: MOCK_SESSION_ID } }, signal: new AbortController().signal }
+    );
+
+    // 等待注册到 registry
+    await sleep(20);
+
+    // 1. 他人单聊消息（不同 openid/peer）：不混入当前用户的等待收集结果
+    fakeWs.emitC2CMessage(
+      buildC2CEvent('ROBOT1.0_OTHER_USER', '别人发的', { openid: OTHER_OPENID, username: '路人' })
+    );
+    // 2. 当前单聊用户发来补充消息：被门控收集并抑制同轮额外唤醒
+    fakeWs.emitC2CMessage(
+      buildC2CEvent('ROBOT1.0_WAIT_HIT', '补充: 改成周三上线', { refIdx: 'REFIDX_WAIT_HIT' })
+    );
 
     const result = await waitPromise;
+    expectLosslessJson(result);
     expect(result).toHaveProperty('total', 1);
-    expect((result as any).messages[0]).toMatchObject({
+    expect(result.messages[0]).toMatchObject({
+      msg_id: 'ROBOT1.0_WAIT_HIT',
+      ref_idx: 'REFIDX_WAIT_HIT',
       from: '测试用户',
-      user_id: USER_QQ,
+      user_id: MOCK_OPENID,
       content: '补充: 改成周三上线',
     });
-    expect(typeof (result as any).messages[0].time).toBe('number');
+
+    // 仅 OTHER_OPENID 触发了正常唤醒；MOCK_PEER 的补充消息被门控消费，抑制了同轮额外唤醒
+    const mockPeerWakeups = dispatchSpy.mock.calls.filter((c) => c[0]?.peer === MOCK_PEER);
+    expect(mockPeerWakeups).toHaveLength(0);
+    // 被收集消息同时更新了出站活跃回合入站 msg_id 锚点
+    const outboundBridge = booted!.ctx.get('kujira-outbound-bridge') as any;
+    expect(outboundBridge.getActiveTurnContext(MOCK_PEER)?.msg_id).toBe('ROBOT1.0_WAIT_HIT');
   });
 
-  it('装配: user_id 过滤——他人消息被抑制不收集，目标用户消息被收集', async () => {
-    const waitPromise = waitForUserMessages({ timeout: 2, user_id: OTHER_QQ } as any, { peer: GROUP_PEER });
+  it('装配: 等待期间入站引用回复 (message_type=103) → 还原 quoted 并抑制额外唤醒', async () => {
+    const sessionManager = booted!.ctx.get('kujira-session') as any;
+    const dispatchSpy = vi.spyOn(sessionManager, 'dispatchWakeup').mockResolvedValue(undefined as any);
+    const provider = booted!.ctx.get('kujiraBridgeTools') as any;
+    provider.registerTools(booted!.ctx);
+    const toolDef = (booted!.ctx.get('tools') as any).get('wait_for_user_messages');
+    const fakeWs = FakeWs.instances[FakeWs.instances.length - 1]!;
 
-    // 他人发言：被抑制（不收集、不唤醒），窗口内等待不结算
-    client.send(JSON.stringify(inboundGroupMessage('不是我', { messageId: 7002, fromUserId: USER_QQ })));
-    await sleep(120);
-
-    // 目标用户发言：收集
-    client.send(JSON.stringify(inboundGroupMessage('是我', { messageId: 7003, fromUserId: OTHER_QQ, fromName: '李四' })));
-
-    const result = await waitPromise;
-    expect(result).toHaveProperty('total', 1);
-    expect((result as any).messages[0]).toMatchObject({ user_id: OTHER_QQ, content: '是我', from: '李四' });
-  });
-
-  it('装配: 等待窗口超时无消息 → 工具返回状态层报错原文', async () => {
-    const result = await waitForUserMessages({ timeout: 0.1 } as any, { peer: GROUP_PEER });
-    expect(result).toHaveProperty('success', false);
-    expect((result as any).error).toBe('No messages received within the specified timeout');
-  });
-
-  it('装配: 等待期间入站引用回复消息 → 门控解析引用消息 → 工具返回带 quoted 与 reply_to 并正确渲染', async () => {
-    // 1. 先注入一条前序历史消息供引用
-    client.send(
-      JSON.stringify(
-        inboundGroupMessage('你是硬梨吗', {
-          messageId: 5001,
-          fromUserId: OTHER_QQ,
-          fromName: '历史用户',
-        })
-      )
+    // 1. 先注入前序历史消息供 REFIDX 查库还原
+    fakeWs.emitC2CMessage(
+      buildC2CEvent('ROBOT1.0_ORIG_5', '你是硬梨吗', {
+        username: '历史用户',
+        refIdx: 'REFIDX_ORIG_5',
+      })
     );
-    await sleep(150);
+    await vi.waitFor(() => expect(dispatchSpy).toHaveBeenCalledTimes(1));
 
     // 2. 发起等待收集
-    const waitPromise = waitForUserMessages({ timeout: 2 } as any, { peer: GROUP_PEER });
+    const waitPromise = toolDef.execute(
+      { timeout: 0.25 },
+      { agent: { session: { id: MOCK_SESSION_ID } }, signal: new AbortController().signal }
+    );
+    await sleep(20);
 
-    // 3. 入站一条引用 5001 的回复消息
-    const replyEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 8001,
-      user_id: USER_QQ,
-      group_id: GROUP_ID,
-      sender: { user_id: USER_QQ, nickname: '测试用户', card: '测试用户' },
-      message: [
-        { type: 'reply', data: { id: '5001' } },
-        { type: 'text', data: { text: '这是回复内容' } },
-      ],
-      raw_message: '[CQ:reply,id=5001]这是回复内容',
-      time: Math.floor(Date.now() / 1000),
-      self_id: BOT_QQ,
-    };
-    client.send(JSON.stringify(replyEvent));
+    // 3. 入站引用 REFIDX_ORIG_5 的回复消息
+    fakeWs.emitC2CMessage(
+      buildC2CEvent('ROBOT1.0_REPLY_8', '这是回复内容', {
+        refIdx: 'REFIDX_REPLY_8',
+        refMsgIdx: 'REFIDX_ORIG_5',
+        messageType: 103,
+      })
+    );
 
     const result = await waitPromise;
+    expectLosslessJson(result);
     expect(result).toHaveProperty('total', 1);
-    const msg = (result as any).messages[0];
-    expect(msg).toMatchObject({
-      msg_id: 8001,
+    expect(result.messages[0]).toMatchObject({
+      msg_id: 'ROBOT1.0_REPLY_8',
+      ref_idx: 'REFIDX_REPLY_8',
       from: '测试用户',
-      user_id: USER_QQ,
+      user_id: MOCK_OPENID,
       content: '这是回复内容',
-      reply_to: 5001,
+      reply_to: 'REFIDX_ORIG_5',
       quoted: {
-        msg_id: 5001,
-        user_id: OTHER_QQ,
+        msg_id: 'ROBOT1.0_ORIG_5',
+        ref_idx: 'REFIDX_ORIG_5',
+        user_id: MOCK_OPENID,
         from_name: '历史用户',
         text: '你是硬梨吗',
       },
     });
+    // 等待期间未产生额外唤醒
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
 
     const rendered = renderWaitResultText(result);
-    expect(rendered).toContain('[消息ID: 8001]');
-    expect(rendered).toContain('[引用回复 历史用户 (QQ: 1000000002): "你是硬梨吗"]');
+    expect(rendered).toContain('[消息ID: ROBOT1.0_REPLY_8]');
+    expect(rendered).toContain('[ref_idx: REFIDX_REPLY_8]');
+    expect(rendered).toContain(`[引用回复 历史用户 (${MOCK_OPENID}): "你是硬梨吗"]`);
     expect(rendered).toContain('这是回复内容');
   });
 });

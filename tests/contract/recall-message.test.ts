@@ -1,46 +1,230 @@
 /**
- * 契约测试: recall_message 消息撤回工具契约与全场景装配 (Recall Message Tool Contract)
+ * 契约测试: recall_message 消息撤回工具契约与真实装配闭环 (Recall Message Tool Contract)
  *
  * 覆盖规范清单:
- * 契约 1: 真实装配下，QQ 群聊与私聊会话均包含 recall_message 工具；WebUI/Review 沙箱安全排除；
- * 契约 2: recallMessage 核心执行契约（数字 ID、数字字符串 ID、网关 delete_msg 动作透传）；
- * 契约 3: recallMessage 异常与边界校验（缺少 ID、非法 ID、网关未连接、底层超时或权限拦截）；
- * 契约 4: 串行队列调度保障（通过 PerPeerSerialSender 串行执行）；
+ * 契约 1: bootDshKujira({ mountPlugin: true }) 真实装配下，Kujira 单聊会话包含 recall_message 工具；WebUI 沙箱排除；
+ * 契约 2: 真实装配闭环下，出站 string ROBOT1.0_... 调 DELETE /v2/users/{openid}/messages/{id} 撤回后置 recalled=1（自身原文保留）；
+ * 契约 3: 平台错码 40061002（入站 ID）与 40064004（超 2 分钟）如实报错，不污染 DB；
+ * 契约 4: 参数校验与串行队列调度保障（通过 PerPeerSerialSender 串行执行）；
  * 契约 5: DSH Lossless JSON 契约（执行返回值所有键值绝无 undefined）。
  */
 
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
+import Database from 'better-sqlite3';
+import { Context } from '@deepseek-ai/cordis';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
+import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
+import type { SessionManager } from '../../src/gateway/session.js';
+import type { KujiraGatewayClient } from '../../src/gateway/server.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 import {
   recallMessage,
-  type RecallMessageParams,
   registerAgentTools,
   resetGlobalToolContext,
 } from '../../src/tools/index.js';
 import { PerPeerSerialSender } from '../../src/outbound/queue.js';
-import { Context } from '@deepseek-ai/cordis';
 
-describe('契约 1: recall_message 工具真实装配与会话隔离契约', () => {
+const nativeFetch = globalThis.fetch;
+
+const MOCK_OPENID = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+const MOCK_APP_ID = 'app_kujira_mock';
+const MOCK_APP_SECRET = 'secret_kujira_mock';
+const MOCK_BOT_ID = 'bot_kujira_01';
+
+function hasUndefinedValue(obj: unknown): boolean {
+  if (obj === undefined) return true;
+  if (obj === null || typeof obj !== 'object') return false;
+  if (Array.isArray(obj)) {
+    return obj.some((item) => hasUndefinedValue(item));
+  }
+  for (const val of Object.values(obj)) {
+    if (val === undefined) return true;
+    if (typeof val === 'object' && hasUndefinedValue(val)) return true;
+  }
+  return false;
+}
+
+class FakeWs {
+  static instances: FakeWs[] = [];
+  readyState = 0;
+  private listeners = new Map<string, Array<(ev: any) => void>>();
+  private seq = 1;
+
+  constructor(public readonly url: string) {
+    FakeWs.instances.push(this);
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.emit('open', {});
+      this.emit('message', {
+        data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }),
+      });
+    });
+  }
+
+  addEventListener(type: string, listener: (ev: any) => void): void {
+    const arr = this.listeners.get(type) ?? [];
+    arr.push(listener);
+    this.listeners.set(type, arr);
+  }
+
+  send(raw: string): void {
+    const frame = JSON.parse(raw);
+    if (frame.op === 2 || frame.op === 6) {
+      this.emit('message', {
+        data: JSON.stringify({
+          op: 0,
+          s: this.seq++,
+          t: 'READY',
+          d: {
+            version: 1,
+            session_id: 'sess-recall-1',
+            user: { id: MOCK_BOT_ID, username: 'Kujira助手', bot: true },
+          },
+        }),
+      });
+    } else if (frame.op === 1) {
+      this.emit('message', { data: JSON.stringify({ op: 11 }) });
+    }
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.emit('close', { code: 1000, reason: '' });
+  }
+
+  emitDispatch(t: string, d: unknown): void {
+    this.emit('message', {
+      data: JSON.stringify({ op: 0, s: this.seq++, t, d }),
+    });
+  }
+
+  private emit(type: string, ev: any): void {
+    for (const fn of this.listeners.get(type) ?? []) {
+      fn(ev);
+    }
+  }
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000, label = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`等待超时: ${label}`);
+}
+
+describe('契约 1-3: recall_message 真实装配、会话隔离与单聊撤回闭环', () => {
   let tmpHome: string;
   let booted: BootedDsh;
-  const TEST_PORT = 29910;
+  let apiCalls: Array<{ method: string; url: string; authorization?: string; body?: any }>;
+  let deleteHandler: (msgId: string) => { status: number; body: Record<string, unknown> };
+  let capturedFollowups: any[];
+
+  function dbPath(): string {
+    return path.join(tmpHome, 'kujira', 'messages.sqlite');
+  }
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-recall-tool-asm-'));
-    booted = await bootDshNapcatBridge({
+    FakeWs.instances = [];
+    apiCalls = [];
+    capturedFollowups = [];
+    deleteHandler = () => ({ status: 200, body: {} });
+
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-kujira-recall-'));
+    await fsp.writeFile(
+      path.join(tmpHome, '.credentials.yaml'),
+      [
+        'version: 1',
+        'refs:',
+        `  QQ_BOT_APP_ID: "${MOCK_APP_ID}"`,
+        `  QQ_BOT_SECRET: "${MOCK_APP_SECRET}"`,
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      const authorization = headers.get('authorization') ?? undefined;
+
+      if (url === 'https://bots.qq.com/app/getAppAccessToken') {
+        return new Response(JSON.stringify({ access_token: 'mock_access_token', expires_in: 7200 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (url === 'https://api.sgroup.qq.com/gateway') {
+        return new Response(JSON.stringify({ url: 'wss://api.sgroup.qq.com/websocket' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (url.startsWith('https://api.sgroup.qq.com/')) {
+        const parsed = new URL(url);
+        let parsedBody: any;
+        if (typeof init?.body === 'string' && init.body) {
+          parsedBody = JSON.parse(init.body);
+        }
+        apiCalls.push({ method, url, authorization, body: parsedBody });
+
+        if (method === 'POST' && parsed.pathname === `/v2/users/${MOCK_OPENID}/messages`) {
+          return new Response(
+            JSON.stringify({
+              id: 'ROBOT1.0_OUT_RECALL_1',
+              timestamp: '2026-11-11T12:00:05+08:00',
+              ext_info: { ref_idx: 'REFIDX_OUT_RECALL_1' },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const delPrefix = `/v2/users/${MOCK_OPENID}/messages/`;
+        if (method === 'DELETE' && parsed.pathname.startsWith(delPrefix)) {
+          const msgId = decodeURIComponent(parsed.pathname.slice(delPrefix.length));
+          const resp = deleteHandler(msgId);
+          return new Response(JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      return nativeFetch(input, init);
+    };
+
+    vi.stubGlobal('WebSocket', FakeWs as unknown as typeof WebSocket);
+    vi.stubGlobal('fetch', mockFetch);
+
+    booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: true,
       config: {
-        bot_qq: '1000000001',
-        ws_port: TEST_PORT,
+        input_notify_enabled: false,
       },
     });
+
+    const gateway = booted.ctx.get('kujira-gateway') as KujiraGatewayClient;
+    const presetsSvc: any = (booted.ctx as any).agentPresets || booted.ctx.get?.('agentPresets');
+    await waitUntil(async () => {
+      if (!gateway.getStatus().ready || FakeWs.instances.length === 0) return false;
+      if (presetsSvc?.list) {
+        const list = await presetsSvc.list();
+        return Array.isArray(list) && list.some((p: any) => p.id === 'kujira-session');
+      }
+      return true;
+    }, 5000, 'gateway ready and kujira-session registered');
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     if (booted) {
       await booted.dispose().catch(() => {});
     }
@@ -49,202 +233,232 @@ describe('契约 1: recall_message 工具真实装配与会话隔离契约', () 
     }
   });
 
-  it('1.1 真实装配下：QQ 群聊会话 assemble 结果中包含 recall_message 工具', async () => {
-    const ctx = booted.ctx;
-    const presetsSvc: any = (ctx as any).agentPresets || ctx.get?.('agentPresets');
-    const qqWs = path.join(tmpHome, 'qq-ws-group');
-    await fsp.mkdir(qqWs, { recursive: true });
+  async function preparePeerAgent() {
+    const sm = booted.ctx.get('kujira-session') as SessionManager;
+    const agent = await sm.getOrCreateAgent(MOCK_PEER);
+    (agent as any).followup = (msg: any) => {
+      capturedFollowups.push(msg);
+    };
+    (agent as any).steer = (msg: any) => {
+      capturedFollowups.push(msg);
+    };
+    return agent;
+  }
 
-    const qqGroupHandle = await ctx.agents.create({
-      sessionId: 'qq-group-8888',
-      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: qqWs },
-      setup: async (agentCtx: any) => {
-        if (presetsSvc?.mount) {
-          await presetsSvc.mount(agentCtx, 'qq-session');
-        } else {
-          (ctx as any).napcatBridgeTools?.registerTools?.(agentCtx);
-        }
-      },
-    });
+  it('1.1 真实装配下：Kujira 单聊会话 assemble 包含 recall_message 工具，WebUI 沙箱排除', async () => {
+    const agent = await preparePeerAgent();
+    const asmUser = await (booted.ctx as any).systemPrompt.assemble({ scope: agent, agent });
+    const userToolNames = (asmUser.tools as any[]).map((t: any) => t.name);
+    expect(userToolNames).toContain('recall_message');
+    expect(userToolNames).toContain('send_qq_message');
 
-    const qqGroupAgent = qqGroupHandle.agent || qqGroupHandle;
-    const asmGroup = await ctx.systemPrompt.assemble({ scope: qqGroupAgent, agent: qqGroupAgent } as any);
-    const toolNames = (asmGroup.tools as any[]).map((t: any) => t.name);
-    expect(toolNames).toContain('recall_message');
-  });
-
-  it('1.2 真实装配下：QQ 私聊会话 assemble 结果中包含 recall_message 工具', async () => {
-    const ctx = booted.ctx;
-    const presetsSvc: any = (ctx as any).agentPresets || ctx.get?.('agentPresets');
-    const qqWs = path.join(tmpHome, 'qq-ws-user');
-    await fsp.mkdir(qqWs, { recursive: true });
-
-    const qqUserHandle = await ctx.agents.create({
-      sessionId: 'qq-user-2222',
-      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      meta: { cwd: qqWs },
-      setup: async (agentCtx: any) => {
-        if (presetsSvc?.mount) {
-          await presetsSvc.mount(agentCtx, 'qq-session');
-        } else {
-          (ctx as any).napcatBridgeTools?.registerTools?.(agentCtx);
-        }
-      },
-    });
-
-    const qqUserAgent = qqUserHandle.agent || qqUserHandle;
-    const asmUser = await ctx.systemPrompt.assemble({ scope: qqUserAgent, agent: qqUserAgent } as any);
-    const toolNames = (asmUser.tools as any[]).map((t: any) => t.name);
-    expect(toolNames).toContain('recall_message');
-  });
-
-  it('1.3 真实装配下：WebUI 与 Review 沙箱会话均排除 recall_message 工具', async () => {
-    const ctx = booted.ctx;
     const webWs = path.join(tmpHome, 'web-ws');
     await fsp.mkdir(webWs, { recursive: true });
-
-    const webHandle = await ctx.agents.create({
+    const webHandle = await (booted.ctx as any).agents.create({
       sessionId: 'web-session-1',
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       meta: { cwd: webWs },
     });
-
     const webAgent = webHandle.agent || webHandle;
-    const asmWeb = await ctx.systemPrompt.assemble({ scope: webAgent, agent: webAgent } as any);
+    const asmWeb = await (booted.ctx as any).systemPrompt.assemble({ scope: webAgent, agent: webAgent });
     const webToolNames = (asmWeb.tools as any[]).map((t: any) => t.name);
     expect(webToolNames).not.toContain('recall_message');
   });
+
+  it('1.2 真实装配闭环：发送出站消息后调用装配的 recall_message 撤回 ROBOT1.0_... 并置 recalled=1（保留自身原文）', async () => {
+    const agent = await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_RECALL_1',
+      content: '发一条然后撤回',
+      timestamp: '2026-11-11T12:00:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_IN_RECALL_1'] },
+    });
+
+    await waitUntil(() => capturedFollowups.length === 1, 5000, 'inbound wakeup');
+
+    const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
+    const sendTool = toolsSvc.get('send_qq_message', agent);
+    const recallTool = toolsSvc.get('recall_message', agent);
+    expect(sendTool).toBeDefined();
+    expect(recallTool).toBeDefined();
+
+    const originalText = '这条出站消息稍后撤回';
+    const sendRes = await sendTool.execute({ text: originalText }, { agent });
+    expect(sendRes.success).toBe(true);
+    expect(sendRes.message_id).toBe('ROBOT1.0_OUT_RECALL_1');
+
+    // 验证出站消息已通过 onMessageSent -> recordOutboundSelfMessage 落库
+    await waitUntil(() => {
+      const db = new Database(dbPath(), { readonly: true });
+      try {
+        return Boolean(db.prepare('SELECT msg_id FROM messages WHERE msg_id = ?').get('ROBOT1.0_OUT_RECALL_1'));
+      } finally {
+        db.close();
+      }
+    }, 3000, 'self record saved');
+
+    const recallRes = await recallTool.execute({ message_id: 'ROBOT1.0_OUT_RECALL_1' }, { agent });
+    expect(recallRes.success).toBe(true);
+    expect(recallRes.message).toContain('ROBOT1.0_OUT_RECALL_1');
+    expect(hasUndefinedValue(recallRes)).toBe(false);
+
+    const deleteCall = apiCalls.find((c) => c.method === 'DELETE');
+    expect(deleteCall).toBeDefined();
+    expect(deleteCall?.url).toBe(
+      `https://api.sgroup.qq.com/v2/users/${MOCK_OPENID}/messages/ROBOT1.0_OUT_RECALL_1`
+    );
+    expect(deleteCall?.authorization).toBe('QQBot mock_access_token');
+
+    const db = new Database(dbPath(), { readonly: true });
+    try {
+      const row = db
+        .prepare('SELECT msg_id, self, recalled, content FROM messages WHERE msg_id = ?')
+        .get('ROBOT1.0_OUT_RECALL_1') as any;
+      expect(row).toBeDefined();
+      expect(row.self).toBe(1);
+      expect(row.recalled).toBe(1);
+      // 自身消息撤回后必须保留原文
+      expect(row.content).toBe(originalText);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('1.3 遇 40061002（入站 ID）或 40064004（超 2 分钟）如实报错，绝不篡改 recalled', async () => {
+    const agent = await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_IN_RECALL_2',
+      content: '试试撤回我的消息',
+      timestamp: '2026-11-11T12:01:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '测试用户' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_IN_RECALL_2'] },
+    });
+
+    await waitUntil(() => {
+      const db = new Database(dbPath(), { readonly: true });
+      try {
+        return Boolean(db.prepare('SELECT msg_id FROM messages WHERE msg_id = ?').get('ROBOT1.0_IN_RECALL_2'));
+      } finally {
+        db.close();
+      }
+    }, 3000, 'inbound message saved');
+
+    const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
+    const recallTool = toolsSvc.get('recall_message', agent);
+    expect(recallTool).toBeDefined();
+
+    // 1. 40061002: 入站 ID 不可撤回
+    deleteHandler = () => ({
+      status: 400,
+      body: { code: 40061002, message: 'invalid message id' },
+    });
+    const resInbound = await recallTool.execute({ message_id: 'ROBOT1.0_IN_RECALL_2' }, { agent });
+    expect(resInbound.success).toBe(false);
+    expect(resInbound.error).toContain('40061002');
+    expect(resInbound.error).toContain('入站消息');
+    expect(hasUndefinedValue(resInbound)).toBe(false);
+
+    const db = new Database(dbPath(), { readonly: true });
+    try {
+      const row = db
+        .prepare('SELECT recalled FROM messages WHERE msg_id = ?')
+        .get('ROBOT1.0_IN_RECALL_2') as any;
+      expect(row.recalled).toBe(0);
+    } finally {
+      db.close();
+    }
+
+    // 2. 40064004: 超 2 分钟硬时限
+    deleteHandler = () => ({
+      status: 400,
+      body: { code: 40064004, message: 'exceeded 2 minutes recall limit' },
+    });
+    const resExpired = await recallTool.execute({ message_id: 'ROBOT1.0_OUT_EXPIRED_1' }, { agent });
+    expect(resExpired.success).toBe(false);
+    expect(resExpired.error).toContain('40064004');
+    expect(resExpired.error).toContain('2 分钟');
+    expect(hasUndefinedValue(resExpired)).toBe(false);
+  });
 });
 
-describe('契约 2-5: recallMessage 核心功能、异常校验、串行调度与 Lossless JSON 契约', () => {
+describe('契约 4-5: recallMessage 参数校验、串行调度与 Lossless JSON 契约', () => {
   beforeEach(() => {
     resetGlobalToolContext();
   });
 
-  function hasUndefinedValue(obj: any): boolean {
-    if (obj === undefined) return true;
-    if (obj === null || typeof obj !== 'object') return false;
-    for (const [key, val] of Object.entries(obj)) {
-      if (val === undefined) return true;
-      if (typeof val === 'object' && hasUndefinedValue(val)) return true;
-    }
-    return false;
-  }
+  it('4.1 异常校验：缺少 ID、传入数字 ID、非单聊会话或网关未连接均安全拦截', async () => {
+    const deleteC2CMock = vi.fn();
+    const mockGateway: any = { deleteC2CMessage: deleteC2CMock };
 
-  it('2.1 正常调用：传入数字 message_id，成功调用 gateway.deleteMsg 并返回无损 JSON', async () => {
-    const deleteMsgMock = vi.fn(async (msgId: number | string) => {
-      return { status: 'ok', retcode: 0, data: null };
+    const resEmpty = await recallMessage({} as any, {
+      gateway: mockGateway,
+      peer: MOCK_PEER,
+      openid: MOCK_OPENID,
     });
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
+    expect(resEmpty.success).toBe(false);
+    expect(resEmpty.error).toContain('message_id');
+    expect(hasUndefinedValue(resEmpty)).toBe(false);
 
-    const res = await recallMessage(
-      { message_id: 123456789 },
-      { gateway: mockGateway }
+    const resNumeric = await recallMessage({ message_id: 123456 } as any, {
+      gateway: mockGateway,
+      peer: MOCK_PEER,
+      openid: MOCK_OPENID,
+    });
+    expect(resNumeric.success).toBe(false);
+    expect(resNumeric.error).toContain('ROBOT1.0_');
+    expect(hasUndefinedValue(resNumeric)).toBe(false);
+
+    const resNonC2C = await recallMessage(
+      { message_id: 'ROBOT1.0_OUT_1' },
+      { gateway: mockGateway, peer: 'web-session-1', openid: MOCK_OPENID }
     );
+    expect(resNonC2C.success).toBe(false);
+    expect(resNonC2C.error).toContain('单聊');
+    expect(hasUndefinedValue(resNonC2C)).toBe(false);
 
-    expect(deleteMsgMock).toHaveBeenCalledWith(123456789);
-    expect(res.success).toBe(true);
-    expect(res.message).toContain('123456789');
-    expect(hasUndefinedValue(res)).toBe(false);
-  });
-
-  it('2.2 正常调用：传入数字字符串 message_id，自动转换为数字调用', async () => {
-    const deleteMsgMock = vi.fn(async (msgId: number | string) => {
-      return { status: 'ok', retcode: 0, data: null };
-    });
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
-
-    const res = await recallMessage(
-      { message_id: '987654321' } as any,
-      { gateway: mockGateway }
+    const resNoGateway = await recallMessage(
+      { message_id: 'ROBOT1.0_OUT_1' },
+      { gateway: undefined, peer: MOCK_PEER, openid: MOCK_OPENID }
     );
-
-    expect(deleteMsgMock).toHaveBeenCalledWith(987654321);
-    expect(res.success).toBe(true);
-    expect(hasUndefinedValue(res)).toBe(false);
+    expect(resNoGateway.success).toBe(false);
+    expect(resNoGateway.error).toContain('Gateway 未连接');
+    expect(hasUndefinedValue(resNoGateway)).toBe(false);
+    expect(deleteC2CMock).not.toHaveBeenCalled();
   });
 
-  it('3.1 异常校验：未提供 message_id 时安全拦截并返回错误信息', async () => {
-    const deleteMsgMock = vi.fn();
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
-
-    const res1 = await recallMessage({} as any, { gateway: mockGateway });
-    expect(res1.success).toBe(false);
-    expect(res1.error).toContain('message_id');
-    expect(deleteMsgMock).not.toHaveBeenCalled();
-    expect(hasUndefinedValue(res1)).toBe(false);
-
-    const res2 = await recallMessage({ message_id: '' } as any, { gateway: mockGateway });
-    expect(res2.success).toBe(false);
-    expect(res2.error).toContain('message_id');
-    expect(hasUndefinedValue(res2)).toBe(false);
-  });
-
-  it('3.2 异常校验：传入非数字字符串等非法 message_id 时安全拦截', async () => {
-    const deleteMsgMock = vi.fn();
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
-
-    const res = await recallMessage({ message_id: 'not-a-number' } as any, { gateway: mockGateway });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('无效的消息 ID');
-    expect(deleteMsgMock).not.toHaveBeenCalled();
-    expect(hasUndefinedValue(res)).toBe(false);
-  });
-
-  it('3.3 异常校验：网关未连接时安全拦截', async () => {
-    const res = await recallMessage({ message_id: 123456 }, { gateway: undefined });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('Gateway 未连接');
-    expect(hasUndefinedValue(res)).toBe(false);
-  });
-
-  it('3.4 平台报错透传：底层超时或无权限时，如实反馈底层报错文本', async () => {
-    const deleteMsgMock = vi.fn(async () => {
-      return {
-        status: 'failed',
-        retcode: 100,
-        message: 'delete_msg failed',
-        wording: '消息发送时间已超过 2 分钟，无法撤回',
-      };
-    });
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
-
-    const res = await recallMessage({ message_id: 123456 }, { gateway: mockGateway });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('消息发送时间已超过 2 分钟，无法撤回');
-    expect(hasUndefinedValue(res)).toBe(false);
-  });
-
-  it('4.1 串行队列调度：存在 peer 与 sender 时，经由 sender.enqueue 调度执行', async () => {
+  it('4.2 串行队列调度：经由 PerPeerSerialSender 保持发送与撤回顺序', async () => {
     const callOrder: string[] = [];
-    const deleteMsgMock = vi.fn(async (msgId: number | string) => {
-      callOrder.push(`gateway:${msgId}`);
-      return { status: 'ok', retcode: 0, data: null };
+    const deleteC2CMock = vi.fn(async (_openid: string, msgId: string) => {
+      callOrder.push(`delete:${msgId}`);
+      return { ok: true, status: 200, body: {} };
     });
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
+    const mockGateway: any = { deleteC2CMessage: deleteC2CMock };
     const sender = new PerPeerSerialSender();
 
-    // 先推一个模拟发送任务
-    sender.enqueue('group_8888', async () => {
+    void sender.enqueue(MOCK_PEER, async () => {
       await new Promise((r) => setTimeout(r, 20));
       callOrder.push('send:1');
     });
 
-    // 紧接着调用 recallMessage
-    const resPromise = recallMessage(
-      { message_id: 123456 },
+    const res = await recallMessage(
+      { message_id: 'ROBOT1.0_OUT_SERIAL_1' },
       {
         gateway: mockGateway,
         sender,
-        peer: 'group_8888',
+        peer: MOCK_PEER,
+        openid: MOCK_OPENID,
       }
     );
 
-    const res = await resPromise;
     expect(res.success).toBe(true);
-    // 验证顺序必须是 send 在前，recall 在后
-    expect(callOrder).toEqual(['send:1', 'gateway:123456']);
+    expect(callOrder).toEqual(['send:1', 'delete:ROBOT1.0_OUT_SERIAL_1']);
     expect(hasUndefinedValue(res)).toBe(false);
   });
 
@@ -259,12 +473,16 @@ describe('契约 2-5: recallMessage 核心功能、异常校验、串行调度�
       },
     });
 
-    const deleteMsgMock = vi.fn(async () => ({ status: 'ok', retcode: 0, data: null }));
-    const mockGateway: any = { deleteMsg: deleteMsgMock };
+    const deleteC2CMock = vi.fn(async () => ({ ok: true, status: 200, body: {} }));
+    const mockGateway: any = { deleteC2CMessage: deleteC2CMock };
+    const mockDb: any = {
+      getOpenidByPeer: () => MOCK_OPENID,
+      markRecalled: vi.fn(),
+    };
 
     registerAgentTools(appCtx, {
       gateway: mockGateway,
-      db: {} as any,
+      db: mockDb,
       mediaManager: {} as any,
     });
 
@@ -273,23 +491,25 @@ describe('契约 2-5: recallMessage 核心功能、异常校验、串行调度�
 
     const mockExec: any = {
       agent: {
-        session: { id: 'group_1000' },
+        session: { id: `kujira-user-${MOCK_PEER.slice(5)}` },
       },
     };
 
-    // 成功分支
-    const execSuccess = await recallTool.execute({ message_id: 11111 }, mockExec);
+    const execSuccess = await recallTool.execute({ message_id: 'ROBOT1.0_OUT_OK_1' }, mockExec);
     expect(execSuccess.success).toBe(true);
+    expect(mockDb.markRecalled).toHaveBeenCalledWith('ROBOT1.0_OUT_OK_1');
     expect(hasUndefinedValue(execSuccess)).toBe(false);
 
-    // 失败分支
-    deleteMsgMock.mockResolvedValueOnce({
-      status: 'failed',
-      retcode: 1200,
-      wording: '无权限撤回该消息',
+    deleteC2CMock.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      code: 40064004,
+      message: 'recall window expired',
+      body: {},
     } as any);
-    const execFail = await recallTool.execute({ message_id: 22222 }, mockExec);
+    const execFail = await recallTool.execute({ message_id: 'ROBOT1.0_OUT_EXP_1' }, mockExec);
     expect(execFail.success).toBe(false);
+    expect(execFail.error).toContain('40064004');
     expect(hasUndefinedValue(execFail)).toBe(false);
   });
 });
