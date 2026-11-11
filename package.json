@@ -68,6 +68,7 @@
     "probe:qq": "tsx scripts/probe-qq.ts",
     "probe:active": "tsx scripts/probe-active-message.ts",
     "probe:e3": "tsx scripts/probe-e3-length.ts",
+    "probe:quote": "tsx scripts/probe-quote.ts",
     "clean": "rm -rf dist"
   },
   "keywords": [
