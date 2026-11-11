@@ -10,7 +10,6 @@
 /** 系统事件类型辨识标签 */
 export type SystemEventKind =
   | 'scheduled_task'    // 定时任务触发
-  | 'agent_ipc'          // 跨 Agent 内部协作
   | 'proactive_lurk'     // 潜水超时唤醒 (idle)
   | 'proactive_polling'  // 主动回复未读消息聚合 (polling)
   | 'synthetic_notice';  // 协议通知合成事件 (如 poke)
@@ -25,17 +24,6 @@ export interface ScheduledTaskEvent {
   prompt: string;
   /** 任务创建者（仅作审计/日志用途，严禁充当当轮唤醒发起人） */
   creator?: string;
-  timestamp?: number;
-}
-
-/** 跨 Agent IPC 协同事件 */
-export interface AgentIpcEvent {
-  kind: 'agent_ipc';
-  targetPeer: string;
-  fromSessionId: string;
-  message: string;
-  /** 是否为首次创建目标 Agent 注入的初始使命 */
-  isInitialDirective?: boolean;
   timestamp?: number;
 }
 
@@ -76,7 +64,6 @@ export interface SyntheticNoticeEvent {
 /** 全量系统事件可辨识联合体 (Discriminated Union) */
 export type SystemWakeupEvent =
   | ScheduledTaskEvent
-  | AgentIpcEvent
   | ProactiveLurkEvent
   | ProactivePollingEvent
   | SyntheticNoticeEvent;

@@ -4,7 +4,7 @@
 
 import type { SystemWakeupEvent } from './system-event.js';
 
-export type WakeupTriggerType = 'at' | 'mention' | 'quote' | 'poke' | 'proactive' | 'scheduled' | 'internal_agent';
+export type WakeupTriggerType = 'at' | 'mention' | 'quote' | 'poke' | 'proactive' | 'scheduled';
 
 export interface WakeupPayload {
   msg_id?: number;
@@ -38,11 +38,7 @@ export interface WakeupPayload {
     images?: string[];
   };
   images?: string[];
-  /** 内部 Agent 协作来源会话 ID (当 trigger === 'internal_agent' 时提供) */
-  from_session?: string;
-  /** 内部 Agent 协作成果回传目标会话 ID (当 trigger === 'internal_agent' 时提供) */
-  reply_to_session?: string;
-  /** 是否为系统内部生成的事件（定时任务/IPC/主动回复/协议通知等，非真实用户消息） */
+  /** 是否为系统内部生成的事件（定时任务/主动回复/协议通知等，非真实用户消息） */
   is_system?: boolean;
   /** 对应的强类型系统事件实体（由 SystemEventHub 统一注入） */
   system_event?: SystemWakeupEvent;

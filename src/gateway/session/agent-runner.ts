@@ -821,7 +821,6 @@ export class SessionAgentRunner {
       Boolean(payload.is_system) ||
       payload.trigger === 'poke' ||
       payload.trigger === 'scheduled' ||
-      payload.trigger === 'internal_agent' ||
       (payload.trigger === 'proactive' && payload.sub_trigger === 'idle') ||
       (!(payload as any).msg_id && !payload.from_user);
 
@@ -831,7 +830,7 @@ export class SessionAgentRunner {
         msg_id: undefined,
         from_user: '',
         is_group: isGroup,
-        trigger: payload.trigger === 'poke' ? 'poke' : payload.trigger === 'scheduled' ? 'scheduled' : payload.trigger === 'internal_agent' ? 'direct' : 'idle',
+        trigger: payload.trigger === 'poke' ? 'poke' : payload.trigger === 'scheduled' ? 'scheduled' : 'idle',
       });
     }
 
@@ -839,8 +838,8 @@ export class SessionAgentRunner {
     const sessionId = (agent as any).session?.id || this.delegate.peerToSessionId(payload.peer);
 
     // 仅当唤醒来源是真实 QQ 发送者（消息 / 戳一戳）时才允许用 from_name 更新私聊标题。
-    // 系统触发器（scheduled / proactive / internal_agent）的 from_name 是系统身份
-    // 「系统定时任务」「协同 Agent」等，若写入标题会把私聊永久改名成系统身份。
+    // 系统触发器（scheduled / proactive）的 from_name 是系统身份，
+    // 若写入标题会把私聊永久改名成系统身份。
     if (
       !payload.is_system &&
       payload.from_name &&
@@ -875,7 +874,7 @@ export class SessionAgentRunner {
         msg_id: undefined,
         from_user: '',
         is_group: isGroup,
-        trigger: payload.trigger === 'poke' ? 'poke' : payload.trigger === 'scheduled' ? 'scheduled' : payload.trigger === 'internal_agent' ? 'direct' : 'idle',
+        trigger: payload.trigger === 'poke' ? 'poke' : payload.trigger === 'scheduled' ? 'scheduled' : 'idle',
       });
     }
 

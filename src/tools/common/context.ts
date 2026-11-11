@@ -23,7 +23,7 @@ export interface ToolExecutionContext {
   waitRegistry?: MessageWaitRegistry | null;
   /** EN-005: 当前工具调用的取消信号（Agent 回合中断时中止等待） */
   signal?: AbortSignal;
-  /** 当前回合入站消息 ID 获取器（react_message 省略 message_id 时默认绑定） */
+  /** 当前回合入站消息 ID 获取器（collect_face 省略 message_id 时默认绑定） */
   inboundMsgIdGetter?: (peer: string) => number | undefined;
   /** 表情包落盘存储目录 */
   faceDir?: string;
@@ -39,8 +39,6 @@ export interface ToolExecutionContext {
   slangStorage?: SlangStorage;
   /** 当前工具执行所在的 Session ID */
   sessionId?: string;
-  /** 会话管理器实例 (供跨 Agent IPC 工具调度) */
-  sessionManager?: any;
   /** 配置项提供器或配置快照 */
   config?: (() => BridgePluginConfig) | BridgePluginConfig;
 }
@@ -57,8 +55,6 @@ export interface AgentToolsOptions {
   slangStorage?: SlangStorage;
   /** 当前工具执行所在的 Session ID */
   sessionId?: string;
-  /** 会话管理器实例 (供跨 Agent IPC 工具调度) */
-  sessionManager?: any;
   config?: (() => BridgePluginConfig) | BridgePluginConfig;
 }
 

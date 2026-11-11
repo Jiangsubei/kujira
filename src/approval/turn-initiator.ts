@@ -12,7 +12,7 @@
 
 /**
  * 「真实 QQ 发送者」触发的唤醒类型：只有这些唤醒才能成为审批申请人锚点。
- * 系统触发（proactive/scheduled/internal_agent）不在此列，不登记发起人，审批保持 Fail-Closed。
+ * 系统触发（proactive/scheduled）不在此列，不登记发起人，审批保持 Fail-Closed。
  */
 const REAL_SENDER_WAKEUP_TRIGGERS = new Set(['at', 'mention', 'quote', 'poke', 'direct']);
 

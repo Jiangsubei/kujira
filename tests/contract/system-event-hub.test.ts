@@ -18,7 +18,6 @@ import { SessionManager } from '../../src/gateway/session.js';
 import { SystemEventHub, formatSystemEventPrompt } from '../../src/gateway/system-event-hub.js';
 import type {
   ScheduledTaskEvent,
-  AgentIpcEvent,
   ProactiveLurkEvent,
   ProactivePollingEvent,
   SyntheticNoticeEvent,
@@ -116,23 +115,6 @@ describe('契约测试: 系统事件与统一唤醒中枢 (SystemEventHub)', () 
       )).toBe(true);
     });
 
-    it('1.2 跨 Agent 协同 IPC: 包含统一头部、来源会话、内容以及置底回执指引', () => {
-      const event: AgentIpcEvent = {
-        kind: 'agent_ipc',
-        targetPeer: PEER_USER,
-        fromSessionId: 'session_caller_123',
-        message: '请协助确认该用户的未付账单',
-        timestamp: 1794000000000,
-      };
-
-      const prompt = formatSystemEventPrompt(event);
-
-      expect(prompt).toContain('系统事件：[内部协同] [来源会话: session_caller_123]');
-      expect(prompt).toContain('\n\n协同内容：\n请协助确认该用户的未付账单\n\n');
-      expect(prompt).toContain('（说明：这是来自其他 Agent 工作区的内部协作指令/消息，QQ 真实用户完全不可见。');
-      expect(prompt).toContain('target_session_id 设为 "session_caller_123"');
-    });
-
     it('1.3 潜水超时冒泡: 包含时长与置底的 [结束] 决策指引', () => {
       const event: ProactiveLurkEvent = {
         kind: 'proactive_lurk',
@@ -222,18 +204,6 @@ describe('契约测试: 系统事件与统一唤醒中枢 (SystemEventHub)', () 
       expect(capturedPayload.trigger).toBe('scheduled');
 
       // 验证标题未被污染
-      expect(rename).not.toHaveBeenCalled();
-      expect(currentTitle).toBe(NEUTRAL_TITLE);
-      expect(sessionManager.getPeerName(PEER_USER)).toBeUndefined();
-    });
-
-    it('2.2 跨 Agent IPC 通过 Hub 分发: 同样杜绝标题污染', async () => {
-      await systemEventHub.dispatchAgentIpc({
-        targetPeer: PEER_USER,
-        fromSessionId: 'session_parent',
-        message: '协同执行任务',
-      });
-
       expect(rename).not.toHaveBeenCalled();
       expect(currentTitle).toBe(NEUTRAL_TITLE);
       expect(sessionManager.getPeerName(PEER_USER)).toBeUndefined();

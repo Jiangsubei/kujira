@@ -4,4 +4,3 @@
 
 export * from './fetch-resource.js';
 export * from './send-file.js';
-export * from './list-group-files.js';

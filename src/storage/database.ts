@@ -9,8 +9,6 @@ import * as path from 'node:path';
 import { DEFAULT_FACE_STORE_MAX } from '../constants/index.js';
 import type {
   SlangEntry,
-  ListGroupFilesParams,
-  ListGroupFilesResult,
   MessageRecord,
   ReadChatHistoryParams,
   ReadChatHistoryResult,
@@ -98,10 +96,6 @@ export class MessageDatabase {
 
   readHistory(peer: string, params: ReadChatHistoryParams = {}): ReadChatHistoryResult {
     return this.messageRepo.readHistory(peer, params);
-  }
-
-  listGroupFiles(peer: string, params: ListGroupFilesParams = {}): ListGroupFilesResult {
-    return this.messageRepo.listGroupFiles(peer, params);
   }
 
   findGroupFileSibling(

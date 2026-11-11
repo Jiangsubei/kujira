@@ -385,7 +385,6 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     scheduler: taskScheduler,
     slangStorage: slangService.storage,
     config: currentConfig,
-    sessionManager,
     inboundMsgIdGetter: (peer: string) => {
       if (!outboundBridge) return undefined;
       const inboundCtx =

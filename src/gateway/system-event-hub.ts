@@ -14,7 +14,6 @@ import type { OutboundBridgeLike } from './session/types.js';
 import type {
   SystemWakeupEvent,
   ScheduledTaskEvent,
-  AgentIpcEvent,
   ProactiveLurkEvent,
   ProactivePollingEvent,
   SyntheticNoticeEvent,
@@ -48,9 +47,7 @@ function resolveChannelInfo(peer: string): { isGroup: boolean; channelStr: strin
 export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
   const now = event.timestamp || Date.now();
   const timeStr = formatDateTime(now);
-  const { channelStr, groupId } = resolveChannelInfo(
-    event.kind === 'agent_ipc' ? event.targetPeer : event.peer
-  );
+  const { channelStr, groupId } = resolveChannelInfo(event.peer);
 
   switch (event.kind) {
     case 'scheduled_task': {
@@ -65,23 +62,6 @@ export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
         `系统事件：[定时任务]${taskTag} ${channelStr} [${timeStr}]${ruleLine}\n\n` +
         `任务内容：\n` +
         `${event.prompt}\n\n` +
-        guide
-      );
-    }
-
-    case 'agent_ipc': {
-      const fromSession = event.fromSessionId || '其他工作区';
-      const replyTag =
-        fromSession && fromSession !== '其他工作区'
-          ? ` 若需向发起方回复或交付成果，请直接调用 send_agent_message 工具，将 target_session_id 设为 "${fromSession}"。`
-        : '';
-      const guide =
-        `（说明：这是来自其他 Agent 工作区的内部协作指令/消息，QQ 真实用户完全不可见。请根据上述内容推进；若需要向目标用户私聊询问，请调用 send_qq_message 发送真实私聊。完成任务后可通过 send_agent_message 回复上述 Session ID。回执一次即视为闭环：除非任务确实需要对方继续处理，不要再次跟发确认或致谢；作为发起方收到回执后，用户没有新的明确要求也无需再回复。${replyTag}）`;
-
-      return (
-        `系统事件：[内部协同] [来源会话: ${fromSession}] [${timeStr}]\n\n` +
-        `协同内容：\n` +
-        `${event.message}\n\n` +
         guide
       );
     }
@@ -151,14 +131,6 @@ export class SystemEventHub {
     return this.dispatchSystemEvent({ kind: 'scheduled_task', ...event }, options);
   }
 
-  /** 分发跨 Agent 协同消息 */
-  public async dispatchAgentIpc(
-    event: Omit<AgentIpcEvent, 'kind'>,
-    options?: { onMessageCreated?: (userMsg: any) => void }
-  ): Promise<any> {
-    return this.dispatchSystemEvent({ kind: 'agent_ipc', ...event }, options);
-  }
-
   /** 分发群聊潜水超时冒泡唤醒 */
   public async dispatchProactiveLurk(
     event: Omit<ProactiveLurkEvent, 'kind'>,
@@ -190,7 +162,7 @@ export class SystemEventHub {
     event: SystemWakeupEvent,
     options?: { onMessageCreated?: (userMsg: any) => void }
   ): Promise<any> {
-    const peer = event.kind === 'agent_ipc' ? event.targetPeer : event.peer;
+    const peer = event.peer;
     const { isGroup } = resolveChannelInfo(peer);
     const now = event.timestamp || Date.now();
     const promptText = formatSystemEventPrompt(event);
@@ -204,10 +176,6 @@ export class SystemEventHub {
       case 'scheduled_task':
         underlyingTrigger = 'scheduled';
         outboundTrigger = 'scheduled';
-        break;
-      case 'agent_ipc':
-        underlyingTrigger = 'internal_agent';
-        outboundTrigger = 'direct';
         break;
       case 'proactive_lurk':
         underlyingTrigger = 'proactive';
@@ -254,7 +222,6 @@ export class SystemEventHub {
       task_id: event.kind === 'scheduled_task' ? event.taskId : undefined,
       task_type: event.kind === 'scheduled_task' ? event.taskType : undefined,
       task_rule: event.kind === 'scheduled_task' ? event.taskRule : undefined,
-      from_session: event.kind === 'agent_ipc' ? event.fromSessionId : undefined,
       buffered_messages: event.kind === 'proactive_polling' ? event.bufferedMessages : undefined,
     };
 

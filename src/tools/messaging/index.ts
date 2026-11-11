@@ -4,5 +4,3 @@
 
 export * from './send-message.js';
 export * from './recall-message.js';
-export * from './react-message.js';
-export * from './poke-user.js';

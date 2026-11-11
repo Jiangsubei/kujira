@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import * as fs from 'node:fs';
-import { fetchChatResource, pokeUser, expandForwardMessage } from '../../src/tools/index.js';
+import { fetchChatResource, expandForwardMessage } from '../../src/tools/index.js';
 import { clearGroupFileResolverCache } from '../../src/tools/group-file-resolve.js';
 
 /**
@@ -168,12 +168,6 @@ describe('契约测试: 群文件下载链路 (Group File Download Contract IS-F
     } finally {
       fs.rmSync(file, { force: true });
     }
-  });
-
-  it('pokeUser 无 gateway 返回 success:false 与清晰错误', async () => {
-    const res = await pokeUser({ user_id: '2000000001' });
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('NapCat 未连接');
   });
 
   it('expandForwardMessage 无 gateway 返回 success:false 与清晰错误', async () => {

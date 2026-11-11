@@ -127,16 +127,14 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(toolNames.has('skill')).toBe(true);
     expect(toolNames.has('ask_user_question')).toBe(true);
 
-    // 5. NapCat 专属工具
+    // 5. 保留的专属工具
     expect(toolNames.has('send_qq_message')).toBe(true);
+    expect(toolNames.has('recall_message')).toBe(true);
     expect(toolNames.has('read_chat_history')).toBe(true);
     expect(toolNames.has('fetch_chat_resource')).toBe(true);
     expect(toolNames.has('expand_forward_message')).toBe(true);
     expect(toolNames.has('send_file')).toBe(true);
-    expect(toolNames.has('poke_user')).toBe(true);
-    expect(toolNames.has('list_group_files')).toBe(true);
     expect(toolNames.has('wait_for_user_messages')).toBe(true);
-    expect(toolNames.has('react_message')).toBe(true);
     expect(toolNames.has('send_face')).toBe(true);
     expect(toolNames.has('list_faces')).toBe(true);
     expect(toolNames.has('collect_face')).toBe(true);
@@ -144,6 +142,28 @@ describe('契约测试: QQ 会话专属预设装配与工具隔离 (QQ Session P
     expect(toolNames.has('read_memory')).toBe(true);
     expect(toolNames.has('create_memory')).toBe(true);
     expect(toolNames.has('edit_memory')).toBe(true);
+
+    // 6. 已移除工具绝不能在预设中注册
+    for (const removed of [
+      'read_qzone_feeds',
+      'publish_qzone_feed',
+      'comment_qzone_feed',
+      'delete_qzone_feed',
+      'get_friend_list',
+      'get_user_profile',
+      'get_group_list',
+      'get_group_info',
+      'get_group_notice',
+      'get_group_member_info',
+      'list_group_files',
+      'poke_user',
+      'react_message',
+      'list_active_agents',
+      'create_target_agent',
+      'send_agent_message',
+    ]) {
+      expect(toolNames.has(removed)).toBe(false);
+    }
   });
 
   it('契约 4: 通过 SessionAgentRunner 创建的 QQ Agent 会话自动挂载 qq-session 预设', async () => {

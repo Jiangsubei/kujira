@@ -4,9 +4,6 @@
 
 import type {
   ChatMessageSummary,
-  GroupFileInfo,
-  ListGroupFilesParams,
-  ListGroupFilesResult,
   MessageRecord,
   ReadChatHistoryParams,
   ReadChatHistoryResult,
@@ -16,7 +13,6 @@ import { formatDateTime, parseTimeValue } from '../time-parser.js';
 import {
   GROUP_FILE_DEDUPE_WINDOW_MS,
   parseGroupFileRowInfo,
-  mergeDuplicateGroupFileRows,
 } from '../group-file-helper.js';
 
 export class MessageRepository {
@@ -307,93 +303,6 @@ export class MessageRepository {
       offset,
       limit,
       has_more: offset + messages.length < total,
-    };
-  }
-
-  listGroupFiles(peer: string, params: ListGroupFilesParams = {}): ListGroupFilesResult {
-    const db = this.getDb();
-    const conditions: string[] = ['peer = ?', "type = 'group_file'"];
-    const sqlParams: any[] = [peer];
-
-    // 1. 发送者 QQ 精确匹配
-    if (params.user_id !== undefined && params.user_id !== '') {
-      conditions.push('user_id = ?');
-      sqlParams.push(String(params.user_id));
-    }
-
-    // 2. 发送者昵称/群名片模糊搜索
-    if (params.sender_name !== undefined && params.sender_name.trim() !== '') {
-      conditions.push('(sender_name LIKE ? OR user_id = ?)');
-      sqlParams.push(`%${params.sender_name.trim()}%`, params.sender_name.trim());
-    }
-
-    // 3. 文件名关键词模糊搜索 (匹配 content 或 raw)
-    if (params.file_name !== undefined && params.file_name.trim() !== '') {
-      conditions.push('(content LIKE ? OR raw LIKE ?)');
-      sqlParams.push(`%${params.file_name.trim()}%`, `%${params.file_name.trim()}%`);
-    }
-
-    // 4. 时间范围筛选
-    const sinceTs = parseTimeValue(params.since, false);
-    const untilTs = parseTimeValue(params.until, true);
-
-    if (sinceTs !== undefined && !Number.isNaN(sinceTs)) {
-      conditions.push('time >= ?');
-      sqlParams.push(sinceTs);
-    }
-    if (untilTs !== undefined && !Number.isNaN(untilTs)) {
-      conditions.push('time <= ?');
-      sqlParams.push(untilTs);
-    }
-
-    const whereClause = conditions.join(' AND ');
-    const order = params.order?.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
-    const offset = Number.isFinite(Number(params.offset)) && Number(params.offset) > 0
-      ? Math.floor(Number(params.offset))
-      : 0;
-    const limit = Math.min(Math.max(params.limit ?? 20, 1), 100);
-
-    // SnowLuma 兼容：同一次上传会同时产生 notice 与消息段两条记录，
-    // 先按时间升序全量取出并合并双记录，再统一排序分页，避免分页后再去重造成条数抖动。
-    const rows = db.prepare(`
-      SELECT * FROM messages
-      WHERE ${whereClause}
-      ORDER BY time ASC, msg_id ASC
-    `).all(...sqlParams) as any[];
-
-    const merged = mergeDuplicateGroupFileRows(rows);
-    if (order === 'DESC') merged.reverse();
-
-    const total = merged.length;
-    const pageEntries = merged.slice(offset, offset + limit);
-
-    const files: GroupFileInfo[] = pageEntries.map((entry) => {
-      const row = entry.row;
-      const senderName = (row.sender_name && String(row.sender_name).trim())
-        ? String(row.sender_name).trim()
-        : String(row.user_id);
-
-      return {
-        msg_id: Number(row.msg_id),
-        file_id: entry.fileId,
-        file_name: entry.fileName,
-        busid: entry.busid,
-        sender_name: senderName,
-        user_id: String(row.user_id),
-        time: Number(row.time),
-        formatted_time: formatDateTime(Number(row.time)),
-        size: entry.size,
-      };
-    });
-
-    return {
-      success: true,
-      files,
-      total: files.length,
-      total_matched: total,
-      offset,
-      limit,
-      has_more: offset + files.length < total,
     };
   }
 

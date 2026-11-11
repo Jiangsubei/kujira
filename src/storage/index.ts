@@ -9,5 +9,4 @@ export * from './schema.js';
 export * from './repositories/index.js';
 export * from './face-migration.js';
 export * from './slang-migration.js';
-export * from './internal-message.js';
 export * from './media.js';

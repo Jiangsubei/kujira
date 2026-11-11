@@ -64,8 +64,8 @@ describe('契约测试: 审批「本轮唤醒者」追踪器 (Turn Initiator Tra
 
   it('契约 5: 系统触发不登记 → 本轮首个 user/message 不产生申请人', () => {
     const tracker = new TurnInitiatorTracker();
-    // proactive / scheduled / internal_agent 经 resolveWakeupInitiator 一律返回 null
-    for (const trigger of ['proactive', 'scheduled', 'internal_agent']) {
+    // proactive / scheduled 经 resolveWakeupInitiator 一律返回 null
+    for (const trigger of ['proactive', 'scheduled']) {
       expect(resolveWakeupInitiator(trigger, '10001')).toBeNull();
     }
 

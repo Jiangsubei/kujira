@@ -8,8 +8,8 @@ describe('契约测试: 审批唤醒发起人判定（本轮登记口径） (App
     }
   });
 
-  it('契约 2: 系统触发（proactive/scheduled/internal_agent）一律不产生锚点', () => {
-    for (const trigger of ['proactive', 'scheduled', 'internal_agent']) {
+  it('契约 2: 系统触发（proactive/scheduled）一律不产生锚点', () => {
+    for (const trigger of ['proactive', 'scheduled']) {
       expect(resolveWakeupInitiator(trigger, '10001')).toBeNull();
       expect(resolveWakeupInitiator(trigger, '')).toBeNull();
     }

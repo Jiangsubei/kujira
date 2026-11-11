@@ -85,51 +85,6 @@ export interface ReadChatHistoryResult {
   message?: string;
 }
 
-export interface ListGroupFilesParams {
-  /** 按群文件名模糊搜索（如 ".pdf", "周报"） */
-  file_name?: string;
-  /** 按上传者昵称或群名片模糊搜索 */
-  sender_name?: string;
-  /** 按上传者 QQ 号精确筛选 */
-  user_id?: string;
-  /** 起始时间: 支持毫秒数字、秒级数字、相对时间 ("7d") 或日期时间字符串 */
-  since?: number | string;
-  /** 截止时间: 支持毫秒数字、秒级数字、相对时间或日期时间字符串 */
-  until?: number | string;
-  /** 起始序号偏移，从 0 开始 (默认 0) */
-  offset?: number;
-  /** 返回最大条数 (默认 20，上限 100) */
-  limit?: number;
-  /** 时间排序 (默认 'desc' 倒序，取最新上传的文件) */
-  order?: 'asc' | 'desc';
-}
-
-export interface GroupFileInfo {
-  msg_id: number;
-  file_id: string;
-  file_name: string;
-  busid: number;
-  sender_name: string;
-  user_id: string;
-  time: number;
-  formatted_time: string;
-  size?: number;
-}
-
-export interface ListGroupFilesResult {
-  success?: boolean;
-  files: GroupFileInfo[];
-  /** 本次实际返回条数 */
-  total: number;
-  /** 过滤后匹配的总条数 */
-  total_matched: number;
-  offset: number;
-  limit: number;
-  has_more: boolean;
-  message?: string;
-  error?: string;
-}
-
 // ==================== 2. 资源下载与合并转发展开 ====================
 
 export interface FetchResourceItem {
@@ -208,33 +163,9 @@ export interface SendQqMessageResult {
   sent_preview?: string;
 }
 
-export interface PokeUserParams {
-  user_id: string;
-}
-
-export interface PokeUserResult {
-  success: boolean;
-  error?: string;
-}
-
 export interface WaitForUserMessagesParams {
   timeout?: number;
   user_id?: string;
-}
-
-export interface ReactMessageParams {
-  /** 表情语义键（对应 QQ 群消息回应表情） */
-  emoji: string;
-  /** 要回应的目标消息 ID。可省略，省略时自动绑定当前回合正在回复的入站消息 */
-  message_id?: number | string;
-}
-
-export interface ReactMessageResult {
-  success: boolean;
-  message_id?: number;
-  emoji?: string;
-  emoji_id?: string;
-  error?: string;
 }
 
 // ==================== 4. 表情包工具 ====================
@@ -413,91 +344,4 @@ export interface ManageSlangResult {
   max_entries?: number;
   message?: string;
   error?: string;
-}
-
-// ==================== 7. QQ 空间动态互动契约 ====================
-
-export interface QzoneImageItem {
-  url: string;
-  local_path?: string;
-}
-
-export interface QzoneCommentItem {
-  comment_id?: string;
-  author: {
-    user_id: number;
-    nickname: string;
-  };
-  content: string;
-  create_time?: string;
-  is_self: boolean;
-}
-
-export interface QzoneFeedItem {
-  feed_id: string;
-  author: {
-    user_id: number;
-    nickname: string;
-  };
-  publish_time: string;
-  content: string;
-  images: QzoneImageItem[];
-  comments: QzoneCommentItem[];
-  total_comment_count: number;
-  like_count?: number;
-}
-
-export interface ReadQzoneFeedsParams {
-  scope?: 'friends' | 'self' | 'user';
-  target_qq?: string | number;
-  limit?: number;
-  offset?: number;
-  cursor?: string;
-  after_feed_id?: string;
-}
-
-export interface ReadQzoneFeedsResult {
-  [key: string]: any;
-  success: boolean;
-  scope: 'friends' | 'self' | 'user';
-  feeds: QzoneFeedItem[];
-  has_more: boolean;
-  next_cursor?: string;
-  message?: string;
-}
-
-export interface PublishQzoneFeedParams {
-  content: string;
-  images?: string[];
-}
-
-export interface PublishQzoneFeedResult {
-  [key: string]: any;
-  success: boolean;
-  feed_id?: string;
-  message: string;
-}
-
-export interface CommentQzoneFeedParams {
-  feed_id: string;
-  target_qq: string | number;
-  content: string;
-}
-
-export interface CommentQzoneFeedResult {
-  [key: string]: any;
-  success: boolean;
-  comment_id?: string;
-  message: string;
-}
-
-export interface DeleteQzoneFeedParams {
-  feed_id: string;
-}
-
-export interface DeleteQzoneFeedResult {
-  [key: string]: any;
-  success: boolean;
-  feed_id?: string;
-  message: string;
 }

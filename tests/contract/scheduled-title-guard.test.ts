@@ -11,7 +11,7 @@
  * - 触发一次定时任务后，昵称就永久变成「系统定时任务」。
  *
  * 覆盖规范:
- * 1. scheduled / proactive / internal_agent 等系统触发器绝不改写私聊标题；
+ * 1. scheduled / proactive 等系统触发器绝不改写私聊标题；
  * 2. 真实消息（at / mention / quote / poke）仍能正常更新昵称；
  * 3. 历史污染数据（plugin_kv 中的「系统定时任务」与已污染标题）会被清理/自愈。
  */
@@ -102,7 +102,7 @@ describe('契约测试: 系统触发器不得污染私聊会话标题', () => {
     expect(sessionManager.getPeerName(PEER)).toBeUndefined();
   });
 
-  it('契约 2: 系统触发器 (proactive / internal_agent) 同样不得改写私聊标题', async () => {
+  it('契约 2: 系统触发器 (proactive) 同样不得改写私聊标题', async () => {
     sessionManager = createManager();
 
     await sessionManager.dispatchWakeup({
@@ -111,14 +111,6 @@ describe('契约测试: 系统触发器不得污染私聊会话标题', () => {
       from_user: '',
       from_name: '系统主动唤醒',
       content: '主动冒泡',
-      timestamp: Date.now(),
-    });
-    await sessionManager.dispatchWakeup({
-      trigger: 'internal_agent',
-      peer: PEER,
-      from_user: 'qq-user-1000000002',
-      from_name: '协同 Agent',
-      content: '内部任务',
       timestamp: Date.now(),
     });
 

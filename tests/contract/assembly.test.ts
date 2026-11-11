@@ -175,7 +175,6 @@ describe('契约测试: DSH 真实服务装配与插件挂载 (Assembly Contract
       'fetch_chat_resource',
       'expand_forward_message',
       'send_file',
-      'poke_user',
     ]);
 
     await fsp.mkdir(path.join(tmpHome, 'web-ws-2'), { recursive: true });

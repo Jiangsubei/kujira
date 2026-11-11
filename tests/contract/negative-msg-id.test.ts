@@ -268,7 +268,6 @@ describe('契约测试: 负数 message_id 全链路支持与透传', () => {
         sentPayload = payload;
         return { status: 'ok', retcode: 0, data: { message_id: 9999 } };
       }),
-      setMsgEmojiLike: vi.fn(async () => ({ status: 'ok', retcode: 0 })),
     };
 
     registerAgentTools(mockCtx, {
@@ -279,12 +278,10 @@ describe('契约测试: 负数 message_id 全链路支持与透传', () => {
     });
 
     const sendTool = registeredTools.find((t) => t.name === 'send_qq_message');
-    const reactTool = registeredTools.find((t) => t.name === 'react_message');
     const collectTool = registeredTools.find((t) => t.name === 'collect_face');
     const historyTool = registeredTools.find((t) => t.name === 'read_chat_history');
 
     expect(sendTool).toBeDefined();
-    expect(reactTool).toBeDefined();
     expect(collectTool).toBeDefined();
     expect(historyTool).toBeDefined();
 
@@ -299,18 +296,7 @@ describe('契约测试: 负数 message_id 全链路支持与透传', () => {
       { type: 'text', data: { text: '测试回复' } },
     ]);
 
-    // 8.2 react_message 传入字符串形式负数 message_id 不被 DSH 拦截报错
-    const reactRes = await reactTool.execute(
-      { emoji: 'thumbs_up', message_id: String(NEGATIVE_MSG_ID) },
-      { agent: { session: { id: 'qq-group-1000000001' } } }
-    );
-    expect(reactRes.success).toBe(true);
-    expect(mockGateway.setMsgEmojiLike).toHaveBeenCalledWith(
-      NEGATIVE_MSG_ID,
-      expect.any(String)
-    );
-
-    // 8.3 read_chat_history 传入字符串形式负数 reply_to 不被 DSH 拦截报错
+    // 8.2 read_chat_history 传入字符串形式负数 reply_to 不被 DSH 拦截报错
     const historyRes = await historyTool.execute(
       { reply_to: String(NEGATIVE_MSG_ID) },
       { agent: { session: { id: 'qq-group-1000000001' } } }
