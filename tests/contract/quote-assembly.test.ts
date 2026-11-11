@@ -18,6 +18,8 @@ import { formatDateTime } from '../../src/storage/time-parser.js';
  * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（保留可用直链 URL），不泄露索引/发送者标识；
  * (d) 双未命中时优雅降级占位，不中断唤醒；
  * (e) 引用未命中本地库时下载 `msg_elements[]` 内合并转发内嵌附件并本地化为 OS 路径；命中本地库时不触发下载。
+ * (f) 引用媒体消息时 `msg_elements[].attachments`（实测形态：结构化附件）落盘并替换为 OS 路径；缺 attachments 时保留
+ *     `parallel_message` 形态摘要，不臆造下载。
  */
 
 function expectLosslessJson(value: unknown, trail = 'root'): void {
@@ -46,6 +48,14 @@ const PNG_BYTES = Buffer.concat([
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
   Buffer.alloc(24, 4),
 ]);
+
+const QUOTED_MP4_BYTES = Buffer.concat([
+  Buffer.from([0x00, 0x00, 0x00, 0x18]),
+  Buffer.from('ftypisom'),
+  Buffer.alloc(16, 0x22),
+]);
+
+const QUOTED_PDF_BYTES = Buffer.from('%PDF-1.7\n%quoted-file\n');
 
 class FakeWs {
   static instances: FakeWs[] = [];
@@ -566,6 +576,205 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
         path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER)
       )
     ).toBe(true);
+  });
+
+  it('(f) 引用媒体消息时 msg_elements[].attachments 落盘并替换为本地路径（实测形态）', async () => {
+    const requests: string[] = [];
+    const srv = http.createServer((req, res) => {
+      requests.push(req.url || '');
+      if (req.url?.includes('clip.mp4')) {
+        res.writeHead(200, { 'Content-Type': 'video/mp4' });
+        res.end(QUOTED_MP4_BYTES);
+        return;
+      }
+      if (req.url?.includes('doc.pdf')) {
+        res.writeHead(200, { 'Content-Type': 'application/pdf' });
+        res.end(QUOTED_PDF_BYTES);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+    servers.push(srv);
+    await new Promise<void>((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => resolve());
+    });
+    const base = `http://127.0.0.1:${(srv.address() as any).port}`;
+
+    await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    // 1. 实测形态：引用图片 → msg_elements[0].attachments 携带 content_type='file' 的 .png
+    //    与直发同源分类口径（`content_type='file'` 的 .png 严格保持 file），落盘 files/
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_QUOTE_IMG',
+      content: '这是啥',
+      timestamp: '2026-11-11T12:05:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_QUOTE_IMG', 'ref_msg_idx=REFIDX_Q_QUOTE_IMG_SRC'] },
+      msg_elements: [
+        {
+          content: '',
+          message_type: 103,
+          msg_idx: 'REFIDX_Q_QUOTE_IMG_SRC',
+          attachments: [
+            {
+              content_type: 'file',
+              filename: 'quoted.png',
+              size: PNG_BYTES.length,
+              url: `${base}/quoted/img.png?rkey=Q_IMG_SECRET`,
+            },
+          ],
+        },
+      ],
+      parallel_message: { msg_nodes: [{ content: '[图片]', message_type: 7 }] },
+    });
+    await waitUntil(() => capturedFollowups.length >= 1, 3000, 'quoted image followup');
+    const promptImg = capturedFollowups[0]!.content;
+    expect(promptImg).toContain('[引用回复: "');
+    expect(promptImg).toContain('[文件:quoted.png 已保存: ');
+    expect(promptImg).not.toContain('[图片]');
+    expect(promptImg).not.toContain('Q_IMG_SECRET');
+    expect(promptImg).not.toContain('rkey');
+    const imgMatch = /已保存: ([^\]]+)\]/.exec(promptImg);
+    expect(imgMatch).toBeTruthy();
+    expect(
+      path.resolve(imgMatch![1]!).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'files', MOCK_PEER)
+      )
+    ).toBe(true);
+    expect(requests).toEqual(['/quoted/img.png?rkey=Q_IMG_SECRET']);
+
+    // 2. 引用机器人发出的图片（实测 content_type='image/png'）→ 落盘 image/ 并渲染 [图片:path]
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_QUOTE_BOT_IMG',
+      content: '这张呢',
+      timestamp: '2026-11-11T12:05:05+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_QUOTE_BOT_IMG', 'ref_msg_idx=REFIDX_Q_QUOTE_BOT_IMG_SRC'] },
+      msg_elements: [
+        {
+          content: '',
+          message_type: 103,
+          msg_idx: 'REFIDX_Q_QUOTE_BOT_IMG_SRC',
+          attachments: [
+            {
+              content_type: 'image/png',
+              filename: 'bot-sent.png',
+              size: PNG_BYTES.length,
+              url: `${base}/quoted/bot.png?rkey=Q_BOT_SECRET`,
+            },
+          ],
+        },
+      ],
+      parallel_message: { msg_nodes: [{ content: '[图片]', message_type: 7 }] },
+    });
+    await waitUntil(() => capturedFollowups.length >= 2, 3000, 'quoted bot image followup');
+    const promptBotImg = capturedFollowups[1]!.content;
+    expect(promptBotImg).toContain('[图片:');
+    expect(promptBotImg).not.toContain('Q_BOT_SECRET');
+    const botImgMatch = /\[图片:([^\]]+)\]/.exec(promptBotImg);
+    expect(botImgMatch).toBeTruthy();
+    expect(
+      path.resolve(botImgMatch![1]!).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER)
+      )
+    ).toBe(true);
+
+    // 3. 引用视频（content_type='video/mp4'）→ 落盘 video/ 并替换本地路径
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_QUOTE_VIDEO',
+      content: '这视频呢',
+      timestamp: '2026-11-11T12:05:10+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_QUOTE_VIDEO', 'ref_msg_idx=REFIDX_Q_QUOTE_VIDEO_SRC'] },
+      msg_elements: [
+        {
+          content: '',
+          message_type: 103,
+          msg_idx: 'REFIDX_Q_QUOTE_VIDEO_SRC',
+          attachments: [
+            {
+              content_type: 'video/mp4',
+              filename: 'quoted.mp4',
+              size: QUOTED_MP4_BYTES.length,
+              url: `${base}/quoted/clip.mp4?rkey=Q_VID_SECRET`,
+            },
+          ],
+        },
+      ],
+      parallel_message: { msg_nodes: [{ content: '[视频]', message_type: 7 }] },
+    });
+    await waitUntil(() => capturedFollowups.length >= 3, 3000, 'quoted video followup');
+    const promptVideo = capturedFollowups[2]!.content;
+    expect(promptVideo).toContain('[视频:quoted.mp4');
+    expect(promptVideo).not.toContain('Q_VID_SECRET');
+    const videoMatch = /已保存: ([^\]]+)\]/.exec(promptVideo);
+    expect(videoMatch).toBeTruthy();
+    expect(
+      path.resolve(videoMatch![1]!).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'video', MOCK_PEER)
+      )
+    ).toBe(true);
+
+    // 4. 引用文件（携带 attachments）→ 落盘 files/ 并替换
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_QUOTE_FILE',
+      content: '这个文件呢',
+      timestamp: '2026-11-11T12:05:20+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_QUOTE_FILE', 'ref_msg_idx=REFIDX_Q_QUOTE_FILE_SRC'] },
+      msg_elements: [
+        {
+          content: '',
+          message_type: 103,
+          msg_idx: 'REFIDX_Q_QUOTE_FILE_SRC',
+          attachments: [
+            {
+              content_type: 'file',
+              filename: 'doc.pdf',
+              size: QUOTED_PDF_BYTES.length,
+              url: `${base}/quoted/doc.pdf?rkey=Q_FILE_SECRET`,
+            },
+          ],
+        },
+      ],
+      parallel_message: { msg_nodes: [{ content: '[文件]', message_type: 7 }] },
+    });
+    await waitUntil(() => capturedFollowups.length >= 4, 3000, 'quoted file followup');
+    const promptFile = capturedFollowups[3]!.content;
+    expect(promptFile).toContain('[文件:doc.pdf 已保存: ');
+    expect(promptFile).not.toContain('Q_FILE_SECRET');
+    const fileMatch = /已保存: ([^\]]+)\]/.exec(promptFile);
+    expect(fileMatch).toBeTruthy();
+    expect(
+      path.resolve(fileMatch![1]!).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'files', MOCK_PEER)
+      )
+    ).toBe(true);
+
+    // 5. 服务端未下发 attachments 时保留 parallel_message 的 [文件]，不臆造下载
+    const requestsBefore = requests.length;
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_QUOTE_FILE_NO_ATT',
+      content: '这个也是文件？',
+      timestamp: '2026-11-11T12:05:30+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_QUOTE_FILE_NO_ATT', 'ref_msg_idx=REFIDX_Q_QUOTE_FILE_NO_SRC'] },
+      msg_elements: [{ content: '', message_type: 103, msg_idx: 'REFIDX_Q_QUOTE_FILE_NO_SRC' }],
+      parallel_message: { msg_nodes: [{ content: '[文件]', message_type: 7 }] },
+    });
+    await waitUntil(() => capturedFollowups.length >= 5, 3000, 'quoted file no-att followup');
+    const promptNoAtt = capturedFollowups[4]!.content;
+    expect(promptNoAtt).toContain('[文件]');
+    expect(promptNoAtt).not.toContain('内容已过期或无法获取');
+    expect(requests.length).toBe(requestsBefore);
   });
 
   it('(d) 本地库与 msg_elements[] 均未命中时优雅降级占位，唤醒不中断', async () => {

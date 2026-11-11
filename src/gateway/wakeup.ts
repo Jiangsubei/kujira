@@ -67,6 +67,8 @@ export interface WakeupOptions {
   prefetchedQuoted?: QuotedMessageRecord | null;
   /** 合并转发式引用内嵌附件的原始 URL → 已落盘占位文案替换表 */
   quotedContentReplacements?: ReadonlyMap<string, string>;
+  /** 引用元素下标 → 已本地化的附件渲染文案（`msg_elements[].attachments` 落盘结果） */
+  quotedElementMedia?: ReadonlyMap<number, string>;
   /** 入站图片匹配本地表情库查询器 */
   getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
 }
@@ -125,6 +127,7 @@ async function resolveQuotedInfo(
   // 2. TMP_... 临时索引、无 ref_msg_idx 或本地库未命中：从 msg_elements[] 提取被引用原文
   const fallbackText = extractMsgElementsText(event, {
     replacements: options.quotedContentReplacements,
+    ...(options.quotedElementMedia ? { elementMedia: options.quotedElementMedia } : {}),
   });
   if (fallbackText) {
     return {

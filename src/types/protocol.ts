@@ -46,6 +46,11 @@ export interface QQMsgElement {
   content?: string;
   message_type?: number;
   msg_idx?: string;
+  /**
+   * 被引用原消息的附件（实测：引用图片/视频时官方直接下发结构化附件，
+   * `content` 为空串；引用文件时可能缺失，需回退 `parallel_message` 形态摘要）。
+   */
+  attachments?: QQAttachment[];
 }
 
 /** C2C 单聊事件发送者（实测 username 与 union_openid 在单聊常为空串） */

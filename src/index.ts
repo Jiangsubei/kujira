@@ -34,7 +34,7 @@ import type {
 } from './types/index.js';
 import type { AttachmentDescriptor } from './attachment/types.js';
 import { MessageDatabase } from './storage/database.js';
-import { MediaStorageManager, startMediaCleanupTask, computeFileMd5 } from './storage/media.js';
+import { MediaStorageManager, startMediaCleanupTask } from './storage/media.js';
 import {
   KujiraGatewayClient,
   MessageWaitRegistry,
@@ -61,6 +61,8 @@ import {
   toMessageMediaFields,
 } from './attachment/classify.js';
 import { serializeAttachments } from './attachment/store.js';
+import { localizeInboundAttachments } from './attachment/localize.js';
+import { renderAttachment } from './attachment/render.js';
 import { mapWithConcurrency } from './utils/concurrency.js';
 import { OutboundStreamBridge } from './outbound/stream.js';
 import { recordOutboundSelfMessage } from './outbound/self-record.js';
@@ -580,23 +582,14 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
 
     // 并发下载入站附件（裸 GET 无鉴权头）并识别命中表情库
-    const descriptors = await resolveInboundAttachments(event, peer, mediaManager, logger);
-    for (const desc of descriptors) {
-      if ((desc.kind === 'image' || desc.kind === 'sticker') && desc.local?.path) {
-        const md5 = desc.local.md5 ?? computeFileMd5(desc.local.path) ?? undefined;
-        if (md5) {
-          if (!desc.local.md5) desc.local.md5 = md5;
-          const matchedFace = db.getFaceByMd5(md5);
-          if (matchedFace && matchedFace.enabled && !matchedFace.deleted_at) {
-            desc.face = {
-              id: matchedFace.id,
-              ...(matchedFace.mood ? { mood: matchedFace.mood } : {}),
-              ...(matchedFace.tags && matchedFace.tags.length > 0 ? { tags: matchedFace.tags } : {}),
-            };
-          }
-        }
-      }
-    }
+    // 直发与引用消息 `msg_elements[].attachments` 共用同一落盘管线（`attachment/localize.ts`）
+    const descriptors = await resolveInboundAttachments(
+      event,
+      peer,
+      mediaManager,
+      logger,
+      (md5) => db.getFaceByMd5(md5)
+    );
 
     // message_type=102 合并转发全量内嵌媒体裸 GET 落盘 + 结构化排版 + 本地表情库匹配
     let formatForwardContent: ((raw: string) => string) | undefined;
@@ -615,13 +608,15 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       forwardDescriptors = descriptorsFromForwardEntries(resolvedFwd.entries);
     }
 
-    // 引用消息：先查本地库；仅在未命中时下载合并转发式 msg_elements 内嵌附件并生成替换表
+    // 引用消息：先查本地库；仅在未命中时落盘引用附件并生成本地化文案
     const quotedRefIdx = extractQuotedRefIdx(event);
     const prefetchedQuoted = isPermanentRefIdx(quotedRefIdx)
       ? toQuotedRecord(db.getMessageByRefIdx(quotedRefIdx))
       : null;
     let quotedContentReplacements: Map<string, string> | undefined;
+    let quotedElementMedia: Map<number, string> | undefined;
     if (!prefetchedQuoted) {
+      // (1) 合并转发式引用片段：解析文本内嵌 `[附件k] ... URL:` 并本地化
       const quotedParts = msgElementsRawContents(event).filter((raw) => isForwardLikeContent(raw));
       if (quotedParts.length > 0) {
         const resolvedParts = await mapWithConcurrency(quotedParts, 4, (part) =>
@@ -640,12 +635,46 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
           quotedContentReplacements = merged;
         }
       }
+
+      // (2) 结构化引用附件：实测引用图片/视频时官方直接下发 msg_elements[].attachments[]
+      const elements = Array.isArray(event.msg_elements) ? event.msg_elements : [];
+      const mediaElements = elements
+        .map((el, index) => ({
+          index,
+          attachments: Array.isArray(el.attachments)
+            ? el.attachments.filter((att) => Boolean(att) && typeof att === 'object')
+            : [],
+        }))
+        .filter((entry) => entry.attachments.length > 0);
+
+      if (mediaElements.length > 0) {
+        const localized = await mapWithConcurrency(mediaElements, 4, (entry) =>
+          localizeInboundAttachments(entry.attachments, {
+            peer,
+            mediaManager,
+            logger,
+            getFaceByMd5: (md5) => db.getFaceByMd5(md5),
+          })
+        );
+        const mediaTexts = new Map<number, string>();
+        mediaElements.forEach((entry, i) => {
+          const text = localized[i]!
+            .map((descriptor) => renderAttachment(descriptor))
+            .filter((value): value is string => Boolean(value))
+            .join(' ');
+          if (text) mediaTexts.set(entry.index, text);
+        });
+        if (mediaTexts.size > 0) {
+          quotedElementMedia = mediaTexts;
+        }
+      }
     }
 
     const decision = await shouldWakeup(event, {
       descriptors,
       prefetchedQuoted,
       ...(quotedContentReplacements ? { quotedContentReplacements } : {}),
+      ...(quotedElementMedia ? { quotedElementMedia } : {}),
       ...(formatForwardContent ? { formatForwardContent } : {}),
       botName: gateway.getStatus().botName,
       getMessageByRefIdx: (idx) => toQuotedRecord(db.getMessageByRefIdx(idx)),

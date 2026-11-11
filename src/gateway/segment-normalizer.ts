@@ -141,32 +141,66 @@ function applyUrlReplacements(raw: string, replacements: ReadonlyMap<string, str
 export interface ExtractMsgElementsOptions {
   /** 合并转发内嵌附件原始 URL → 已落盘占位文案（仅对合并转发式引用片段生效，普通引用原文保持不变） */
   replacements?: ReadonlyMap<string, string>;
+  /**
+   * 元素下标 → 已本地化的附件渲染文案（如 `[图片:/path]`）。
+   * 实测：引用图片/视频时 `msg_elements[].content` 为空串，附件只在 `attachments[]` 中下发。
+   */
+  elementMedia?: ReadonlyMap<number, string>;
+}
+
+function transformQuotedPart(
+  raw: string,
+  replacements: ReadonlyMap<string, string> | undefined,
+  hasReplacements: boolean
+): string {
+  if (!isForwardLikeContent(raw)) return raw;
+  if (raw.includes('=== 消息 ')) {
+    return formatForwardMessageContent(raw, hasReplacements ? { replacements } : undefined);
+  }
+  return hasReplacements ? applyUrlReplacements(raw, replacements!) : raw;
 }
 
 /**
  * 从 `event.msg_elements[]`（及必要时 `parallel_message.msg_nodes[]`）提取被引用原文；
  * 含嵌套合并转发头（`=== 消息 `）时自动结构化清洗排版；合并转发式片段可按替换表将内嵌附件 URL 本地化；
- * 其余普通引用文本原样保留。
+ * 其余普通引用文本原样保留；`elementMedia` 可把「正文为空、附件在 attachments[]」的媒体引用还原为本地路径。
  */
 export function extractMsgElementsText(
   event: QQC2CMessageCreateEvent | null | undefined,
   options?: ExtractMsgElementsOptions
 ): string | undefined {
-  const rawParts = msgElementsRawContents(event);
-  if (rawParts.length === 0) return undefined;
-
   const replacements = options?.replacements;
   const hasReplacements = Boolean(replacements && replacements.size > 0);
+  const elementMedia = options?.elementMedia;
 
-  const parts = rawParts.map((raw) => {
-    if (!isForwardLikeContent(raw)) return raw;
-    if (raw.includes('=== 消息 ')) {
-      return formatForwardMessageContent(raw, hasReplacements ? { replacements } : undefined);
-    }
-    return hasReplacements ? applyUrlReplacements(raw, replacements!) : raw;
-  });
+  const elements = Array.isArray(event?.msg_elements) ? event.msg_elements : [];
+  const elementContents = elements.map((el) =>
+    typeof el?.content === 'string' ? el.content.trim() : ''
+  );
+  const hasAnyContent = elementContents.some(Boolean);
 
-  const joined = parts.join('\n').trim();
+  // 正文全空且没有任何已本地化附件：保持既有行为，整体回退 parallel_message 形态摘要
+  if (!hasAnyContent && !(elementMedia && elementMedia.size > 0)) {
+    const rawParts = msgElementsRawContents(event);
+    if (rawParts.length === 0) return undefined;
+    const joined = rawParts
+      .map((raw) => transformQuotedPart(raw, replacements, hasReplacements))
+      .join('\n')
+      .trim();
+    return joined || undefined;
+  }
+
+  const parts: string[] = [];
+  for (const [index, raw] of elementContents.entries()) {
+    const text = raw ? transformQuotedPart(raw, replacements, hasReplacements) : '';
+    const mediaText = elementMedia?.get(index)?.trim() || '';
+    if (text && mediaText) parts.push(`${text} ${mediaText}`);
+    else if (mediaText) parts.push(mediaText);
+    else if (text) parts.push(text);
+  }
+
+  // 有附件但正文全空的极端情况兜底：若一个片段都没产出，再回退 parallel_message
+  const joined = parts.join('\n').trim() || msgElementsRawContents(event).join('\n').trim();
   return joined || undefined;
 }
 

@@ -12,19 +12,25 @@
  *    提取视频分辨率/大小/时长并重排为精简编号列表，剥离 `<faceType=...>` 壳并匹配本地表情库。
  */
 
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { FaceRecord, QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor, AttachmentFaceMeta, AttachmentKind } from '../attachment/types.js';
 import {
   classifyAttachment,
-  describeAttachment,
   extractFaceXmlTexts,
   isImageFileExt,
   isPureStickerMessage,
-  sanitizeAttachmentFileName,
   stripFaceXmlTags,
 } from '../attachment/classify.js';
+import {
+  detectSavedFormat,
+  inferExtFromFilename,
+  localizeInboundAttachment,
+  localizeInboundAttachments,
+  nonEmpty,
+  sanitizeInboundFilename,
+  toActiveFaceMeta,
+} from '../attachment/localize.js';
 import {
   formatAttachmentByteSize,
   formatFacePlaceholder,
@@ -32,14 +38,13 @@ import {
 } from '../attachment/render.js';
 import {
   computeFileMd5,
-  detectBufferExt,
   sanitizeUrlForLog,
-  type MediaResourceType,
   type MediaStorageManager,
-  type SaveResourceOptions,
 } from '../storage/media.js';
 import { mapWithConcurrency } from '../utils/concurrency.js';
 
+// 兼容既有调用方（`src/tools/file-source.ts` 与契约测试）的导入路径
+export { sanitizeErrorMessage, sanitizeInboundFilename } from '../attachment/localize.js';
 export { sanitizeUrlForLog };
 
 export interface InboundMediaLogger {
@@ -152,239 +157,11 @@ const FORWARD_FILE_EXTS = new Set([
   'fig',
 ]);
 
-function nonEmpty(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  return trimmed === '' ? undefined : trimmed;
-}
-
-function isHttpUrl(value: unknown): value is string {
-  return typeof value === 'string' && /^https?:\/\//i.test(value.trim());
-}
-
-/** 对异常信息执行 URL 凭证与敏感参数脱敏，严禁泄露 rkey/token/sig。 */
-export function sanitizeErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err ?? '未知错误');
-  const cleaned = raw
-    .replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => sanitizeUrlForLog(match))
-    .replace(/([?&](?:rkey|auth_token|token|sig|sign|key)=)[^&\s"'<>)\]]+/gi, '$1***');
-  return cleaned.slice(0, 200);
-}
-
-/** 净化外部传入文件名（防止路径穿越与非法字符）。 */
-export function sanitizeInboundFilename(rawName?: unknown): string | undefined {
-  return sanitizeAttachmentFileName(rawName);
-}
-
-function inferExtFromFilename(name?: string): string | undefined {
-  if (!name) return undefined;
-  const ext = path.extname(name).replace(/^\./, '').toLowerCase();
-  return ext || undefined;
-}
-
-function inferExtFromUrl(rawUrl?: string): string | undefined {
-  if (!rawUrl) return undefined;
-  const clean = sanitizeUrlForLog(rawUrl);
-  const match = /\.([a-zA-Z0-9]+)$/.exec(clean);
-  return match ? match[1]!.toLowerCase() : undefined;
-}
-
-function replaceExtForWav(fileName?: string): string | undefined {
-  if (!fileName) return undefined;
-  const parsed = path.parse(fileName);
-  const stem = parsed.name.trim();
-  return stem ? `${stem}.wav` : 'voice.wav';
-}
-
-function detectSavedFormat(localPath: string, fallbackExt?: string): string | undefined {
-  try {
-    const fd = fs.openSync(localPath, 'r');
-    try {
-      const buf = Buffer.allocUnsafe(64);
-      const bytesRead = fs.readSync(fd, buf, 0, 64, 0);
-      if (bytesRead > 0) {
-        const magic = detectBufferExt(buf.subarray(0, bytesRead));
-        if (magic) return magic;
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    // 忽略读取异常，回退扩展名
-  }
-  const ext = path.extname(localPath).replace(/^\./, '').toLowerCase();
-  return ext || fallbackExt;
-}
-
-function readLocalSize(localPath: string, declaredSize?: number): number | undefined {
-  try {
-    const stat = fs.statSync(localPath);
-    if (Number.isFinite(stat.size)) return stat.size;
-  } catch {
-    // ignore
-  }
-  return declaredSize !== undefined && Number.isFinite(declaredSize) ? declaredSize : undefined;
-}
-
-function extractAttachmentDimensions(att: QQAttachment): string | undefined {
-  if (
-    typeof att.width === 'number' &&
-    Number.isFinite(att.width) &&
-    att.width > 0 &&
-    typeof att.height === 'number' &&
-    Number.isFinite(att.height) &&
-    att.height > 0
-  ) {
-    return `${Math.round(att.width)}x${Math.round(att.height)}`;
-  }
-  return undefined;
-}
-
-function normalizePositiveDuration(value: unknown): number | undefined {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    return undefined;
-  }
-  return value;
-}
-
-async function resolveSingleInboundAttachment(
-  att: QQAttachment,
-  peer: string,
-  mediaManager: MediaStorageManager,
-  logger?: InboundMediaLogger,
-  forceSticker = false
-): Promise<AttachmentDescriptor> {
-  const base = describeAttachment(att, 'inbound');
-  const safeName = sanitizeInboundFilename(att.filename);
-  const declaredSize = typeof att.size === 'number' && Number.isFinite(att.size) ? att.size : undefined;
-  const dimensions = extractAttachmentDimensions(att);
-
-  const rawUrl = isHttpUrl(att.url) ? att.url.trim() : undefined;
-  const voiceWavUrl = isHttpUrl(att.voice_wav_url) ? att.voice_wav_url.trim() : undefined;
-
-  // 语音特殊规则：忽略响应头错报 audio/mp3，以 content_type === 'voice' 为准，优先拉取 voice_wav_url
-  if (base.kind === 'record') {
-    const candidates: Array<{ url: string; ext: string; filename?: string }> = [];
-    if (voiceWavUrl) {
-      candidates.push({
-        url: voiceWavUrl,
-        ext: 'wav',
-        filename: replaceExtForWav(safeName),
-      });
-    }
-    if (rawUrl) {
-      candidates.push({
-        url: rawUrl,
-        ext: inferExtFromFilename(safeName) || inferExtFromUrl(rawUrl) || 'amr',
-        filename: safeName,
-      });
-    }
-
-    if (candidates.length === 0) {
-      return {
-        ...base,
-        unavailable: 'no_download_url',
-      };
-    }
-
-    let lastError = 'download_failed';
-    for (const candidate of candidates) {
-      try {
-        const saveOpts: SaveResourceOptions = {
-          type: 'voice',
-          sessionId: peer,
-          ext: candidate.ext,
-          ...(candidate.filename ? { filename: candidate.filename } : {}),
-        };
-        const saved = await mediaManager.downloadAndSave(candidate.url, saveOpts);
-        const format = detectSavedFormat(saved.localPath, candidate.ext);
-        const size = readLocalSize(saved.localPath, declaredSize);
-        const durationSec = normalizePositiveDuration(saved.durationSec);
-        return {
-          ...base,
-          local: {
-            path: saved.localPath,
-            ...(format ? { format } : {}),
-            ...(size !== undefined ? { size } : {}),
-            ...(saved.md5 ? { md5: saved.md5 } : {}),
-            ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
-            ...(durationSec !== undefined ? { durationSec } : {}),
-          },
-        };
-      } catch (err) {
-        lastError = sanitizeErrorMessage(err);
-        logger?.warn?.(
-          `[InboundMedia] 语音附件下载失败 (peer: ${peer}, url: ${sanitizeUrlForLog(candidate.url)}): ${lastError}`
-        );
-      }
-    }
-
-    return {
-      ...base,
-      unavailable: lastError,
-    };
-  }
-
-  // 图片 / 表情包 / 视频 / 文件（含以 content_type='file' 下发的 .png 等文件）
-  if (!rawUrl) {
-    return {
-      ...base,
-      unavailable: 'no_download_url',
-    };
-  }
-
-  const targetType: MediaResourceType =
-    base.kind === 'image' || base.kind === 'sticker'
-      ? forceSticker
-        ? 'sticker'
-        : 'image'
-      : base.kind === 'video'
-        ? 'video'
-        : 'files';
-
-  const fallbackExt =
-    inferExtFromFilename(safeName) ||
-    inferExtFromUrl(rawUrl) ||
-    (base.kind === 'video' ? 'mp4' : undefined);
-
-  try {
-    const saveOpts: SaveResourceOptions = {
-      type: targetType,
-      sessionId: peer,
-      ...(safeName ? { filename: safeName } : {}),
-      ...(fallbackExt ? { ext: fallbackExt } : {}),
-    };
-    const saved = await mediaManager.downloadAndSave(rawUrl, saveOpts);
-    const format = detectSavedFormat(saved.localPath, fallbackExt);
-    const size = readLocalSize(saved.localPath, declaredSize);
-    const durationSec = normalizePositiveDuration(saved.durationSec);
-
-    return {
-      ...base,
-      local: {
-        path: saved.localPath,
-        ...(format ? { format } : {}),
-        ...(size !== undefined ? { size } : {}),
-        ...(saved.md5 ? { md5: saved.md5 } : {}),
-        ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
-        ...(base.kind === 'video' && dimensions ? { dimensions } : {}),
-        ...(durationSec !== undefined ? { durationSec } : {}),
-      },
-    };
-  } catch (err) {
-    const safeError = sanitizeErrorMessage(err);
-    logger?.warn?.(
-      `[InboundMedia] 入站附件下载失败 (peer: ${peer}, kind: ${base.kind}, url: ${sanitizeUrlForLog(rawUrl)}): ${safeError}`
-    );
-    return {
-      ...base,
-      unavailable: safeError,
-    };
-  }
-}
-
 /**
  * 并发下载并落盘 `QQC2CMessageCreateEvent.attachments[]` 中的所有入站附件。
+ *
+ * 实际落盘策略统一收敛在 {@link localizeInboundAttachments}（与引用消息 `msg_elements[].attachments`
+ * 共用同一管线）；本函数只负责「直发消息」特有的严格表情包判定：
  * - 直接裸 GET（不附加任何 Authorization 头，不设大小上限）；
  * - 任一附件失败只标记 `unavailable`（已剥离 URL query），不阻断其他附件或整条消息处理。
  */
@@ -392,7 +169,8 @@ export async function resolveInboundAttachments(
   event: QQC2CMessageCreateEvent,
   peer: string,
   mediaManager: MediaStorageManager,
-  logger?: InboundMediaLogger
+  logger?: InboundMediaLogger,
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined
 ): Promise<AttachmentDescriptor[]> {
   if (!Array.isArray(event?.attachments) || event.attachments.length === 0) {
     return [];
@@ -412,9 +190,13 @@ export async function resolveInboundAttachments(
   }
   const forceSticker = isPureStickerMessage(event?.content, imageAttachmentCount);
 
-  return mapWithConcurrency(validAttachments, 4, (att) =>
-    resolveSingleInboundAttachment(att, peer, mediaManager, logger, forceSticker)
-  );
+  return localizeInboundAttachments(validAttachments, {
+    peer,
+    mediaManager,
+    ...(logger ? { logger } : {}),
+    forceSticker,
+    ...(getFaceByMd5 ? { getFaceByMd5 } : {}),
+  });
 }
 
 const FORWARD_NODE_HEADER_RE = /^\s*===\s*消息\s*(\d+)\s*===\s*$/;
@@ -500,15 +282,6 @@ function parseForwardAttachmentLine(line: string): ParsedForwardAttachment | nul
     ...(dimensions ? { dimensions } : {}),
     ...(sizeText ? { sizeText } : {}),
     ...(rawUrl ? { rawUrl } : {}),
-  };
-}
-
-function toActiveFaceMeta(face: FaceRecord | null | undefined): AttachmentFaceMeta | undefined {
-  if (!face || !face.enabled || face.deleted_at) return undefined;
-  return {
-    id: face.id,
-    ...(face.mood ? { mood: face.mood } : {}),
-    ...(face.tags && face.tags.length > 0 ? { tags: face.tags } : {}),
   };
 }
 
@@ -1033,47 +806,44 @@ export async function resolveEmbeddedForwardMedia(
     };
   }
 
+  /** 合并转发 `[附件k]` 的媒体类型 → 统一本地化管线可识别的结构化附件形态。 */
+  function toLocalizableAttachment(
+    parsed: ParsedForwardAttachment,
+    rawUrl: string
+  ): QQAttachment {
+    const contentType =
+      parsed.mediaType === 'video'
+        ? 'video'
+        : parsed.mediaType === 'voice'
+          ? 'voice'
+          : parsed.mediaType === 'files'
+            ? 'file'
+            : 'image';
+    return {
+      content_type: contentType,
+      ...(parsed.fileName ? { filename: parsed.fileName } : {}),
+      url: rawUrl,
+    };
+  }
+
   async function downloadEntry(
     parsed: ParsedForwardAttachment,
     rawUrl: string
   ): Promise<EmbeddedForwardAttachmentEntry> {
     const base = baseEntry(parsed, rawUrl);
-    const fallbackExt =
-      inferExtFromFilename(parsed.fileName) ||
-      inferExtFromUrl(rawUrl) ||
-      (parsed.mediaType === 'video' ? 'mp4' : undefined);
 
-    try {
-      const saved = await mediaManager!.downloadAndSave(rawUrl, {
-        type: parsed.mediaType,
-        sessionId: peer,
-        ...(parsed.fileName ? { filename: parsed.fileName } : {}),
-        ...(fallbackExt ? { ext: fallbackExt } : {}),
-      });
+    // 与直发 / 引用共用同一套落盘 + 检视 + 表情匹配管线
+    const descriptor = await localizeInboundAttachment(toLocalizableAttachment(parsed, rawUrl), {
+      peer,
+      mediaManager: mediaManager!,
+      ...(logger ? { logger } : {}),
+      forceSticker: parsed.mediaType === 'sticker',
+      ...(getFaceByMd5 ? { getFaceByMd5 } : {}),
+    });
 
-      const localSize = readLocalSize(saved.localPath);
-      const durationSec = normalizePositiveDuration(saved.durationSec);
-      const md5 =
-        saved.md5?.trim().toLowerCase() ||
-        computeFileMd5(saved.localPath)?.toLowerCase() ||
-        undefined;
-      const face =
-        md5 && getFaceByMd5 && (parsed.mediaType === 'image' || parsed.mediaType === 'sticker')
-          ? toActiveFaceMeta(getFaceByMd5(md5))
-          : undefined;
-
-      return {
-        ...base,
-        localPath: saved.localPath,
-        ...(localSize !== undefined ? { localSize } : {}),
-        ...(durationSec !== undefined ? { durationSec } : {}),
-        ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
-        ...(md5 ? { md5 } : {}),
-        ...(face ? { face } : {}),
-        downloaded: true,
-      };
-    } catch (err) {
-      const safeError = sanitizeErrorMessage(err);
+    const localPath = descriptor.local?.path;
+    if (!localPath) {
+      const safeError = descriptor.unavailable || 'download_failed';
       logger?.warn?.(
         `[InboundMedia] 合并转发内嵌媒体下载失败 (peer: ${peer}, type: ${parsed.mediaType}, url: ${base.sanitizedUrl}): ${safeError}`
       );
@@ -1083,6 +853,27 @@ export async function resolveEmbeddedForwardMedia(
         error: safeError,
       };
     }
+
+    const md5 =
+      descriptor.local?.md5?.trim().toLowerCase() ||
+      computeFileMd5(localPath)?.toLowerCase() ||
+      undefined;
+    const face =
+      descriptor.face ||
+      resolveEntryFaceMeta({ ...base, md5, downloaded: false }, parsed.mediaType, localPath, getFaceByMd5);
+
+    return {
+      ...base,
+      localPath,
+      ...(descriptor.local?.size !== undefined ? { localSize: descriptor.local.size } : {}),
+      ...(descriptor.local?.durationSec !== undefined
+        ? { durationSec: descriptor.local.durationSec }
+        : {}),
+      ...(descriptor.local?.fingerprint ? { fingerprint: descriptor.local.fingerprint } : {}),
+      ...(md5 ? { md5 } : {}),
+      ...(face ? { face } : {}),
+      downloaded: true,
+    };
   }
 
   if (Number.isFinite(maxDownloads)) {
