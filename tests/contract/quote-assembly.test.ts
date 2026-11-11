@@ -23,6 +23,7 @@ import { formatDateTime } from '../../src/storage/time-parser.js';
  * (f) 引用媒体消息时 `msg_elements[].attachments`（实测形态：结构化附件）落盘并替换为 OS 路径；缺 attachments 时保留
  *     `parallel_message` 形态摘要，不臆造下载。
  * (g) 同一媒体 URL 重复引用命中短期缓存（rkey 轮换仍命中），本地文件缺失后缓存失效并重新下载。
+ * (h) 引用含媒体的合并转发时官方只给 `[文件]` 形态摘要（无 content/attachments），不臆造展开或下载。
  */
 
 function expectLosslessJson(value: unknown, trail = 'root'): void {
@@ -848,6 +849,43 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     emitQuote('ROBOT1.0_Q_CACHE_3', 'CACHE_RKEY_C');
     await waitUntil(() => capturedFollowups.length >= 3, 3000, 'cache third followup');
     expect(requests).toHaveLength(2);
+  });
+
+  it('(h) 引用含媒体的合并转发：官方仅给 [文件] 形态摘要，不臆造展开或下载', async () => {
+    const requests: string[] = [];
+    const srv = http.createServer((req, res) => {
+      requests.push(req.url || '');
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+    servers.push(srv);
+    await new Promise<void>((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    // 实测形态：引用一条含图片的合并转发时，msg_elements[0] 只有 type/msg_idx，
+    // content 为空且无 attachments；parallel_message 只给 message_type=7 的 `[文件]` 摘要
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_QUOTE_FWD_MEDIA',
+      content: '这段聊天记录呢',
+      timestamp: '2026-11-11T12:07:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_QUOTE_FWD_MEDIA', 'ref_msg_idx=REFIDX_Q_QUOTE_FWD_MEDIA_SRC'] },
+      msg_elements: [{ message_type: 103, msg_idx: 'REFIDX_Q_QUOTE_FWD_MEDIA_SRC' }],
+      parallel_message: { msg_nodes: [{ content: '[文件]', message_type: 7 }] },
+    });
+
+    await waitUntil(() => capturedFollowups.length >= 1, 3000, 'quoted forward media followup');
+    const prompt = capturedFollowups[0]!.content;
+    expect(prompt).toContain('[引用回复: "[文件]"]');
+    expect(prompt).not.toContain('内容已过期或无法获取');
+    expect(prompt).not.toContain('=== 消息');
+    expect(requests).toHaveLength(0);
   });
 
   it('(d) 本地库与 msg_elements[] 均未命中时优雅降级占位，唤醒不中断', async () => {
