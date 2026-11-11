@@ -12,6 +12,7 @@
  * - FC-1 契约 3: 默认取消 10 个数量与大小上限（12 个全量落盘）；显式传 `{ limit: 2 }` 时超出部分保留选项 A `直链: ...`；
  * - FC-1 契约 4: 单附件 HTTP 403/404 失败不阻断其余附件下载，正文保留 `(下载失败: ...)` 与真实 `直链: <rawUrl>`，日志保持脱敏；
  * - FC-1 契约 5: 与 `shouldWakeup` 真实联动，转发含视频 + 图片时 `payload.content` 为清晰对话流，`payload` 不含任何视觉载荷。
+ * - FC-1 契约 6: 内嵌附件缺失 `URL:` 时明确标记 `无下载地址`，绝不静默伪装成已处理或输出空直链。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -388,7 +389,7 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(warnLogs.join('\n')).not.toContain('rkey=');
   });
 
-  it('FC-1 契约 5: 与 shouldWakeup 联动 — 视频 + 图片并发落盘时 payload.images 仅含图片且 content 为清晰对话流', async () => {
+  it('FC-1 契约 5: 与 shouldWakeup 联动 — 视频 + 图片并发落盘时 content 为清晰对话流且无视觉载荷', async () => {
     const mp4Bytes = makeMp4WithDuration(1000, 8776);
     const base = await startServer((req, res) => {
       if (req.url?.includes('kind=video')) {
@@ -442,5 +443,48 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(decision.payload?.content).not.toContain('WAKEUP_FWD_SECRET');
     expect(decision.payload?.content).not.toContain('WAKEUP_FWD_VIDEO_SECRET');
     expect(decision.payload?.content).not.toContain('=== 消息');
+  });
+
+  it('FC-1 契约 6: 内嵌附件缺失 URL 时明确标记 `无下载地址`，绝不静默伪装成已处理', async () => {
+    const content = [
+      '[群聊的聊天记录]',
+      '=== 消息 1 ===',
+      '[发送者] 群友A',
+      '[附件1] 类型:图片 文件名:no-url.png 尺寸:800x600',
+      '=== 消息 2 ===',
+      '[发送者] 群友B',
+      '[附件1] 类型:视频 文件名:no-url.mp4 尺寸:720x1280',
+      '=== 消息 3 ===',
+      '[发送者] 群友C',
+      '[附件1] 类型:语音 文件名:no-url.amr',
+      '=== 消息 4 ===',
+      '[发送者] 群友D',
+      '[附件1] 类型:文件 文件名:no-url.pdf',
+      '=== 消息 5 ===',
+      '[发送者] 群友E',
+      '<faceType=6,faceId="0">',
+      '[附件1] 类型:图片 文件名:no-url-sticker.png',
+    ].join('\n');
+
+    const res = await resolveEmbeddedForwardMedia(content, PEER, manager);
+
+    // 无 URL 的附件不产生下载记录，也不臆造 localPaths
+    expect(res.entries).toHaveLength(0);
+    expect(res.localPaths).toHaveLength(0);
+
+    expect(res.formattedContent).toContain(
+      '1. 群友A: [图片:no-url.png (800x600) 无下载地址]'
+    );
+    expect(res.formattedContent).toContain(
+      '2. 群友B: [视频:no-url.mp4 (720x1280) 无下载地址]'
+    );
+    expect(res.formattedContent).toContain('3. 群友C: [语音:no-url.amr 无下载地址]');
+    expect(res.formattedContent).toContain('4. 群友D: [文件:no-url.pdf 无下载地址]');
+    expect(res.formattedContent).toContain('[表情包:no-url-sticker.png 无下载地址]');
+
+    // 无 URL 时不能出现空直链、undefined 或脱敏占位
+    expect(res.formattedContent).not.toContain('直链:');
+    expect(res.formattedContent).not.toContain('undefined');
+    expect(res.formattedContent).not.toContain('链接已脱敏');
   });
 });

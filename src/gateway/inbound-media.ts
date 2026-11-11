@@ -585,7 +585,7 @@ function renderForwardAttachment(
     return ctx.replacement;
   }
 
-  // 选项 A：未落盘或下载失败时保留真实直链 URL
+  // 选项 A：未落盘或下载失败时保留真实直链 URL；若官方响应本身缺 URL 则明确标记无法下载
   const kindLabel =
     mediaType === 'video'
       ? '视频'
@@ -606,7 +606,7 @@ function renderForwardAttachment(
         })
       : [dimensions, rawSizeText].filter(Boolean).join(', ');
 
-  return `[${kindLabel}${namePart}${meta ? ` (${meta})` : ''}${error ? ` (下载失败: ${error})` : ''}${rawUrl ? ` 直链: ${rawUrl}` : ''}]`;
+  return `[${kindLabel}${namePart}${meta ? ` (${meta})` : ''}${error ? ` (下载失败: ${error})` : ''}${rawUrl ? ` 直链: ${rawUrl}` : ' 无下载地址'}]`;
 }
 
 interface ParsedForwardNode {
