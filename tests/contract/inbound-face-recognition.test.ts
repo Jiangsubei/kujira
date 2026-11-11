@@ -297,7 +297,8 @@ describe('契约测试: 入站图片识别本地表情库并替换语义 (Inboun
         getFaceByMd5: lookupFace,
       });
       expect(collectedContent).toBe(`笑死 [表情包: face_sticker_hit (情绪: 大笑) 路径: ${collectedPath}]`);
-      expect(collectedDesc[0]!.kind).toBe('sticker');
+      // 严格口径：文字 + <faceType> + 图片 不升格为 sticker（仍渲染表情包只因 MD5 命中表情库）
+      expect(collectedDesc[0]!.kind).toBe('image');
 
       // 仅含 <faceType=...> 且无附件时兜底输出 '[表情]'
       expect(parseNormalizedContent(makeEvent({ content: faceTag }), [])).toBe('[表情]');
@@ -399,6 +400,83 @@ describe('契约测试: 入站图片识别本地表情库并替换语义 (Inboun
       expect(decision.payload?.content).toBe(`[表情包:${descriptors[0]!.local!.path}]`);
       expect(decision.payload?.content).not.toContain('<faceType');
       expect(event.content).toBe(faceTag);
+      // 严格表情包判定：纯 <faceType> + 单图片附件 → 落盘 sticker/<peer>/
+      expect(descriptors[0]!.kind).toBe('sticker');
+      expect(
+        descriptors[0]!.local!.path.startsWith(path.join(tmpDir, 'downloads', 'sticker', peer))
+      ).toBe(true);
+    });
+
+    it('契约 3.3: 文字 + <faceType> + 图片 属普通图片消息，落盘 image/ 并渲染 [图片:path]', async () => {
+      const { buf } = createMockImageFile('face-with-text', 'with-text.png');
+      const url = await new Promise<string>((resolve, reject) => {
+        const srv = http.createServer((_req, res) => {
+          res.writeHead(200, { 'Content-Type': 'image/png' });
+          res.end(buf);
+        });
+        srv.on('error', reject);
+        servers.push(srv);
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address() as any;
+          resolve(`http://127.0.0.1:${addr.port}/with-text.png?rkey=TEXT_RKEY`);
+        });
+      });
+
+      const manager = new MediaStorageManager({ dshHome: tmpDir, downloadDir: 'downloads' });
+      const peer = openidToPeer(MOCK_OPENID);
+      const event = makeEvent({
+        content: '<faceType=1,faceId="14"> 快看这张截图',
+        attachments: [{ content_type: 'image/png', filename: 'shot.png', size: buf.length, url }],
+      });
+
+      const descriptors = await resolveInboundAttachments(event, peer, manager);
+      const decision = await shouldWakeup(event, { descriptors });
+
+      expect(descriptors[0]!.kind).toBe('image');
+      expect(
+        descriptors[0]!.local!.path.startsWith(path.join(tmpDir, 'downloads', 'image', peer))
+      ).toBe(true);
+      expect(decision.payload?.content).toBe(`快看这张截图 [图片:${descriptors[0]!.local!.path}]`);
+    });
+
+    it('契约 3.4: <faceType> + 多个图片附件 属普通图片消息，落盘 image/ 并渲染 [图片:path]', async () => {
+      const { buf: bufA } = createMockImageFile('face-multi-a', 'multi-a.png');
+      const { buf: bufB } = createMockImageFile('face-multi-b', 'multi-b.png');
+      const serve = async (body: Buffer, name: string): Promise<string> =>
+        new Promise<string>((resolve, reject) => {
+          const srv = http.createServer((_req, res) => {
+            res.writeHead(200, { 'Content-Type': 'image/png' });
+            res.end(body);
+          });
+          srv.on('error', reject);
+          servers.push(srv);
+          srv.listen(0, '127.0.0.1', () => {
+            const addr = srv.address() as any;
+            resolve(`http://127.0.0.1:${addr.port}/${name}?rkey=MULTI_RKEY`);
+          });
+        });
+      const urlA = await serve(bufA, 'multi-a.png');
+      const urlB = await serve(bufB, 'multi-b.png');
+
+      const manager = new MediaStorageManager({ dshHome: tmpDir, downloadDir: 'downloads' });
+      const peer = openidToPeer(MOCK_OPENID);
+      const event = makeEvent({
+        content: '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">',
+        attachments: [
+          { content_type: 'image/png', filename: 'multi-a.png', size: bufA.length, url: urlA },
+          { content_type: 'image/png', filename: 'multi-b.png', size: bufB.length, url: urlB },
+        ],
+      });
+
+      const descriptors = await resolveInboundAttachments(event, peer, manager);
+      const decision = await shouldWakeup(event, { descriptors });
+
+      expect(descriptors.map((d) => d.kind)).toEqual(['image', 'image']);
+      for (const desc of descriptors) {
+        expect(desc.local!.path.startsWith(path.join(tmpDir, 'downloads', 'image', peer))).toBe(true);
+      }
+      expect(decision.payload?.content).toContain('[图片:');
+      expect(decision.payload?.content).not.toContain('[表情包');
     });
   });
 });

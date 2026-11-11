@@ -66,6 +66,24 @@ export function stripFaceXmlTags(content?: string): { text: string; hadFaceTag: 
   };
 }
 
+/**
+ * 严格判定「纯表情包消息」：正文去除全部 `<faceType=...>` 标签后为空，且整条消息恰好只有一个图片类附件。
+ *
+ * 之所以要求「无其他文字 + 单图片」，是为了避免「文字 + 系统表情 + 一张截图」这类消息被误判为表情包，
+ * 从而错误地把普通图片落盘到 `sticker/` 并渲染成 `[表情包]`。
+ *
+ * @param content 原始 `event.content`
+ * @param imageAttachmentCount 本条消息中按 `content_type` 判定为图片的附件数量
+ */
+export function isPureStickerMessage(
+  content: string | undefined,
+  imageAttachmentCount: number
+): boolean {
+  if (!hasFaceXmlTag(content)) return false;
+  if (imageAttachmentCount !== 1) return false;
+  return stripFaceXmlTags(content).text === '';
+}
+
 function decodeFaceExtText(rawExt: string): string | undefined {
   const b64 = rawExt.trim();
   if (b64 === '' || b64.length % 4 === 1 || !BASE64_FORMAT_RE.test(b64)) {
@@ -267,7 +285,10 @@ export function inferInboundMessageType(
   if (event.message_type === 3 || event.ark_data) return 'card';
 
   if (descriptors.length > 0) {
-    const isFaceTagged = hasFaceXmlTag(event?.content);
+    const imageAttachments = descriptors.filter(
+      (d) => d.origin !== 'outbound' && d.kind === 'image'
+    ).length;
+    const isStickerMessage = isPureStickerMessage(event?.content, imageAttachments);
     if (descriptors.some((d) => d.kind === 'file')) return 'file';
     if (descriptors.some((d) => d.kind === 'forward')) return 'forward';
     if (descriptors.some((d) => d.kind === 'record')) return 'record';
@@ -277,7 +298,7 @@ export function inferInboundMessageType(
         (d) =>
           d.kind === 'sticker' ||
           Boolean(d.face?.id) ||
-          (isFaceTagged && d.kind === 'image' && d.origin !== 'outbound')
+          (isStickerMessage && d.kind === 'image' && d.origin !== 'outbound')
       )
     ) {
       return 'sticker';
@@ -305,7 +326,13 @@ export function describeInboundAttachments(
           .map((att) => describeAttachment(att, 'inbound'))
       : [];
 
-  const attachments: AttachmentDescriptor[] = hasFaceXmlTag(event?.content)
+  const inboundImageCount = rawAttachments.filter(
+    (d) => d.origin !== 'outbound' && d.kind === 'image'
+  ).length;
+  const attachments: AttachmentDescriptor[] = isPureStickerMessage(
+    event?.content,
+    inboundImageCount
+  )
     ? rawAttachments.map((d) =>
         d.kind === 'image' && d.origin !== 'outbound' ? { ...d, kind: 'sticker' as const } : d
       )

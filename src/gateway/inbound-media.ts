@@ -17,9 +17,11 @@ import * as path from 'node:path';
 import type { FaceRecord, QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor, AttachmentFaceMeta } from '../attachment/types.js';
 import {
+  classifyAttachment,
   describeAttachment,
   extractFaceXmlTexts,
   isImageFileExt,
+  isPureStickerMessage,
   sanitizeAttachmentFileName,
   stripFaceXmlTags,
 } from '../attachment/classify.js';
@@ -248,7 +250,8 @@ async function resolveSingleInboundAttachment(
   att: QQAttachment,
   peer: string,
   mediaManager: MediaStorageManager,
-  logger?: InboundMediaLogger
+  logger?: InboundMediaLogger,
+  forceSticker = false
 ): Promise<AttachmentDescriptor> {
   const base = describeAttachment(att, 'inbound');
   const safeName = sanitizeInboundFilename(att.filename);
@@ -331,7 +334,9 @@ async function resolveSingleInboundAttachment(
 
   const targetType: MediaResourceType =
     base.kind === 'image' || base.kind === 'sticker'
-      ? 'image'
+      ? forceSticker
+        ? 'sticker'
+        : 'image'
       : base.kind === 'video'
         ? 'video'
         : 'files';
@@ -399,8 +404,17 @@ export async function resolveInboundAttachments(
     return [];
   }
 
+  // 严格表情包判定：正文仅由 <faceType=...> 构成且恰好一个图片类附件 → 落盘 `sticker/`
+  let imageAttachmentCount = 0;
+  for (const att of validAttachments) {
+    if (classifyAttachment(att) === 'image') imageAttachmentCount++;
+  }
+  const forceSticker = isPureStickerMessage(event?.content, imageAttachmentCount);
+
   return Promise.all(
-    validAttachments.map((att) => resolveSingleInboundAttachment(att, peer, mediaManager, logger))
+    validAttachments.map((att) =>
+      resolveSingleInboundAttachment(att, peer, mediaManager, logger, forceSticker)
+    )
   );
 }
 

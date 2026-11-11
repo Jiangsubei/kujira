@@ -10,7 +10,7 @@
 
 import type { FaceRecord, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
-import { extractFaceXmlTexts, hasFaceXmlTag, stripFaceXmlTags } from '../attachment/classify.js';
+import { extractFaceXmlTexts, hasFaceXmlTag, isPureStickerMessage, stripFaceXmlTags } from '../attachment/classify.js';
 import {
   formatFacePlaceholder as renderFacePlaceholder,
   renderAttachment,
@@ -166,9 +166,14 @@ export function parseNormalizedContent(
   const { text: cleanText, hadFaceTag } = stripFaceXmlTags(rawContent);
 
   if (hadFaceTag) {
-    for (const descriptor of descriptors) {
-      if (descriptor.origin !== 'outbound' && descriptor.kind === 'image') {
-        descriptor.kind = 'sticker';
+    const inboundImageCount = descriptors.filter(
+      (d) => d.origin !== 'outbound' && d.kind === 'image'
+    ).length;
+    if (isPureStickerMessage(rawContent, inboundImageCount)) {
+      for (const descriptor of descriptors) {
+        if (descriptor.origin !== 'outbound' && descriptor.kind === 'image') {
+          descriptor.kind = 'sticker';
+        }
       }
     }
   }
