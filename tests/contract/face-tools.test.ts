@@ -475,6 +475,109 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     expect((collectTool.parameters as any)?.properties?.message_id?.description).toContain('msg_12');
   });
 
+  it('契约 4.1: 混合媒体消息中收敛到图片，绝不把视频或普通文件当表情收藏', async () => {
+    const mediaDir = path.join(tmpDir, 'mixed-media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const videoBytes = Buffer.from('fake-mp4-video-bytes');
+    const videoPath = path.join(mediaDir, 'clip.mp4');
+    fs.writeFileSync(videoPath, videoBytes);
+    const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x41, 0x42]);
+    const imgPath = path.join(mediaDir, 'cat.png');
+    fs.writeFileSync(imgPath, imgBytes);
+    const pdfPath = path.join(mediaDir, 'report.pdf');
+    fs.writeFileSync(pdfPath, '%PDF-1.7-mixed');
+
+    // 模拟历史合并转发消息：local_path 仍指向首个附件（视频），attachments 中同时含图片
+    const mixedRecord = {
+      msg_id: 'ROBOT1.0_MIXED_88001',
+      peer: USER_PEER,
+      user_id: MOCK_OPENID,
+      sender_name: '',
+      time: Date.now(),
+      type: 'forward',
+      content: '混合媒体转发',
+      raw: '{}',
+      file_id: null,
+      local_path: videoPath,
+      fingerprint: null,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
+      source: 'qq' as const,
+      attachments: serializeAttachments([
+        { kind: 'video', origin: 'inbound', local: { path: videoPath, format: 'mp4' } },
+        {
+          kind: 'file',
+          origin: 'inbound',
+          fileName: 'report.pdf',
+          local: { path: pdfPath, format: 'pdf' },
+        },
+        { kind: 'image', origin: 'inbound', local: { path: imgPath, format: 'png' } },
+      ]),
+    };
+    db.saveMessage(mixedRecord);
+    const mixedId = (mixedRecord as any).short_id as string;
+
+    const resMixed = await collectFace(
+      { message_id: mixedId, tags: ['猫猫'], mood: '开心' },
+      { db, peer: USER_PEER, faceDir }
+    );
+    expect(resMixed.success).toBe(true);
+    assertNoUndefinedFields(resMixed);
+
+    const stored = db.getFaceById(resMixed.face_id!);
+    expect(stored?.md5).toBe(crypto.createHash('md5').update(imgBytes).digest('hex'));
+    expect(stored?.format).toBe('png');
+    expect(fs.readFileSync(stored!.file_path).equals(imgBytes)).toBe(true);
+    expect(fs.readFileSync(stored!.file_path).equals(videoBytes)).toBe(false);
+
+    // 纯视频消息：明确拒绝，绝不把视频转存为表情
+    const videoRecord = {
+      ...mixedRecord,
+      msg_id: 'ROBOT1.0_VIDEO_ONLY_88002',
+      type: 'video',
+      content: '视频',
+      local_path: videoPath,
+      attachments: serializeAttachments([
+        { kind: 'video', origin: 'inbound', local: { path: videoPath, format: 'mp4' } },
+      ]),
+    };
+    db.saveMessage(videoRecord);
+    const videoId = (videoRecord as any).short_id as string;
+    const resVideo = await collectFace(
+      { message_id: videoId, tags: ['猫猫'], mood: '开心' },
+      { db, peer: USER_PEER, faceDir }
+    );
+    expect(resVideo.success).toBe(false);
+    expect(resVideo.error).toContain('未找到图片或表情附件');
+    assertNoUndefinedFields(resVideo);
+
+    // 普通文件消息（.pdf）：同样拒绝
+    const fileRecord = {
+      ...mixedRecord,
+      msg_id: 'ROBOT1.0_FILE_ONLY_88003',
+      type: 'file',
+      content: '文件',
+      local_path: pdfPath,
+      attachments: serializeAttachments([
+        {
+          kind: 'file',
+          origin: 'inbound',
+          fileName: 'report.pdf',
+          local: { path: pdfPath, format: 'pdf' },
+        },
+      ]),
+    };
+    db.saveMessage(fileRecord);
+    const fileId = (fileRecord as any).short_id as string;
+    const resFile = await collectFace(
+      { message_id: fileId, tags: ['猫猫'], mood: '开心' },
+      { db, peer: USER_PEER, faceDir }
+    );
+    expect(resFile.success).toBe(false);
+    expect(resFile.error).toContain('未找到图片或表情附件');
+  });
+
   it('契约 5: collect_face 重复偷图时显式告知已存在与既有标签', async () => {
     const srcImgFile = path.join(tmpDir, 'dup_image.png');
     fs.writeFileSync(srcImgFile, 'duplicate-content-xyz');

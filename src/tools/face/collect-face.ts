@@ -40,30 +40,52 @@ function findImageLocalPathFromRecord(record: MessageRecord): {
     descriptors = descriptorsFromRaw(record.raw);
   }
 
-  const imageDesc = descriptors.find(
-    (d) =>
-      d.kind === 'image' ||
-      d.kind === 'sticker' ||
-      (d.kind === 'file' && isImageFileExt(d.local?.path || d.fileName))
-  );
+  const exists = (p: string | null | undefined): p is string => Boolean(p && fs.existsSync(p));
+  const isImageDescriptor = (d: (typeof descriptors)[number]): boolean =>
+    d.kind === 'image' || d.kind === 'sticker';
+  const isImageFileDescriptor = (d: (typeof descriptors)[number]): boolean =>
+    d.kind === 'file' && isImageFileExt(d.local?.path || d.fileName);
+
+  const imageDescriptors = descriptors.filter(isImageDescriptor);
+  const imageFileDescriptors = descriptors.filter(isImageFileDescriptor);
+  const localPathIsImage =
+    exists(record.local_path) &&
+    (record.type === 'image' || record.type === 'sticker' || isImageFileExt(record.local_path));
 
   const hasImage =
+    imageDescriptors.length > 0 ||
+    imageFileDescriptors.length > 0 ||
     record.type === 'image' ||
     record.type === 'sticker' ||
-    Boolean(imageDesc) ||
-    (record.type === 'file' && isImageFileExt(record.local_path));
+    isImageFileExt(record.local_path);
 
   if (!hasImage) {
     return { hasImage: false, localPath: null };
   }
 
-  if (record.local_path && fs.existsSync(record.local_path)) {
+  // 严格收敛选取顺序：image/sticker → file 且图片扩展名 → local_path 且图片扩展名。
+  // 绝不允许回退到视频/语音/普通文件路径（历史上 local_path 可能指向合并转发的首个视频）。
+  const existingImage = imageDescriptors.find((d) => exists(d.local?.path));
+  if (existingImage?.local?.path) {
+    return { hasImage: true, localPath: existingImage.local.path };
+  }
+  const existingImageFile = imageFileDescriptors.find((d) => exists(d.local?.path));
+  if (existingImageFile?.local?.path) {
+    return { hasImage: true, localPath: existingImageFile.local.path };
+  }
+  if (localPathIsImage && record.local_path) {
     return { hasImage: true, localPath: record.local_path };
   }
-  if (imageDesc?.local?.path && fs.existsSync(imageDesc.local.path)) {
-    return { hasImage: true, localPath: imageDesc.local.path };
-  }
-  return { hasImage: true, localPath: record.local_path || imageDesc?.local?.path || null };
+
+  // 声明了图片但本地文件缺失：返回图片候选路径，交由调用方报“缓存文件不存在”
+  const fallbackPath =
+    imageDescriptors.find((d) => d.local?.path)?.local?.path ??
+    imageFileDescriptors.find((d) => d.local?.path)?.local?.path ??
+    (record.type === 'image' || record.type === 'sticker' || isImageFileExt(record.local_path)
+      ? record.local_path
+      : null) ??
+    null;
+  return { hasImage: true, localPath: fallbackPath };
 }
 
 /**
