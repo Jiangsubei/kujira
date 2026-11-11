@@ -16,7 +16,8 @@
   - [实测报告-单聊消息类型Markdown渲染与引用交互.md](devlog/archive/QQ官方Bot_API实测与踩坑/实测报告-单聊消息类型Markdown渲染与引用交互.md)：`msg_type=0/2/6` 边界、单聊 Markdown 渲染能力、URL 限制与 `message_reference` 引用锚点；
   - [实测报告-被动回复窗口主动消息与msg_seq去重机制.md](devlog/archive/QQ官方Bot_API实测与踩坑/实测报告-被动回复窗口主动消息与msg_seq去重机制.md)：被动窗口与次数实测、主动消息与流式 `50015001`、`(msg_id, msg_seq)` 跨天去重与入/出站 ID 区分；
   - [实测报告-单聊文本与流式消息长度字节上限.md](devlog/archive/QQ官方Bot_API实测与踩坑/实测报告-单聊文本与流式消息长度字节上限.md)：流式单次 UTF-8 字节上限、`append`/`replace` 约束、`remain_msg_len` 实测与普通消息下界；
-  - [实测报告-富媒体四步分片上传与入站附件处理.md](devlog/archive/QQ官方Bot_API实测与踩坑/实测报告-富媒体四步分片上传与入站附件处理.md)：分片上传 1-based `index` 与单片 `block_size`、`file_info` 复用及入站裸 GET / 语音 `voice_wav_url` / `asr_refer_text`。
+  - [实测报告-富媒体四步分片上传与入站附件处理.md](devlog/archive/QQ官方Bot_API实测与踩坑/实测报告-富媒体四步分片上传与入站附件处理.md)：分片上传 1-based `index` 与单片 `block_size`、`file_info` 复用及入站裸 GET / 语音 `voice_wav_url` / `asr_refer_text`；
+  - [实测报告-单聊撤回时限与入站引用卡片合并转发.md](devlog/archive/QQ官方Bot_API实测与踩坑/实测报告-单聊撤回时限与入站引用卡片合并转发.md)：单聊 `DELETE` 撤回 2 分钟硬时限（`40064004` / `40061002`）、`user_openid` 32 位大写十六进制形态、入站引用（`message_type=103` `ref_msg_idx`/`msg_elements`）、合并转发（`message_type=102`）与卡片（`message_type=3` `ark_data`）。
 
 ---
 

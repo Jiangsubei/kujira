@@ -90,6 +90,8 @@ export class QQProbeClient {
   private isClosing = false;
   private readonly backoffDelays = [2000, 5000, 10000, 30000, 60000];
 
+  /** 收到任意 Gateway DISPATCH 事件的回调 */
+  public onDispatch: ((eventName: string, data: any, fullPayload: any) => void) | null = null;
   /** 收到单聊消息的回调（含原始事件体，探针需要 message_scene.ext） */
   public onC2CMessage: ((event: any) => void) | null = null;
   /** 连接就绪（READY）回调 */
@@ -208,7 +210,9 @@ export class QQProbeClient {
       }
       case 0: {
         // DISPATCH
-        if (payload.t === 'READY') {
+        const eventName = String(payload.t ?? '');
+        this.onDispatch?.(eventName, payload.d, payload);
+        if (eventName === 'READY') {
           this.sessionId = payload.d?.session_id ?? null;
           this.log(`[qq] READY：机器人 ${payload.d?.user?.username}(${payload.d?.user?.id})`);
           this.onReady?.({
@@ -216,9 +220,9 @@ export class QQProbeClient {
             botId: String(payload.d?.user?.id ?? ''),
             botName: String(payload.d?.user?.username ?? ''),
           });
-        } else if (payload.t === 'RESUMED') {
+        } else if (eventName === 'RESUMED') {
           this.log('[qq] RESUMED');
-        } else if (payload.t === 'C2C_MESSAGE_CREATE') {
+        } else if (eventName === 'C2C_MESSAGE_CREATE') {
           this.onC2CMessage?.(payload.d);
         }
         break;
@@ -292,11 +296,11 @@ export class QQProbeClient {
 
   // ─────────────────────────────── REST ───────────────────────────────
 
-  private async request(url: string, payload: unknown): Promise<QQApiResult> {
+  private async requestWithMethod(method: 'POST' | 'DELETE', url: string, payload?: unknown): Promise<QQApiResult> {
     const res = await fetch(url, {
-      method: 'POST',
+      method,
       headers: await this.authHeaders(),
-      body: JSON.stringify(payload),
+      ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
     });
     const text = await res.text();
     let body: any = null;
@@ -311,9 +315,22 @@ export class QQProbeClient {
     return { ok, status: res.status, code, message, body };
   }
 
+  private async request(url: string, payload: unknown): Promise<QQApiResult> {
+    return this.requestWithMethod('POST', url, payload);
+  }
+
   /** 发送单聊消息（`POST /v2/users/{openid}/messages`） */
   public async sendMessage(openid: string, payload: Record<string, unknown>): Promise<QQApiResult> {
     return this.request(`${QQ_API_BASE}/v2/users/${encodeURIComponent(openid)}/messages`, payload);
+  }
+
+  /** 撤回单聊消息（`DELETE /v2/users/{openid}/messages/{message_id}`） */
+  public async deleteMessage(openid: string, messageId: string, query?: string): Promise<QQApiResult> {
+    const suffix = query ? `?${query}` : '';
+    return this.requestWithMethod(
+      'DELETE',
+      `${QQ_API_BASE}/v2/users/${encodeURIComponent(openid)}/messages/${encodeURIComponent(messageId)}${suffix}`
+    );
   }
 
   /** 流式发送单聊消息（`POST /v2/users/{openid}/stream_messages`） */
