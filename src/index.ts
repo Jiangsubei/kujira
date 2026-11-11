@@ -1,344 +1,248 @@
 /**
- * dsh-napcat-bridge: 主插件入口 (Cordis Plugin)
- * 接入 NapCat (OneBot 11)，让 DeepSeek Harness Agent 在 QQ 群聊/私聊中对话、检索历史与收发文件。
+ * kujira: 主插件入口 (Cordis Plugin)
+ * 接入 QQ 官方 Bot API v2（合规单聊 C2C），整合网关、SQLite 存储、双层记忆、
+ * 黑话学习、表情包资产库、工具集、定时调度、提问/审批瀑布流与 WebUI 配置路由。
  */
 
 import * as path from 'node:path';
-import { Context } from '@deepseek-ai/cordis';
+import type { Context } from '@deepseek-ai/cordis';
 import {
   PLUGIN_NAME,
   SETTINGS_NAMESPACE,
-  DEFAULT_WS_PORT,
   DEFAULT_MEMORY_DIR,
   DEFAULT_USER_PROFILE_BUDGET_CHARS,
   DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
-  DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
   DEFAULT_DATABASE_PATH,
-  DEFAULT_FACE_STORE_DIR,
   DEFAULT_FACE_STORE_MAX,
+  DEFAULT_IMAGE_TTL_DAYS,
+  DEFAULT_SLANG_STORAGE_PATH,
+  DEFAULT_SLANG_MAX_ENTRIES,
+  DEFAULT_SLANG_EVICT_POLICY,
 } from './constants/index.js';
+
+const QQ_INBOUND_MSG_TYPE_FORWARD = 102;
+import { getRuntimePresetDefinition, QQ_PRESET_ID } from './constants/preset.js';
 import { BridgeConfigSchema } from './config/schema.js';
+import { sanitizeConfigPayload, healProfileConfigFile } from './config/heal.js';
+import { resolveCredentials } from './config/credentials.js';
 import { resolveDshPath } from './utils/path.js';
-import { EMOJI_MAP, type BridgePluginConfig, type MessageRecord } from './types/index.js';
+import { isValidOpenid, openidToPeer } from './utils/peer.js';
+import type {
+  BridgePluginConfig,
+  MessageRecord,
+  QQC2CMessageCreateEvent,
+} from './types/index.js';
 import { MessageDatabase } from './storage/database.js';
 import { MediaStorageManager, startMediaCleanupTask, computeFileMd5 } from './storage/media.js';
-import { NapCatGatewayServer, MessageWaitRegistry, type WaitCollectedMessage } from './gateway/server.js';
-import { resolveInboundImage } from './gateway/inbound-media.js';
-import { OfflineMessageSyncer } from './gateway/sync.js';
+import {
+  KujiraGatewayClient,
+  MessageWaitRegistry,
+  type WaitCollectedMessage,
+} from './gateway/server.js';
+import {
+  resolveInboundAttachments,
+  resolveEmbeddedForwardImages,
+  sanitizeForwardContentUrls,
+} from './gateway/inbound-media.js';
+import {
+  shouldWakeup,
+  extractMessageRefIdx,
+  extractQuotedRefIdx,
+  type QuotedMessageRecord,
+} from './gateway/wakeup.js';
 import { SessionManager } from './gateway/session.js';
-import { shouldWakeup, parseNormalizedContent, resolveAtNicknames, isExcludedFromProactive } from './gateway/wakeup.js';
-import { CachedGroupMemberResolver } from './gateway/members.js';
-import { FriendNoticeTracker } from './gateway/friend-tracker.js';
-import { ProactiveManager } from './gateway/proactive.js';
-import { registerAgentTools, type AgentToolsOptions } from './tools/index.js';
-import { setGlobalBridgeToolsProvider, type NapCatBridgeToolsProvider } from './tools/plugin.js';
-import { createMemoryToolDefinitions } from './tools/index.js';
+import { SystemEventHub } from './gateway/system-event-hub.js';
+import {
+  describeInboundAttachments,
+  toMessageMediaFields,
+} from './attachment/classify.js';
+import { deserializeAttachments, serializeAttachments } from './attachment/store.js';
 import { OutboundStreamBridge } from './outbound/stream.js';
-import { recordOutboundSelfMessage, enrichOutboundMediaRecord } from './outbound/self-record.js';
-import { describeMessage, toMessageMediaFields } from './attachment/classify.js';
-import { serializeAttachments } from './attachment/store.js';
-import { PerPeerSerialSender } from './outbound/queue.js';
-import { NapCatQuestionProvider, registerNapCatQuestionChannel } from './approval/question-provider.js';
-import { NapCatApprovalResponder } from './approval/tool-approval.js';
-import { TurnInitiatorTracker } from './approval/turn-initiator.js';
-import { downloadPrivateFile } from './tools/private-file.js';
-import { isSlashCommand, handleSlashCommand } from './commands/index.js';
+import { recordOutboundSelfMessage } from './outbound/self-record.js';
+import {
+  KujiraQuestionProvider,
+  registerKujiraQuestionChannel,
+  KujiraApprovalResponder,
+  TurnInitiatorTracker,
+} from './approval/index.js';
+import { TaskScheduler } from './scheduler/index.js';
 import { setupSnapshotHub, type SnapshotManager } from './prompt/snapshot.js';
 import { setupMemoryService } from './memory/index.js';
-import { getRuntimePresetDefinition, QQ_PRESET_ID } from './constants/preset.js';
-
+import { setupSlangService } from './slang/index.js';
+import {
+  registerAgentTools,
+  createMemoryToolDefinitions,
+  type AgentToolsOptions,
+} from './tools/index.js';
+import { setGlobalBridgeToolsProvider, type KujiraBridgeToolsProvider } from './tools/plugin.js';
+import { isSlashCommand, handleSlashCommand } from './commands/index.js';
 import { registerConfigRoute } from './server/routes.js';
 import { registerFacesRoutes } from './server/face-routes.js';
-import { migrateLegacyConfig, readLegacyConfig } from './config/migrate.js';
-import { healProfileConfigFile, sanitizeConfigPayload } from './config/heal.js';
-import { migrateFaceStoragePaths } from './storage/face-migration.js';
-import { TaskScheduler } from './scheduler/index.js';
-import { SystemEventHub } from './gateway/system-event-hub.js';
+import { registerSlangRoutes } from './server/slang-routes.js';
 
 export * from './memory/index.js';
-import { setupSlangService } from './slang/index.js';
-import { registerSlangRoutes } from './server/slang-routes.js';
-import { DEFAULT_SLANG_STORAGE_PATH, DEFAULT_SLANG_MAX_ENTRIES, DEFAULT_SLANG_EVICT_POLICY } from './constants/index.js';
 export * from './slang/index.js';
-
 
 export const name = PLUGIN_NAME;
 export const inject = ['tools', 'systemPrompt', 'agents'];
 export const Config: any = BridgeConfigSchema;
 
-export function apply(ctx: Context, config: BridgePluginConfig = {}) {
-  const logger = ctx.logger ? ctx.logger(PLUGIN_NAME) : console;
-  const dshHome = path.resolve(
+function resolvePluginDshHome(): string {
+  return path.resolve(
     process.env.DSH_HOME || path.join(process.env.HOME || process.env.USERPROFILE || '/tmp', '.dsh')
   );
+}
 
-  const extractConfig = (cfg: unknown): BridgePluginConfig => {
-    if (!cfg || typeof cfg !== 'object') return {};
-    const out: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(cfg as Record<string, unknown>)) {
-      if (val && typeof val === 'object' && typeof (val as { get?: unknown }).get === 'function') {
-        out[key] = (val as { get: () => unknown }).get();
-      } else {
-        out[key] = val;
-      }
+function extractConfigValues(cfg: unknown): BridgePluginConfig {
+  if (!cfg || typeof cfg !== 'object') return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(cfg as Record<string, unknown>)) {
+    if (val && typeof val === 'object' && typeof (val as { get?: unknown }).get === 'function') {
+      out[key] = (val as { get: () => unknown }).get();
+    } else {
+      out[key] = val;
     }
-    return out as BridgePluginConfig;
-  };
-
-  const readSettingsConfig = (): BridgePluginConfig => {
-    const settingsService = (ctx as any).get?.('settings');
-    if (!settingsService) return {};
-    try {
-      if (typeof settingsService.describe === 'function') {
-        const desc = settingsService.describe().find(
-          (d: any) => d.ns === SETTINGS_NAMESPACE
-        );
-        if (desc?.value) return desc.value as BridgePluginConfig;
-      }
-      if (typeof settingsService.get === 'function') {
-        const val = settingsService.get(SETTINGS_NAMESPACE);
-        if (val && typeof val === 'object') return val;
-      }
-    } catch {
-      // ignore
-    }
-    return {};
-  };
-
-  const mergeConfigs = (base: BridgePluginConfig, overrides: BridgePluginConfig): BridgePluginConfig => {
-    const result: Record<string, unknown> = { ...base };
-    for (const [key, val] of Object.entries(overrides)) {
-      if (val !== undefined && val !== '') {
-        result[key] = val;
-      } else if (result[key] === undefined) {
-        result[key] = val;
-      }
-    }
-    return result as BridgePluginConfig;
-  };
-
-  const currentConfig = (): BridgePluginConfig => {
-    const fromSettings = readSettingsConfig();
-    const fromArgs = extractConfig(config);
-    // 0.2.1 规范优先级：以加载时传入的配置参数 (fromArgs) 为底，以用户在设置系统中配置并保存的最新项 (fromSettings) 覆盖
-    let merged = mergeConfigs(fromArgs, fromSettings);
-    if (!merged.bot_qq && !merged.ws_token) {
-      const legacy = readLegacyConfig(dshHome);
-      if (legacy) {
-        merged = mergeConfigs(legacy, merged);
-      }
-    }
-    return sanitizeConfigPayload(merged).valid;
-  };
-
-  // B6: bot_qq 为 Spec 必填项 (Spec §8.2 / §1.1)；缺失时明确告警，避免自循环防护静默降级
-  if (!String(currentConfig().bot_qq || '').trim()) {
-    logger.warn?.(
-      '[Plugin] 配置缺失 bot_qq（机器人自身 QQ 号，Spec 必填）：自循环防护将退化为仅依赖 post_type===message_sent，无法按 QQ 号过滤，请在设置卡片中补全'
-    );
   }
+  return out as BridgePluginConfig;
+}
 
-  if (!String(currentConfig().ws_token || '').trim()) {
-    logger.warn?.(
-      '[Plugin] 配置缺失 ws_token（WebSocket 鉴权 Token，必填）：当前未配置鉴权 Token，反向 WS 服务端将直接拒绝一切未经鉴权的连接，请尽快在设置卡片中配置并与 NapCat 对齐'
-    );
+function readHostSettingsConfig(ctx: Context): BridgePluginConfig {
+  const settingsService = (ctx as any).get?.('settings');
+  if (!settingsService) return {};
+  try {
+    if (typeof settingsService.describe === 'function') {
+      const desc = settingsService.describe().find((d: any) => d.ns === SETTINGS_NAMESPACE);
+      if (desc?.value) return desc.value as BridgePluginConfig;
+    }
+    if (typeof settingsService.get === 'function') {
+      const val = settingsService.get(SETTINGS_NAMESPACE);
+      if (val && typeof val === 'object') return val as BridgePluginConfig;
+    }
+  } catch {
+    // 忽略 settings 尚未就绪或不可读的场景
   }
+  return {};
+}
 
-  // A3: 共享 per-peer 串行发送器 (Spec §7.3)：正文、提问、审批、发文件全部经由同一队列下发
-  const serialSender = new PerPeerSerialSender();
+function mergeBridgeConfigs(base: BridgePluginConfig, overrides: BridgePluginConfig): BridgePluginConfig {
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, val] of Object.entries(overrides)) {
+    if (val !== undefined && val !== '') {
+      result[key] = val;
+    } else if (result[key] === undefined) {
+      result[key] = val;
+    }
+  }
+  return result as BridgePluginConfig;
+}
 
-  // 主动回复管理器 (冷却控制、潜水定时巡检、免打扰判定)
-  const proactiveManager = new ProactiveManager();
+function parseIsoTimeMs(raw?: string): number {
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
 
-  // EN-005: 入站消息等待收集器（wait_for_user_messages 工具的消息桥接，
-  //         等待期间同 peer 入站消息经 index.ts 门控转发给收集器并抑制唤醒）
-  const waitRegistry = new MessageWaitRegistry();
+function toQuotedRecord(row: MessageRecord | null | undefined): QuotedMessageRecord | null {
+  if (!row) return null;
+  const images: string[] = [];
+  if (row.local_path) images.push(row.local_path);
+  for (const desc of deserializeAttachments(row.attachments)) {
+    const p = desc.local?.path;
+    if (p && (desc.kind === 'image' || desc.kind === 'sticker') && !images.includes(p)) {
+      images.push(p);
+    }
+  }
+  return {
+    msg_id: row.msg_id,
+    ref_idx: row.ref_idx ?? null,
+    user_id: row.user_id,
+    sender_name: row.sender_name,
+    content: row.content,
+    self: row.self,
+    local_path: row.local_path,
+    type: row.type,
+    ...(images.length > 0 ? { images } : {}),
+  };
+}
 
-  let memoryService: any = null;
-  let unregisterFacesRoutes: (() => void) | undefined;
-  let slangService: any = null;
-  let unregisterSlangRoutes: (() => void) | undefined;
-  let snapshotManager: SnapshotManager | null = null;
+function provideService(ctx: Context, key: string, value: unknown): void {
+  try {
+    if (typeof (ctx as any).provide === 'function') {
+      (ctx as any).provide(key, value);
+    }
+  } catch {}
+  (ctx as any)[key] = value;
+  try {
+    if (typeof (ctx as any).set === 'function') {
+      (ctx as any).set(key, value);
+    }
+  } catch {}
+}
+
+export function apply(ctx: Context, config: BridgePluginConfig = {}) {
+  const logger = typeof (ctx as any).logger === 'function' ? (ctx as any).logger(PLUGIN_NAME) : console;
+  const dshHome = resolvePluginDshHome();
   let isDisposed = false;
 
-  // C2: Notice 事件 (group_upload / poke) 无真实 message_id 时的稳定正数主键策略
-  //     FNV-1a 32-bit，避免 -Date.now() 负数假 id 在极高并发下撞主键
-  const stableNoticeMsgId = (key: string): number => {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < key.length; i++) {
-      hash ^= key.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    return (hash >>> 0) || 1;
+  const currentConfig = (): BridgePluginConfig => {
+    const fromSettings = readHostSettingsConfig(ctx);
+    const fromArgs = extractConfigValues(config);
+    return sanitizeConfigPayload(mergeBridgeConfigs(fromArgs, fromSettings)).valid;
   };
 
-  const friendNoticeTracker = new FriendNoticeTracker();
-
-  // 1. 初始化 Gateway WebSocket 服务端
-  const server = new NapCatGatewayServer({
-    port: currentConfig().ws_port || DEFAULT_WS_PORT,
-    token: currentConfig().ws_token,
-    logger,
-  });
-
-  // 声明自定义设置卡片，跳过官方粗糙默认表单 (DSH 0.2.1 规范)
-  (ctx as any).inject(['settings'], (s: any) => (s as any).settings?.configure?.({ auto: false }, ctx.fiber));
-
-  // Reconciler 状态机：配置变更时对齐运行状态
-  const reconcile = async (forcedConfig?: BridgePluginConfig): Promise<void> => {
-    if (isDisposed) return;
-    const active = forcedConfig
-      ? { ...currentConfig(), ...extractConfig(forcedConfig) }
-      : currentConfig();
-
-    logger.info?.('[Plugin] 对齐并应用最新配置:', active);
-
-    const targetPort = active.ws_port || DEFAULT_WS_PORT;
-    const targetToken = active.ws_token || '';
-
-    if (server.options.port !== targetPort || (server.options.token || '') !== targetToken) {
-      logger.info?.(`[Plugin] 检测到 WS 端口/Token 变更 (${server.options.port} -> ${targetPort})，正在热重启 WS 服务端...`);
-      try {
-        await server.restart({
-          port: targetPort,
-          token: targetToken,
-        });
-        logger.info?.(`[Plugin] WS 服务端热重启成功，正在监听端口 ${targetPort}`);
-      } catch (err) {
-        logger.error?.('[Plugin] WS 服务端热重启失败:', err);
-      }
-    }
-
-    if (active.memory_storage_dir) {
-      const updatedMemoryDir = resolveDshPath(dshHome, active.memory_storage_dir, DEFAULT_MEMORY_DIR);
-      if (memoryService?.storage && memoryService.storage.getBaseDir() !== updatedMemoryDir) {
-        memoryService.storage.setBaseDir(updatedMemoryDir, dshHome);
-      }
-    }
-  };
-
-  let reconcileRunning = false;
-  let hasPendingReconcile = false;
-  let pendingConfig: BridgePluginConfig | undefined = undefined;
-
-  const queueReconcile = async (newVal?: BridgePluginConfig): Promise<void> => {
-    if (newVal) pendingConfig = newVal;
-    hasPendingReconcile = true;
-    if (reconcileRunning) return;
-    reconcileRunning = true;
-    try {
-      while (hasPendingReconcile) {
-        hasPendingReconcile = false;
-        const nextCfg = pendingConfig;
-        pendingConfig = undefined;
-        await reconcile(nextCfg);
-      }
-    } finally {
-      reconcileRunning = false;
-    }
-  };
-
-  // 挂载服务端配置 REST 路由
-  const unregisterConfigRoute = registerConfigRoute(ctx, currentConfig, queueReconcile);
-
-  // 监听 0.2.1 原生 volatile 配置热更新与 settings document-updated 事件
-  (ctx as any).on('loader/volatile-update', () => {
-    if (isDisposed) return;
-    logger.info?.('[Plugin] 收到 loader/volatile-update 事件，正在对齐运行状态...');
-    void queueReconcile();
-  });
-  (ctx as any).on('settings/document-updated', (ns: string) => {
-    if (isDisposed) return;
-    if (!ns || ns === SETTINGS_NAMESPACE) {
-      logger.info?.('[Plugin] 收到 settings/document-updated 事件，正在对齐运行状态...');
-      void queueReconcile();
-    }
-  });
-
-  // 立即按当前有效配置启动 WebSocket 服务端
-  const effectivePort = currentConfig().ws_port || DEFAULT_WS_PORT;
-  const effectiveToken = currentConfig().ws_token || '';
-  if (server.options.port !== effectivePort || (server.options.token || '') !== effectiveToken) {
-    server.options.port = effectivePort;
-    server.options.token = effectiveToken;
-  }
-
-  server.start().then(() => {
-    logger.info?.(`[Plugin] OneBot 11 反向 WS 服务端已在端口 ${server.options.port} 成功启动`);
-  }).catch((err) => {
-    logger.warn?.(`[Plugin] GatewayServer 启动告警 (端口: ${server.options.port}):`, err);
-  });
-
-  // EN-001: 群成员昵称解析器（at 段被@者昵称，TTL 缓存避免每条消息多次 get_group_member_info）
-  const memberResolver = new CachedGroupMemberResolver(server);
-
-  // 2. 初始化存储、媒体管理器与会话管理器
+  // 1. 初始化存储层（SQLite 与本地媒体管理）
   const dbPath = resolveDshPath(dshHome, undefined, DEFAULT_DATABASE_PATH);
   const db = new MessageDatabase(dbPath);
   db.init();
 
-  // 2.1 出站消息自记录：发送成功即主动落库 (self = 1)，
-  //     不再单点依赖 NapCat 的 reportSelfMessage 自身消息上报。
-  server.options.onMessageSent = (event) => {
-    try {
-      const cfg = currentConfig();
-      const record = recordOutboundSelfMessage(event, {
-        db,
-        botQQ: String(cfg.bot_qq || ''),
-        senderName: (cfg as any).bot_nickname || cfg.aliases?.[0] || '智能助手',
-        getFaceByMd5: (md5: string) => db.getFaceByMd5(md5),
-        logger,
-      });
-      // 媒体消息异步回查 get_msg 补全 file_id/raw；失败不影响已落库的 payload 版本
-      if (record) {
-        void enrichOutboundMediaRecord(server, db, record, logger);
-      }
-    } catch (err) {
-      logger.warn?.('[Plugin] 出站消息自记录异常:', err);
-    }
-  };
-
-  // 启动时自动规范化存量表情包存储路径，并从工作区 profiles 目录自愈找回物理文件
-  try {
-    const rawFaceDir = currentConfig().face_store_dir;
-    const faceStoreDir = resolveDshPath(dshHome, rawFaceDir, DEFAULT_FACE_STORE_DIR);
-    migrateFaceStoragePaths({ db, dshHome, faceStoreDir });
-  } catch (migErr) {
-    logger.warn?.('[Plugin] 启动时表情包存储路径自愈迁移失败:', migErr);
-  }
-
-  // 挂载表情包管理 REST 路由 (列表、上传、大图预览、编辑、删除)
-  unregisterFacesRoutes = registerFacesRoutes({ ctx, db, getConfig: currentConfig, dshHome });
-
-  // 挂载黑话学习服务与 REST 路由
-  const rawSlangPath = currentConfig().slang_storage_path;
-  const normalizedSlangPath = resolveDshPath(dshHome, rawSlangPath, DEFAULT_SLANG_STORAGE_PATH);
-  slangService = setupSlangService(ctx, {
-    db,
-    storagePath: normalizedSlangPath,
-    dshHome,
-    registerGlobalTools: false,
-    registerPromptContext: false,
-    maxEntries: currentConfig().slang_max_entries,
-    getMaxEntries: () => currentConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
-    evictPolicy: currentConfig().slang_evict_policy,
-    getEvictPolicy: () => currentConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
-    enabled: currentConfig().slang_enabled,
-    getEnabled: () => currentConfig().slang_enabled ?? true,
-  });
-  unregisterSlangRoutes = registerSlangRoutes({ ctx, storage: slangService.storage });
-
   const mediaManager = new MediaStorageManager({
     dshHome,
     db,
-    ttlDays: config.image_ttl_days ?? 7,
+    ttlDays: currentConfig().image_ttl_days ?? DEFAULT_IMAGE_TTL_DAYS,
+  });
+  const stopCleanupTask = startMediaCleanupTask(ctx, mediaManager);
+
+  // 2. 初始化 QQ 官方 Bot v2 正向网关与自记录回执
+  const waitRegistry = new MessageWaitRegistry();
+  const gateway = new KujiraGatewayClient({
+    logger,
+    onReady: (info) => {
+      logger.info?.(`[Plugin] QQ Gateway 已就绪 (botId=${info.botId || 'unknown'})`);
+    },
+    onDispatch: (eventName, data) => {
+      if (eventName === 'READY' || eventName === 'C2C_MESSAGE_CREATE') return;
+      if (eventName === 'FRIEND_ADD') {
+        const rawOpenid =
+          data && typeof data === 'object' ? String((data as any).openid ?? (data as any).user_openid ?? '') : '';
+        const peerTag = rawOpenid && isValidOpenid(rawOpenid) ? ` peer=${openidToPeer(rawOpenid)}` : '';
+        logger.info?.(`[Plugin] 收到好友添加事件 (FRIEND_ADD${peerTag})`);
+        return;
+      }
+      logger.debug?.(`[Plugin] 收到网关分发事件: ${eventName}`);
+    },
+    onMessageSent: (event) => {
+      try {
+        const status = gateway.getStatus();
+        recordOutboundSelfMessage(event, {
+          db,
+          ...(status.botId ? { botId: status.botId } : {}),
+          senderName: status.botName || '智能助手',
+          logger,
+        });
+      } catch (err) {
+        logger.warn?.('[Plugin] 出站消息自记录异常:', err);
+      }
+    },
   });
 
+  // 3. 声明自定义设置卡片并挂载 WebUI 配置/表情/黑话 HTTP REST 路由
+  (ctx as any).inject?.(['settings'], (s: any) => s?.settings?.configure?.({ auto: false }, (ctx as any).fiber));
+
+  // 4. 初始化会话管理器、本轮唤醒者追踪器、出站调度中枢与定时任务引擎
   const sessionManager = new SessionManager(ctx, dshHome, db, { configGetter: currentConfig });
 
-  // 审批「本轮唤醒者」追踪：由 dispatchWakeup 登记唤醒消息，根 Context 订阅官方
-  // session/event（turn/start / user/message / turn/end）维护严格本轮归属。
-  // 普通插话、群友刷屏与排队轮次互不覆盖；系统触发不登记 → 审批 Fail-Closed。
   const turnInitiatorTracker = new TurnInitiatorTracker({ maxExpectations: 256 });
   sessionManager.setTurnInitiatorTracker(turnInitiatorTracker);
   const unregisterTurnInitiator = (ctx as any).on?.('session/event', (session: any, event: any) => {
@@ -349,18 +253,24 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
   });
 
-  sessionManager.registerWorkspace(sessionManager.resolveCwd()).catch((wsErr) => {
-    logger.warn?.('[Plugin] 初始化注册 NapCat 顶级工作区失败:', wsErr);
+  sessionManager.registerWorkspace(sessionManager.resolveCwd(), undefined, 'Kujira').catch((wsErr) => {
+    logger.warn?.('[Plugin] 初始化注册 Kujira 工作区失败:', wsErr);
   });
 
-  // 3.0 初始化系统内部事件与统一唤醒中枢 (SystemEventHub)
-  const systemEventHub = new SystemEventHub({
+  const outboundBridge = new OutboundStreamBridge(ctx, {
+    gateway,
     sessionManager,
+    db,
+    getConfig: currentConfig,
     logger,
   });
+  sessionManager.setOutboundBridge(outboundBridge);
+  const stopOutboundBridge = outboundBridge.start();
+  const serialSender = outboundBridge.getSender();
+
+  const systemEventHub = new SystemEventHub({ sessionManager, logger });
   sessionManager.setSystemEventHub(systemEventHub);
 
-  // 3.1 初始化定时任务与周期调度引擎
   const taskScheduler = new TaskScheduler({
     systemEventHub,
     db,
@@ -372,72 +282,41 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   });
   taskScheduler.start();
 
-  let outboundBridge: OutboundStreamBridge | null = null;
-
-  // 4. 注册 Agent 工具集与 7 天 TTL 定时清理任务
-  const toolsOptions: AgentToolsOptions = {
-    db,
-    gateway: server,
-    mediaManager,
-    sender: serialSender,
-    dshHome,
-    waitRegistry,
-    scheduler: taskScheduler,
-    slangStorage: slangService.storage,
-    config: currentConfig,
-    inboundMsgIdGetter: (peer: string) => {
-      if (!outboundBridge) return undefined;
-      const inboundCtx =
-        outboundBridge.getActiveTurnContext?.(peer) ??
-        (outboundBridge as any).getInboundContext?.(peer) ??
-        (outboundBridge as any).inboundContexts?.get?.(peer);
-      if (inboundCtx && ((inboundCtx as any).is_synthetic || (inboundCtx as any).synthetic)) {
-        return undefined;
-      }
-      return inboundCtx?.msg_id;
-    },
-  };
-  // 工具不再全局直挂到 root ctx，杜绝向 Web UI 等非 QQ 会话泄露；
-  // 统一通过 qq-session 预设（dsh-napcat-bridge/tools 插件）挂载至具体 QQ Agent 实例 Context。
-  const unregisterTools = () => {};
-
-  // 5. 初始化并挂载 Memory 两层记忆体系插件服务 (storageDir 严格绝对路径锚定到 dshHome)
-  const currentSpeakers = new Map<string, string>();
+  // 5. 初始化单聊强隔离双层记忆、黑话学习与 System Prompt SnapshotHub
   const rawMemoryDir = currentConfig().memory_storage_dir;
-  const normalizedMemoryDir = resolveDshPath(dshHome, rawMemoryDir, DEFAULT_MEMORY_DIR);
-
-  memoryService = setupMemoryService(ctx, {
-    storageDir: normalizedMemoryDir,
+  const memoryService = setupMemoryService(ctx, {
+    storageDir: resolveDshPath(dshHome, rawMemoryDir, DEFAULT_MEMORY_DIR),
     dshHome,
     registerGlobalTools: false,
     registerPromptContext: false,
-    groupMemoryTotalBudgetChars: currentConfig().group_memory_total_budget_chars,
     userProfileBudgetChars: currentConfig().user_profile_budget_chars,
     sessionMemoryBudgetChars: currentConfig().session_memory_budget_chars,
-    getGroupMemoryTotalBudgetChars: () =>
-      currentConfig().group_memory_total_budget_chars ??
-      DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
     getUserProfileBudgetChars: () =>
-      currentConfig().user_profile_budget_chars ??
-      DEFAULT_USER_PROFILE_BUDGET_CHARS,
+      currentConfig().user_profile_budget_chars ?? DEFAULT_USER_PROFILE_BUDGET_CHARS,
     getSessionMemoryBudgetChars: () =>
-      currentConfig().session_memory_budget_chars ??
-      DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
-    getCurrentSpeaker: (peer: string) => currentSpeakers.get(peer),
-    db,
-    sessionManager,
+      currentConfig().session_memory_budget_chars ?? DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
   });
 
-  // 6. 统一装配 System Prompt 动态上下文快照 Hub (Fail-Closed 安全白名单隔离)
-  snapshotManager = setupSnapshotHub({
+  const rawSlangPath = currentConfig().slang_storage_path;
+  const slangService = setupSlangService(ctx, {
+    db,
+    storagePath: resolveDshPath(dshHome, rawSlangPath, DEFAULT_SLANG_STORAGE_PATH),
+    dshHome,
+    registerGlobalTools: false,
+    registerPromptContext: false,
+    maxEntries: currentConfig().slang_max_entries,
+    getMaxEntries: () => currentConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
+    evictPolicy: currentConfig().slang_evict_policy,
+    getEvictPolicy: () => currentConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
+    enabled: currentConfig().slang_enabled,
+    getEnabled: () => currentConfig().slang_enabled ?? true,
+  });
+
+  let snapshotManager: SnapshotManager | null = setupSnapshotHub({
     ctx,
     db,
     memoryStorage: memoryService.storage,
     slangStorage: slangService.storage,
-    getCurrentSpeaker: (peer: string) => currentSpeakers.get(peer),
-    getGroupMemoryBudget: () =>
-      currentConfig().group_memory_total_budget_chars ??
-      DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
     getSlangEnabled: () => currentConfig().slang_enabled ?? true,
     getFaceEnabled: () => Boolean(currentConfig().face_enabled),
     getFaceStoreMax: () => currentConfig().face_store_max ?? DEFAULT_FACE_STORE_MAX,
@@ -446,11 +325,33 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     logger,
   });
   if (typeof (ctx as any).reflect?.provide === 'function') {
-    (ctx as any).reflect.provide('snapshotManager', snapshotManager);
+    try {
+      (ctx as any).reflect.provide('snapshotManager', snapshotManager);
+    } catch {}
   }
 
-  // 5.1 构造 NapCat 专属工具提供者 (供 dsh-napcat-bridge/tools 插件与 qq-session 预设挂载)
-  const napcatBridgeTools: NapCatBridgeToolsProvider = {
+  // 6. 装配 Agent 工具提供者 (通过 kujira-session 预设挂载，不污染 Web 会话)
+  const toolsOptions: AgentToolsOptions = {
+    db,
+    outboundBridge,
+    gateway,
+    mediaManager,
+    sender: serialSender,
+    dshHome,
+    waitRegistry,
+    scheduler: taskScheduler,
+    slangStorage: slangService.storage,
+    config: currentConfig,
+    inboundMsgIdGetter: (peer: string) => {
+      const inboundCtx = outboundBridge.getActiveTurnContext(peer);
+      if (inboundCtx && ((inboundCtx as any).is_synthetic || (inboundCtx as any).synthetic)) {
+        return undefined;
+      }
+      return typeof inboundCtx?.msg_id === 'string' ? inboundCtx.msg_id : undefined;
+    },
+  };
+
+  const kujiraBridgeTools: KujiraBridgeToolsProvider = {
     registerTools(targetCtx: Context) {
       const unregAgent = registerAgentTools(targetCtx, toolsOptions);
       const unregMemory: Array<() => void> = [];
@@ -459,8 +360,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
           (targetCtx as any).tools ||
           (typeof (targetCtx as any).get === 'function' ? (targetCtx as any).get('tools') : undefined);
         if (toolsService && typeof toolsService.register === 'function') {
-          const defs = createMemoryToolDefinitions(memoryService.tools);
-          for (const def of defs) {
+          for (const def of createMemoryToolDefinitions(memoryService.tools)) {
             if (typeof toolsService.get === 'function' && toolsService.get(def.name)) {
               continue;
             }
@@ -481,14 +381,14 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     },
   };
 
-  setGlobalBridgeToolsProvider(napcatBridgeTools);
-  if (typeof (ctx as any).provide === 'function') {
-    try {
-      (ctx as any).provide('napcatBridgeTools', napcatBridgeTools);
-    } catch {}
-  }
+  setGlobalBridgeToolsProvider(kujiraBridgeTools);
+  provideService(ctx, 'kujiraBridgeTools', kujiraBridgeTools);
+  provideService(ctx, 'kujira-session', sessionManager);
+  provideService(ctx, 'kujira-system-event-hub', systemEventHub);
+  provideService(ctx, 'kujira-bridge-config', currentConfig);
+  provideService(ctx, 'kujira-gateway', gateway);
+  provideService(ctx, 'kujira-outbound-bridge', outboundBridge);
 
-  // 5.2 若当前环境提供了 agentPresets 且未注册 qq-session 预设，则动态补全注册 (消费 SSOT 规范定义)
   (ctx as any).inject?.(['agentPresets'], (presetCtx: Context) => {
     const agentPresetsSvc = (presetCtx as any).agentPresets;
     if (agentPresetsSvc && typeof agentPresetsSvc.register === 'function') {
@@ -496,468 +396,302 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
         const exists = Array.isArray(presetsList) && presetsList.some((p: any) => p.id === QQ_PRESET_ID);
         if (!exists) {
           agentPresetsSvc.register(getRuntimePresetDefinition()).catch((err: any) => {
-            logger.debug?.('[Plugin] 动态注册 qq-session 预设已跳过或失败:', err?.message);
+            logger.debug?.(`[Plugin] 动态注册 ${QQ_PRESET_ID} 预设已跳过或失败:`, err?.message);
           });
         }
       }).catch(() => {});
     }
   });
 
-  // 4.1 初始化后台媒体清理任务
-  const stopCleanupTask = startMediaCleanupTask(ctx, mediaManager);
-
-  // 5. 挂载出方向事件流桥接器 (过滤 reasoning/tool-call，Markdown Strip 后分段下发)
-  outboundBridge = new OutboundStreamBridge(ctx, {
-    gateway: server,
+  // 7. 接入单聊提问 & 审批 waterfall（单聊好友均开放；scheduled_task 无发起人保留 Fail-Closed）
+  const approvalResponder = new KujiraApprovalResponder({
+    outboundBridge,
+    gateway,
     sessionManager,
-    getConfig: currentConfig,
-    logger,
-  });
-  sessionManager.setOutboundBridge?.(outboundBridge);
-  const stopOutboundBridge = outboundBridge.start();
-
-  // 暴露 proactiveManager 与 sessionManager 供 Cordis 上下文获取
-  try {
-    if (typeof (ctx as any).provide === 'function') {
-      (ctx as any).provide('napcat-proactive');
-      (ctx as any).provide('napcat-session');
-      (ctx as any).provide('napcat-system-event-hub');
-      (ctx as any).provide('napcat-bridge-config');
-      // 网关实例暴露至 Cordis 上下文，供内部模块与装配契约测试访问（出站落库 onMessageSent 接线断言）
-      (ctx as any).provide('napcat-gateway', server);
-    }
-  } catch {}
-  (ctx as any)['napcat-proactive'] = proactiveManager;
-  (ctx as any)['napcat-session'] = sessionManager;
-  (ctx as any)['napcat-system-event-hub'] = systemEventHub;
-  (ctx as any)['napcat-bridge-config'] = currentConfig;
-  (ctx as any)['napcat-gateway'] = server;
-  if (typeof (ctx as any).set === 'function') {
-    (ctx as any).set('napcat-proactive', proactiveManager);
-    (ctx as any).set('napcat-session', sessionManager);
-    (ctx as any).set('napcat-system-event-hub', systemEventHub);
-  }
-
-  // 6. 审批 waterfall 响应器（独立于提问 provider，不注册 userQuestions 以避免与官方冲突）
-  // 注：提问 provider 注册已移除 —— DSH web profile 下官方 dsh-host-apiproxy 已注册唯一 userQuestions
-  // provider（registerProvider 抛 DUPLICATE_PROVIDER）。本插件不再注册 NapCat 提问渠道，提问经官方
-  // Web UI 渠道呈现。QQ 侧提问能力待按官方「单一组合 provider 统一路由」方式由后续整改接入
-  //（见 issue / 子代理调研 dsh-host-apiproxy provider 集成方式 —— 由下方 TD-001 接线补入 QQ 渠道）。
-  const approvalResponder = new NapCatApprovalResponder({
-    gateway: server,
-    sessionManager,
+    db,
     sender: serialSender,
-    admins: currentConfig().admins,
+    turnInitiatorTracker,
     logger,
   });
 
-  // TD-001: QQ 侧提问渠道 —— 按用户拍板方案（参照 nyagent composite 成熟实现）接线：
-  // 纯 headless 无宿主 provider 时走官方 registerProvider；web+QQ 同部署时以按 session
-  // 路由的 composite provider 直接赋值（等 apiProxy 就绪后接管，卸载还原宿主 provider）。
-  const questionProvider = new NapCatQuestionProvider({
-    gateway: server,
+  const questionProvider = new KujiraQuestionProvider({
+    outboundBridge,
+    gateway,
     sessionManager,
+    db,
     sender: serialSender,
     logger,
   });
+
   let unregisterQuestionChannel: (() => void) | null = null;
   try {
-    unregisterQuestionChannel = registerNapCatQuestionChannel(ctx as any, {
+    unregisterQuestionChannel = registerKujiraQuestionChannel(ctx as any, {
       questionProvider,
-      isQQSession: (sessionId) => sessionManager.isQQSession(sessionId),
+      isQQSession: (sid) => sessionManager.isKujiraSession(sid),
       logger,
     });
   } catch (channelErr) {
-    logger.warn?.('[Plugin] 注册 QQ 提问渠道异常:', channelErr);
+    logger.warn?.('[Plugin] 注册 Kujira 提问渠道异常:', channelErr);
   }
 
-  const unregisterApproval = (ctx as any).on(
+  const unregisterApproval = (ctx as any).on?.(
     'approval/request',
     async (req: any, next: any) => {
       const sessionId = req.agent?.session?.id;
-      if (!sessionId || !sessionManager.isQQSession(sessionId)) {
+      if (!sessionId || !sessionManager.isKujiraSession(sessionId)) {
         return next ? next() : 'unavailable';
       }
       const peer = sessionManager.sessionIdToPeer(sessionId);
-      // 群聊只认「开启当前轮次的那条真实唤醒消息的发送者」；系统触发 / 轮次外无归属时
-      // responder 直接拒绝 (Fail-Closed)，普通群友刷屏与 steer 插话不会覆盖。
       const applicantId = turnInitiatorTracker.getInitiator(sessionId);
       return await approvalResponder.handleApprovalRequest({
         peer,
+        sessionId,
         toolName: req.toolName,
         callId: req.callId,
         reason: req.reason,
-        ...(applicantId ? { applicantId } : {}),
+        applicantId: applicantId ?? null,
         signal: req.signal,
       });
     },
     { prepend: true }
   );
 
-  // 7. 监听入方向消息并执行入库、审批/提问拦截与唤醒门控
-  server.onMessage(async (event) => {
-    const botQQ = currentConfig().bot_qq || '';
-    const isGroup = event.message_type === 'group';
-    const isSelfMsg = event.post_type === 'message_sent';
-    const fromUser = isSelfMsg
-      ? String(event.self_id || botQQ || event.sender?.user_id || event.user_id || '')
-      : String(event.sender?.user_id ?? event.user_id ?? '');
-    const targetUser = isSelfMsg
-      ? String(event.target_id || (event.user_id && String(event.user_id) !== String(botQQ) ? event.user_id : '') || '')
-      : fromUser;
-    const peer = isGroup
-      ? `group_${event.group_id}`
-      : `user_${targetUser || fromUser}`;
-    let senderName = isSelfMsg
-      ? (currentConfig().aliases?.[0] || '智能助手')
-      : event.sender?.card || event.sender?.nickname || '';
-    if (isGroup && !senderName && event.group_id !== undefined && !isSelfMsg) {
-      try {
-        senderName = (await memberResolver.resolve(event.group_id, fromUser)) || '';
-      } catch {}
-    }
-    if (!isSelfMsg && fromUser && fromUser !== '10000') {
-      currentSpeakers.set(peer, fromUser);
-    }
-    const timestamp = event.time
-      ? event.time < 10000000000
-        ? event.time * 1000
-        : event.time
-      : Date.now();
+  // 8. Reconcile 热对齐（设置与凭据）+ 路由注册
+  let activeCredSignature = '';
+  let gatewayStarted = false;
 
-    let primaryLocalPath: string | null = null;
-    let primaryFingerprint: string | null = null;
+  const syncGatewayCredentials = async (): Promise<void> => {
+    const resolved = await resolveCredentials(ctx, { dshHome });
+    const appId = (resolved.credential?.appId ?? '').trim();
+    const appSecret = (resolved.credential?.appSecret ?? '').trim();
+    const nextSig = appId && appSecret ? `${appId}\n${appSecret}` : '';
 
-    const imageSegs: Array<{
-      seg: any;
-      data: any;
-      isSticker: boolean;
-    }> = [];
-
-    // 1. 即时预处理并下载图片/表情包落盘
-    if (Array.isArray(event.message)) {
-      for (const seg of event.message) {
-        if (!seg || typeof seg !== 'object') continue;
-        const data = (seg.data || {}) as any;
-
-        if (seg.type === 'image') {
-          const isSticker = data.sub_type === 1 || Boolean(data.emoji_package_id);
-          imageSegs.push({ seg, data, isSticker });
-        } else if (seg.type === 'file') {
-          const fileId = data.file_id || data.file || null;
-          const busid = data.busid ?? null;
-          // PF-001: 私聊文件入站即时落盘（同步 await 落盘完成后再构建唤醒包/入库，任务包 §3.3）。
-          //   - 群聊 file 段保持现状（group_upload notice 懒载），静默跳过；
-          //   - 机器人自己发出的文件（message_sent）不入站回拉：段内即本机来源路径，无需 NapCat 中转。
-          //   - 两级退化（用户拍板 §3.1）：首选 get_private_file_url 直链 → 回退 get_file 本地路径；
-          //     双失败绝不返回占位假路径：消息照常入库但 local_path 置空，content 如实标注入站落盘失败。
-          if (!isGroup && !isSelfMsg && fileId && mediaManager) {
-            const pf = await downloadPrivateFile({
-              fileId,
-              peer,
-              busid,
-              filename: data.file_name || data.file || undefined,
-              gateway: server,
-              mediaManager,
-              logger,
-            });
-            if (pf.ok && pf.localPath) {
-              data.local_path = pf.localPath;
-              if (pf.fingerprint) data.fingerprint = pf.fingerprint;
-              logger.info?.(`[Plugin] 私聊文件已即时落盘 (peer: ${peer}, file_id: ${fileId}) -> ${pf.localPath}`);
-            } else {
-              data.dl_failed = true;
-              logger.warn?.(
-                `[Plugin] 私聊文件入站落盘失败 (peer: ${peer}, file_id: ${fileId}): ${pf.error || '未知原因'}`
-              );
-            }
-          }
-        } else if (seg.type === 'video') {
-          const fileId = data.file_id || data.file || null;
-          // 私聊视频入站即时落盘：优先直链下载 -> 回退 downloadPrivateFile (get_file)
-          if (!isGroup && !isSelfMsg && mediaManager && (data.url || fileId)) {
-            let savedPath: string | null = null;
-            let savedFingerprint: string | null = null;
-
-            // 1. 直链首选（NapCat 与 SnowLuma 双端原生支持）
-            if (typeof data.url === 'string' && /^https?:\/\//i.test(data.url)) {
-              try {
-                const saved = await mediaManager.downloadAndSave(data.url.trim(), {
-                  fileId: fileId || undefined,
-                  type: 'files',
-                  sessionId: peer,
-                  filename: data.file_name || (typeof data.file === 'string' ? data.file : undefined),
-                });
-                if (saved?.localPath) {
-                  savedPath = saved.localPath;
-                  savedFingerprint = saved.fingerprint ?? null;
-                }
-              } catch (err: any) {
-                logger.debug?.(`[Plugin] 私聊视频直链下载未成功，准备回退: ${err?.message || '未知错误'}`);
-              }
-            }
-
-            // 2. 直链未成功时回退 downloadPrivateFile (调用 get_file 换取本地路径或新直链)
-            if (!savedPath && fileId) {
-              const pf = await downloadPrivateFile({
-                fileId,
-                peer,
-                filename: data.file_name || data.file || undefined,
-                gateway: server,
-                mediaManager,
-                logger,
-              });
-              if (pf.ok && pf.localPath) {
-                savedPath = pf.localPath;
-                savedFingerprint = pf.fingerprint ?? null;
-              }
-            }
-
-            if (savedPath) {
-              data.local_path = savedPath;
-              if (savedFingerprint) data.fingerprint = savedFingerprint;
-              logger.info?.(`[Plugin] 私聊视频已即时落盘 (peer: ${peer}, file: ${fileId || 'direct_url'}) -> ${savedPath}`);
-            } else {
-              data.dl_failed = true;
-              logger.warn?.(`[Plugin] 私聊视频入站落盘失败 (peer: ${peer}, file: ${fileId || 'direct_url'})`);
-            }
-          }
-        }
+    if (!nextSig) {
+      if (gatewayStarted) {
+        logger.warn?.('[Plugin] QQ Bot 凭据已清空或移除，停止 Gateway 连接');
+        gateway.stop();
+        gatewayStarted = false;
       }
-
-      // 多图异步并发解析落盘 (Promise.all 消除串行阻塞与十余秒超时累加)
-      if (mediaManager && imageSegs.length > 0) {
-        const resolvedList = await Promise.all(
-          imageSegs.map(({ data, isSticker }) =>
-            resolveInboundImage({
-              peer,
-              isSticker,
-              url: data.url,
-              file: data.file,
-              fileId: data.file_id,
-              declaredSize: data.file_size,
-              localPath: data.local_path,
-              msgId: Number(event.message_id) || undefined,
-              emojiPackageId: data.emoji_package_id,
-              emojiId: data.emoji_id,
-              botQQ: config?.bot_qq,
-              gateway: server,
-              mediaManager,
-              logger,
-            })
-          )
-        );
-
-        for (let i = 0; i < imageSegs.length; i++) {
-          const resolved = resolvedList[i];
-          const { data } = imageSegs[i];
-          if (resolved.ok && resolved.localPath) {
-            data.local_path = resolved.localPath;
-            if (resolved.fingerprint) data.fingerprint = resolved.fingerprint;
-            if (resolved.md5) data.md5 = resolved.md5;
-
-            // 识别入站图片/表情包是否命中本地已收藏表情库
-            const md5 = resolved.md5 || (resolved.localPath ? computeFileMd5(resolved.localPath) : undefined);
-            if (md5) {
-              const matchedFace = db.getFaceByMd5(md5);
-              if (matchedFace && matchedFace.enabled && !matchedFace.deleted_at) {
-                data.face = {
-                  id: matchedFace.id,
-                  ...(matchedFace.mood ? { mood: matchedFace.mood } : {}),
-                  ...(matchedFace.tags && matchedFace.tags.length > 0
-                    ? { tags: matchedFace.tags }
-                    : {}),
-                };
-              }
-            }
-          } else {
-            logger.warn?.(
-              `[Plugin] 入站图片落盘失败 (peer: ${peer}, msg_id: ${event.message_id}, file: ${data.file || data.file_id || '?'}): ${resolved.error || '未知原因'}`
-            );
-          }
-        }
-      }
-    }
-
-    const { content: rawContent, replyId, atQQs } = parseNormalizedContent(event, {
-      getFaceByMd5: (hash) => db.getFaceByMd5(hash),
-    });
-
-    // 统一附件描述符：入站落盘 / 表情库匹配完成后一次性提取全部事实
-    const description = describeMessage(
-      Array.isArray(event.message) ? event.message : [],
-      { origin: 'inbound', isGroup }
-    );
-    const mediaFields = toMessageMediaFields(description);
-    primaryLocalPath = mediaFields.local_path;
-    primaryFingerprint = mediaFields.fingerprint;
-
-    // 过滤完全为空的消息事件 (无字符、无媒体、无文件、无引用，如 NapCat 上报的文件下载回执/系统灰条)
-    const hasMedia = Boolean(
-      mediaFields.local_path ||
-      mediaFields.file_id ||
-      description.attachments.length > 0
-    );
-    const isCompletelyEmpty =
-      rawContent.length === 0 &&
-      !hasMedia &&
-      replyId === undefined &&
-      atQQs.length === 0;
-
-    if (isCompletelyEmpty) {
-      logger.debug?.(
-        `[Plugin] 收到完全为空的消息事件 (msg_id: ${event.message_id}, peer: ${peer})，已过滤不落盘不唤醒`
-      );
+      activeCredSignature = '';
       return;
     }
 
-    // 过滤 QQ 系统号 (如 10000 系统通知) 或系统通知子类型
-    const isSystemSender = !isGroup && (fromUser === '10000' || event.sub_type === 'notice' || event.sub_type === 'system');
-
-    // 检查是否为好友申请附言自动注入消息
-    const isFriendNotice = !isGroup && Boolean(friendNoticeTracker.checkAndConsumeFriendNotice(fromUser, rawContent, timestamp));
-
-    if (isSystemSender || isFriendNotice) {
-      logger.info?.(
-        `[Plugin] 收到${isFriendNotice ? '好友申请附言自动注入' : '系统通知'}消息 (peer: ${peer}, from: ${fromUser}, content: "${rawContent}")，仅入库审计，绝不唤醒 Agent`
-      );
-
-      try {
-        db.saveMessage({
-          msg_id: event.message_id,
-          peer,
-          user_id: fromUser,
-          sender_name: '系统提示',
-          time: timestamp,
-          type: isFriendNotice ? 'friend_notice' : 'system',
-          content: rawContent,
-          raw: JSON.stringify(event.message || event.raw_message),
-          file_id: null,
-          busid: null,
-          local_path: null,
-          fingerprint: null,
-          recalled: 0,
-          self: 0,
-          reply_to: null,
-        });
-      } catch (err) {
-        logger.error?.('[Plugin] 系统/好友通知消息入库失败:', err);
-      }
-
-      return;
-    }
-
-    // EN-001: 入库 content 统一归一化为 @昵称(QQ号)（落库/唤醒包/消息记录同源格式）；
-    // 纯文本手敲的 "@昵称"（非 CQ:at 段）保持原样
-    let content = rawContent;
-    const msgGroupId = event.group_id;
-    if (isGroup && atQQs.length > 0 && msgGroupId !== undefined) {
-      try {
-        content = await resolveAtNicknames(
-          content,
-          atQQs,
-          msgGroupId,
-          (gid, qq) => memberResolver.resolve(gid, qq)
-        );
-      } catch (resolveErr) {
-        logger.debug?.('[Plugin] at 昵称归一化失败 (回退裸 QQ 号):', resolveErr);
+    if (nextSig !== activeCredSignature || !gatewayStarted) {
+      activeCredSignature = nextSig;
+      if (gatewayStarted) {
+        logger.info?.('[Plugin] 检测到 QQ Bot 凭据变更，正在热重启 Gateway...');
+        await gateway.restart({ appId, appSecret });
+      } else {
+        gateway.updateCredentials({ appId, appSecret });
+        gatewayStarted = true;
+        logger.info?.('[Plugin] 已读取 QQ Bot 凭据，正在连接官方 Gateway...');
+        await gateway.start();
       }
     }
+  };
 
-    const isSelf = isSelfMsg || (botQQ !== '' && fromUser === botQQ) ? 1 : 0;
+  const reconcile = async (forcedConfig?: BridgePluginConfig): Promise<void> => {
+    if (isDisposed) return;
+    const active = forcedConfig
+      ? sanitizeConfigPayload({ ...currentConfig(), ...extractConfigValues(forcedConfig) }).valid
+      : currentConfig();
 
-    const record: MessageRecord = {
-      msg_id: event.message_id,
-      peer,
-      user_id: fromUser,
-      sender_name: senderName,
-      time: timestamp,
-      type: mediaFields.type,
-      content,
-      raw: JSON.stringify(event.message || event.raw_message),
-      file_id: mediaFields.file_id,
-      busid: mediaFields.busid,
-      local_path: primaryLocalPath,
-      fingerprint: primaryFingerprint,
-      recalled: 0,
-      self: isSelf,
-      reply_to: replyId ?? null,
-      attachments: serializeAttachments(description.attachments),
-    };
+    if (active.memory_storage_dir) {
+      const updatedMemoryDir = resolveDshPath(dshHome, active.memory_storage_dir, DEFAULT_MEMORY_DIR);
+      if (memoryService.storage.getBaseDir() !== updatedMemoryDir) {
+        memoryService.storage.setBaseDir(updatedMemoryDir, dshHome);
+      }
+    }
 
     try {
-      db.saveMessage(record);
+      await syncGatewayCredentials();
     } catch (err) {
-      logger.error?.('[Plugin] 消息入库失败:', err);
+      logger.warn?.('[Plugin] 对齐 QQ Bot 凭据并连接 Gateway 失败:', err);
     }
+  };
 
-    // 发言黑名单门控：消息正常落库供审计，但阻断一切唤醒、斜杠命令与提问审批（管理员亦不例外）
-    const cfg = currentConfig();
-    const isPrivateBlacklisted =
-      !isGroup &&
-      fromUser &&
-      Array.isArray(cfg.private_blacklist) &&
-      cfg.private_blacklist.some((item: any) => {
-        const targetId = typeof item === 'string' ? item : item?.id;
-        return String(targetId).trim() === fromUser;
-      });
+  let reconcileRunning = false;
+  let hasPendingReconcile = false;
+  let pendingConfig: BridgePluginConfig | undefined;
 
-    const isGroupBlacklisted =
-      isGroup &&
-      event.group_id !== undefined &&
-      Array.isArray(cfg.group_blacklist) &&
-      cfg.group_blacklist.some((item: any) => {
-        const targetId = typeof item === 'string' ? item : item?.id;
-        return String(targetId).trim() === String(event.group_id);
-      });
+  const queueReconcile = async (newVal?: BridgePluginConfig): Promise<void> => {
+    if (newVal) pendingConfig = newVal;
+    hasPendingReconcile = true;
+    if (reconcileRunning) return;
+    reconcileRunning = true;
+    try {
+      while (hasPendingReconcile) {
+        hasPendingReconcile = false;
+        const nextCfg = pendingConfig;
+        pendingConfig = undefined;
+        await reconcile(nextCfg);
+      }
+    } finally {
+      reconcileRunning = false;
+    }
+  };
 
-    if (isPrivateBlacklisted || isGroupBlacklisted) {
-      logger.info?.(
-        `[Plugin] 命中发言黑名单 (peer: ${peer}, user: ${fromUser})，消息已入库但阻断一切唤醒、指令与回复`
-      );
+  const unregisterConfigRoute = registerConfigRoute(ctx, currentConfig, queueReconcile, { dshHome });
+  const unregisterFacesRoutes = registerFacesRoutes({ ctx, db, getConfig: currentConfig, dshHome });
+  const unregisterSlangRoutes = registerSlangRoutes({ ctx, storage: slangService.storage });
+
+  const unregVolatile = (ctx as any).on?.('loader/volatile-update', () => {
+    if (!isDisposed) void queueReconcile();
+  });
+  const unregSettingsDoc = (ctx as any).on?.('settings/document-updated', (ns: string) => {
+    if (!isDisposed && (!ns || ns === SETTINGS_NAMESPACE)) {
+      void queueReconcile();
+    }
+  });
+  const unregCredUpdate = (ctx as any).on?.('credentials/reference-updated', () => {
+    if (!isDisposed) void queueReconcile();
+  });
+
+  // 9. 入站 C2C_MESSAGE_CREATE 全链路：落盘媒体 → 记录槽位/映射 → 存库 → 命令 → 等待 → 提问 → 审批 → 唤醒
+  const handleInboundC2CMessage = async (event: QQC2CMessageCreateEvent): Promise<void> => {
+    if (isDisposed || !event || event.author?.bot === true) return;
+
+    const openid = typeof event.author?.user_openid === 'string' ? event.author.user_openid.trim() : '';
+    if (!isValidOpenid(openid)) {
+      logger.debug?.('[Plugin] 忽略缺少有效 user_openid 的入站事件');
       return;
     }
 
-    // 优先拦截斜杠命令 (如 /mode, /model, /think, /help, /clear)
+    const peer = openidToPeer(openid);
+    const receivedAt = parseIsoTimeMs(event.timestamp);
+    const msgId = typeof event.id === 'string' ? event.id.trim() : '';
+    const refIdx = extractMessageRefIdx(event) ?? null;
+    const refMsgIdx = extractQuotedRefIdx(event) ?? null;
+    const senderName =
+      (typeof event.author?.username === 'string' && event.author.username.trim()) ||
+      sessionManager.getPeerName(peer) ||
+      '';
+
+    // 注册 peer <-> openid 双向映射，并登记最新入站 msg_id 被动回复槽位
+    try {
+      db.upsertPeerOpenid(peer, openid, senderName || undefined);
+    } catch (err) {
+      logger.warn?.('[Plugin] 写入 peer_openid_map 失败:', err);
+    }
+    outboundBridge.registerPeerOpenid(peer, openid);
+
+    if (msgId) {
+      try {
+        db.recordInboundReplySlot(msgId, peer, openid, receivedAt);
+      } catch (err) {
+        logger.warn?.('[Plugin] 登记 inbound_reply_slots 失败:', err);
+      }
+    }
+
+    // 并发下载入站附件（裸 GET 无鉴权头）并识别命中表情库
+    const descriptors = await resolveInboundAttachments(event, peer, mediaManager, logger);
+    for (const desc of descriptors) {
+      if ((desc.kind === 'image' || desc.kind === 'sticker') && desc.local?.path) {
+        const md5 = desc.local.md5 ?? computeFileMd5(desc.local.path) ?? undefined;
+        if (md5) {
+          if (!desc.local.md5) desc.local.md5 = md5;
+          const matchedFace = db.getFaceByMd5(md5);
+          if (matchedFace && matchedFace.enabled && !matchedFace.deleted_at) {
+            desc.face = {
+              id: matchedFace.id,
+              ...(matchedFace.mood ? { mood: matchedFace.mood } : {}),
+              ...(matchedFace.tags && matchedFace.tags.length > 0 ? { tags: matchedFace.tags } : {}),
+            };
+          }
+        }
+      }
+    }
+
+    // message_type=102 合并转发内嵌图片限量裸 GET 落盘 + rkey 凭证彻底脱敏
+    let forwardImages: string[] | undefined;
+    let sanitizeForwardContent: ((raw: string) => string) | undefined;
+    if (event.message_type === QQ_INBOUND_MSG_TYPE_FORWARD && typeof event.content === 'string') {
+      const resolvedFwd = await resolveEmbeddedForwardImages(
+        event.content,
+        peer,
+        mediaManager,
+        10,
+        logger
+      );
+      if (resolvedFwd.localPaths.length > 0) {
+        forwardImages = resolvedFwd.localPaths;
+      }
+      sanitizeForwardContent = (raw: string) =>
+        sanitizeForwardContentUrls(raw, resolvedFwd.replacements);
+    }
+
+    const decision = await shouldWakeup(event, {
+      descriptors,
+      ...(forwardImages ? { forwardImages } : {}),
+      ...(sanitizeForwardContent ? { sanitizeForwardContent } : {}),
+      botName: gateway.getStatus().botName,
+      senderRemark: sessionManager.getPeerName(peer),
+      getMessageByRefIdx: (idx) => toQuotedRecord(db.getMessageByRefIdx(idx)),
+      getFaceByMd5: (md5) => db.getFaceByMd5(md5),
+    });
+
+    if (!decision.wakeup || !decision.payload) {
+      logger.debug?.(`[Plugin] 忽略空入站事件 (peer: ${peer}, msg_id: ${msgId || '?'})`);
+      return;
+    }
+
+    const content = decision.payload.content;
+    const description = describeInboundAttachments(event, descriptors);
+    const mediaFields = toMessageMediaFields(description);
+
+    if (msgId) {
+      try {
+        db.saveMessage({
+          msg_id: msgId,
+          peer,
+          user_id: openid,
+          sender_name: senderName,
+          time: receivedAt,
+          type: mediaFields.type,
+          content,
+          raw: JSON.stringify(event),
+          file_id: mediaFields.file_id,
+          local_path: mediaFields.local_path,
+          fingerprint: mediaFields.fingerprint,
+          recalled: 0,
+          self: 0,
+          reply_to: refMsgIdx,
+          ref_idx: refIdx,
+          source: 'qq',
+          attachments: serializeAttachments(description.attachments),
+        });
+      } catch (err) {
+        logger.error?.('[Plugin] 入站消息落库失败:', err);
+      }
+    }
+
+    // 拦截 1：斜杠命令
     if (isSlashCommand(content)) {
       try {
         const agent = await sessionManager.getOrCreateAgent(peer);
-        const session = agent.session;
         const result = await handleSlashCommand(content, {
-          userId: fromUser,
-          admins: currentConfig().admins || [],
-          session,
+          userId: openid,
+          session: (agent as any).session,
           agent,
           ctx,
           sessionManager,
         });
         const replyText = result.reply || result.error;
         if (replyText) {
-          if (isGroup && event.group_id) {
-            await server.sendGroupMsg(event.group_id, replyText).catch((err) => {
-              logger.error?.('[Plugin] 下发斜杠命令响应异常:', err);
-            });
-          } else if (event.user_id) {
-            await server.sendPrivateMsg(event.user_id, replyText).catch((err) => {
-              logger.error?.('[Plugin] 下发斜杠命令响应异常:', err);
-            });
-          }
+          await outboundBridge.sendTextReply(peer, replyText, {
+            openid,
+            ...(msgId ? { msgId } : {}),
+          });
         }
         if (typeof result.followUp === 'function') {
-          // 异步等待 followUp 完成，不阻塞当前消息循环，完成后向对应会话追加发送
-          (async () => {
+          void (async () => {
             try {
               const followUpText = await result.followUp!();
               if (followUpText) {
-                if (isGroup && event.group_id) {
-                  await server.sendGroupMsg(event.group_id, followUpText).catch((err) => {
-                    logger.error?.('[Plugin] 下发斜杠命令 followUp 响应异常:', err);
-                  });
-                } else if (event.user_id) {
-                  await server.sendPrivateMsg(event.user_id, followUpText).catch((err) => {
-                    logger.error?.('[Plugin] 下发斜杠命令 followUp 响应异常:', err);
-                  });
-                }
+                await outboundBridge.sendTextReply(peer, followUpText, {
+                  openid,
+                  ...(msgId ? { msgId } : {}),
+                });
               }
             } catch (followErr) {
               logger.error?.('[Plugin] 执行斜杠命令 followUp 异常:', followErr);
@@ -966,665 +700,111 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
         }
       } catch (cmdErr: any) {
         logger.error?.('[Plugin] 执行斜杠命令异常:', cmdErr);
-        const errMsg = `执行指令失败：${cmdErr?.message || String(cmdErr)}`;
-        if (isGroup && event.group_id) {
-          server.sendGroupMsg(event.group_id, errMsg).catch(() => {});
-        } else if (event.user_id) {
-          server.sendPrivateMsg(event.user_id, errMsg).catch(() => {});
-        }
+        await outboundBridge
+          .sendTextReply(peer, `执行指令失败：${cmdErr?.message || String(cmdErr)}`, {
+            openid,
+            ...(msgId ? { msgId } : {}),
+          })
+          .catch(() => {});
       }
       return;
     }
 
-    // 统一引用消息解析 Helper (供等待门控与唤醒门控共用)
-    const getQuotedMessageHelper = async (repId: number): Promise<{
-      user_id: string;
-      sender_name: string;
-      content: string;
-      self: number;
-      images?: string[];
-    } | null> => {
-      // 1. 本地 SQLite 优先查询（耗时 < 1ms，0 网络/API 开销）
-      const cached = db.getMessage(repId);
-      if (cached) {
-        let quotedContent = cached.content;
-        const images: string[] = [];
-
-        // 若本地记录存有原始 raw，使用最新解析器动态重新解析（兼顾历史老数据升级与格式对齐）
-        if (cached.raw) {
-          try {
-            const rawSegments = JSON.parse(cached.raw);
-            if (Array.isArray(rawSegments)) {
-              const reParsed = parseNormalizedContent({
-                message: rawSegments,
-                raw_message: '',
-              } as any, {
-                getFaceByMd5: (hash) => db.getFaceByMd5(hash),
-              });
-              if (reParsed.content) {
-                quotedContent = reParsed.content;
-              }
-              if (reParsed.images && Array.isArray(reParsed.images)) {
-                for (const img of reParsed.images) {
-                  if (img && !images.includes(img)) images.push(img);
-                }
-              }
-            }
-          } catch {}
-        }
-
-        if (cached.local_path && !images.includes(cached.local_path)) {
-          images.push(cached.local_path);
-        }
-
-        return {
-          user_id: cached.user_id,
-          sender_name: cached.sender_name,
-          content: quotedContent,
-          self: cached.self,
-          images: images.length > 0 ? images : undefined,
-        };
-      }
-
-      // 2. 本地未命中，调用 NapCat get_msg API 二级兜底拉取
-      try {
-        const res = await server.getMsg(repId);
-        if (res && res.status === 'ok' && res.data) {
-          const remoteMsg = res.data;
-          const { content: quotedContent, images: quotedImages } = parseNormalizedContent(remoteMsg, {
-            getFaceByMd5: (hash) => db.getFaceByMd5(hash),
-          });
-          const quotedUserId = String(remoteMsg.sender?.user_id ?? remoteMsg.user_id ?? '');
-          let quotedName = remoteMsg.sender?.card || remoteMsg.sender?.nickname || '';
-          if (!quotedName && isGroup && event.group_id && quotedUserId) {
-            try {
-              quotedName = (await memberResolver.resolve(event.group_id, quotedUserId)) || '';
-            } catch {}
-          }
-          const quotedSelf = botQQ !== '' && quotedUserId === botQQ ? 1 : 0;
-
-          // 自动回填本地 SQLite 补齐记录
-          try {
-            db.saveMessage({
-              msg_id: repId,
-              peer,
-              user_id: quotedUserId,
-              sender_name: quotedName,
-              time: remoteMsg.time
-                ? remoteMsg.time < 10000000000
-                  ? remoteMsg.time * 1000
-                  : remoteMsg.time
-                : Date.now(),
-              type: 'text',
-              content: quotedContent,
-              raw: JSON.stringify(remoteMsg.message || remoteMsg.raw_message),
-              file_id: null,
-              busid: null,
-              local_path: quotedImages[0] || null,
-              fingerprint: null,
-              recalled: 0,
-              self: quotedSelf,
-              reply_to: null,
-            });
-          } catch {}
-
-          return {
-            user_id: quotedUserId,
-            sender_name: quotedName,
-            content: quotedContent,
-            self: quotedSelf,
-            images: quotedImages.length > 0 ? quotedImages : undefined,
-          };
-        }
-      } catch (apiErr) {
-        logger.debug?.(`[Plugin] 从 NapCat 拉取引用消息 (msg_id: ${repId}) 失败:`, apiErr);
-      }
-
-      // 3. 两级均查不到时返回 null（触发 shouldWakeup 优雅降级保底）
-      return null;
+    const inboundContext = {
+      ...(msgId ? { msg_id: msgId } : {}),
+      ...(refIdx ? { ref_idx: refIdx } : {}),
+      openid,
+      from_user: openid,
+      trigger: decision.trigger,
     };
 
-    // EN-005: 等待门控——等待期间该 peer 新消息「仅落库 + (命中则)进收集器」，
-    //         其余环节（提问/审批/主动回复/唤醒）全部跳过，杜绝 collect + followup 双重投递。
-    //         斜杠命令已在上方拦截（程序层，用户拍板除外项）；自身消息回显只抑制不收集。
+    // 拦截 2：wait_for_user_messages 单轮等待收集门控
     if (waitRegistry.isWaiting(peer)) {
-      if (!isSelf) {
-        let quotedInfo: WaitCollectedMessage['quoted'] = undefined;
-        if (replyId !== undefined) {
-          try {
-            const qMsg = await getQuotedMessageHelper(replyId);
-            if (qMsg) {
-              const isQuotingSelf = Boolean(
-                qMsg.self === 1 ||
-                (botQQ !== '' && String(qMsg.user_id) === botQQ)
-              );
-              quotedInfo = {
-                msg_id: replyId,
-                user_id: String(qMsg.user_id || ''),
-                from_name: qMsg.sender_name || (isQuotingSelf ? ((currentConfig() as any).bot_nickname || (currentConfig().aliases?.[0] ?? '')) : ''),
-                text: qMsg.content || '',
-                images: qMsg.images && qMsg.images.length > 0 ? qMsg.images : undefined,
-              };
-            } else {
-              quotedInfo = {
-                msg_id: replyId,
-                user_id: '',
-                from_name: '',
-                text: '〔历史引用消息：内容已过期或无法获取〕',
-              };
-            }
-          } catch {
-            quotedInfo = {
-              msg_id: replyId,
-              user_id: '',
-              from_name: '',
-              text: '〔历史引用消息：内容已过期或无法获取〕',
-            };
-          }
-        }
-
-        const consumedMsgId = Number(event.message_id);
-        const deliveredMsg: WaitCollectedMessage = {
-          from: senderName,
-          user_id: fromUser,
-          content,
-          time: timestamp,
-          ...(Number.isFinite(consumedMsgId) ? { msg_id: consumedMsgId } : {}),
-          ...(replyId !== undefined ? { reply_to: replyId } : {}),
-          ...(quotedInfo ? { quoted: quotedInfo } : {}),
-        };
-
-        if (waitRegistry.tryDeliver(peer, deliveredMsg)) {
-          // 刷新出方向回复锚点（@提问者/引用原消息锚定最后一条被收集消息）
-          if (consumedMsgId) {
-            const waitCtx = {
-              msg_id: consumedMsgId,
-              from_user: fromUser,
-              is_group: isGroup,
-            };
-            outboundBridge.trackInboundContext(peer, waitCtx);
-            outboundBridge.updateActiveTurnContext(peer, waitCtx);
-          }
-        }
+      const deliveredMsg: WaitCollectedMessage = {
+        ...(msgId ? { msg_id: msgId } : {}),
+        ...(refIdx ? { ref_idx: refIdx } : {}),
+        from: senderName,
+        user_id: openid,
+        content,
+        time: receivedAt,
+        ...(refMsgIdx ? { reply_to: refMsgIdx } : {}),
+        ...(decision.payload.quoted ? { quoted: decision.payload.quoted } : {}),
+      };
+      if (waitRegistry.tryDeliver(peer, deliveredMsg) && msgId) {
+        outboundBridge.trackInboundContext(peer, inboundContext);
+        outboundBridge.updateActiveTurnContext(peer, inboundContext);
       }
-      logger.debug?.(`[Plugin] 等待收集期间抑制入站消息流转 (peer: ${peer})`);
       return;
     }
 
-    // 提问回复拦截（用户拍板顺序：存库 → 斜杠命令 → 提问 → 审批 → 唤醒）
-    // 群聊引用锚定：仅「引用当前提问卡片那条消息」的回复命中；未命中按普通消息继续流转
+    // 拦截 3：交互式提问回复
     try {
-      const questionConsumed = questionProvider.handleInboundReply(peer, content, {
-        replyId: replyId ?? undefined,
-      });
-      if (questionConsumed) {
-        logger.info?.(`[Plugin] 提问回复已处理 (peer: ${peer}, reply: ${content})`);
+      if (questionProvider.handleInboundReply(peer, content)) {
+        logger.info?.(`[Plugin] 提问回复已消费 (peer: ${peer})`);
         return;
       }
-    } catch (questionErr) {
-      // 拦截异常不应殃及正常消息流：记日志后继续（不吞消息、不误答）
-      logger.warn?.('[Plugin] 提问回复拦截异常 (忽略继续流转):', questionErr);
+    } catch (qErr) {
+      logger.warn?.('[Plugin] 提问回复拦截异常 (忽略继续流转):', qErr);
     }
 
-    // 审批回复拦截 (y/n) —— 提问回复不再在此拦截（提问拦截已前置并独立处理）
-    if (
-      approvalResponder.handleInboundReply(peer, content, {
-        userId: event.user_id,
-        replyId: (event as any).reply?.id,
-      })
-    ) {
-      logger.info?.(`[Plugin] 审批决策已处理 (peer: ${peer}, reply: ${content})`);
+    // 拦截 4：工具审批决策回复 (y/n)
+    if (approvalResponder.handleInboundReply(peer, content)) {
+      logger.info?.(`[Plugin] 审批决策已消费 (peer: ${peer})`);
       return;
     }
 
-    // 记录人类发言时间 (非自身群聊消息)
-    if (isGroup && !isSelf) {
-      proactiveManager.recordHumanMessage(peer, timestamp);
+    // 拦截 5：正常唤醒 Agent（先更新入站上下文与输入中状态，再入队唤醒）
+    outboundBridge.trackInboundContext(peer, inboundContext);
+    if (msgId) {
+      void outboundBridge.sendInputNotifyIfEnabled(peer, { openid, msgId }).catch(() => {});
     }
 
-    // 唤醒门控判定
     try {
-      const decision = await shouldWakeup(event, {
-        bot_qq: botQQ,
-        bot_nickname: (currentConfig() as any).bot_nickname || (currentConfig().aliases?.[0] ?? undefined),
-        aliases: currentConfig().aliases,
-        proactive: currentConfig(),
-        proactiveManager,
-        friendTracker: friendNoticeTracker,
-        getFaceByMd5: (hash) => db.getFaceByMd5(hash),
-        // EN-001: 被@者昵称解析（有 TTL 缓存，不重复 API 调用）
-        resolveNickname: (gid, qq) => memberResolver.resolve(gid, qq),
-        getQuotedMessage: getQuotedMessageHelper,
-        isQuotingBot: async (repId: number) => {
-          const quotedMsg = db.getMessage(repId);
-          return quotedMsg?.self === 1 || (botQQ !== '' && quotedMsg?.user_id === botQQ);
+      await sessionManager.dispatchWakeup(decision.payload, {
+        onMessageCreated: (userMsg) => {
+          if (userMsg?.id) {
+            outboundBridge.trackPendingMessage(userMsg.id, peer, inboundContext);
+          }
         },
       });
-
-      if (decision.wakeup && decision.payload) {
-        logger.info?.(`[Plugin] 触发唤醒 (trigger: ${decision.trigger}, peer: ${decision.payload.peer})`);
-
-        if (decision.trigger === 'proactive') {
-          proactiveManager.recordProactiveReply(decision.payload.peer, timestamp);
-        } else if (isGroup) {
-          // 即时被动唤醒：获取前序未回复消息快照拼入 payload，为 Agent 提供短程群聊上下文
-          const unrepliedBefore = proactiveManager.getUnrepliedMessages(decision.payload.peer);
-          if (unrepliedBefore.length > 0 && !decision.payload.buffered_messages) {
-            decision.payload.buffered_messages = unrepliedBefore;
-          }
-
-          // 即时直接唤醒：重置群主动回复观测计时，并将直接唤醒消息记录至滑动窗口 (replied: true)，
-          // 同时将滑动窗口中此前所有未回复消息全部原子标记为 replied: true（已读消费，防止幽灵重复打扰）
-          proactiveManager.recordDirectWakeup(
-            decision.payload.peer,
-            timestamp,
-            {
-              from_user: String(event.user_id),
-              from_name: event.sender?.card || event.sender?.nickname || '',
-              content: content || (event.raw_message ?? ''),
-              msg_id: Number(event.message_id) || undefined,
-            },
-            currentConfig()
-          );
-        }
-
-        // A1: 记录唤醒源消息上下文 (msg_id + 提问者 QQ)，供入站唤醒与上下文跟踪 (Spec §7.1 决策 A)
-        // 审批申请人由 turnInitiatorTracker 在 dispatchWakeup 登记、按 session/event 严格绑定本轮，
-        // 此处不再维护 peer 维度的「最近唤醒者」锚点。
-        const payloadPeer = decision.payload.peer;
-        const msgIdFromEvent = Number(event.message_id);
-        if (msgIdFromEvent) {
-          (decision.payload as any).msg_id = msgIdFromEvent;
-        }
-        const replyContext = (payloadPeer && msgIdFromEvent)
-          ? {
-              msg_id: msgIdFromEvent,
-              from_user: decision.payload.from_user,
-              is_group: isGroup,
-            }
-          : undefined;
-
-        if (payloadPeer && replyContext) {
-          outboundBridge.trackInboundContext(payloadPeer, replyContext);
-        }
-
-        // 若为群聊且当前群名称未缓存，尝试异步获取群信息以更新会话标题
-        if (isGroup && event.group_id && !sessionManager.getPeerName(payloadPeer)) {
-          server.getGroupInfo(event.group_id).then((infoRes: any) => {
-            const groupName = infoRes?.data?.group_name || infoRes?.group_name;
-            if (groupName) {
-              sessionManager.setPeerName(payloadPeer, groupName);
-              const agent = sessionManager.getAgent(payloadPeer);
-              if (agent) {
-                const sessionId = sessionManager.peerToSessionId(payloadPeer);
-                sessionManager.updateSessionTitle((agent as any).session, payloadPeer, sessionId, groupName);
-              }
-            }
-          }).catch(() => {});
-        }
-
-        await sessionManager.dispatchWakeup(decision.payload, {
-          onMessageCreated: (userMsg) => {
-            if (payloadPeer && replyContext && userMsg?.id) {
-              outboundBridge.trackPendingMessage(userMsg.id, payloadPeer, replyContext);
-            }
-          },
-        });
-      } else {
-        // 未触发即时唤醒：若为群聊普通消息且开启主动回复，将消息存入主动回复待读池
-        if (isGroup && !isSelf) {
-          proactiveManager.recordGroupMessage(
-            peer,
-            {
-              timestamp,
-              from_user: String(event.user_id),
-              from_name: event.sender?.card || event.sender?.nickname || '',
-              content: content || (event.raw_message ?? ''),
-              msg_id: Number(event.message_id) || undefined,
-              isTextOnly: !isExcludedFromProactive(event, true),
-            },
-            currentConfig()
-          );
-        }
-      }
     } catch (err) {
-      logger.error?.('[Plugin] 唤醒判定或下发异常:', err);
+      logger.error?.('[Plugin] 唤醒下发异常:', err);
     }
-  });
+  };
 
-  // 7.1 监听 Request 事件 (加好友申请等)
-  server.onRequest(async (event) => {
-    if (event.request_type === 'friend') {
-      logger.info?.(`[Plugin] 收到好友申请 (from: ${event.user_id}, comment: "${event.comment || ''}")`);
-      friendNoticeTracker.recordRequest(event.user_id, event.comment || '', event.time, event.flag);
-    }
-  });
+  const unregC2CMessage = gateway.onC2CMessage((event) => handleInboundC2CMessage(event));
 
-  // 8. 监听 Notice 事件 (撤回、戳一戳、群文件上传、好友增加等)
-  server.onNotice(async (event) => {
-    // 好友添加成功通知
-    if (event.notice_type === 'friend_add') {
-      const fromUser = String(event.user_id || '');
-      logger.info?.(`[Plugin] 收到好友添加成功通知 (user: ${fromUser})`);
-      friendNoticeTracker.recordFriendAdd(fromUser, event.time);
-      return;
-    }
-    // 撤回处理
-    if (event.notice_type === 'group_recall' || event.notice_type === 'friend_recall') {
-      if (event.message_id) {
-        db.markRecalled(Number(event.message_id));
-        logger.info?.(`[Plugin] 标记消息已撤回 (msg_id: ${event.message_id})`);
-      }
-      return;
-    }
-
-    // 群消息贴表情事件处理 (group_msg_emoji_like: 纯后台审计落库，绝不唤醒 Agent)
-    if (event.notice_type === 'group_msg_emoji_like') {
-      // 1. 解析目标消息 ID 与群号
-      const targetMsgId = Number(event.message_id);
-      const groupId = event.group_id;
-      if (!groupId || !targetMsgId) return;
-
-      const peer = `group_${groupId}`;
-      const fromUser = String(event.user_id ?? event.operator_id ?? '');
-      const timestamp = event.time
-        ? event.time < 10000000000
-          ? event.time * 1000
-          : event.time
-        : Date.now();
-
-      // 2. 合成稳定正数 msg_id (利用已有的 stableNoticeMsgId 函数)
-      const syntheticMsgId = stableNoticeMsgId(`emoji_like:${groupId}:${targetMsgId}:${timestamp}`);
-
-      // 3. 汇总 likes 列表为易读 content
-      const likesArr = Array.isArray(event.likes) ? event.likes : [];
-      const likesSummary = likesArr.map((l: any) => {
-        const eid = String(l.emoji_id ?? l.id ?? '');
-        // 从 EMOJI_MAP 找匹配的中文名
-        const found = Object.values(EMOJI_MAP).find(e => e.id === eid);
-        const name = found ? `${found.name}(${eid})` : eid;
-        return `${name}x${l.count ?? 1}`;
-      }).join(', ');
-      const content = `[表情回应: ${likesSummary || '无'}]`;
-
-      // 4. 落库保存至 messages 表
-      try {
-        db.saveMessage({
-          msg_id: syntheticMsgId,
-          peer,
-          user_id: fromUser,
-          sender_name: '',
-          time: timestamp,
-          type: 'emoji_like',
-          content,
-          raw: JSON.stringify(event),
-          file_id: null,
-          busid: null,
-          local_path: null,
-          fingerprint: null,
-          recalled: 0,
-          self: 0,
-          reply_to: targetMsgId, // 记录被贴表情的目标消息 ID
-        });
-        logger.info?.(`[Plugin] 群消息贴表情事件已入库 (group: ${groupId}, target_msg: ${targetMsgId}, likes: ${likesSummary})`);
-      } catch (saveErr) {
-        logger.error?.('[Plugin] 群消息贴表情事件入库失败:', saveErr);
-      }
-
-      // 直接 return，绝不流转到唤醒逻辑
-      return;
-    }
-
-    // 群文件上传通知处理
-    if (event.notice_type === 'group_upload') {
-      const file = event.file;
-      if (file && event.group_id) {
-        const peer = `group_${event.group_id}`;
-        const fromUser = String(event.user_id || '');
-        const timestamp = event.time
-          ? event.time < 10000000000
-            ? event.time * 1000
-            : event.time
-          : Date.now();
-        let senderName = '';
-        if (event.group_id && fromUser) {
-          try {
-            senderName = (await memberResolver.resolve(event.group_id, fromUser)) || '';
-          } catch {}
-        }
-        const fakeMsgId = Number(event.message_id) || stableNoticeMsgId(`group_upload:${event.group_id}:${file.id}:${timestamp}`);
-
-        try {
-          db.saveMessage({
-            msg_id: fakeMsgId,
-            peer,
-            user_id: fromUser,
-            sender_name: senderName,
-            time: timestamp,
-            type: 'group_file',
-            content: `[群文件:${file.name || '未知文件'} (ID:${file.id})]`,
-            raw: JSON.stringify(event),
-            file_id: file.id,
-            busid: file.busid ?? null,
-            local_path: null,
-            fingerprint: null,
-            recalled: 0,
-            self: 0,
-            reply_to: null,
-          });
-          logger.info?.(`[Plugin] 群文件上传事件已入库 (group: ${event.group_id}, file: ${file.name})`);
-        } catch (saveErr) {
-          logger.error?.('[Plugin] 群文件上传事件入库失败:', saveErr);
-        }
-      }
-      return;
-    }
-
-    // 戳一戳入库与唤醒处理
-    if (event.notice_type === 'notify' && event.sub_type === 'poke') {
-      const botQQ = currentConfig().bot_qq || '';
-      const fromUser = String(event.user_id ?? event.sender_id ?? event.operator_id ?? '');
-      const isGroup = Boolean(event.group_id);
-      const peer = isGroup ? `group_${event.group_id}` : `user_${fromUser}`;
-      const isSelf = botQQ !== '' && fromUser === botQQ ? 1 : 0;
-      const timestamp = event.time
-        ? event.time < 10000000000
-          ? event.time * 1000
-          : event.time
-        : Date.now();
-
-      let senderName = '';
-      if (isGroup && event.group_id) {
-        try {
-          senderName = (await memberResolver.resolve(event.group_id, fromUser)) || '';
-        } catch {}
-      }
-
-      try {
-        db.saveMessage({
-          msg_id: Number(event.message_id) || stableNoticeMsgId(`poke:${peer}:${fromUser}:${timestamp}`),
-          peer,
-          user_id: fromUser,
-          sender_name: senderName,
-          time: timestamp,
-          type: 'poke',
-          content: '[戳一戳]',
-          raw: JSON.stringify(event),
-          file_id: null,
-          busid: null,
-          local_path: null,
-          fingerprint: null,
-          recalled: 0,
-          self: isSelf,
-          reply_to: null,
-        });
-      } catch (saveErr) {
-        logger.error?.('[Plugin] 戳一戳消息入库失败:', saveErr);
-      }
-
-      // EN-005: 等待收集期间，戳一戳仅入库不唤醒（不触发新回合，保持等待回合独占）
-      if (waitRegistry.isWaiting(peer)) {
-        logger.debug?.(`[Plugin] 等待收集期间忽略戳一戳唤醒 (peer: ${peer})`);
-        return;
-      }
-
-      try {
-        const decision = await shouldWakeup(event, {
-          bot_qq: botQQ,
-          bot_nickname: (currentConfig() as any).bot_nickname || (currentConfig().aliases?.[0] ?? undefined),
-          aliases: currentConfig().aliases,
-          resolveNickname: (gid, qq) => memberResolver.resolve(gid, qq),
-        });
-
-        if (decision.wakeup && decision.payload) {
-          const payloadPeer = decision.payload.peer;
-          logger.info?.(`[Plugin] 戳一戳触发唤醒 (peer: ${payloadPeer})`);
-          if (isGroup) {
-            // 即时被动唤醒：获取前序未回复消息快照拼入 payload，为 Agent 提供短程群聊上下文
-            const unrepliedBefore = proactiveManager.getUnrepliedMessages(payloadPeer);
-            if (unrepliedBefore.length > 0 && !decision.payload.buffered_messages) {
-              decision.payload.buffered_messages = unrepliedBefore;
-            }
-
-            // 即时直接唤醒：重置群主动回复观测计时，并将直接唤醒消息记录至滑动窗口 (replied: true)，
-            // 同时将滑动窗口中此前所有未回复消息全部原子标记为 replied: true（已读消费，防止幽灵重复打扰）
-            proactiveManager.recordDirectWakeup(
-              payloadPeer,
-              timestamp,
-              {
-                from_user: decision.payload.from_user,
-                from_name: decision.payload.from_name || '',
-                content: '[戳一戳]',
-                msg_id: undefined,
-              },
-              currentConfig()
-            );
-          }
-
-          const replyContext = payloadPeer
-            ? {
-                msg_id: undefined as any,
-                from_user: decision.payload.from_user,
-                is_group: isGroup,
-                trigger: 'poke',
-              }
-            : undefined;
-
-          if (payloadPeer && replyContext) {
-            outboundBridge.trackInboundContext(payloadPeer, replyContext);
-          }
-
-          // 若为群聊且当前群名称未缓存，尝试异步获取群信息以更新会话标题
-          if (isGroup && event.group_id && !sessionManager.getPeerName(payloadPeer)) {
-            server.getGroupInfo(event.group_id).then((infoRes: any) => {
-              const groupName = infoRes?.data?.group_name || infoRes?.group_name;
-              if (groupName) {
-                sessionManager.setPeerName(payloadPeer, groupName);
-                const agent = sessionManager.getAgent(payloadPeer);
-                if (agent) {
-                  const sessionId = sessionManager.peerToSessionId(payloadPeer);
-                  sessionManager.updateSessionTitle((agent as any).session, payloadPeer, sessionId, groupName);
-                }
-              }
-            }).catch(() => {});
-          }
-
-          await sessionManager.dispatchWakeup(decision.payload, {
-            onMessageCreated: (userMsg) => {
-              if (payloadPeer && replyContext && userMsg?.id) {
-                outboundBridge.trackPendingMessage(userMsg.id, payloadPeer, replyContext);
-              }
-            },
-          });
-        }
-      } catch (err) {
-        logger.error?.('[Plugin] 通知事件处理异常:', err);
-      }
-    }
-  });
-
-  // 8. 离线历史消息同步与去重引擎 (OfflineMessageSyncer)
-  const offlineSyncer = new OfflineMessageSyncer({
-    gateway: server,
-    db,
-    botQQ: currentConfig().bot_qq,
-    logger,
-  });
-
-  server.onConnect(() => {
-    // 延迟 500ms 等待 NapCat 内部完成状态就绪后执行离线增量同步
-    setTimeout(() => {
-      offlineSyncer.sync().catch((err) => {
-        logger.error?.('[Plugin] 离线消息增量同步异常:', err);
-      });
-    }, 500);
-  });
-
-  // 9. 生命周期接线
-  const startServer = async () => {
+  // 10. 启动生命周期对齐
+  const startPlugin = async () => {
     logger.info?.(`${PLUGIN_NAME} 插件已加载并就绪`);
     try {
-      await server.start();
+      const initialCreds = await resolveCredentials(ctx, { dshHome });
+      if (!initialCreds.credential?.appId?.trim() || !initialCreds.credential?.appSecret?.trim()) {
+        logger.warn?.(
+          '[Plugin] 未配置 QQ Bot 凭据 (QQ_BOT_APP_ID / QQ_BOT_SECRET)，Gateway 暂处于待机状态；请在 WebUI 设置卡片或凭据文件中配置后自动连接'
+        );
+      }
+      await syncGatewayCredentials();
     } catch (err) {
-      logger.warn?.('[Plugin] GatewayServer 启动告警 (可能端口被占用或测试环境):', err);
+      logger.warn?.('[Plugin] 启动时连接 QQ Gateway 告警:', err);
     }
-
-    if (server.isConnected) {
-      offlineSyncer.sync().catch((err) => {
-        logger.error?.('[Plugin] 离线消息增量同步异常:', err);
-      });
-    }
-
-    // 启动群聊主动回复与潜水超时集中巡检定时器
-    proactiveManager.startChecker(() => ({
-      config: currentConfig(),
-      isSessionBusy: (peer) => sessionManager.isBusy(peer),
-      systemEventHub,
-      dispatchWakeup: async (payload) => {
-        logger.info?.(`[Plugin] 主动回复触发唤醒 (trigger: ${payload.trigger}, sub_trigger: ${payload.sub_trigger}, peer: ${payload.peer})`);
-        const isGroup = payload.peer.startsWith('group_') || payload.peer.startsWith('qq-group-');
-        const blankContext = {
-          msg_id: undefined as any,
-          from_user: '',
-          is_group: isGroup,
-          trigger: payload.sub_trigger || 'idle',
-          is_synthetic: true,
-        };
-        outboundBridge.trackInboundContext(payload.peer, blankContext);
-        await sessionManager.dispatchWakeup(payload, {
-          onMessageCreated: (userMsg) => {
-            if (userMsg?.id) {
-              outboundBridge.trackPendingMessage(userMsg.id, payload.peer, blankContext);
-            }
-          },
-        });
-      },
-      knownPeers: () => {
-        try {
-          return db.getAllSessionStates().map((s) => s.peer);
-        } catch {
-          return [];
-        }
-      },
-    }), (currentConfig().proactive_interval_mins ?? 3) * 60 * 1000);
   };
 
   const appReady = typeof (ctx as any).get === 'function' ? (ctx as any).get('appReady') : undefined;
+  const bootTask = () => {
+    try {
+      healProfileConfigFile(dshHome, undefined, logger);
+    } catch {}
+    void startPlugin().catch(() => {});
+  };
   if (appReady && typeof appReady.onReady === 'function') {
-    appReady.onReady(() => {
-      try { healProfileConfigFile(dshHome, undefined, logger); } catch {} 
-      void migrateLegacyConfig(ctx, currentConfig());
-      void startServer().catch(() => {});
-    });
+    appReady.onReady(bootTask);
   } else {
-    // 独立环境 / 测试环境 / 未注入 appReady 的场景兜底直接触发
-    try { healProfileConfigFile(dshHome, undefined, logger); } catch {} 
-      void migrateLegacyConfig(ctx, currentConfig());
-    void startServer().catch(() => {});
+    bootTask();
   }
 
   const onProcessExit = () => {
-    server.stop().catch(() => {});
+    gateway.stop();
   };
   process.once('SIGINT', onProcessExit);
   process.once('SIGTERM', onProcessExit);
@@ -1633,58 +813,54 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   const disposePlugin = async () => {
     if (isDisposed) return;
     isDisposed = true;
-    try {
-      unregisterConfigRoute();
-      if (typeof unregisterFacesRoutes === 'function') unregisterFacesRoutes();
-      if (typeof unregisterSlangRoutes === 'function') unregisterSlangRoutes();
-    } catch {
-      // ignore
-    }
     logger.info?.(`${PLUGIN_NAME} 插件正在卸载`);
+
     process.removeListener('SIGINT', onProcessExit);
     process.removeListener('SIGTERM', onProcessExit);
     process.removeListener('beforeExit', onProcessExit);
+
+    const safeCall = (fn: unknown) => {
+      if (typeof fn === 'function') {
+        try {
+          fn();
+        } catch {}
+      }
+    };
+
+    safeCall(unregisterConfigRoute);
+    safeCall(unregisterFacesRoutes);
+    safeCall(unregisterSlangRoutes);
+    safeCall(unregVolatile);
+    safeCall(unregSettingsDoc);
+    safeCall(unregCredUpdate);
+    safeCall(unregC2CMessage);
+    safeCall(unregisterApproval);
+    safeCall(unregisterQuestionChannel);
+    safeCall(unregisterTurnInitiator);
+
     stopCleanupTask();
-    unregisterTools();
     waitRegistry.clear();
     memoryService.dispose();
-    slangService?.dispose?.();
-    proactiveManager.dispose();
+    slangService.dispose();
     taskScheduler.dispose();
-    if (typeof stopOutboundBridge === 'function') {
-      stopOutboundBridge();
-    }
+    safeCall(stopOutboundBridge);
     try {
       outboundBridge.dispose();
       sessionManager.setOutboundBridge?.(null as any);
     } catch {}
-    if (typeof unregisterApproval === 'function') {
-      unregisterApproval();
-    }
-    if (typeof unregisterQuestionChannel === 'function') {
-      unregisterQuestionChannel();
-    }
-    if (typeof unregisterTurnInitiator === 'function') {
-      unregisterTurnInitiator();
-    }
     turnInitiatorTracker.clear();
     if (snapshotManager) {
       snapshotManager.dispose();
       snapshotManager = null;
     }
-    await server.stop().catch(() => {});
+
+    gateway.stop();
     await sessionManager.dispose().catch(() => {});
     db.close();
   };
 
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => {
-      return disposePlugin();
-    });
+  if (typeof (ctx as any).effect === 'function') {
+    (ctx as any).effect(() => () => disposePlugin());
   }
-
-  (ctx as any).on?.('dispose', () => {
-    return disposePlugin();
-  });
+  (ctx as any).on?.('dispose', () => disposePlugin());
 }
-
