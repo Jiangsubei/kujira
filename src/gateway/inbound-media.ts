@@ -1,24 +1,35 @@
 /**
- * kujira: 入站媒体裸 GET 下载、安全文件名净化与合并转发内嵌图片脱敏落盘
+ * kujira: 入站媒体裸 GET 下载、安全文件名净化与合并转发全量媒体落盘排版
  *
  * 严格依据 QQ 官方 Bot API v2 实测行为：
- * 1. 入站 `event.attachments[]` 所有下载链接均自带访问凭证 query，直接裸 GET 即可（无需 Authorization 头）；
- * 2. 所有错误、描述符 `unavailable` 与日志输出严禁携带带 query / `rkey` 凭证的完整 URL；
- * 3. 语音附件严格以 `content_type === 'voice'` 为准（忽略响应头错报 `audio/mp3`），
+ * 1. 入站 `event.attachments[]` 所有下载链接均自带访问凭证 query，直接裸 GET 即可（无需 Authorization 头），不设体积上限；
+ * 2. 内部服务器日志 (`logger?.warn`) 与 `unavailable` 短错误字段严禁携带带 query / `rkey` 凭证的完整 URL；
+ * 3. 选项 A：面向 Agent 展示未落盘或下载失败附件时保留真实直链 URL；已落盘附件仅展示本地 OS 路径；
+ * 4. 语音附件严格以 `content_type === 'voice'` 为准（忽略响应头错报 `audio/mp3`），
  *    优先拉取 `voice_wav_url`（`type: 'voice'`, `ext: 'wav'`），缺失/失败再回退 `url`，始终保留 `asr_refer_text`；
- * 4. 外部传入的 `filename` 一律先做 `path.basename` 与危险字符净化后再传入存储层；
- * 5. `message_type=102` 合并转发内嵌 `[附件...] ... URL:https://...` 限量裸 GET 落盘，并从正文彻底剥离/替换含 `rkey` 明文 URL。
+ * 5. 外部传入的 `filename` 一律先做 `path.basename` 与危险字符净化后再传入存储层；
+ * 6. `message_type=102` 合并转发全量提取 `[附件...] ... URL:https://...`（图片/表情/视频/语音/文件）裸 GET 落盘，
+ *    提取视频分辨率/大小/时长并重排为精简编号列表，剥离 `<faceType=...>` 壳并匹配本地表情库。
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
-import type { AttachmentDescriptor } from '../attachment/types.js';
+import type { FaceRecord, QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
+import type { AttachmentDescriptor, AttachmentFaceMeta } from '../attachment/types.js';
 import {
   describeAttachment,
+  extractFaceXmlTexts,
+  isImageFileExt,
   sanitizeAttachmentFileName,
+  stripFaceXmlTags,
 } from '../attachment/classify.js';
 import {
+  formatAttachmentByteSize,
+  formatFacePlaceholder,
+  formatVideoMetaSummary,
+} from '../attachment/render.js';
+import {
+  computeFileMd5,
   detectBufferExt,
   sanitizeUrlForLog,
   type MediaResourceType,
@@ -35,30 +46,110 @@ export interface InboundMediaLogger {
   error?: (...args: any[]) => void;
 }
 
-export interface EmbeddedForwardImageEntry {
-  /** 脱敏后的 URL（已剥离 query 与 fragment 凭证） */
+export type ForwardMediaType = 'image' | 'sticker' | 'video' | 'voice' | 'files';
+
+export interface EmbeddedForwardAttachmentEntry {
+  /** 原始下载地址（含访问凭证 query；仅用于未落盘/失败时的选项 A 直链展示，严禁写入服务器日志） */
+  rawUrl: string;
+  /** 脱敏后的 URL（已剥离 query 与 fragment 凭证，供服务器日志使用） */
   sanitizedUrl: string;
   attachmentType?: string;
+  mediaType: ForwardMediaType;
   fileName?: string;
+  dimensions?: string;
+  sizeText?: string;
   localPath?: string;
+  localSize?: number;
+  durationSec?: number;
   fingerprint?: string;
   md5?: string;
+  face?: AttachmentFaceMeta;
   downloaded: boolean;
   error?: string;
 }
 
-export interface ResolveEmbeddedForwardImagesResult {
-  /** 已将正文内所有含凭证 URL 替换为 `[图片:<local_path>]` 或 `[图片(链接已脱敏)]` 后的安全文本 */
-  sanitizedContent: string;
-  /** 原始 URL → 替换文本映射 */
-  replacements: Map<string, string>;
-  /** 成功落盘的本地图片路径列表（去重，保持出现顺序） */
-  localPaths: string[];
-  /** 每个内嵌附件的脱敏处理明细 */
-  entries: EmbeddedForwardImageEntry[];
+/** @deprecated 兼容别名，请使用 {@link EmbeddedForwardAttachmentEntry} */
+export type EmbeddedForwardImageEntry = EmbeddedForwardAttachmentEntry;
+
+export interface ResolveEmbeddedForwardOptions {
+  limit?: number;
+  logger?: InboundMediaLogger;
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
 }
 
-const DEFAULT_FORWARD_IMAGE_LIMIT = 10;
+export interface ResolveEmbeddedForwardMediaResult {
+  /** 清洗重排后的合并转发文本（已落盘只展示路径，未落盘/失败展示选项 A 真实直链） */
+  formattedContent: string;
+  /** 与 `formattedContent` 同步的兼容字段 */
+  sanitizedContent: string;
+  /** 原始 URL → 渲染后占位符文案映射 */
+  replacements: Map<string, string>;
+  /** 所有成功落盘附件的本地路径列表（去重，保持出现顺序） */
+  localPaths: string[];
+  /** 仅包含 `image` 与 `sticker` 成功落盘路径的列表（绝不含视频/语音/文件，避免污染视觉模块） */
+  localImagePaths: string[];
+  /** 每个内嵌附件的处理明细 */
+  entries: EmbeddedForwardAttachmentEntry[];
+}
+
+/** @deprecated 兼容别名，请使用 {@link ResolveEmbeddedForwardMediaResult} */
+export type ResolveEmbeddedForwardImagesResult = ResolveEmbeddedForwardMediaResult;
+
+export interface FormatForwardMessageOptions {
+  resolvedEntries?: ReadonlyMap<string, EmbeddedForwardAttachmentEntry>;
+  replacements?: ReadonlyMap<string, string>;
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
+}
+
+const FORWARD_VIDEO_EXTS = new Set(['mp4', 'mov', 'mkv', 'webm', 'avi']);
+const FORWARD_VOICE_EXTS = new Set(['wav', 'amr', 'ogg', 'mp3', 'm4a']);
+const FORWARD_FILE_EXTS = new Set([
+  'pdf',
+  'doc',
+  'docx',
+  'xls',
+  'xlsx',
+  'ppt',
+  'pptx',
+  'txt',
+  'md',
+  'csv',
+  'tsv',
+  'json',
+  'xml',
+  'yaml',
+  'yml',
+  'html',
+  'htm',
+  'rtf',
+  'epub',
+  'log',
+  'sql',
+  'db',
+  'sqlite',
+  'zip',
+  'rar',
+  '7z',
+  'tar',
+  'gz',
+  'bz2',
+  'xz',
+  'apk',
+  'ipa',
+  'exe',
+  'msi',
+  'dmg',
+  'pkg',
+  'deb',
+  'rpm',
+  'iso',
+  'bin',
+  'dat',
+  'psd',
+  'ai',
+  'sketch',
+  'fig',
+]);
 
 function nonEmpty(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -134,6 +225,27 @@ function readLocalSize(localPath: string, declaredSize?: number): number | undef
   return declaredSize !== undefined && Number.isFinite(declaredSize) ? declaredSize : undefined;
 }
 
+function extractAttachmentDimensions(att: QQAttachment): string | undefined {
+  if (
+    typeof att.width === 'number' &&
+    Number.isFinite(att.width) &&
+    att.width > 0 &&
+    typeof att.height === 'number' &&
+    Number.isFinite(att.height) &&
+    att.height > 0
+  ) {
+    return `${Math.round(att.width)}x${Math.round(att.height)}`;
+  }
+  return undefined;
+}
+
+function normalizePositiveDuration(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return value;
+}
+
 async function resolveSingleInboundAttachment(
   att: QQAttachment,
   peer: string,
@@ -143,6 +255,7 @@ async function resolveSingleInboundAttachment(
   const base = describeAttachment(att, 'inbound');
   const safeName = sanitizeInboundFilename(att.filename);
   const declaredSize = typeof att.size === 'number' && Number.isFinite(att.size) ? att.size : undefined;
+  const dimensions = extractAttachmentDimensions(att);
 
   const rawUrl = isHttpUrl(att.url) ? att.url.trim() : undefined;
   const voiceWavUrl = isHttpUrl(att.voice_wav_url) ? att.voice_wav_url.trim() : undefined;
@@ -184,6 +297,7 @@ async function resolveSingleInboundAttachment(
         const saved = await mediaManager.downloadAndSave(candidate.url, saveOpts);
         const format = detectSavedFormat(saved.localPath, candidate.ext);
         const size = readLocalSize(saved.localPath, declaredSize);
+        const durationSec = normalizePositiveDuration(saved.durationSec);
         return {
           ...base,
           local: {
@@ -192,6 +306,7 @@ async function resolveSingleInboundAttachment(
             ...(size !== undefined ? { size } : {}),
             ...(saved.md5 ? { md5: saved.md5 } : {}),
             ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+            ...(durationSec !== undefined ? { durationSec } : {}),
           },
         };
       } catch (err) {
@@ -208,7 +323,7 @@ async function resolveSingleInboundAttachment(
     };
   }
 
-  // 图片 / 视频 / 文件（含以 content_type='file' 下发的 .png 等文件）
+  // 图片 / 表情包 / 视频 / 文件（含以 content_type='file' 下发的 .png 等文件）
   if (!rawUrl) {
     return {
       ...base,
@@ -238,6 +353,7 @@ async function resolveSingleInboundAttachment(
     const saved = await mediaManager.downloadAndSave(rawUrl, saveOpts);
     const format = detectSavedFormat(saved.localPath, fallbackExt);
     const size = readLocalSize(saved.localPath, declaredSize);
+    const durationSec = normalizePositiveDuration(saved.durationSec);
 
     return {
       ...base,
@@ -247,6 +363,8 @@ async function resolveSingleInboundAttachment(
         ...(size !== undefined ? { size } : {}),
         ...(saved.md5 ? { md5: saved.md5 } : {}),
         ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+        ...(base.kind === 'video' && dimensions ? { dimensions } : {}),
+        ...(durationSec !== undefined ? { durationSec } : {}),
       },
     };
   } catch (err) {
@@ -263,7 +381,7 @@ async function resolveSingleInboundAttachment(
 
 /**
  * 并发下载并落盘 `QQC2CMessageCreateEvent.attachments[]` 中的所有入站附件。
- * - 直接裸 GET（不附加任何 Authorization 头）；
+ * - 直接裸 GET（不附加任何 Authorization 头，不设大小上限）；
  * - 任一附件失败只标记 `unavailable`（已剥离 URL query），不阻断其他附件或整条消息处理。
  */
 export async function resolveInboundAttachments(
@@ -288,165 +406,669 @@ export async function resolveInboundAttachments(
   );
 }
 
-const EMBEDDED_URL_TOKEN_REGEX = /URL\s*:\s*(https?:\/\/[^\s"'<>)\]]+)/gi;
-const BARE_CREDENTIAL_URL_REGEX = /https?:\/\/[^\s"'<>)\]]*[?&](?:rkey|auth_token|sig)=[^\s"'<>)\]]+/gi;
+const FORWARD_NODE_HEADER_RE = /^\s*===\s*消息\s*(\d+)\s*===\s*$/;
+const FORWARD_ATTACHMENT_LINE_RE = /^\s*\[附件\d+\]\s*(.*)$/;
+const FORWARD_SENDER_LINE_RE = /^\s*\[发送者\]\s*(.*)$/;
+const FORWARD_CONTENT_LINE_RE = /^\s*\[消息内容\][ \t]?(.*)$/;
+const FORWARD_RELATED_LINE_RE = /^\s*\[关联消息\]/;
+const EMBEDDED_URL_TOKEN_REGEX = /URL\s*:\s*(https?:\/\/[^\s"'<>)\]]+)/i;
+const FORWARD_TYPE_RE = /(?:^|\s)类型\s*:\s*([^\s]+)/;
+const FORWARD_NAME_RE =
+  /(?:^|\s)文件名\s*:[ \t]*(?!(?:类型|尺寸|大小|URL)\s*:)(.+?)(?=[ \t]+(?:类型|尺寸|大小|URL)\s*:|$)/;
+const FORWARD_DIM_RE = /(?:^|\s)尺寸\s*:\s*([^\s]+)/;
+const FORWARD_SIZE_RE = /(?:^|\s)大小\s*:\s*([^\s]+)/;
 
-function isDownloadableForwardType(attachmentType?: string): boolean {
-  if (!attachmentType) return true;
-  const normalized = attachmentType.trim().toLowerCase();
-  if (!normalized) return true;
-  if (/视频|音频|语音|file|video|audio|voice/.test(normalized)) {
-    return false;
+/**
+ * 根据合并转发 `[附件k]` 的 `类型` 与 `文件名` 推断存储目录类型。
+ */
+export function inferForwardMediaType(
+  attachmentType?: string,
+  fileName?: string
+): ForwardMediaType {
+  const norm = attachmentType?.trim().toLowerCase() ?? '';
+  if (norm) {
+    if (/表情|sticker/.test(norm)) return 'sticker';
+    if (/视频|video/.test(norm)) return 'video';
+    if (/语音|音频|voice|audio/.test(norm)) return 'voice';
+    if (/图|动图|image|gif|pic/.test(norm)) return 'image';
+    if (/文件|file/.test(norm)) return 'files';
   }
-  return /图|表情|image|sticker|gif|pic/.test(normalized);
+
+  const ext = inferExtFromFilename(fileName);
+  if (ext) {
+    if (isImageFileExt(fileName)) return 'image';
+    if (FORWARD_VIDEO_EXTS.has(ext)) return 'video';
+    if (FORWARD_VOICE_EXTS.has(ext)) return 'voice';
+    if (FORWARD_FILE_EXTS.has(ext)) return 'files';
+  }
+
+  return 'image';
 }
 
-function isStickerForwardType(attachmentType?: string): boolean {
-  if (!attachmentType) return false;
-  return /表情|sticker/.test(attachmentType.trim().toLowerCase());
+interface ParsedForwardAttachment {
+  attachmentType?: string;
+  mediaType: ForwardMediaType;
+  fileName?: string;
+  dimensions?: string;
+  sizeText?: string;
+  rawUrl?: string;
+}
+
+function normalizeForwardDimensions(raw?: string): string | undefined {
+  const value = nonEmpty(raw);
+  if (!value) return undefined;
+  const match = /^(\d+)\s*[x×]\s*(\d+)$/i.exec(value);
+  if (match) {
+    const w = Number(match[1]);
+    const h = Number(match[2]);
+    if (w > 0 && h > 0) {
+      return `${w}x${h}`;
+    }
+    return undefined;
+  }
+  return value === '0x0' ? undefined : value;
+}
+
+function parseForwardAttachmentLine(line: string): ParsedForwardAttachment | null {
+  const attMatch = FORWARD_ATTACHMENT_LINE_RE.exec(line);
+  const urlMatch = EMBEDDED_URL_TOKEN_REGEX.exec(line);
+  if (!attMatch && !urlMatch) return null;
+
+  const attachmentType = nonEmpty(FORWARD_TYPE_RE.exec(line)?.[1]);
+  const rawName = FORWARD_NAME_RE.exec(line)?.[1];
+  const fileName = sanitizeInboundFilename(rawName);
+  const dimensions = normalizeForwardDimensions(FORWARD_DIM_RE.exec(line)?.[1]);
+  const sizeText = nonEmpty(FORWARD_SIZE_RE.exec(line)?.[1]);
+  const rawUrl = nonEmpty(urlMatch?.[1]);
+  const mediaType = inferForwardMediaType(attachmentType, fileName);
+
+  return {
+    ...(attachmentType ? { attachmentType } : {}),
+    mediaType,
+    ...(fileName ? { fileName } : {}),
+    ...(dimensions ? { dimensions } : {}),
+    ...(sizeText ? { sizeText } : {}),
+    ...(rawUrl ? { rawUrl } : {}),
+  };
+}
+
+function toActiveFaceMeta(face: FaceRecord | null | undefined): AttachmentFaceMeta | undefined {
+  if (!face || !face.enabled || face.deleted_at) return undefined;
+  return {
+    id: face.id,
+    ...(face.mood ? { mood: face.mood } : {}),
+    ...(face.tags && face.tags.length > 0 ? { tags: face.tags } : {}),
+  };
+}
+
+function resolveEntryFaceMeta(
+  entry: EmbeddedForwardAttachmentEntry | undefined,
+  mediaType: ForwardMediaType,
+  localPath: string | undefined,
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined
+): AttachmentFaceMeta | undefined {
+  if (entry?.face?.id) return entry.face;
+  if (!getFaceByMd5 || (mediaType !== 'image' && mediaType !== 'sticker')) return undefined;
+  const md5 =
+    entry?.md5?.trim().toLowerCase() ||
+    (localPath ? computeFileMd5(localPath)?.toLowerCase() : undefined);
+  if (!md5) return undefined;
+  return toActiveFaceMeta(getFaceByMd5(md5));
+}
+
+function renderForwardAttachment(
+  parsed: ParsedForwardAttachment,
+  entry: EmbeddedForwardAttachmentEntry | undefined,
+  ctx: {
+    hadFaceTag: boolean;
+    getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
+    replacement?: string;
+  }
+): string {
+  const mediaType = entry?.mediaType ?? parsed.mediaType;
+  const fileName = parsed.fileName ?? entry?.fileName;
+  const dimensions = parsed.dimensions ?? entry?.dimensions;
+  const rawSizeText = parsed.sizeText ?? entry?.sizeText;
+  const localPath = entry?.localPath?.trim();
+  const rawUrl = parsed.rawUrl ?? entry?.rawUrl;
+  const error = entry?.error?.trim();
+
+  if (localPath) {
+    if (mediaType === 'image' || mediaType === 'sticker') {
+      const face = resolveEntryFaceMeta(entry, mediaType, localPath, ctx.getFaceByMd5);
+      if (face) {
+        return formatFacePlaceholder(face, localPath);
+      }
+      if (ctx.hadFaceTag || mediaType === 'sticker') {
+        return `[表情包:${localPath}]`;
+      }
+      return `[图片:${localPath}]`;
+    }
+
+    if (mediaType === 'video') {
+      const namePart = fileName ? `:${fileName}` : '';
+      const computedSize =
+        rawSizeText ||
+        (typeof entry?.localSize === 'number' && entry.localSize > 0
+          ? formatAttachmentByteSize(entry.localSize)
+          : undefined);
+      const meta = formatVideoMetaSummary({
+        dimensions,
+        sizeText: computedSize,
+        durationSec: entry?.durationSec,
+      });
+      return `[视频${namePart}${meta ? ` (${meta})` : ''} 已保存: ${localPath}]`;
+    }
+
+    if (mediaType === 'voice') {
+      const namePart = fileName ? `:${fileName}` : '';
+      return `[语音${namePart} 已保存: ${localPath}]`;
+    }
+
+    const displayName = fileName || path.basename(localPath);
+    return `[文件:${displayName} 已保存: ${localPath}]`;
+  }
+
+  if (ctx.replacement) {
+    return ctx.replacement;
+  }
+
+  // 选项 A：未落盘或下载失败时保留真实直链 URL
+  const kindLabel =
+    mediaType === 'video'
+      ? '视频'
+      : mediaType === 'voice'
+        ? '语音'
+        : mediaType === 'files'
+          ? '文件'
+          : ctx.hadFaceTag || mediaType === 'sticker'
+            ? '表情包'
+            : '图片';
+  const namePart = fileName ? `:${fileName}` : '';
+  const meta =
+    mediaType === 'video'
+      ? formatVideoMetaSummary({
+          dimensions,
+          sizeText: rawSizeText,
+          durationSec: entry?.durationSec,
+        })
+      : [dimensions, rawSizeText].filter(Boolean).join(', ');
+
+  return `[${kindLabel}${namePart}${meta ? ` (${meta})` : ''}${error ? ` (下载失败: ${error})` : ''}${rawUrl ? ` 直链: ${rawUrl}` : ''}]`;
+}
+
+interface ParsedForwardNode {
+  index: number;
+  senderName?: string;
+  rawTextLines: string[];
+  attachments: ParsedForwardAttachment[];
+}
+
+interface ParsedForwardDocument {
+  headerLines: string[];
+  nodes: ParsedForwardNode[];
+}
+
+function trimBlankLines(lines: string[]): string[] {
+  let start = 0;
+  while (start < lines.length && lines[start]!.trim() === '') {
+    start++;
+  }
+  let end = lines.length;
+  while (end > start && lines[end - 1]!.trim() === '') {
+    end--;
+  }
+  return lines.slice(start, end);
+}
+
+function parseForwardDocument(content: string): ParsedForwardDocument {
+  const lines = content.split(/\r?\n/);
+  const headerLines: string[] = [];
+  const nodes: ParsedForwardNode[] = [];
+  let currentNode: ParsedForwardNode | null = null;
+  let inRelated = false;
+
+  for (const line of lines) {
+    const headerMatch = FORWARD_NODE_HEADER_RE.exec(line);
+    if (headerMatch) {
+      if (currentNode) {
+        currentNode.rawTextLines = trimBlankLines(currentNode.rawTextLines);
+        nodes.push(currentNode);
+      }
+      currentNode = {
+        index: Number(headerMatch[1]),
+        rawTextLines: [],
+        attachments: [],
+      };
+      inRelated = false;
+      continue;
+    }
+
+    if (!currentNode) {
+      headerLines.push(line);
+      continue;
+    }
+
+    if (!inRelated && FORWARD_RELATED_LINE_RE.test(line)) {
+      inRelated = true;
+      currentNode.rawTextLines.push(line);
+      continue;
+    }
+
+    if (!inRelated) {
+      const senderMatch = FORWARD_SENDER_LINE_RE.exec(line);
+      if (senderMatch) {
+        const sender = nonEmpty(senderMatch[1]);
+        if (sender && !currentNode.senderName) {
+          currentNode.senderName = sender;
+        }
+        continue;
+      }
+    }
+
+    if (FORWARD_ATTACHMENT_LINE_RE.test(line)) {
+      const parsedAtt = parseForwardAttachmentLine(line);
+      if (parsedAtt) {
+        currentNode.attachments.push(parsedAtt);
+      }
+      continue;
+    }
+
+    if (!inRelated) {
+      const contentMatch = FORWARD_CONTENT_LINE_RE.exec(line);
+      if (contentMatch) {
+        const firstPart = contentMatch[1] ?? '';
+        if (firstPart.trim() !== '' || currentNode.rawTextLines.length > 0) {
+          currentNode.rawTextLines.push(firstPart);
+        }
+        continue;
+      }
+    }
+
+    if (line.trim() === '' && currentNode.rawTextLines.length === 0) {
+      continue;
+    }
+    currentNode.rawTextLines.push(line);
+  }
+
+  if (currentNode) {
+    currentNode.rawTextLines = trimBlankLines(currentNode.rawTextLines);
+    nodes.push(currentNode);
+  }
+
+  return {
+    headerLines: trimBlankLines(headerLines),
+    nodes,
+  };
+}
+
+function stripNodeFaceTags(rawTextLines: string[]): {
+  rawNodeText: string;
+  cleanText: string;
+  hadFaceTag: boolean;
+  faceTexts: string[];
+} {
+  const rawNodeText = rawTextLines.join('\n');
+  let hadFaceTag = false;
+  const cleanedLines: string[] = [];
+
+  for (const line of rawTextLines) {
+    const res = stripFaceXmlTags(line);
+    if (res.hadFaceTag) {
+      hadFaceTag = true;
+      if (res.text !== '') {
+        cleanedLines.push(res.text);
+      }
+    } else {
+      cleanedLines.push(line);
+    }
+  }
+
+  const trimmed = trimBlankLines(cleanedLines);
+  const cleanText = trimmed.join('\n');
+  const faceTexts = hadFaceTag ? extractFaceXmlTexts(rawNodeText) : [];
+  return { rawNodeText, cleanText, hadFaceTag, faceTexts };
 }
 
 /**
- * 同步脱敏合并转发文本中任何携带访问凭证的 URL（防泄漏兜底）。
- * 若传入 `replacements` 映射表，优先替换为已落盘的 `[图片:<local_path>]`。
+ * 解析并清洗重构 QQ 官方 `message_type=102` 合并转发文本（剥离冗余标签与 `<faceType=...>` 壳，
+ * 按 `1. 发送者: 内容/附件` 重排；已落盘附件仅展示本地路径，未落盘/失败保留选项 A 真实直链）。
  */
-export function sanitizeForwardContentUrls(
+export function formatForwardMessageContent(
   content: string,
-  replacements?: ReadonlyMap<string, string>
+  options?: FormatForwardMessageOptions
 ): string {
   if (!content || typeof content !== 'string') return '';
+  if (content.trim() === '') return '';
 
-  const withUrlTokensReplaced = content.replace(EMBEDDED_URL_TOKEN_REGEX, (_full, rawUrl: string) => {
-    const mapped = replacements?.get(rawUrl);
-    if (mapped) return mapped;
-    return '[图片(链接已脱敏)]';
-  });
+  const doc = parseForwardDocument(content);
 
-  return withUrlTokensReplaced.replace(BARE_CREDENTIAL_URL_REGEX, (rawUrl) => {
-    const mapped = replacements?.get(rawUrl);
-    if (mapped) return mapped;
-    return '[图片(链接已脱敏)]';
-  });
+  // 兼容分支：无 `=== 消息 N ===` 头的散装 `[附件k] ... URL:...` 片段
+  if (doc.nodes.length === 0) {
+    const outLines = content.split(/\r?\n/).map((line) => {
+      if (!FORWARD_ATTACHMENT_LINE_RE.test(line)) {
+        return line;
+      }
+      const parsed = parseForwardAttachmentLine(line);
+      if (!parsed) return line;
+      const entry = parsed.rawUrl ? options?.resolvedEntries?.get(parsed.rawUrl) : undefined;
+      const replacement = parsed.rawUrl ? options?.replacements?.get(parsed.rawUrl) : undefined;
+      return renderForwardAttachment(parsed, entry, {
+        hadFaceTag: false,
+        getFaceByMd5: options?.getFaceByMd5,
+        replacement,
+      });
+    });
+    return outLines.join('\n');
+  }
+
+  const outLines: string[] = [...doc.headerLines];
+
+  for (const node of doc.nodes) {
+    const { cleanText, hadFaceTag, faceTexts } = stripNodeFaceTags(node.rawTextLines);
+
+    const renderedAttachments = node.attachments.map((att) => {
+      const entry = att.rawUrl ? options?.resolvedEntries?.get(att.rawUrl) : undefined;
+      const replacement = att.rawUrl ? options?.replacements?.get(att.rawUrl) : undefined;
+      return renderForwardAttachment(att, entry, {
+        hadFaceTag,
+        getFaceByMd5: options?.getFaceByMd5,
+        replacement,
+      });
+    });
+
+    const contentLines: string[] = [];
+    if (cleanText !== '') {
+      const textLines = cleanText.split(/\r?\n/);
+      if (renderedAttachments.length === 0 && hadFaceTag && faceTexts.length > 0) {
+        const lastIdx = textLines.length - 1;
+        textLines[lastIdx] = `${textLines[lastIdx]} ${faceTexts.map((t) => `[表情: ${t}]`).join(' ')}`;
+      }
+      if (textLines.length === 1 && renderedAttachments.length === 1) {
+        contentLines.push(`${textLines[0]} ${renderedAttachments[0]}`);
+      } else {
+        contentLines.push(...textLines, ...renderedAttachments);
+      }
+    } else if (renderedAttachments.length > 0) {
+      contentLines.push(...renderedAttachments);
+    } else if (hadFaceTag) {
+      contentLines.push(
+        faceTexts.length > 0 ? faceTexts.map((t) => `[表情: ${t}]`).join(' ') : '[表情]'
+      );
+    }
+
+    if (contentLines.length === 0) {
+      outLines.push(node.senderName ? `${node.index}. ${node.senderName}` : `${node.index}. [空消息]`);
+      continue;
+    }
+
+    const prefix = node.senderName ? `${node.index}. ${node.senderName}: ` : `${node.index}. `;
+    outLines.push(`${prefix}${contentLines[0]}`);
+    for (let i = 1; i < contentLines.length; i++) {
+      outLines.push(`   ${contentLines[i]}`);
+    }
+  }
+
+  return outLines.join('\n');
+}
+
+function normalizeDownloadLimit(limit?: number): number {
+  if (limit === undefined || limit === null || Number.isNaN(limit)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (limit === Number.POSITIVE_INFINITY) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (!Number.isFinite(limit)) {
+    return limit > 0 ? Number.POSITIVE_INFINITY : 0;
+  }
+  return Math.max(0, Math.floor(limit));
+}
+
+function parseForwardResolveArgs(
+  limitOrOptions?: number | ResolveEmbeddedForwardOptions,
+  maybeLogger?: InboundMediaLogger
+): {
+  limit: number;
+  logger?: InboundMediaLogger;
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
+} {
+  if (typeof limitOrOptions === 'number') {
+    return {
+      limit: normalizeDownloadLimit(limitOrOptions),
+      logger: maybeLogger,
+    };
+  }
+  if (limitOrOptions && typeof limitOrOptions === 'object') {
+    const obj = limitOrOptions as Record<string, unknown>;
+    const looksLikeOptions =
+      'limit' in obj || 'logger' in obj || 'getFaceByMd5' in obj;
+    if (!looksLikeOptions && ('warn' in obj || 'info' in obj || 'debug' in obj || 'error' in obj)) {
+      return {
+        limit: Number.POSITIVE_INFINITY,
+        logger: limitOrOptions as InboundMediaLogger,
+      };
+    }
+    const opts = limitOrOptions as ResolveEmbeddedForwardOptions;
+    return {
+      limit: normalizeDownloadLimit(opts.limit),
+      logger: opts.logger ?? maybeLogger,
+      getFaceByMd5: opts.getFaceByMd5,
+    };
+  }
+  return {
+    limit: Number.POSITIVE_INFINITY,
+    logger: maybeLogger,
+  };
 }
 
 /**
- * 从官方 `message_type=102` 展开文本中提取 `[附件...] ... URL:https://...` 内嵌图片链接并限量裸 GET 落盘，
- * 返回替换映射与已脱敏正文（所有含 `rkey` 的明文 URL 均替换为 `[图片:<local_path>]` 或 `[图片(链接已脱敏)]`）。
+ * 从官方 `message_type=102` 展开文本中提取全量 `[附件...] ... URL:https://...` 内嵌媒体
+ * （图片/表情/视频/语音/文件）并裸 GET 落盘（不设默认数量或大小上限），返回排版后正文与区分视觉图的路径集合。
  */
-export async function resolveEmbeddedForwardImages(
+export async function resolveEmbeddedForwardMedia(
   content: string,
   peer: string,
   mediaManager?: MediaStorageManager,
-  limit: number = DEFAULT_FORWARD_IMAGE_LIMIT,
+  options?: ResolveEmbeddedForwardOptions
+): Promise<ResolveEmbeddedForwardMediaResult>;
+export async function resolveEmbeddedForwardMedia(
+  content: string,
+  peer: string,
+  mediaManager: MediaStorageManager | undefined,
+  limit?: number,
   logger?: InboundMediaLogger
-): Promise<ResolveEmbeddedForwardImagesResult> {
+): Promise<ResolveEmbeddedForwardMediaResult>;
+export async function resolveEmbeddedForwardMedia(
+  content: string,
+  peer: string,
+  mediaManager?: MediaStorageManager,
+  limitOrOptions?: number | ResolveEmbeddedForwardOptions,
+  maybeLogger?: InboundMediaLogger
+): Promise<ResolveEmbeddedForwardMediaResult> {
   const replacements = new Map<string, string>();
   const localPaths: string[] = [];
-  const entries: EmbeddedForwardImageEntry[] = [];
+  const localImagePaths: string[] = [];
+  const entries: EmbeddedForwardAttachmentEntry[] = [];
 
   if (!content || typeof content !== 'string') {
     return {
+      formattedContent: '',
       sanitizedContent: '',
       replacements,
       localPaths,
+      localImagePaths,
       entries,
     };
   }
 
-  const maxDownloads = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : DEFAULT_FORWARD_IMAGE_LIMIT;
+  const { limit: maxDownloads, logger, getFaceByMd5 } = parseForwardResolveArgs(
+    limitOrOptions,
+    maybeLogger
+  );
   let downloadedCount = 0;
-  const cachedByUrl = new Map<string, { localPath: string; fingerprint?: string; md5?: string }>();
+  const cachedByUrl = new Map<string, EmbeddedForwardAttachmentEntry>();
 
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    EMBEDDED_URL_TOKEN_REGEX.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = EMBEDDED_URL_TOKEN_REGEX.exec(line)) !== null) {
-      const rawUrl = match[1]!;
-      const sanitizedUrl = sanitizeUrlForLog(rawUrl);
+  const doc = parseForwardDocument(content);
+  const workItems: Array<{ parsed: ParsedForwardAttachment; hadFaceTag: boolean }> = [];
 
-      const typeMatch = /类型\s*:\s*([^\s]+)/.exec(line);
-      const attachmentType = nonEmpty(typeMatch?.[1]);
-      const nameMatch = /文件名\s*:\s*([^\s]+)/.exec(line);
-      const fileName = sanitizeInboundFilename(nameMatch?.[1]);
-
-      if (replacements.has(rawUrl)) {
-        const cached = cachedByUrl.get(rawUrl);
-        entries.push({
-          sanitizedUrl,
-          ...(attachmentType ? { attachmentType } : {}),
-          ...(fileName ? { fileName } : {}),
-          ...(cached?.localPath ? { localPath: cached.localPath } : {}),
-          ...(cached?.fingerprint ? { fingerprint: cached.fingerprint } : {}),
-          ...(cached?.md5 ? { md5: cached.md5 } : {}),
-          downloaded: Boolean(cached?.localPath),
-        });
-        continue;
-      }
-
-      if (!mediaManager || !isDownloadableForwardType(attachmentType) || downloadedCount >= maxDownloads) {
-        replacements.set(rawUrl, '[图片(链接已脱敏)]');
-        entries.push({
-          sanitizedUrl,
-          ...(attachmentType ? { attachmentType } : {}),
-          ...(fileName ? { fileName } : {}),
-          downloaded: false,
-        });
-        continue;
-      }
-
-      const urlExt = inferExtFromFilename(fileName) || inferExtFromUrl(rawUrl);
-      const mediaType: MediaResourceType = isStickerForwardType(attachmentType) ? 'sticker' : 'image';
-
-      try {
-        const saved = await mediaManager.downloadAndSave(rawUrl, {
-          type: mediaType,
-          sessionId: peer,
-          ...(fileName ? { filename: fileName } : {}),
-          ...(urlExt ? { ext: urlExt } : {}),
-        });
-        downloadedCount++;
-        const replacement = `[图片:${saved.localPath}]`;
-        replacements.set(rawUrl, replacement);
-        cachedByUrl.set(rawUrl, {
-          localPath: saved.localPath,
-          fingerprint: saved.fingerprint,
-          md5: saved.md5,
-        });
-        if (!localPaths.includes(saved.localPath)) {
-          localPaths.push(saved.localPath);
+  if (doc.nodes.length > 0) {
+    for (const node of doc.nodes) {
+      const { hadFaceTag } = stripNodeFaceTags(node.rawTextLines);
+      for (const att of node.attachments) {
+        if (att.rawUrl) {
+          workItems.push({ parsed: att, hadFaceTag });
         }
-        entries.push({
-          sanitizedUrl,
-          ...(attachmentType ? { attachmentType } : {}),
-          ...(fileName ? { fileName } : {}),
-          localPath: saved.localPath,
-          ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
-          ...(saved.md5 ? { md5: saved.md5 } : {}),
-          downloaded: true,
-        });
-      } catch (err) {
-        const safeError = sanitizeErrorMessage(err);
-        logger?.warn?.(
-          `[InboundMedia] 合并转发内嵌图片下载失败 (peer: ${peer}, url: ${sanitizedUrl}): ${safeError}`
-        );
-        replacements.set(rawUrl, '[图片(链接已脱敏)]');
-        entries.push({
-          sanitizedUrl,
-          ...(attachmentType ? { attachmentType } : {}),
-          ...(fileName ? { fileName } : {}),
-          downloaded: false,
-          error: safeError,
-        });
+      }
+    }
+  } else {
+    for (const line of content.split(/\r?\n/)) {
+      const parsed = parseForwardAttachmentLine(line);
+      if (parsed?.rawUrl) {
+        workItems.push({ parsed, hadFaceTag: false });
       }
     }
   }
 
-  const sanitizedContent = sanitizeForwardContentUrls(content, replacements);
+  for (const { parsed, hadFaceTag } of workItems) {
+    const rawUrl = parsed.rawUrl!;
+    const sanitizedUrl = sanitizeUrlForLog(rawUrl);
+
+    if (cachedByUrl.has(rawUrl)) {
+      const cached = cachedByUrl.get(rawUrl)!;
+      const cloned: EmbeddedForwardAttachmentEntry = {
+        ...cached,
+        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
+        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
+        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+      };
+      entries.push(cloned);
+      if (!replacements.has(rawUrl)) {
+        replacements.set(
+          rawUrl,
+          renderForwardAttachment(parsed, cloned, { hadFaceTag, getFaceByMd5 })
+        );
+      }
+      continue;
+    }
+
+    if (!mediaManager || downloadedCount >= maxDownloads) {
+      const unresolvedEntry: EmbeddedForwardAttachmentEntry = {
+        rawUrl,
+        sanitizedUrl,
+        mediaType: parsed.mediaType,
+        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
+        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
+        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+        downloaded: false,
+      };
+      cachedByUrl.set(rawUrl, unresolvedEntry);
+      entries.push(unresolvedEntry);
+      replacements.set(
+        rawUrl,
+        renderForwardAttachment(parsed, unresolvedEntry, { hadFaceTag, getFaceByMd5 })
+      );
+      continue;
+    }
+
+    const fallbackExt =
+      inferExtFromFilename(parsed.fileName) ||
+      inferExtFromUrl(rawUrl) ||
+      (parsed.mediaType === 'video' ? 'mp4' : undefined);
+
+    try {
+      const saved = await mediaManager.downloadAndSave(rawUrl, {
+        type: parsed.mediaType,
+        sessionId: peer,
+        ...(parsed.fileName ? { filename: parsed.fileName } : {}),
+        ...(fallbackExt ? { ext: fallbackExt } : {}),
+      });
+      downloadedCount++;
+
+      const localSize = readLocalSize(saved.localPath);
+      const durationSec = normalizePositiveDuration(saved.durationSec);
+      const md5 =
+        saved.md5?.trim().toLowerCase() ||
+        computeFileMd5(saved.localPath)?.toLowerCase() ||
+        undefined;
+      const face =
+        md5 && getFaceByMd5 && (parsed.mediaType === 'image' || parsed.mediaType === 'sticker')
+          ? toActiveFaceMeta(getFaceByMd5(md5))
+          : undefined;
+
+      if (!localPaths.includes(saved.localPath)) {
+        localPaths.push(saved.localPath);
+      }
+      if (
+        (parsed.mediaType === 'image' || parsed.mediaType === 'sticker') &&
+        !localImagePaths.includes(saved.localPath)
+      ) {
+        localImagePaths.push(saved.localPath);
+      }
+
+      const okEntry: EmbeddedForwardAttachmentEntry = {
+        rawUrl,
+        sanitizedUrl,
+        mediaType: parsed.mediaType,
+        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
+        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
+        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+        localPath: saved.localPath,
+        ...(localSize !== undefined ? { localSize } : {}),
+        ...(durationSec !== undefined ? { durationSec } : {}),
+        ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+        ...(md5 ? { md5 } : {}),
+        ...(face ? { face } : {}),
+        downloaded: true,
+      };
+      cachedByUrl.set(rawUrl, okEntry);
+      entries.push(okEntry);
+      replacements.set(
+        rawUrl,
+        renderForwardAttachment(parsed, okEntry, { hadFaceTag, getFaceByMd5 })
+      );
+    } catch (err) {
+      const safeError = sanitizeErrorMessage(err);
+      logger?.warn?.(
+        `[InboundMedia] 合并转发内嵌媒体下载失败 (peer: ${peer}, type: ${parsed.mediaType}, url: ${sanitizedUrl}): ${safeError}`
+      );
+      const failedEntry: EmbeddedForwardAttachmentEntry = {
+        rawUrl,
+        sanitizedUrl,
+        mediaType: parsed.mediaType,
+        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
+        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
+        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+        downloaded: false,
+        error: safeError,
+      };
+      cachedByUrl.set(rawUrl, failedEntry);
+      entries.push(failedEntry);
+      replacements.set(
+        rawUrl,
+        renderForwardAttachment(parsed, failedEntry, { hadFaceTag, getFaceByMd5 })
+      );
+    }
+  }
+
+  const formattedContent = formatForwardMessageContent(content, {
+    resolvedEntries: cachedByUrl,
+    getFaceByMd5,
+  });
+
   return {
-    sanitizedContent,
+    formattedContent,
+    sanitizedContent: formattedContent,
     replacements,
     localPaths,
+    localImagePaths,
     entries,
   };
 }
+
+/** 兼容别名，等价于 {@link resolveEmbeddedForwardMedia} */
+export const resolveEmbeddedForwardImages = resolveEmbeddedForwardMedia;

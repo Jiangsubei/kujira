@@ -36,6 +36,7 @@ export interface SaveResourceResult {
   deduplicated: boolean;
   level?: 1 | 2;
   md5?: string;
+  durationSec?: number;
 }
 
 /**
@@ -138,6 +139,213 @@ export function detectBufferExt(buffer: Buffer): string | undefined {
   return undefined;
 }
 
+const MAX_MOOV_BYTES = 8 * 1024 * 1024;
+
+interface IsoBoxHeader {
+  type: string;
+  headerSize: number;
+  boxSize: number;
+  boxEnd: number;
+  payloadStart: number;
+}
+
+function parseIsoBoxHeaderFromBuffer(
+  buf: Buffer,
+  offset: number,
+  end: number,
+  totalAvailableEnd: number = end
+): IsoBoxHeader | null {
+  if (offset + 8 > end) return null;
+  const rawSize = buf.readUInt32BE(offset);
+  const type = buf.toString('ascii', offset + 4, offset + 8);
+  let headerSize = 8;
+  let boxSize: number;
+
+  if (rawSize === 1) {
+    if (offset + 16 > end) return null;
+    headerSize = 16;
+    const bigSize = buf.readBigUInt64BE(offset + 8);
+    if (bigSize > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    boxSize = Number(bigSize);
+  } else if (rawSize === 0) {
+    boxSize = totalAvailableEnd - offset;
+  } else {
+    boxSize = rawSize;
+  }
+
+  if (!Number.isFinite(boxSize) || boxSize < headerSize) return null;
+  const boxEnd = offset + boxSize;
+  if (boxEnd > totalAvailableEnd) return null;
+  return {
+    type,
+    headerSize,
+    boxSize,
+    boxEnd,
+    payloadStart: offset + headerSize,
+  };
+}
+
+function parseMvhdDurationSec(buf: Buffer, payloadStart: number, boxEnd: number): number | undefined {
+  const payloadLen = boxEnd - payloadStart;
+  if (payloadLen < 1) return undefined;
+  const version = buf.readUInt8(payloadStart);
+  let timescale = 0;
+  let duration = 0;
+
+  if (version === 0) {
+    if (payloadLen < 20) return undefined;
+    timescale = buf.readUInt32BE(payloadStart + 12);
+    duration = buf.readUInt32BE(payloadStart + 16);
+  } else if (version === 1) {
+    if (payloadLen < 32) return undefined;
+    timescale = buf.readUInt32BE(payloadStart + 20);
+    duration = Number(buf.readBigUInt64BE(payloadStart + 24));
+  } else {
+    return undefined;
+  }
+
+  if (timescale > 0 && Number.isFinite(duration) && duration > 0) {
+    const sec = duration / timescale;
+    return Number.isFinite(sec) && sec > 0 ? sec : undefined;
+  }
+  return undefined;
+}
+
+function findMvhdDurationInRange(buf: Buffer, start: number, end: number): number | undefined {
+  let offset = start;
+  while (offset + 8 <= end) {
+    const box = parseIsoBoxHeaderFromBuffer(buf, offset, end);
+    if (!box) break;
+    if (box.type === 'mvhd') {
+      const durationSec = parseMvhdDurationSec(buf, box.payloadStart, box.boxEnd);
+      if (durationSec !== undefined) return durationSec;
+    }
+    offset = box.boxEnd;
+  }
+  return undefined;
+}
+
+/**
+ * 纯 Node.js 解析 MP4/MOV Buffer 中的视频时长（秒），基于 ISO BMFF `moov -> mvhd`。
+ * 不依赖外部 ffprobe；无法识别或异常时静默返回 undefined。
+ */
+export function extractMp4DurationSecFromBuffer(buffer: Buffer): number | undefined {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 8) return undefined;
+  try {
+    let offset = 0;
+    const end = buffer.length;
+    while (offset + 8 <= end) {
+      const box = parseIsoBoxHeaderFromBuffer(buffer, offset, end);
+      if (!box) break;
+      if (box.type === 'moov') {
+        const durationSec = findMvhdDurationInRange(buffer, box.payloadStart, box.boxEnd);
+        if (durationSec !== undefined) return durationSec;
+      }
+      offset = box.boxEnd;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readExactSync(
+  fd: number,
+  target: Buffer,
+  targetOffset: number,
+  length: number,
+  filePosition: number
+): boolean {
+  let total = 0;
+  while (total < length) {
+    const n = fs.readSync(fd, target, targetOffset + total, length - total, filePosition + total);
+    if (n <= 0) return false;
+    total += n;
+  }
+  return true;
+}
+
+/**
+ * 纯 Node.js 从本地 MP4/MOV 文件提取视频时长（秒）。
+ * 仅顺序扫描顶层 8/16 字节 Box 头并跳过 `mdat` 等大块数据，仅将不超过 8 MiB 的 `moov` Box 读入内存解析。
+ * 绝不整文件读入内存；异常时静默返回 undefined。
+ */
+export function extractMp4DurationSecFromFile(filePath: string): number | undefined {
+  if (!filePath || typeof filePath !== 'string') return undefined;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const stat = fs.fstatSync(fd);
+    const fileSize = stat.size;
+    if (!Number.isFinite(fileSize) || fileSize < 8) {
+      return undefined;
+    }
+
+    const headerBuf = Buffer.alloc(16);
+    let offset = 0;
+    while (offset + 8 <= fileSize) {
+      const remaining = fileSize - offset;
+      const headerReadLen = Math.min(16, remaining);
+      if (!readExactSync(fd, headerBuf, 0, headerReadLen, offset)) {
+        break;
+      }
+
+      const box = parseIsoBoxHeaderFromBuffer(headerBuf, 0, headerReadLen, remaining);
+      if (!box) break;
+
+      if (box.type === 'moov' && box.boxSize <= MAX_MOOV_BYTES) {
+        const moovBuf = Buffer.alloc(box.boxSize);
+        if (readExactSync(fd, moovBuf, 0, box.boxSize, offset)) {
+          const durationSec = extractMp4DurationSecFromBuffer(moovBuf);
+          if (durationSec !== undefined) {
+            return durationSec;
+          }
+        }
+      }
+
+      offset += box.boxSize;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+function normalizePositiveDuration(value: number | undefined): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function resolveVideoDurationSec(options: {
+  type?: MediaResourceType;
+  detectedExt?: string;
+  filePath: string;
+  buffer?: Buffer;
+  fallbackToFile?: boolean;
+}): number | undefined {
+  const shouldExtract =
+    options.type === 'video' ||
+    options.detectedExt === 'mp4' ||
+    path.extname(options.filePath).toLowerCase() === '.mp4';
+  if (!shouldExtract) return undefined;
+
+  if (options.buffer) {
+    const fromBuf = normalizePositiveDuration(extractMp4DurationSecFromBuffer(options.buffer));
+    if (fromBuf !== undefined) return fromBuf;
+    if (!options.fallbackToFile) return undefined;
+  }
+
+  return normalizePositiveDuration(extractMp4DurationSecFromFile(options.filePath));
+}
+
 function sanitizeTextUrls(text: string): string {
   return text.replace(/https?:\/\/[^\s'"]+/gi, (match) => sanitizeUrlForLog(match));
 }
@@ -227,18 +435,26 @@ export class MediaStorageManager {
     return null;
   }
 
-  private async tryReuseByFileId(fileId?: string | null): Promise<SaveResourceResult | null> {
+  private async tryReuseByFileId(
+    fileId?: string | null,
+    type?: MediaResourceType
+  ): Promise<SaveResourceResult | null> {
     if (!fileId || !this.db) return null;
     const record = this.db.getByFileId(fileId);
     if (record?.local_path && fs.existsSync(record.local_path)) {
       const now = new Date();
       await fsp.utimes(record.local_path, now, now).catch(() => {});
+      const durationSec = resolveVideoDurationSec({
+        type,
+        filePath: record.local_path,
+      });
       return {
         localPath: record.local_path,
         fingerprint: record.fingerprint || '',
         deduplicated: true,
         level: 1,
         md5: computeFileMd5(record.local_path) || undefined,
+        ...(durationSec !== undefined ? { durationSec } : {}),
       };
     }
     return null;
@@ -252,7 +468,7 @@ export class MediaStorageManager {
     const type = options.type === 'file' ? 'files' : options.type || 'image';
 
     // 1. 一级去重: file_id 查库
-    const l1Hit = await this.tryReuseByFileId(options.fileId);
+    const l1Hit = await this.tryReuseByFileId(options.fileId, type);
     if (l1Hit) return l1Hit;
 
     // 2. 二级去重: SHA-256 指纹去重
@@ -287,12 +503,20 @@ export class MediaStorageManager {
         }
         const now = new Date();
         await fsp.utimes(validPath, now, now).catch(() => {});
+        const durationSec = resolveVideoDurationSec({
+          type,
+          detectedExt,
+          filePath: validPath,
+          buffer,
+          fallbackToFile: true,
+        });
         return {
           localPath: validPath,
           fingerprint,
           deduplicated: true,
           level: 2,
           md5,
+          ...(durationSec !== undefined ? { durationSec } : {}),
         };
       }
     }
@@ -333,11 +557,19 @@ export class MediaStorageManager {
       this.db.updateLocalPathByFileId(options.fileId, targetPath, fingerprint);
     }
 
+    const durationSec = resolveVideoDurationSec({
+      type,
+      detectedExt,
+      filePath: targetPath,
+      buffer,
+    });
+
     return {
       localPath: targetPath,
       fingerprint,
       deduplicated: false,
       md5,
+      ...(durationSec !== undefined ? { durationSec } : {}),
     };
   }
 
@@ -350,7 +582,8 @@ export class MediaStorageManager {
     options: SaveResourceOptions = {}
   ): Promise<SaveResourceResult> {
     // 1. 一级去重先行校验
-    const l1Hit = await this.tryReuseByFileId(options.fileId);
+    const type = options.type === 'file' ? 'files' : options.type || 'image';
+    const l1Hit = await this.tryReuseByFileId(options.fileId, type);
     if (l1Hit) return l1Hit;
 
     let buffer: Buffer;

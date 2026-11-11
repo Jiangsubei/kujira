@@ -76,86 +76,7 @@ export interface ReadChatHistoryResult {
   message?: string;
 }
 
-// ==================== 2. 资源下载与合并转发展开 ====================
-
-export interface FetchResourceItem {
-  /** 入站附件索引、文件标识或消息 ID */
-  file_id: string;
-  /** 保存文件名建议（落盘前执行 basename 与安全净化） */
-  file_name?: string;
-  /** 可选直链 URL（裸 GET 拉取；严禁在结果中明文回显带凭证 query） */
-  url?: string;
-}
-
-export interface FetchChatResourceItemResult {
-  file_id: string;
-  file_name?: string;
-  success: boolean;
-  local_path?: string;
-  error?: string;
-}
-
-export interface FetchChatResourceParams {
-  file_id?: string;
-  file_name?: string;
-  url?: string;
-  /** 可选：仅接收短消息 ID（`msg_<n>` / `msg_self_<n>`），重新拉取该条消息关联的入站附件 */
-  msg_id?: string;
-  files?: FetchResourceItem[];
-}
-
-export interface FetchChatResourceResult {
-  success: boolean;
-  local_path?: string;
-  error?: string;
-  total?: number;
-  downloaded_count?: number;
-  results?: FetchChatResourceItemResult[];
-}
-
-/** 展开合并转发入参（适配 QQ 官方 Bot message_type=102 展开文本与内嵌图片提取） */
-export interface ExpandForwardMessageParams {
-  /** 入站合并转发消息的短消息 ID（仅接收 `msg_<n>` / `msg_self_<n>`，优先查库获取 message_type=102 原始内容并提取内嵌图片） */
-  msg_id?: string;
-  /** 可选：直接传入的 message_type=102 合并转发原文 */
-  content?: string;
-  /** 可选兼容别名：仅接收短消息 ID（`msg_<n>` / `msg_self_<n>`，等价于 msg_id） */
-  forward_id?: string;
-}
-
-/** 合并转发节点中提取的内嵌附件摘要（URL 仅内部裸 GET 使用，不对外暴露带凭证地址） */
-export interface ForwardEmbeddedAttachment {
-  type?: string;
-  filename?: string;
-  dimensions?: string;
-  size_text?: string;
-  local_path?: string;
-  error?: string;
-}
-
-/** 合并转发单条展开节点（适配官方 message_type=102 结构化文本段落） */
-export interface ForwardNode {
-  /** 节点序号（如 === 消息 1 ===） */
-  index?: number;
-  /** 节点文本中解析出的展示名（[发送者]） */
-  sender_name?: string;
-  /** 节点正文内容（已剥离含访问凭证的原始下载 URL） */
-  content: string;
-  /** 从节点 [附件k] 提取并尝试裸 GET 落盘的附件列表 */
-  attachments?: ForwardEmbeddedAttachment[];
-}
-
-export interface ExpandForwardMessageResult {
-  success: boolean;
-  /** 合并转发首行标题（若有） */
-  title?: string;
-  messages?: ForwardNode[];
-  /** 本次展开中成功裸 GET 落盘的内嵌图片数量（缺省表示无新增落盘） */
-  images_downloaded?: number;
-  error?: string;
-}
-
-// ==================== 3. 消息/文件发送、撤回与轻量等待 ====================
+// ==================== 2. 消息/文件发送、撤回与轻量等待 ====================
 
 export interface SendFileParams {
   file_path: string;
@@ -199,7 +120,7 @@ export interface WaitForUserMessagesParams {
   timeout?: number;
 }
 
-// ==================== 4. 表情包工具 ====================
+// ==================== 3. 表情包工具 ====================
 
 export interface ListFacesParams {
   query?: string;
@@ -269,7 +190,7 @@ export interface ManageFacesResult {
   error?: string;
 }
 
-// ==================== 5. 定时任务工具 ====================
+// ==================== 4. 定时任务工具 ====================
 
 export interface ScheduleTaskParams {
   prompt: string;
@@ -318,7 +239,7 @@ export interface ManageScheduledTasksResult {
   error?: string;
 }
 
-// ==================== 6. 黑话工具 ====================
+// ==================== 5. 黑话工具 ====================
 
 export interface QuerySlangParams {
   term: string;
@@ -379,7 +300,7 @@ export interface ManageSlangResult {
   error?: string;
 }
 
-// ==================== 7. 记忆工具（单聊强隔离，禁止跨会话） ====================
+// ==================== 6. 记忆工具（单聊强隔离，禁止跨会话） ====================
 
 export type MemoryScope = 'session' | 'user';
 

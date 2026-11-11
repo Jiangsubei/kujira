@@ -4,7 +4,8 @@
  * 严格遵循 QQ 官方 Bot API v2 实测行为：
  * - 基于 `QQC2CMessageCreateEvent.attachments[]` 的 `content_type` 判定类型；
  * - 语音严格以 `content_type === 'voice'` 为准，提取 `voice_wav_url` 与 `asr_refer_text`；
- * - 注意实测存在 `.png` 文件以 `content_type === 'file'` 下发，保持 `'file'` 分类并保留真实扩展名。
+ * - 注意实测存在 `.png` 文件以 `content_type === 'file'` 下发，保持 `'file'` 分类并保留真实扩展名；
+ * - 当 `content_type` 为空或为通用 `application/octet-stream` 时，结合 `filename` 扩展名补充识别图片/视频/音频。
  */
 
 import * as path from 'node:path';
@@ -32,6 +33,8 @@ export interface MessageMediaFields {
 }
 
 const IMAGE_FILE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+const VIDEO_FILE_EXTENSIONS = new Set(['mp4', 'mov', 'mkv', 'webm', 'avi']);
+const AUDIO_FILE_EXTENSIONS = new Set(['wav', 'amr', 'ogg', 'm4a', 'mp3']);
 const FACE_XML_TAG_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/;
 const FACE_XML_TAG_GLOBAL_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/g;
 const FACE_XML_EXT_ATTR_RE = /(?:^|[\s,])ext\s*=\s*(?:"([^"]*)"|'([^']*)')/;
@@ -166,11 +169,17 @@ export function sanitizeAttachmentFileName(value: unknown): string | undefined {
   return cleaned;
 }
 
+function extractLowerExt(fileNameOrPath?: string | null): string {
+  if (!fileNameOrPath || typeof fileNameOrPath !== 'string') return '';
+  const trimmed = fileNameOrPath.trim();
+  if (!trimmed) return '';
+  return path.extname(trimmed).replace(/^\./, '').toLowerCase();
+}
+
 /** 判断路径或文件名扩展名是否为常见位图图片格式。 */
 export function isImageFileExt(fileNameOrPath?: string | null): boolean {
-  if (!fileNameOrPath || typeof fileNameOrPath !== 'string') return false;
-  const ext = path.extname(fileNameOrPath).replace(/^\./, '').toLowerCase();
-  return IMAGE_FILE_EXTENSIONS.has(ext);
+  const ext = extractLowerExt(fileNameOrPath);
+  return ext !== '' && IMAGE_FILE_EXTENSIONS.has(ext);
 }
 
 /** 根据官方 `QQAttachment.content_type` 判定统一附件类别。 */
@@ -194,6 +203,21 @@ export function classifyAttachment(attachment: QQAttachment | null | undefined):
   if (nonEmptyString(attachment.voice_wav_url) || nonEmptyString(attachment.asr_refer_text)) {
     return 'record';
   }
+
+  const baseCt = ct.split(';')[0]?.trim() ?? '';
+  if (baseCt === '' || baseCt === 'application/octet-stream') {
+    const ext = extractLowerExt(attachment.filename);
+    if (IMAGE_FILE_EXTENSIONS.has(ext)) {
+      return 'image';
+    }
+    if (VIDEO_FILE_EXTENSIONS.has(ext)) {
+      return 'video';
+    }
+    if (AUDIO_FILE_EXTENSIONS.has(ext)) {
+      return 'record';
+    }
+  }
+
   return 'file';
 }
 

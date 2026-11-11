@@ -41,8 +41,7 @@ import {
 } from './gateway/server.js';
 import {
   resolveInboundAttachments,
-  resolveEmbeddedForwardImages,
-  sanitizeForwardContentUrls,
+  resolveEmbeddedForwardMedia,
 } from './gateway/inbound-media.js';
 import {
   shouldWakeup,
@@ -602,28 +601,29 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       }
     }
 
-    // message_type=102 合并转发内嵌图片限量裸 GET 落盘 + rkey 凭证彻底脱敏
+    // message_type=102 合并转发全量内嵌媒体裸 GET 落盘 + 结构化排版 + 本地表情库匹配
     let forwardImages: string[] | undefined;
-    let sanitizeForwardContent: ((raw: string) => string) | undefined;
+    let formatForwardContent: ((raw: string) => string) | undefined;
     if (event.message_type === QQ_INBOUND_MSG_TYPE_FORWARD && typeof event.content === 'string') {
-      const resolvedFwd = await resolveEmbeddedForwardImages(
+      const resolvedFwd = await resolveEmbeddedForwardMedia(
         event.content,
         peer,
         mediaManager,
-        10,
-        logger
+        {
+          logger,
+          getFaceByMd5: (md5) => db.getFaceByMd5(md5),
+        }
       );
-      if (resolvedFwd.localPaths.length > 0) {
-        forwardImages = resolvedFwd.localPaths;
+      if (resolvedFwd.localImagePaths.length > 0) {
+        forwardImages = resolvedFwd.localImagePaths;
       }
-      sanitizeForwardContent = (raw: string) =>
-        sanitizeForwardContentUrls(raw, resolvedFwd.replacements);
+      formatForwardContent = () => resolvedFwd.formattedContent;
     }
 
     const decision = await shouldWakeup(event, {
       descriptors,
       ...(forwardImages ? { forwardImages } : {}),
-      ...(sanitizeForwardContent ? { sanitizeForwardContent } : {}),
+      ...(formatForwardContent ? { formatForwardContent } : {}),
       botName: gateway.getStatus().botName,
       getMessageByRefIdx: (idx) => toQuotedRecord(db.getMessageByRefIdx(idx)),
       getFaceByMd5: (md5) => db.getFaceByMd5(md5),

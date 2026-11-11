@@ -3,15 +3,75 @@
  *
  * 入站、出站、引用重解析、历史重放共用同一套安全文案：
  * - 命中表情库 → `[表情包: <face_id> (情绪: <mood>) 路径: <local_path>]`（入站/出站完全一致）；
- * - 普通图片 → `[图片:<local_path>]`；无本地路径时严禁输出带 query 凭证的 `remote.url`！
+ * - 普通图片 → `[图片:<local_path>]`；
  * - 文件（含以 `content_type='file'` 下发的 `.png` 等文件）→ `[文件:<name> 已保存: <local_path>]`；
  * - 语音 → 结合 `local.path` 与 `remote.asrReferText` 渲染；
+ * - 视频 → `[视频(:<name>) (<dimensions>, <size>, <duration>) 已保存: <local_path>]`（无分辨率/时长时保持简洁路径）；
  * - 合并转发 → 适配官方 `message_type=102` 合并转发占位渲染；
- * - 一律展示 OS 路径，绝不把 `file:///` URI 或带 `rkey` 凭证 URL 暴露给模型或历史。
+ * - 已落盘附件一律只展示 OS 路径（绝不输出 `file:///` URI 且不附加 URL）；未落盘或下载失败时展示真实直链 URL 供 Agent 处理。
  */
 
 import * as path from 'node:path';
 import type { AttachmentDescriptor } from './types.js';
+
+/** 格式化附件字节大小（`< 1024 -> B`，`< 1MB -> KB`，其余 `MB`；非法或负数返回 `''`）。 */
+export function formatAttachmentByteSize(bytes: number): string {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) {
+    return '';
+  }
+  if (bytes < 1024) {
+    return `${bytes}B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)}KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** 格式化视频时长（无效或 `<= 0` 返回 `''`；`< 60` 保留至多一位小数；`>= 60` 按分秒输出）。 */
+export function formatVideoDuration(seconds: number): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+    return '';
+  }
+  if (seconds < 60) {
+    return `${Number((Math.round(seconds * 10) / 10).toFixed(1))}s`;
+  }
+  const totalSeconds = Math.round(seconds);
+  const mins = Math.floor(totalSeconds / 60);
+  const remSecs = totalSeconds % 60;
+  return remSecs > 0 ? `${mins}m${remSecs}s` : `${mins}m`;
+}
+
+/** 组合视频元信息摘要（`分辨率, 大小, 时长`，无有效字段时返回 `''`）。 */
+export function formatVideoMetaSummary(meta: {
+  dimensions?: string;
+  sizeText?: string;
+  sizeBytes?: number;
+  durationSec?: number;
+}): string {
+  const dimensions = meta.dimensions?.trim() || '';
+  const resolvedSizeText =
+    meta.sizeText?.trim() ||
+    (typeof meta.sizeBytes === 'number' ? formatAttachmentByteSize(meta.sizeBytes) : '');
+  const durationText =
+    typeof meta.durationSec === 'number' ? formatVideoDuration(meta.durationSec) : '';
+  return [dimensions, resolvedSizeText, durationText].filter(Boolean).join(', ');
+}
+
+function renderUnresolvedAttachment(
+  basePrefix: string,
+  unavailable?: string,
+  url?: string
+): string {
+  const reason = unavailable?.trim();
+  const resolvedUrl = url?.trim();
+  if (reason) {
+    return resolvedUrl
+      ? `${basePrefix} (下载失败: ${reason}) 直链: ${resolvedUrl}]`
+      : `${basePrefix} (入站落盘失败)]`;
+  }
+  return resolvedUrl ? `${basePrefix} 直链: ${resolvedUrl}]` : `${basePrefix}]`;
+}
 
 /** 格式化已收藏表情包语义占位符（支持附带本地路径）。 */
 export function formatFacePlaceholder(
@@ -41,13 +101,11 @@ function renderSticker(descriptor: AttachmentDescriptor): string {
   if (descriptor.face?.id) {
     return formatFacePlaceholder(descriptor.face, descriptor.local?.path);
   }
-  if (descriptor.local?.path) {
-    return `[表情包:${descriptor.local.path}]`;
+  const localPath = descriptor.local?.path?.trim() || '';
+  if (localPath) {
+    return `[表情包:${localPath}]`;
   }
-  if (descriptor.unavailable) {
-    return '[表情包 (入站落盘失败)]';
-  }
-  return '[表情包]';
+  return renderUnresolvedAttachment('[表情包', descriptor.unavailable, descriptor.remote?.url);
 }
 
 function renderImage(descriptor: AttachmentDescriptor): string {
@@ -55,31 +113,28 @@ function renderImage(descriptor: AttachmentDescriptor): string {
   if (descriptor.face?.id) {
     return formatFacePlaceholder(descriptor.face, descriptor.local?.path);
   }
-  if (descriptor.local?.path) {
-    return `[图片:${descriptor.local.path}]`;
+  const localPath = descriptor.local?.path?.trim() || '';
+  if (localPath) {
+    return `[图片:${localPath}]`;
   }
-  // 安全红线：严禁将带 query 凭证的 remote.url 直接输出给模型，仅输出脱敏占位
   const safeName = descriptor.fileName?.trim() || '';
-  const safeRemoteId = (descriptor.remote?.fileUuid || descriptor.remote?.fileId || '').trim();
+  const safeRemoteId =
+    descriptor.remote?.fileUuid?.trim() || descriptor.remote?.fileId?.trim() || '';
   const safeLabel = safeName || safeRemoteId;
-  if (descriptor.unavailable) {
-    return safeLabel ? `[图片:${safeLabel} (入站落盘失败)]` : '[图片 (入站落盘失败)]';
-  }
-  return safeLabel ? `[图片:${safeLabel}]` : '[图片]';
+  const basePrefix = safeLabel ? `[图片:${safeLabel}` : '[图片';
+  return renderUnresolvedAttachment(basePrefix, descriptor.unavailable, descriptor.remote?.url);
 }
 
 function renderFile(descriptor: AttachmentDescriptor): string {
+  const localPath = descriptor.local?.path?.trim() || '';
   const name =
     descriptor.fileName?.trim() ||
-    (descriptor.local?.path ? path.basename(descriptor.local.path) : '') ||
+    (localPath ? path.basename(localPath) : '') ||
     '未知文件';
-  if (descriptor.local?.path) {
-    return `[文件:${name} 已保存: ${descriptor.local.path}]`;
+  if (localPath) {
+    return `[文件:${name} 已保存: ${localPath}]`;
   }
-  if (descriptor.unavailable) {
-    return `[文件:${name} (入站落盘失败)]`;
-  }
-  return `[文件:${name}]`;
+  return renderUnresolvedAttachment(`[文件:${name}`, descriptor.unavailable, descriptor.remote?.url);
 }
 
 function renderRecord(descriptor: AttachmentDescriptor): string {
@@ -90,32 +145,40 @@ function renderRecord(descriptor: AttachmentDescriptor): string {
   if (localPath) {
     return `[语音 已保存: ${localPath}${asrPart}]`;
   }
-  if (descriptor.unavailable) {
-    return `[语音${asrPart} (入站落盘失败)]`;
-  }
-  if (asrPart) {
-    return `[语音${asrPart}]`;
-  }
-  return '[语音]';
+  const recordUrl = descriptor.remote?.voiceWavUrl?.trim() || descriptor.remote?.url?.trim();
+  return renderUnresolvedAttachment(`[语音${asrPart}`, descriptor.unavailable, recordUrl);
 }
 
 function renderVideo(descriptor: AttachmentDescriptor): string {
   const rawFileName = descriptor.fileName?.trim() || '';
-  const remoteId = (descriptor.remote?.fileUuid || descriptor.remote?.fileId || '').trim();
+  const remoteId =
+    descriptor.remote?.fileUuid?.trim() || descriptor.remote?.fileId?.trim() || '';
   const isRedundantName = Boolean(rawFileName && remoteId && rawFileName === remoteId);
   const namePart = rawFileName && !isRedundantName ? `:${rawFileName}` : '';
 
-  if (descriptor.local?.path) {
-    return `[视频${namePart} 已保存: ${descriptor.local.path}]`;
+  const localPath = descriptor.local?.path?.trim() || '';
+  if (localPath) {
+    const hasDimensions = Boolean(descriptor.local?.dimensions?.trim());
+    const hasValidDuration =
+      typeof descriptor.local?.durationSec === 'number' &&
+      Number.isFinite(descriptor.local.durationSec) &&
+      descriptor.local.durationSec > 0;
+    if (hasDimensions || hasValidDuration) {
+      const meta = formatVideoMetaSummary({
+        dimensions: descriptor.local?.dimensions,
+        sizeBytes: descriptor.local?.size,
+        durationSec: descriptor.local?.durationSec,
+      });
+      return `[视频${namePart}${meta ? ` (${meta})` : ''} 已保存: ${localPath}]`;
+    }
+    return `[视频${namePart} 已保存: ${localPath}]`;
   }
-  if (descriptor.unavailable) {
-    const idPart = remoteId ? ` (ID:${remoteId})` : '';
-    return `[视频${namePart}${idPart} (入站落盘失败)]`;
-  }
-  if (remoteId) {
-    return `[视频${namePart} (ID:${remoteId})]`;
-  }
-  return `[视频${namePart}]`;
+  const idPart = remoteId ? ` (ID:${remoteId})` : '';
+  return renderUnresolvedAttachment(
+    `[视频${namePart}${idPart}`,
+    descriptor.unavailable,
+    descriptor.remote?.url
+  );
 }
 
 function renderForward(descriptor: AttachmentDescriptor): string {

@@ -2,7 +2,7 @@
  * kujira: QQ 官方 Bot 单聊消息内容归一化模块
  *
  * 彻底移除 OneBot 段 AST、`[CQ:*]` 与 `resolveAtNicknames`，专职：
- * - `message_type === 102`（合并转发）：结合内嵌图片脱敏置换回调安全呈现正文，绝不泄露带 `rkey` 的 URL；
+ * - `message_type === 102`（合并转发）：结合内嵌媒体落盘与结构化重排安全呈现正文（未落盘/失败保留选项 A 真实直链）；
  * - `message_type === 3`（卡片）：优先通过 `extractArkDataContent` 渲染结构化 `ark_data`；
  * - 入站附件描述符：自动计算本地落盘图片 MD5 匹配已收藏表情库，升格为语义占位符 `[表情包: <id> ...]`；
  * - 引用索引与 `msg_elements` 要素提取，供 `wakeup.ts` 精确还原引用消息。
@@ -18,7 +18,7 @@ import {
 } from '../attachment/render.js';
 import { computeFileMd5 } from '../storage/media.js';
 import { extractArkDataContent } from './card-parser.js';
-import { sanitizeForwardContentUrls } from './inbound-media.js';
+import { formatForwardMessageContent } from './inbound-media.js';
 
 export { extractFaceXmlTexts, hasFaceXmlTag, stripFaceXmlTags };
 
@@ -31,8 +31,8 @@ export interface MatchedFaceInfo {
 export interface ParseNormalizedContentOptions {
   /** 入站图片匹配本地表情库查询器 */
   getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
-  /** 合并转发文本 URL 脱敏替换函数（通常由 `resolveEmbeddedForwardImages` 提供） */
-  sanitizeForwardContent?: (content: string) => string;
+  /** 合并转发文本结构化排版与占位替换函数（通常由 `resolveEmbeddedForwardMedia` 提供） */
+  formatForwardContent?: (content: string) => string;
 }
 
 /**
@@ -94,7 +94,8 @@ export function isPermanentRefIdx(refIdx?: string | null): refIdx is string {
 }
 
 /**
- * 从 `event.msg_elements[]`（及必要时 `parallel_message.msg_nodes[]`）提取并脱敏被引用原文。
+ * 从 `event.msg_elements[]`（及必要时 `parallel_message.msg_nodes[]`）提取被引用原文；
+ * 含嵌套合并转发头（`=== 消息 `）时自动结构化清洗排版；其余文本（含直链 URL）原样保留。
  */
 export function extractMsgElementsText(
   event: QQC2CMessageCreateEvent | null | undefined
@@ -104,7 +105,10 @@ export function extractMsgElementsText(
   if (Array.isArray(event?.msg_elements)) {
     for (const el of event.msg_elements) {
       if (typeof el?.content === 'string' && el.content.trim()) {
-        parts.push(sanitizeForwardContentUrls(el.content.trim()));
+        const trimmed = el.content.trim();
+        parts.push(
+          trimmed.includes('=== 消息 ') ? formatForwardMessageContent(trimmed) : trimmed
+        );
       }
     }
   }
@@ -112,7 +116,10 @@ export function extractMsgElementsText(
   if (parts.length === 0 && Array.isArray(event?.parallel_message?.msg_nodes)) {
     for (const node of event.parallel_message.msg_nodes) {
       if (typeof node?.content === 'string' && node.content.trim()) {
-        parts.push(sanitizeForwardContentUrls(node.content.trim()));
+        const trimmed = node.content.trim();
+        parts.push(
+          trimmed.includes('=== 消息 ') ? formatForwardMessageContent(trimmed) : trimmed
+        );
       }
     }
   }
@@ -172,11 +179,10 @@ export function parseNormalizedContent(
 
   // 1. 合并转发消息（message_type === 102）
   if (event?.message_type === 102) {
-    const customSanitized = options?.sanitizeForwardContent
-      ? options.sanitizeForwardContent(rawContent)
-      : rawContent;
-    const safeForwardText = sanitizeForwardContentUrls(customSanitized);
-    const parts = [safeForwardText, ...renderedAttachments].filter((p) => p !== '');
+    const formattedForward = options?.formatForwardContent
+      ? options.formatForwardContent(rawContent)
+      : formatForwardMessageContent(rawContent, { getFaceByMd5: options?.getFaceByMd5 });
+    const parts = [formattedForward, ...renderedAttachments].filter((p) => p !== '');
     if (parts.length > 0) {
       return parts.join('\n');
     }

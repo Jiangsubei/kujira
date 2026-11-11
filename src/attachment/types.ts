@@ -3,8 +3,8 @@
  *
  * 设计约束：
  * - `remote` 只承载 QQ 官方侧元信息（fileUuid / fileInfo / url / voiceWavUrl / contentType / asrReferText / fileId）；
- * - `local` 只承载本机落盘事实（OS 路径 / 字节魔数或实测格式 / 大小 / md5 / 去重指纹）；
- * - `remote.url` 与 `remote.voiceWavUrl` 可能携带访问凭证 query，渲染层与日志层严禁明文输出；
+ * - `local` 只承载本机落盘事实（OS 路径 / 字节魔数或实测格式 / 大小 / md5 / 去重指纹 / 分辨率 / 时长）；
+ * - `remote.url` 与 `remote.voiceWavUrl` 可能携带较长访问凭证 query，服务器日志避免随意刷屏；面向 Agent 展示未落盘或下载失败附件时需提供真实可用直链 URL，已落盘附件仅展示本地路径；
  * - 可选字段一律条件展开，描述符中绝不出现 `undefined` 键。
  */
 
@@ -18,7 +18,7 @@ export type AttachmentKind =
 
 export type AttachmentOrigin = 'inbound' | 'outbound';
 
-/** QQ 官方侧的远端附件元信息（严禁将带凭证 url 直接明文输出给模型）。 */
+/** QQ 官方侧的远端附件元信息（日志应避免刷屏长凭证，未落盘/失败时向 Agent 展示可用直链）。 */
 export interface AttachmentRemoteMeta {
   /** 仅作兼容只读展示如需（或无 fileUuid 时的远端标识）。 */
   fileId?: string;
@@ -26,7 +26,7 @@ export interface AttachmentRemoteMeta {
   fileUuid?: string;
   /** 官方四步上传返回的 file_info（用于 msg_type=7 下发）。 */
   fileInfo?: string;
-  /** 远端下载地址（可能携带凭证 query，日志与正文渲染严禁暴露）。 */
+  /** 远端下载地址（可能携带凭证 query，日志避免刷屏；未落盘或下载失败时向 Agent 展示直链）。 */
   url?: string;
   /** 官方语音 WAV 转码地址（audio/x-wav）。 */
   voiceWavUrl?: string;
@@ -45,6 +45,10 @@ export interface AttachmentLocalMeta {
   md5?: string;
   /** 本地去重指纹。 */
   fingerprint?: string;
+  /** 媒体分辨率（例如 `'720x1280'`，在已知分辨率时保存）。 */
+  dimensions?: string;
+  /** 视频时长秒数（例如 `8.776`）。 */
+  durationSec?: number;
 }
 
 export interface AttachmentFaceMeta {

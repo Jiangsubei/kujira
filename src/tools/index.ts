@@ -39,13 +39,9 @@ import {
 } from './common/context.js';
 import {
   createReadChatHistoryTool,
-  createExpandForwardMessageTool,
   createWaitForUserMessagesTool,
 } from './chat-history/index.js';
-import {
-  createFetchChatResourceTool,
-  createSendFileTool,
-} from './resource/index.js';
+import { createSendFileTool } from './resource/index.js';
 import {
   createSendQqMessageTool,
   createRecallMessageTool,
@@ -111,25 +107,19 @@ export function registerAgentTools(
     // 1. read_chat_history
     unregisters.push(tools.register(createReadChatHistoryTool(options)));
 
-    // 2. fetch_chat_resource
-    unregisters.push(tools.register(createFetchChatResourceTool(options)));
-
-    // 3. expand_forward_message
-    unregisters.push(tools.register(createExpandForwardMessageTool(options)));
-
-    // 4. send_file
+    // 2. send_file
     unregisters.push(tools.register(createSendFileTool(options)));
 
-    // 5. wait_for_user_messages
+    // 3. wait_for_user_messages
     unregisters.push(tools.register(createWaitForUserMessagesTool(options)));
 
-    // 6. send_qq_message
+    // 4. send_qq_message
     unregisters.push(tools.register(createSendQqMessageTool(options)));
 
-    // 7. recall_message
+    // 5. recall_message
     unregisters.push(tools.register(createRecallMessageTool(options)));
 
-    // 8. 表情包能力 (由 face_enabled 总开关前置门控)
+    // 6. 表情包能力 (由 face_enabled 总开关前置门控)
     if (getConfig().face_enabled) {
       unregisters.push(tools.register(createListFacesTool(options)));
       unregisters.push(tools.register(createSendFaceTool(options)));
@@ -137,7 +127,7 @@ export function registerAgentTools(
       unregisters.push(tools.register(createManageFacesTool(options)));
     }
 
-    // 9. schedule_task
+    // 7. schedule_task
     unregisters.push(
       tools.register(
         createScheduleTaskTool(() => {
@@ -150,7 +140,7 @@ export function registerAgentTools(
       )
     );
 
-    // 10. 黑话学习工具集 (由 slang_enabled 总开关前置门控，默认开启)
+    // 8. 黑话学习工具集 (由 slang_enabled 总开关前置门控，默认开启)
     if (getConfig().slang_enabled !== false) {
       const storage =
         options.slangStorage ||
@@ -166,7 +156,7 @@ export function registerAgentTools(
       }
     }
 
-    // 11. manage_scheduled_tasks
+    // 9. manage_scheduled_tasks
     unregisters.push(
       tools.register(
         createManageScheduledTasksTool(() => {

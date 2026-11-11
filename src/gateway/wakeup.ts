@@ -49,10 +49,10 @@ export interface WakeupOptions {
   descriptors?: AttachmentDescriptor[];
   /** 当前入站消息分配到的单聊短消息 ID（如 `msg_<n>`），可选注入到 WakeupPayload */
   shortId?: string;
-  /** 从 message_type=102 合并转发内嵌图片下载落盘得到的本地路径 */
+  /** 从 message_type=102 合并转发内嵌媒体落盘得到的本地图片/表情包路径（仅含图片与表情包，不含视频/语音/文件） */
   forwardImages?: string[];
-  /** 合并转发文本 URL 脱敏替换回调 */
-  sanitizeForwardContent?: (content: string) => string;
+  /** 合并转发文本结构化排版与占位替换回调 */
+  formatForwardContent?: (content: string) => string;
   /** 机器人展示名（引用自身消息时用于填充 quoted.from_name） */
   botName?: string;
   /** 发送者本地备注/展示名覆盖 */
@@ -199,7 +199,7 @@ export async function shouldWakeup(
 
   const content = parseNormalizedContent(event, descriptors, {
     getFaceByMd5: options.getFaceByMd5,
-    sanitizeForwardContent: options.sanitizeForwardContent,
+    formatForwardContent: options.formatForwardContent,
   });
 
   // 3. 入站引用解析（REFIDX_ 查库 -> msg_elements 兜底）
