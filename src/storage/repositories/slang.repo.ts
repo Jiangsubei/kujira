@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 社群黑话词典持久化仓库 (slang_entries)
+ * kujira: 黑话词典持久化仓库 (slang_entries)
  */
 
 import type { SlangEntry } from '../../types/index.js';

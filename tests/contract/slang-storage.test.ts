@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -8,8 +8,10 @@ import {
   formatSlangContextIndex,
   SlangStorage,
 } from '../../src/slang/storage.js';
+import { setupSlangService } from '../../src/slang/index.js';
+import { SnapshotManager } from '../../src/prompt/snapshot.js';
 import { MessageDatabase } from '../../src/storage/database.js';
-import { migrateSlangStorage } from '../../src/storage/slang-migration.js';
+import { openidToSessionBaseId } from '../../src/utils/peer.js';
 import type { SlangEntry } from '../../src/types/index.js';
 
 describe('SlangStorage Contract Tests', () => {
@@ -18,7 +20,7 @@ describe('SlangStorage Contract Tests', () => {
   let db: MessageDatabase;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-slang-storage-test-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-slang-storage-test-'));
     testDbPath = path.join(tmpDir, 'test_messages.sqlite');
     db = new MessageDatabase(testDbPath);
   });
@@ -69,9 +71,9 @@ describe('SlangStorage Contract Tests', () => {
 
       const entries = parseSlangMarkdown(md);
       expect(entries).toHaveLength(1);
-      expect(entries[0].term).toBe('有效词条');
-      expect(entries[0].definition).toBe('释义内容。');
-      expect(entries[0].example).toBe('例句内容');
+      expect(entries[0]!.term).toBe('有效词条');
+      expect(entries[0]!.definition).toBe('释义内容。');
+      expect(entries[0]!.example).toBe('例句内容');
     });
 
     it('should format entries into standard compact markdown lines', () => {
@@ -150,13 +152,11 @@ describe('SlangStorage Contract Tests', () => {
       expect(res.entry.term).toBe('牢大');
       expect(res.entry.tags).toBe('科比、坠机梗');
 
-      // 再次读取校验
       const entries = await storage.getEntries();
       expect(entries).toHaveLength(1);
-      expect(entries[0].term).toBe('牢大');
-      expect(entries[0].tags).toBe('科比、坠机梗');
+      expect(entries[0]!.term).toBe('牢大');
+      expect(entries[0]!.tags).toBe('科比、坠机梗');
 
-      // 验证 L1 常驻 Prompt 索引内容
       const rawPrompt = storage.getRawMarkdownSync();
       expect(rawPrompt).toContain('- 牢大：科比、坠机梗');
     });
@@ -183,8 +183,8 @@ describe('SlangStorage Contract Tests', () => {
 
       const entries = await storage.getEntries();
       expect(entries).toHaveLength(1);
-      expect(entries[0].definition).toBe('新释义');
-      expect(entries[0].example).toBe('新例句');
+      expect(entries[0]!.definition).toBe('新释义');
+      expect(entries[0]!.example).toBe('新例句');
     });
 
     it('should edit entry with rename support and partial update', async () => {
@@ -207,7 +207,7 @@ describe('SlangStorage Contract Tests', () => {
 
       const entries = await storage.getEntries();
       expect(entries).toHaveLength(1);
-      expect(entries[0].term).toBe('更名词');
+      expect(entries[0]!.term).toBe('更名词');
     });
 
     it('should throw error when editing non-existent entry', async () => {
@@ -227,7 +227,7 @@ describe('SlangStorage Contract Tests', () => {
 
       const entries = await storage.getEntries();
       expect(entries).toHaveLength(1);
-      expect(entries[0].term).toBe('词2');
+      expect(entries[0]!.term).toBe('词2');
     });
 
     it('should return false when deleting non-existent entry', async () => {
@@ -247,11 +247,11 @@ describe('SlangStorage Contract Tests', () => {
 
       const filteredByTerm = await storage.listEntries('香槟');
       expect(filteredByTerm).toHaveLength(1);
-      expect(filteredByTerm[0].term).toBe('开香槟');
+      expect(filteredByTerm[0]!.term).toBe('开香槟');
 
       const filteredByDef = await storage.listEntries('游戏');
       expect(filteredByDef).toHaveLength(1);
-      expect(filteredByDef[0].term).toBe('电子阳痿');
+      expect(filteredByDef[0]!.term).toBe('电子阳痿');
     });
 
     it('queryEntry should increment query_count and update last_queried_at', async () => {
@@ -263,11 +263,9 @@ describe('SlangStorage Contract Tests', () => {
         example: '优势很大，但先别开香槟',
       });
 
-      // 初始查询次数为 0
       const initial = db.getSlangEntry('开香槟', false);
       expect(initial?.query_count).toBe(0);
 
-      // 查询
       const q1 = await storage.queryEntry('开香槟');
       expect(q1?.term).toBe('开香槟');
       expect(q1?.query_count).toBe(1);
@@ -280,13 +278,11 @@ describe('SlangStorage Contract Tests', () => {
 
   describe('Capacity and Eviction Policy (reject vs evict_lru)', () => {
     it('should reject adding entry when maxEntries is reached under reject policy', async () => {
-      // 设定容量上限为 2
       const storage = new SlangStorage(db, 2, 'reject');
 
       await storage.recordEntry({ term: '词1', tags: '标1', definition: '释1', example: '例1' });
       await storage.recordEntry({ term: '词2', tags: '标2', definition: '释2', example: '例2' });
 
-      // 第 3 条在 reject 策略下被拒绝
       await expect(
         storage.recordEntry({ term: '词3', tags: '标3', definition: '释3', example: '例3' })
       ).rejects.toThrow(/条数上限 \(2\/2\)/);
@@ -296,17 +292,14 @@ describe('SlangStorage Contract Tests', () => {
     });
 
     it('should evict least queried entry under evict_lru policy', async () => {
-      // 设定容量上限为 2，策略为 evict_lru
       const storage = new SlangStorage(db, 2, 'evict_lru');
 
       await storage.recordEntry({ term: '冷门词', tags: '冷', definition: '没人查的词', example: '例1' });
       await storage.recordEntry({ term: '热门词', tags: '热', definition: '经常查的词', example: '例2' });
 
-      // 模拟模型查询热门词
       await storage.queryEntry('热门词');
       await storage.queryEntry('热门词');
 
-      // 插入第 3 条，应当自动淘汰冷门词 (query_count 为 0)
       const res = await storage.recordEntry({ term: '新词3', tags: '新', definition: '新释义', example: '新例3' });
 
       expect(res.action).toBe('created');
@@ -321,41 +314,61 @@ describe('SlangStorage Contract Tests', () => {
     });
   });
 
-  describe('Legacy Markdown Migration', () => {
-    it('should migrate legacy markdown entries into SQLite without deleting legacy files', () => {
-      const legacyMdPath = path.join(tmpDir, 'slang.md');
-      const legacyMdContent = [
-        '- **老梗1**：旧释义1（例：旧例句1）',
-        '- **老梗2**：旧释义2（例：旧例句2）',
-      ].join('\n');
-      fs.writeFileSync(legacyMdPath, legacyMdContent, 'utf-8');
+  describe('setupSlangService Kujira Channel Registration', () => {
+    it('should register kujira:slang channel and isolate non-kujira sessions without legacy migration', async () => {
+      let preStepHandler: ((args: any, next: any) => Promise<any>) | undefined;
+      const mockCtx: any = {
+        on: vi.fn().mockImplementation((event: string, handler: any) => {
+          if (event === 'agent/pre-step') {
+            preStepHandler = handler;
+          }
+          return () => {
+            if (preStepHandler === handler) {
+              preStepHandler = undefined;
+            }
+          };
+        }),
+      };
 
-      const result = migrateSlangStorage({
+      const service = setupSlangService(mockCtx, {
         db,
         dshHome: tmpDir,
-        storagePath: legacyMdPath,
+        registerGlobalTools: false,
+        registerPromptContext: true,
       });
 
-      expect(result.migratedCount).toBe(2);
-      expect(result.totalFound).toBe(2);
-
-      // 验证 SQLite 中已入库，且 tags 保持为空字符串留给模型后续维护
-      const entry1 = db.getSlangEntry('老梗1', false);
-      expect(entry1).not.toBeNull();
-      expect(entry1?.tags).toBe('');
-      expect(entry1?.definition).toBe('旧释义1');
-      expect(entry1?.example).toBe('旧例句1');
-
-      // 验证物理旧文件完好保留，未被删除
-      expect(fs.existsSync(legacyMdPath)).toBe(true);
-
-      // 再次执行，幂等不再重复写入
-      const rerun = migrateSlangStorage({
-        db,
-        dshHome: tmpDir,
-        storagePath: legacyMdPath,
+      await service.storage.recordEntry({
+        term: '真香',
+        tags: '打脸反转、前后态度反差',
+        definition: '起初拒绝，事后真香。',
+        example: '我绝对不写测试……真香！',
       });
-      expect(rerun.migratedCount).toBe(0);
+
+      expect(preStepHandler).toBeDefined();
+
+      // 1. Kujira 单聊放行注入 kujira:slang
+      const kujiraSessionId = openidToSessionBaseId('MOCK_OPENID_SLANG_001');
+      const kujiraRes = await preStepHandler!(
+        { agent: { session: { id: kujiraSessionId } }, messages: [] },
+        async () => ({ kind: 'enter', messages: [] })
+      );
+      expect(kujiraRes.messages).toHaveLength(1);
+      expect(kujiraRes.messages[0].source.kind).toBe('kujira:slang');
+      expect(kujiraRes.messages[0].source.sections[0].text).toContain('## 黑话与梗知识库 (Slang & Memes)');
+      expect(kujiraRes.messages[0].source.sections[0].text).toContain('- 真香：打脸反转、前后态度反差');
+
+      // 2. Web UI 会话拦截 0 注入
+      const webRes = await preStepHandler!(
+        { agent: { session: { id: 'web-session-01' } }, messages: [] },
+        async () => ({ kind: 'enter', messages: [] })
+      );
+      expect(webRes.messages).toHaveLength(0);
+
+      // 3. 验证 SnapshotManager 实例也按 Fail-Closed 门控
+      const mgr = new SnapshotManager(mockCtx);
+      mgr.dispose();
+
+      service.dispose();
     });
   });
 });

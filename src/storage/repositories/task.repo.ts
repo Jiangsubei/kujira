@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 定时任务表持久化仓库 (scheduled_tasks)
+ * kujira: 定时任务表持久化仓库 (scheduled_tasks)
  */
 
 import type {

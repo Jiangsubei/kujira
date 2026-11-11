@@ -1,529 +1,350 @@
 /**
  * tests/contract/outbound-self-record.test.ts
  *
- * 契约测试: 出站消息自身落库 (不依赖 OneBot reportSelfMessage 上报)
- *
- * 缺陷背景:
- * 插件此前完全依赖 NapCat 的 message_sent 上报来写入 self = 1 记录。
- * 一旦对端 reportSelfMessage 关闭，Bot 发出的消息在 QQ 端可见但本地历史静默丢失。
+ * 契约测试: QQ 官方 Bot 出站消息自身落库 (Outbound Self Record)
  *
  * 覆盖规范:
- * 1. 出站发送成功（retcode/status 成功且有 message_id）立即落库，self = 1；
- * 2. 发送失败绝不落库；
- * 3. group / private / send_msg 三种出站 action 的 peer 解析正确；
- * 4. 消息段归一化 (文本 / 引用 / @ / 图片 / 表情包) 与类型推导；
- * 5. 真实 WS 网关 + 真实 SQLite 的端到端闭环（非自造桩）。
+ * 1. 纯函数构造: 字符串 `msg_id` (`ROBOT1.0_...`)、`ref_idx` (`REFIDX_...`)、`reply_to`、`self = 1`，不含 `undefined`；
+ * 2. REST 发送返回 200 并拿到字符串 `id` 与可选 `ext_info.ref_idx` 后立即写入 `messages`；
+ * 3. 发送失败、缺有效字符串 `msgId`、空正文或 `msg_type=6` 输入状态绝不落库；
+ * 4. 幂等入库（`saveMessageIfNotExists` 不重复、不覆盖）；
+ * 5. 三 ID 严格隔离: 出站 `body.id` 绝不写入 `inbound_reply_slots`。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import WebSocket from 'ws';
+import Database from 'better-sqlite3';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
-import { NapCatGatewayServer, type OutboundSentEvent } from '../../src/gateway/server.js';
-import { MessageDatabase } from '../../src/storage/database.js';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
+import { KujiraGatewayClient, type OutboundSentEvent } from '../../src/gateway/server.js';
 import {
   buildSelfMessageRecord,
   recordOutboundSelfMessage,
-  enrichOutboundMediaRecord,
+  type SelfRecordDb,
 } from '../../src/outbound/self-record.js';
+import type { MessageRecord } from '../../src/types/index.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
-const BOT_QQ = '1000000000';
-const FRIEND_QQ = '1000000001';
-const GROUP_ID = '8000000001';
+const BOT_ID = '1000000000';
+const TEST_OPENID = '00112233445566778899AABBCCDDEEFF';
+const TEST_PEER = openidToPeer(TEST_OPENID);
 const SENDER_NAME = '测试助手';
 
-function noopLogger(): any {
-  return { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-}
+function createV2TestDb(dbPath: string): {
+  raw: Database.Database;
+  adapter: SelfRecordDb;
+  getMessage: (msgId: string) => any;
+  listInboundSlots: () => any[];
+} {
+  const raw = new Database(dbPath);
+  raw.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      msg_id TEXT PRIMARY KEY,
+      peer TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      sender_name TEXT NOT NULL,
+      time INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      raw TEXT NOT NULL,
+      file_id TEXT,
+      local_path TEXT,
+      fingerprint TEXT,
+      recalled INTEGER NOT NULL DEFAULT 0,
+      self INTEGER NOT NULL DEFAULT 0,
+      reply_to TEXT,
+      ref_idx TEXT,
+      source TEXT NOT NULL DEFAULT 'qq',
+      attachments TEXT
+    );
 
-describe('契约测试: 出站消息自身记录 (纯函数)', () => {
-  const base = {
-    botQQ: BOT_QQ,
-    senderName: SENDER_NAME,
+    CREATE TABLE IF NOT EXISTS inbound_reply_slots (
+      msg_id TEXT PRIMARY KEY,
+      peer TEXT NOT NULL,
+      openid TEXT NOT NULL,
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      received_at INTEGER NOT NULL,
+      invalidated INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  const insertStmt = raw.prepare(`
+    INSERT OR IGNORE INTO messages (
+      msg_id, peer, user_id, sender_name, time, type, content, raw,
+      file_id, local_path, fingerprint, recalled, self, reply_to, ref_idx, source, attachments
+    ) VALUES (
+      @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
+      @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @ref_idx, @source, @attachments
+    )
+  `);
+
+  const adapter: SelfRecordDb = {
+    saveMessageIfNotExists(record: MessageRecord): boolean {
+      const result = insertStmt.run({
+        msg_id: record.msg_id,
+        peer: record.peer,
+        user_id: record.user_id,
+        sender_name: record.sender_name || '',
+        time: record.time,
+        type: record.type,
+        content: record.content,
+        raw: record.raw,
+        file_id: record.file_id ?? null,
+        local_path: record.local_path ?? null,
+        fingerprint: record.fingerprint ?? null,
+        recalled: record.recalled ? 1 : 0,
+        self: record.self ? 1 : 0,
+        reply_to: record.reply_to ?? null,
+        ref_idx: record.ref_idx ?? null,
+        source: record.source ?? 'qq',
+        attachments: record.attachments ?? null,
+      });
+      return result.changes > 0;
+    },
   };
 
-  it('契约 1: 纯文本出站 → self=1、peer/msg_id/content 正确', () => {
+  return {
+    raw,
+    adapter,
+    getMessage: (msgId: string) => raw.prepare('SELECT * FROM messages WHERE msg_id = ?').get(msgId),
+    listInboundSlots: () => raw.prepare('SELECT * FROM inbound_reply_slots').all(),
+  };
+}
+
+describe('契约测试: 出站消息自身记录 (纯函数 buildSelfMessageRecord)', () => {
+  const base = { botId: BOT_ID, senderName: SENDER_NAME };
+
+  it('契约 1: 纯文本/Markdown 出站 -> self=1、string msg_id、ref_idx、reply_to 正确且无 undefined', () => {
     const record = buildSelfMessageRecord(
-      { peer: `group_${GROUP_ID}`, msgId: -123456789, message: '你好呀', time: 1793800000000 },
+      {
+        peer: TEST_PEER,
+        openid: TEST_OPENID,
+        msgId: 'ROBOT1.0_OUT_TEXT_001',
+        refIdx: 'REFIDX_OUT_TEXT_001',
+        replyTo: 'ROBOT1.0_IN_001',
+        msgType: 2,
+        text: '# 你好呀\n这是单聊 Markdown 回复',
+        payload: { msg_type: 2, markdown: { content: '# 你好呀\n这是单聊 Markdown 回复' } },
+        time: 1793800000000,
+      },
       base
     );
 
     expect(record).not.toBeNull();
-    expect(record!.msg_id).toBe(-123456789);
-    expect(record!.peer).toBe(`group_${GROUP_ID}`);
-    expect(record!.user_id).toBe(BOT_QQ);
+    expect(record!.msg_id).toBe('ROBOT1.0_OUT_TEXT_001');
+    expect(record!.ref_idx).toBe('REFIDX_OUT_TEXT_001');
+    expect(record!.reply_to).toBe('ROBOT1.0_IN_001');
+    expect(record!.peer).toBe(TEST_PEER);
+    expect(record!.user_id).toBe(BOT_ID);
     expect(record!.sender_name).toBe(SENDER_NAME);
     expect(record!.self).toBe(1);
     expect(record!.recalled).toBe(0);
-    expect(record!.type).toBe('text');
-    expect(record!.content).toBe('你好呀');
-    expect(record!.reply_to).toBeNull();
-    expect(JSON.parse(record!.raw)).toEqual([{ type: 'text', data: { text: '你好呀' } }]);
-  });
-
-  it('契约 2: 带引用与艾特的出站段 → reply_to 保留、类型为 reply', () => {
-    const record = buildSelfMessageRecord(
-      {
-        peer: `group_${GROUP_ID}`,
-        msgId: 987654321,
-        message: [
-          { type: 'reply', data: { id: 112233 } },
-          { type: 'at', data: { qq: FRIEND_QQ } },
-          { type: 'text', data: { text: ' 收到' } },
-        ],
-        time: 1793800001000,
-      },
-      base
-    );
-
-    expect(record).not.toBeNull();
-    expect(record!.reply_to).toBe(112233);
     expect(record!.type).toBe('reply');
-    expect(record!.content).toContain(`@${FRIEND_QQ}`);
-    expect(record!.content).toContain('收到');
-  });
+    expect(record!.source).toBe('qq');
+    expect(record!.content).toBe('# 你好呀\n这是单聊 Markdown 回复');
+    expect((record as any).busid).toBeUndefined();
 
-  it('契约 3: 图片与表情包段 → 类型推导为 image / sticker', () => {
-    const image = buildSelfMessageRecord(
-      {
-        peer: `user_${FRIEND_QQ}`,
-        msgId: 1,
-        message: [{ type: 'image', data: { file: 'file:///tmp/a.png' } }],
-        time: 1793800002000,
-      },
-      base
-    );
-    expect(image!.type).toBe('image');
-    expect(image!.content).toContain('[图片:');
-
-    const sticker = buildSelfMessageRecord(
-      {
-        peer: `user_${FRIEND_QQ}`,
-        msgId: 2,
-        message: [{ type: 'image', data: { file: 'file:///tmp/b.png', sub_type: 1 } }],
-        time: 1793800003000,
-      },
-      base
-    );
-    expect(sticker!.type).toBe('sticker');
-  });
-
-  it('契约 4: 空内容不产生记录（避免写入无意义行）', () => {
-    expect(
-      buildSelfMessageRecord(
-        { peer: `user_${FRIEND_QQ}`, msgId: 3, message: '', time: 1793800004000 },
-        base
-      )
-    ).toBeNull();
-    expect(
-      buildSelfMessageRecord(
-        { peer: `user_${FRIEND_QQ}`, msgId: 4, message: [], time: 1793800005000 },
-        base
-      )
-    ).toBeNull();
-  });
-
-  it('契约 5: 记录字段完整且不含 undefined', () => {
-    const record = buildSelfMessageRecord(
-      { peer: `user_${FRIEND_QQ}`, msgId: 5, message: 'x', time: 1793800006000 },
-      base
-    );
     for (const [key, value] of Object.entries(record!)) {
       expect(value, `字段 ${key} 不应为 undefined`).not.toBeUndefined();
     }
   });
 
-  it('契约 6: 群聊文件出站 → 类型 group_file、内容为群文件占位；私聊文件为 file', () => {
-    const groupFile = buildSelfMessageRecord(
+  it('契约 2: 无 replyTo 时 type=text，refIdx 缺失时 ref_idx=null', () => {
+    const record = buildSelfMessageRecord(
       {
-        peer: `group_${GROUP_ID}`,
-        msgId: 6,
-        message: [{ type: 'file', data: { file: 'report.pdf' } }],
-        time: 1793800007000,
+        peer: TEST_PEER,
+        openid: TEST_OPENID,
+        msgId: 'ROBOT1.0_OUT_TEXT_002',
+        msgType: 0,
+        text: '纯文本消息',
+        time: 1793800001000,
       },
       base
-    );
-    expect(groupFile!.type).toBe('group_file');
-    expect(groupFile!.content).toContain('[群文件:report.pdf]');
+    )!;
 
-    const privateFile = buildSelfMessageRecord(
-      {
-        peer: `user_${FRIEND_QQ}`,
-        msgId: 7,
-        message: [{ type: 'file', data: { file: 'report.pdf' } }],
-        time: 1793800008000,
-      },
-      base
-    );
-    expect(privateFile!.type).toBe('file');
-    expect(privateFile!.content).toContain('[文件:report.pdf]');
+    expect(record.type).toBe('text');
+    expect(record.ref_idx).toBeNull();
+    expect(record.reply_to).toBeNull();
   });
 
-  it('契约 7: 出站媒体 payload 解析 local_path（file:// 与绝对路径），URL/base64 不落本地路径', () => {
-    const image = buildSelfMessageRecord(
+  it('契约 3: 图片与文件附件描述符 -> 类型与本地路径准确落库', () => {
+    const imgRecord = buildSelfMessageRecord(
       {
-        peer: `group_${GROUP_ID}`,
-        msgId: 8,
-        message: [{ type: 'image', data: { file: 'file:///C:/tmp/outbound-image.png' } }],
-        time: 1793800009000,
+        peer: TEST_PEER,
+        openid: TEST_OPENID,
+        msgId: 'ROBOT1.0_OUT_IMG_001',
+        msgType: 7,
+        time: 1793800002000,
+        attachments: [
+          {
+            kind: 'image',
+            origin: 'outbound',
+            local: { path: '/tmp/out.png', format: 'png', fingerprint: 'fp_1' },
+            remote: { fileId: 'uuid_img_1' },
+          },
+        ],
       },
       base
-    );
-    expect(image!.local_path).toBeTruthy();
-    expect(image!.local_path!.endsWith('outbound-image.png')).toBe(true);
+    )!;
 
-    const file = buildSelfMessageRecord(
-      {
-        peer: `group_${GROUP_ID}`,
-        msgId: 9,
-        message: [{ type: 'file', data: { file: 'file:///C:/tmp/report.pdf' } }],
-        time: 1793800010000,
-      },
-      base
-    );
-    expect(file!.type).toBe('group_file');
-    expect(file!.local_path).toBeTruthy();
-    expect(file!.local_path!.endsWith('report.pdf')).toBe(true);
+    expect(imgRecord.type).toBe('image');
+    expect(imgRecord.content).toBe('[图片:/tmp/out.png]');
+    expect(imgRecord.local_path).toBe('/tmp/out.png');
+    expect(imgRecord.file_id).toBe('uuid_img_1');
+    expect(imgRecord.fingerprint).toBe('fp_1');
 
-    const urlImage = buildSelfMessageRecord(
+    const fileRecord = buildSelfMessageRecord(
       {
-        peer: `user_${FRIEND_QQ}`,
-        msgId: 10,
-        message: [{ type: 'image', data: { file: 'https://example.com/a.png' } }],
-        time: 1793800011000,
+        peer: TEST_PEER,
+        openid: TEST_OPENID,
+        msgId: 'ROBOT1.0_OUT_FILE_001',
+        msgType: 7,
+        time: 1793800003000,
+        attachments: [
+          {
+            kind: 'file',
+            origin: 'outbound',
+            fileName: 'report.pdf',
+            local: { path: '/tmp/report.pdf' },
+          },
+        ],
       },
       base
-    );
-    expect(urlImage!.local_path).toBeNull();
+    )!;
+    expect(fileRecord.type).toBe('file');
+    expect(fileRecord.content).toBe('[文件:report.pdf 已保存: /tmp/report.pdf]');
+  });
 
-    const b64Image = buildSelfMessageRecord(
-      {
-        peer: `user_${FRIEND_QQ}`,
-        msgId: 11,
-        message: [{ type: 'image', data: { file: 'base64://iVBORw0KGgo=' } }],
-        time: 1793800012000,
-      },
-      base
-    );
-    expect(b64Image!.local_path).toBeNull();
+  it('契约 4: 空 msgId 或空正文不产生记录', () => {
+    expect(
+      buildSelfMessageRecord(
+        { peer: TEST_PEER, openid: TEST_OPENID, msgId: '', msgType: 0, text: 'hello', time: 1793800004000 },
+        base
+      )
+    ).toBeNull();
+    expect(
+      buildSelfMessageRecord(
+        { peer: TEST_PEER, openid: TEST_OPENID, msgId: 'ROBOT1.0_EMPTY', msgType: 0, text: '   ', time: 1793800005000 },
+        base
+      )
+    ).toBeNull();
   });
 });
 
-describe('契约测试: 出站消息自身落库 (真实 WS 网关 + SQLite 闭环)', () => {
+describe('契约测试: KujiraGatewayClient + SQLite 出站自记录与三 ID 隔离闭环', () => {
   let tmpDir: string;
-  let db: MessageDatabase;
-  let server: NapCatGatewayServer;
-  let client: WebSocket;
-  let received: Array<Record<string, any>> = [];
-  let sentEvents: OutboundSentEvent[] = [];
+  let dbBundle: ReturnType<typeof createV2TestDb>;
+  let sentEvents: OutboundSentEvent[];
 
   beforeEach(async () => {
-    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-outbound-self-'));
-    db = new MessageDatabase(path.join(tmpDir, 'messages.sqlite'));
-    db.init();
-
-    received = [];
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-self-record-'));
+    dbBundle = createV2TestDb(path.join(tmpDir, 'messages.sqlite'));
     sentEvents = [];
-    server = new NapCatGatewayServer({
-      port: 0,
-      token: 'test-mock-token',
-      logger: noopLogger(),
-      onMessageSent: (event) => {
-        sentEvents.push(event);
-        const record = recordOutboundSelfMessage(event, {
-          db,
-          botQQ: BOT_QQ,
-          senderName: SENDER_NAME,
-          logger: noopLogger(),
-        });
-        if (record) {
-          void enrichOutboundMediaRecord(server, db, record, noopLogger());
-        }
-      },
-    });
-    await server.start();
-    const addr: any = (server as any).wss.address();
-    client = new WebSocket(`ws://127.0.0.1:${addr.port}?access_token=test-mock-token`);
-    await new Promise<void>((resolve, reject) => {
-      client.once('open', () => resolve());
-      client.once('error', reject);
-    });
-    client.on('message', (data) => {
-      received.push(JSON.parse(data.toString()));
-    });
   });
 
   afterEach(async () => {
-    if (client) client.terminate();
-    await server.stop().catch(() => {});
-    db.close();
+    dbBundle.raw.close();
     await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  async function respondTo(action: string, data: any): Promise<Record<string, any>> {
-    let pending: Record<string, any> | undefined;
-    for (let i = 0; i < 100 && !pending; i++) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      pending = received.find((r) => r.action === action);
-    }
-    if (!pending) throw new Error(`未收到 action: ${action}, received=${JSON.stringify(received)}`);
-    client.send(JSON.stringify({ echo: pending.echo, status: 'ok', retcode: 0, data }));
-    return pending;
-  }
+  function createMockClient(responder: (url: string, init?: RequestInit) => Promise<Response>) {
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('getAppAccessToken')) {
+        return new Response(JSON.stringify({ access_token: 'mock_token', expires_in: 7200 }), { status: 200 });
+      }
+      return responder(url, init);
+    };
 
-  it('端到端 1: 群聊发送成功 → 自身消息写入本地历史 (无需 message_sent 上报)', async () => {
-    const pending = server.sendGroupMsg(GROUP_ID, '群里的自发言');
-    await respondTo('send_group_msg', { message_id: -987654 });
-    await pending;
-
-    const history = db.readHistory(`group_${GROUP_ID}`, { self_only: true });
-    expect(history.messages).toHaveLength(1);
-    const msg = history.messages[0];
-    expect(msg.msg_id).toBe(-987654);
-    expect(msg.self).toBe(true);
-    expect(msg.user_id).toBe(BOT_QQ);
-    expect(msg.sender_name).toBe(SENDER_NAME);
-    expect(msg.content).toBe('群里的自发言');
-    expect(sentEvents).toHaveLength(1);
-    expect(sentEvents[0].peer).toBe(`group_${GROUP_ID}`);
-  });
-
-  it('端到端 2: 私聊发送成功 → 落库到对应用户会话', async () => {
-    const pending = server.sendPrivateMsg(FRIEND_QQ, [{ type: 'text', data: { text: '私聊自发言' } }]);
-    await respondTo('send_private_msg', { message_id: 123456 });
-    await pending;
-
-    const history = db.readHistory(`user_${FRIEND_QQ}`, { self_only: true });
-    expect(history.messages).toHaveLength(1);
-    expect(history.messages[0].user_id).toBe(BOT_QQ);
-    expect(history.messages[0].content).toBe('私聊自发言');
-  });
-
-  it('端到端 3: 发送失败 (retcode ≠ 0) → 绝不落库', async () => {
-    const pending = server.sendGroupMsg(GROUP_ID, '失败消息');
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
-    const req = received.find((r) => r.action === 'send_group_msg')!;
-    client.send(
-      JSON.stringify({ echo: req.echo, status: 'failed', retcode: 100, data: null, message: '风控' })
-    );
-    const res = await pending;
-    expect(res.retcode).toBe(100);
-
-    const history = db.readHistory(`group_${GROUP_ID}`, { self_only: true });
-    expect(history.messages).toHaveLength(0);
-    expect(sentEvents).toHaveLength(0);
-  });
-
-  it('端到端 4: 缺 message_id 的成功应答 → 不落库 (无主键可用)', async () => {
-    const pending = server.sendGroupMsg(GROUP_ID, '无 IDF');
-    await respondTo('send_group_msg', {});
-    await pending;
-
-    expect(db.readHistory(`group_${GROUP_ID}`, { self_only: true }).messages).toHaveLength(0);
-    expect(sentEvents).toHaveLength(0);
-  });
-
-  it('端到端 5: send_msg 通用 action → 按 group_id 正确解析 peer', async () => {
-    const pending = server.sendAction('send_msg', {
-      message_type: 'group',
-      group_id: Number(GROUP_ID),
-      message: '通用发送',
-    });
-    await respondTo('send_msg', { message_id: 555666 });
-    await pending;
-
-    const history = db.readHistory(`group_${GROUP_ID}`, { self_only: true });
-    expect(history.messages).toHaveLength(1);
-    expect(history.messages[0].content).toBe('通用发送');
-  });
-
-  it('端到端 6: 重复上报幂等 → 记录不重复、不覆盖', async () => {
-    const pending = server.sendGroupMsg(GROUP_ID, '幂等消息');
-    await respondTo('send_group_msg', { message_id: 777888 });
-    await pending;
-
-    // 模拟后续收到 message_sent 回显（reportSelfMessage 开启后的场景）
-    const inserted = db.saveMessageIfNotExists({
-      ...buildSelfMessageRecord(
-        { peer: `group_${GROUP_ID}`, msgId: 777888, message: '幂等消息', time: Date.now() },
-        { botQQ: BOT_QQ, senderName: SENDER_NAME }
-      )!,
-      content: '回显内容',
-    });
-    expect(inserted).toBe(false);
-
-    const history = db.readHistory(`group_${GROUP_ID}`, { self_only: true });
-    expect(history.messages).toHaveLength(1);
-    expect(history.messages[0].content).toBe('幂等消息');
-  });
-
-  it('端到端 7: 图片出站 → local_path 立即落库，get_msg 回查补全 file_id 与 raw', async () => {
-    const pending = server.sendGroupMsg(GROUP_ID, [
-      { type: 'image', data: { file: 'file:///C:/tmp/outbound-image.png' } },
-    ]);
-    await respondTo('send_group_msg', { message_id: 314159 });
-    await pending;
-
-    // payload 版本：local_path 已解析，file_id 尚未知
-    const before = db.getMessage(314159)!;
-    expect(before.local_path).toBeTruthy();
-    expect(before.local_path!.endsWith('outbound-image.png')).toBe(true);
-    expect(before.file_id).toBeNull();
-
-    // NapCat 回查：返回完整消息对象（含媒体信息）
-    await respondTo('get_msg', {
-      message: [
-        {
-          type: 'image',
-          data: {
-            file: '9E64D1403F9FBA2D5F9CB90289AD23F4.jpg',
-            url: 'https://multimedia.example/download?fileid=mock',
-            file_size: '12345',
-          },
-        },
-      ],
-    });
-
-    // 等待异步补全完成
-    let after = db.getMessage(314159)!;
-    for (let i = 0; i < 100 && after.file_id === null; i++) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      after = db.getMessage(314159)!;
-    }
-
-    expect(after.file_id).toBe('9E64D1403F9FBA2D5F9CB90289AD23F4.jpg');
-    // payload 解析出的源文件路径必须优先保留
-    expect(after.local_path).toBe(before.local_path);
-    expect(JSON.parse(after.raw)[0].data.url).toContain('multimedia.example');
-  });
-
-  it('端到端 8: get_msg 回查失败 → 保留 payload 版本，不丢记录', async () => {
-    const pending = server.sendGroupMsg(GROUP_ID, [
-      { type: 'file', data: { file: 'file:///C:/tmp/report.pdf' } },
-    ]);
-    await respondTo('send_group_msg', { message_id: 271828 });
-    await pending;
-
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
-    const req = received.find((r) => r.action === 'get_msg')!;
-    expect(req).toBeDefined();
-    client.send(
-      JSON.stringify({ echo: req.echo, status: 'failed', retcode: 100, data: null })
-    );
-
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    const after = db.getMessage(271828)!;
-    expect(after.local_path).toBeTruthy();
-    expect(after.local_path!.endsWith('report.pdf')).toBe(true);
-  });
-});
-
-describe('契约测试: 出站自身落库在真实装配下闭环 (bootDshNapcatBridge)', () => {
-  const WS_PORT = 29871;
-  const WS_TOKEN = 'test-mock-token';
-  const ASSEMBLY_SENDER = '装配助手';
-
-  let tmpHome: string;
-  let booted: BootedDsh | undefined;
-  let gateway: NapCatGatewayServer;
-  let client: WebSocket | undefined;
-
-  async function waitFor<T>(probe: () => T | undefined, timeoutMs = 8000): Promise<T> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const value = probe();
-      if (value !== undefined) return value;
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
-    }
-    throw new Error('等待装配就绪超时');
-  }
-
-  beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-outbound-assembly-'));
-    booted = await bootDshNapcatBridge({
-      dshHome: tmpHome,
-      mountPlugin: true,
-      config: {
-        bot_qq: BOT_QQ,
-        ws_port: WS_PORT,
-        ws_token: WS_TOKEN,
-        aliases: [ASSEMBLY_SENDER],
+    return new KujiraGatewayClient({
+      credentials: { appId: 'mock_app_id', appSecret: 'mock_app_secret' },
+      fetchFn: fetchMock,
+      onMessageSent: (event) => {
+        sentEvents.push(event);
+        recordOutboundSelfMessage(event, {
+          db: dbBundle.adapter,
+          botId: BOT_ID,
+          senderName: SENDER_NAME,
+        });
       },
     });
+  }
 
-    gateway = await waitFor(() => {
-      const c: any = booted!.ctx;
-      return (c.get?.('napcat-gateway') || c['napcat-gateway']) as NapCatGatewayServer | undefined;
-    });
-  });
+  it('端到端 1: REST 发送成功拿到 body.id 与 ext_info.ref_idx -> 立即写入 messages，绝不写入 inbound_reply_slots', async () => {
+    const client = createMockClient(async () =>
+      new Response(
+        JSON.stringify({
+          id: 'ROBOT1.0_OUT_LIVE_001',
+          timestamp: '2026-11-11T18:30:00+08:00',
+          ext_info: { ref_idx: 'REFIDX_OUT_LIVE_001' },
+        }),
+        { status: 200 }
+      )
+    );
 
-  afterEach(async () => {
-    if (client) {
-      client.terminate();
-      client = undefined;
-    }
-    if (booted) {
-      await booted.dispose().catch(() => {});
-      booted = undefined;
-    }
-    if (tmpHome) {
-      await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
-    }
-  });
-
-  it('装配 1: 真实 boot 挂载后网关必须已接线 onMessageSent 落库回调', () => {
-    expect(gateway).toBeInstanceOf(NapCatGatewayServer);
-    expect(typeof gateway.options.onMessageSent).toBe('function');
-  });
-
-  it('装配 2: 真实 boot + 真实 WS 客户端发送成功 → 插件数据库出现 self=1 记录', async () => {
-    client = new WebSocket(`ws://127.0.0.1:${WS_PORT}?access_token=${WS_TOKEN}`);
-    await new Promise<void>((resolve, reject) => {
-      client!.once('open', () => resolve());
-      client!.once('error', reject);
-    });
-
-    let pendingRequest: Record<string, any> | undefined;
-    client.on('message', (data) => {
-      const payload = JSON.parse(data.toString());
-      if (payload.action === 'send_group_msg' && payload.echo) {
-        pendingRequest = payload;
-        client!.send(
-          JSON.stringify({
-            echo: payload.echo,
-            status: 'ok',
-            retcode: 0,
-            data: { message_id: -424242 },
-          })
-        );
+    const res = await client.sendC2CMessage(
+      TEST_OPENID,
+      {
+        msg_type: 2,
+        markdown: { content: '你好单聊' },
+        message_reference: { message_id: 'REFIDX_IN_PREV' },
+        msg_id: 'ROBOT1.0_INBOUND_001',
+        msg_seq: 1,
+      },
+      {
+        peer: TEST_PEER,
+        replyTo: 'ROBOT1.0_IN_PREV',
       }
+    );
+
+    expect(res.ok).toBe(true);
+    expect(sentEvents).toHaveLength(1);
+
+    const row = dbBundle.getMessage('ROBOT1.0_OUT_LIVE_001');
+    expect(row).toBeDefined();
+    expect(row.self).toBe(1);
+    expect(row.peer).toBe(TEST_PEER);
+    expect(row.user_id).toBe(BOT_ID);
+    expect(row.sender_name).toBe(SENDER_NAME);
+    expect(row.content).toBe('你好单聊');
+    expect(row.ref_idx).toBe('REFIDX_OUT_LIVE_001');
+    expect(row.reply_to).toBe('ROBOT1.0_IN_PREV');
+
+    // 严禁把出站 body.id 写入入站槽位表
+    expect(dbBundle.listInboundSlots()).toHaveLength(0);
+  });
+
+  it('端到端 2: 发送失败 (HTTP 400) 或 msg_type=6 输入状态 -> 绝不触发落库', async () => {
+    const failingClient = createMockClient(async () =>
+      new Response(JSON.stringify({ code: 40034024, message: '请求参数msg_id无效或越权' }), { status: 400 })
+    );
+    const failRes = await failingClient.sendC2CMessage(TEST_OPENID, { msg_type: 0, content: '失败消息' });
+    expect(failRes.ok).toBe(false);
+    expect(sentEvents).toHaveLength(0);
+
+    const notifyClient = createMockClient(async () =>
+      new Response(JSON.stringify({ id: 'ROBOT1.0_INPUT_NOTIFY_TEMP' }), { status: 200 })
+    );
+    const notifyRes = await notifyClient.sendInputNotify(TEST_OPENID, 'ROBOT1.0_INBOUND_001', 1);
+    expect(notifyRes.ok).toBe(true);
+    expect(sentEvents).toHaveLength(0);
+    expect(dbBundle.getMessage('ROBOT1.0_INPUT_NOTIFY_TEMP')).toBeUndefined();
+  });
+
+  it('端到端 3: 幂等入库 -> 相同 msg_id 重复触发不覆盖原内容', async () => {
+    const client = createMockClient(async () =>
+      new Response(JSON.stringify({ id: 'ROBOT1.0_OUT_DUP' }), { status: 200 })
+    );
+
+    await client.sendC2CMessage(TEST_OPENID, { msg_type: 0, content: '原始消息' });
+    const insertedAgain = dbBundle.adapter.saveMessageIfNotExists({
+      ...buildSelfMessageRecord(
+        { peer: TEST_PEER, openid: TEST_OPENID, msgId: 'ROBOT1.0_OUT_DUP', msgType: 0, text: '被覆盖文本', time: Date.now() },
+        { botId: BOT_ID, senderName: SENDER_NAME }
+      )!,
     });
-
-    await gateway.sendGroupMsg(GROUP_ID, '装配闭环自发言');
-    expect(pendingRequest).toBeDefined();
-
-    // 插件自身持有的数据库文件（真实落盘位置）
-    const dbPath = path.join(tmpHome, 'napcat', 'messages.sqlite');
-    const rawDb = new DatabaseSync(dbPath, { readOnly: true });
-    try {
-      const row = rawDb
-        .prepare(
-          'SELECT msg_id, peer, user_id, sender_name, content, self, type FROM messages WHERE msg_id = ?'
-        )
-        .get(-424242) as any;
-
-      expect(row).toBeDefined();
-      expect(row.self).toBe(1);
-      expect(row.peer).toBe(`group_${GROUP_ID}`);
-      expect(row.user_id).toBe(BOT_QQ);
-      expect(row.sender_name).toBe(ASSEMBLY_SENDER);
-      expect(row.content).toBe('装配闭环自发言');
-      expect(row.type).toBe('text');
-    } finally {
-      rawDb.close();
-    }
+    expect(insertedAgain).toBe(false);
+    expect(dbBundle.getMessage('ROBOT1.0_OUT_DUP').content).toBe('原始消息');
   });
 });

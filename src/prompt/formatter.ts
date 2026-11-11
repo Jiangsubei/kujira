@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 统一提示词与上下文格式化模块 (PromptFormatter)
+ * kujira: 统一提示词与上下文格式化模块 (PromptFormatter)
  * 集中管理所有注入到 SystemPrompt 动态段的排版契约与 Markdown 规范。
  * 强制顶层采用统一的二级标题 `## <中文模块名> (<English Subtitle>)`，
  * 消除各业务各自拼接、格式碎片化与层级漂移。
@@ -126,14 +126,14 @@ export function formatBehaviorContext(behavior: string): string {
 }
 
 /**
- * 格式化社群黑话知识库 (Slang & Memes)
+ * 格式化黑话与梗知识库 (Slang & Memes)
  */
 export function formatSlangContext(slangContent: string): string {
   return formatPromptSection({
-    title: '社群黑话知识库',
+    title: '黑话与梗知识库',
     subtitle: 'Slang & Memes',
     description:
-      '以下为社群黑话及其触发情境与招牌句式索引（若对方发言契合对应场景、出现标志句式或玩梗，且前文未查过该词条时，构思回复前应调用 query_slang 工具查询详细释义与例句，已掌握则无需重复查询，严禁未查明即凭空臆测）：',
+      '以下为黑话与梗及其触发情境与招牌句式索引（若对方发言契合对应场景、出现标志句式或玩梗，且前文未查过该词条时，构思回复前应调用 query_slang 工具查询详细释义与例句，已掌握则无需重复查询，严禁未查明即凭空臆测）：',
     content: slangContent,
   });
 }
@@ -150,12 +150,12 @@ export function formatSessionRulesContext(rulesContent: string): string {
 }
 
 /**
- * 格式化用户画像与群成员 (User Profiles & Members)
+ * 格式化用户画像与偏好 (User Profile)
  */
 export function formatUserProfilesContext(profilesContent: string): string {
   return formatPromptSection({
-    title: '用户画像与群成员',
-    subtitle: 'User Profiles & Members',
+    title: '用户画像与偏好',
+    subtitle: 'User Profile',
     content: profilesContent,
   });
 }

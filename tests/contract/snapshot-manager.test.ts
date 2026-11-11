@@ -1,27 +1,41 @@
 /**
  * tests/contract/snapshot-manager.test.ts
- * 契约测试: 多通道独立运行时快照与上下文注入管理器 (SnapshotManager Contract)
+ * 契约测试: Kujira 多通道独立运行时快照与上下文注入管理器 (SnapshotManager Contract)
  *
  * 验证规则:
- * 1. 契约 1: resolveQQSessionContext 具备严格 Fail-Closed 白名单校验与多源解析能力；
- * 2. 契约 2: SnapshotManager 安全门控 — 非 QQ 会话 (Web UI / 空上下文 / 沙箱) 100% 阻断，0 条注入；
+ * 1. 契约 1: resolveQQSessionContext 与 isExplicitNonQQSession 具备严格 Fail-Closed 白名单校验（仅放行 kujira-user-<hash> 与 user_<hash>）；
+ * 2. 契约 2: SnapshotManager 安全门控 — Web UI / 旧群聊格式 / 空上下文 / 沙箱 100% 阻断，0 条注入；
  * 3. 契约 3: 单 Provider 异常时优雅降级隔离，绝不影响其他 Provider 和装配流程；
  * 4. 契约 4: dispose 与 unregister 正确释放 Provider 与清理会话状态；
- * 5. 契约 5: setupSnapshotHub 规范装配 6 大独立原子通道，排版严格遵循 ## 模块名 规范；
+ * 5. 契约 5: setupSnapshotHub 规范装配 6 大独立原子通道 (kujira:*)，单聊用户画像严格按 session.peer 隔离读取；
  * 6. 契约 6: 多通道独立快照脏检查与增量注入契约（0-Token 命中、单通道增量、历史恢复）。
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { promises as fsp } from 'node:fs';
 import {
   SnapshotManager,
   resolveQQSessionContext,
+  isExplicitNonQQSession,
   setupSnapshotHub,
   type SnapshotProvider,
 } from '../../src/prompt/snapshot.js';
+import { MemoryStorage } from '../../src/memory/storage.js';
+import { DEFAULT_BEHAVIOR } from '../../src/constants/index.js';
+import { computeOpenidHash16, openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
-describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager Contract)', () => {
+describe('契约测试: Kujira 多通道独立运行时快照管理器 (SnapshotManager Contract)', () => {
   let mockCtx: any;
   let preStepHandler: ((args: any, next: any) => Promise<any>) | undefined;
+
+  const hashA = computeOpenidHash16('MOCK_OPENID_SNAPSHOT_A');
+  const peerA = openidToPeer('MOCK_OPENID_SNAPSHOT_A');
+  const sessionBaseA = openidToSessionBaseId('MOCK_OPENID_SNAPSHOT_A');
+
+  const hashB = computeOpenidHash16('MOCK_OPENID_SNAPSHOT_B');
+  const peerB = openidToPeer('MOCK_OPENID_SNAPSHOT_B');
 
   beforeEach(() => {
     preStepHandler = undefined;
@@ -39,55 +53,33 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
     };
   });
 
-  describe('契约 1: resolveQQSessionContext Fail-Closed 判定与解析', () => {
-    it('1.1 能从多种合法群聊格式中解析出 group peer', () => {
-      const ctx1 = { agent: { session: { id: 'qq-group-1000000001-1' } } };
+  describe('契约 1: resolveQQSessionContext 与 isExplicitNonQQSession Fail-Closed 判定', () => {
+    it('1.1 能从 kujira-user-<hash>（含可选轮次/版本/防撞后缀）与 user_<hash> 解析出干净 { peer, userId }', () => {
+      const ctx1 = { agent: { session: { id: sessionBaseA } } };
       const res1 = resolveQQSessionContext(ctx1);
-      expect(res1).not.toBeNull();
-      expect(res1?.peer).toBe('group_1000000001');
-      expect(res1?.isGroup).toBe(true);
-      expect(res1?.isPrivate).toBe(false);
+      expect(res1).toEqual({ peer: peerA, userId: hashA });
+      expect((res1 as any).qq).toBeUndefined();
+      expect((res1 as any).isGroup).toBeUndefined();
+      expect((res1 as any).isPrivate).toBeUndefined();
 
-      const ctx2 = { session: { id: 'group_1000000002' } };
-      const res2 = resolveQQSessionContext(ctx2);
-      expect(res2?.peer).toBe('group_1000000002');
-      expect(res2?.isGroup).toBe(true);
+      const ctx2 = { agent: { sessionId: `${sessionBaseA}-2` } };
+      expect(resolveQQSessionContext(ctx2)).toEqual({ peer: peerA, userId: hashA });
 
-      const ctx3 = { peer: 'qq-group-1000000003' };
-      const res3 = resolveQQSessionContext(ctx3);
-      expect(res3?.peer).toBe('group_1000000003');
-      expect(res3?.isGroup).toBe(true);
+      const ctx3 = { session: { id: `${sessionBaseA}-r3-2-deadbe` } };
+      expect(resolveQQSessionContext(ctx3)).toEqual({ peer: peerA, userId: hashA });
+
+      const ctx4 = { peer: peerB };
+      expect(resolveQQSessionContext(ctx4)).toEqual({ peer: peerB, userId: hashB });
+
+      // 不受 \d+ 纯数字限制，兼容大小写字母与下划线短哈希
+      const ctx5 = { sessionId: 'kujira-user-abc123DEF_99-r1-1-a1b2' };
+      expect(resolveQQSessionContext(ctx5)).toEqual({
+        peer: 'user_abc123DEF_99',
+        userId: 'abc123DEF_99',
+      });
     });
 
-    it('1.2 能从多种合法私聊格式中解析出 user peer 与 QQ 号', () => {
-      const ctx1 = { agent: { sessionId: 'qq-user-1000000010' } };
-      const res1 = resolveQQSessionContext(ctx1);
-      expect(res1).not.toBeNull();
-      expect(res1?.peer).toBe('user_1000000010');
-      expect(res1?.qq).toBe('1000000010');
-      expect(res1?.isPrivate).toBe(true);
-      expect(res1?.isGroup).toBe(false);
-
-      const ctx2 = { sessionId: 'user_1000000020' };
-      const res2 = resolveQQSessionContext(ctx2);
-      expect(res2?.peer).toBe('user_1000000020');
-      expect(res2?.qq).toBe('1000000020');
-
-      const ctx3 = { session: { id: 'qq-1000000030' } };
-      const res3 = resolveQQSessionContext(ctx3);
-      expect(res3?.peer).toBe('user_1000000030');
-      expect(res3?.qq).toBe('1000000030');
-    });
-
-    it('1.3 发言人识别：配合 getCurrentSpeaker 正确解析群内发言人', () => {
-      const ctx = { agent: { session: { id: 'qq-group-1000000001-1' } } };
-      const getSpeaker = (peer: string) => (peer === 'group_1000000001' ? '1000000099' : undefined);
-      const res = resolveQQSessionContext(ctx, getSpeaker);
-      expect(res?.peer).toBe('group_1000000001');
-      expect(res?.qq).toBe('1000000099');
-    });
-
-    it('1.4 严格 Fail-Closed: 非 QQ 会话、未知格式与空上下文一律返回 null', () => {
+    it('1.2 严格 Fail-Closed: 旧群聊/旧 NapCat、Web UI、沙箱、空上下文及畸形 ID 一律返回 null', () => {
       expect(resolveQQSessionContext(undefined)).toBeNull();
       expect(resolveQQSessionContext(null)).toBeNull();
       expect(resolveQQSessionContext({})).toBeNull();
@@ -96,24 +88,53 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       expect(resolveQQSessionContext({ agent: { sessionId: 'desktop-main' } })).toBeNull();
       expect(resolveQQSessionContext({ scope: 's-random-guid' })).toBeNull();
       expect(resolveQQSessionContext({ peer: 'default' })).toBeNull();
-      expect(resolveQQSessionContext({ peer: 'review-group_1000000001' })).toBeNull();
+      expect(resolveQQSessionContext({ peer: `review-${peerA}` })).toBeNull();
+
+      // 彻底移除旧群聊与旧 NapCat 格式
+      expect(resolveQQSessionContext({ session: { id: 'qq-group-1000000001-1' } })).toBeNull();
+      expect(resolveQQSessionContext({ peer: 'group_1000000001' })).toBeNull();
+      expect(resolveQQSessionContext({ session: { id: 'group-1000000001' } })).toBeNull();
+      expect(resolveQQSessionContext({ session: { id: 'qq-user-1000000010' } })).toBeNull();
+      expect(resolveQQSessionContext({ session: { id: 'qq-1000000030' } })).toBeNull();
+
+      // 畸形/不完整 Kujira 前缀
+      expect(resolveQQSessionContext({ session: { id: 'kujira-user-' } })).toBeNull();
+      expect(resolveQQSessionContext({ peer: 'user_' })).toBeNull();
+      expect(resolveQQSessionContext({ session: { id: `${sessionBaseA}-bad-suffix` } })).toBeNull();
+    });
+
+    it('1.3 isExplicitNonQQSession 放行 kujira-user-* 与 user_*，拦截显式非 Kujira 会话', () => {
+      expect(isExplicitNonQQSession(undefined)).toBe(false);
+      expect(isExplicitNonQQSession({})).toBe(false);
+      expect(isExplicitNonQQSession({ session: { id: sessionBaseA } })).toBe(false);
+      expect(isExplicitNonQQSession({ session: { id: `${sessionBaseA}-r1-1-a1b2c3` } })).toBe(false);
+      expect(isExplicitNonQQSession({ peer: peerB })).toBe(false);
+
+      expect(isExplicitNonQQSession({ session: { id: 'web-session-123' } })).toBe(true);
+      expect(isExplicitNonQQSession({ agent: { sessionId: 'desktop-main' } })).toBe(true);
+      expect(isExplicitNonQQSession({ scope: 's-random-guid' })).toBe(true);
+      expect(isExplicitNonQQSession({ peer: `review-${peerA}` })).toBe(true);
+      expect(isExplicitNonQQSession({ peer: 'default' })).toBe(true);
+      expect(isExplicitNonQQSession({ session: { id: 'qq-group-1000000001' } })).toBe(true);
+      expect(isExplicitNonQQSession({ peer: 'group_1000000001' })).toBe(true);
+      expect(isExplicitNonQQSession({ session: { id: 'qq-user-1000000010' } })).toBe(true);
     });
   });
 
-  describe('契约 2: SnapshotManager 统一安全门控 (Web UI / 非 QQ 0 泄露)', () => {
-    it('2.1 非 QQ 会话下触发 pre-step，所有默认 qqOnly Provider 均不被调用且 0 条消息注入', async () => {
+  describe('契约 2: SnapshotManager 统一安全门控 (Web UI / 旧群聊 / 非 Kujira 0 泄露)', () => {
+    it('2.1 Web UI 与旧群聊会话触发 pre-step，所有 qqOnly Provider 均不被调用且 0 条消息注入', async () => {
       const manager = new SnapshotManager(mockCtx);
 
-      const provideSlang = vi.fn().mockReturnValue('# 社群黑话知识库内容');
-      const provideFace = vi.fn().mockReturnValue('[本地表情库概览]');
+      const provideSlang = vi.fn().mockReturnValue('## 黑话与梗知识库 (Slang & Memes)\n- 词条A');
+      const provideFace = vi.fn().mockReturnValue('## 本地表情包库存 (Sticker & Meme Library)');
 
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
         provide: provideSlang,
       });
       manager.registerProvider({
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: provideFace,
       });
@@ -123,40 +144,53 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
         messages: [{ role: 'user', content: [{ type: 'text', text: 'Web 用户提问' }] }],
       };
 
-      const result = await manager.handlePreStep(webArgs, async () => ({
+      const webResult = await manager.handlePreStep(webArgs, async () => ({
         kind: 'enter',
         messages: webArgs.messages,
       }));
+      expect(webResult.messages.length).toBe(1);
+      expect(webResult.messages[0].content[0].text).toBe('Web 用户提问');
 
-      // 完全原样返回，0 条注入
-      expect(result.messages.length).toBe(1);
-      expect(result.messages[0].content[0].text).toBe('Web 用户提问');
+      const legacyGroupArgs = {
+        agent: { session: { id: 'qq-group-1000000001' } },
+        messages: [],
+      };
+      const groupResult = await manager.handlePreStep(legacyGroupArgs, async () => ({
+        kind: 'enter',
+        messages: [],
+      }));
+      expect(groupResult.messages.length).toBe(0);
+
       expect(provideSlang).not.toHaveBeenCalled();
       expect(provideFace).not.toHaveBeenCalled();
 
       manager.dispose();
     });
 
-    it('2.2 QQ 会话下，正常放行并调用 provide 产生专属通道快照消息', async () => {
+    it('2.2 Kujira 单聊会话下，正常放行并调用 provide 产生专属通道快照消息', async () => {
       const manager = new SnapshotManager(mockCtx);
 
-      const provideSlang = vi.fn().mockReturnValue('## 社群黑话\n- 词条A: 释义A');
+      const provideSlang = vi.fn().mockReturnValue('## 黑话与梗知识库 (Slang & Memes)\n- 词条A: 释义A');
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
         provide: provideSlang,
       });
 
-      const qqArgs = {
-        agent: { session: { id: 'qq-group-1000000001' } },
+      const kujiraArgs = {
+        agent: { session: { id: `${sessionBaseA}-r1-1` } },
         messages: [],
       };
 
-      const result = await manager.handlePreStep(qqArgs, async () => ({ kind: 'enter', messages: [] }));
+      const result = await manager.handlePreStep(kujiraArgs, async () => ({
+        kind: 'enter',
+        messages: [],
+      }));
 
       expect(provideSlang).toHaveBeenCalledTimes(1);
+      expect(provideSlang).toHaveBeenCalledWith({ peer: peerA, userId: hashA }, expect.anything());
       expect(result.messages.length).toBe(1);
-      expect(result.messages[0].source.kind).toBe('napcat:slang');
+      expect(result.messages[0].source.kind).toBe('kujira:slang');
       expect(result.messages[0].source.form).toBe('snapshot');
       expect(result.messages[0].source.sections[0].text).toContain('词条A');
 
@@ -169,7 +203,7 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       const manager = new SnapshotManager(mockCtx);
 
       const badProvider: SnapshotProvider = {
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: () => {
           throw new Error('SQLite disk I/O error');
@@ -177,24 +211,26 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       };
 
       const goodProvider: SnapshotProvider = {
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
-        provide: () => '## 社群黑话\n正常黑话内容',
+        provide: () => '## 黑话与梗知识库 (Slang & Memes)\n正常黑话内容',
       };
 
       manager.registerProvider(badProvider);
       manager.registerProvider(goodProvider);
 
-      const qqArgs = {
-        agent: { session: { id: 'qq-user-1000000001' } },
+      const kujiraArgs = {
+        agent: { session: { id: sessionBaseA } },
         messages: [],
       };
 
-      const result = await manager.handlePreStep(qqArgs, async () => ({ kind: 'enter', messages: [] }));
+      const result = await manager.handlePreStep(kujiraArgs, async () => ({
+        kind: 'enter',
+        messages: [],
+      }));
 
-      // 异常 Provider 静默跳过，正常 Provider 成功注入
       expect(result.messages.length).toBe(1);
-      expect(result.messages[0].source.kind).toBe('napcat:slang');
+      expect(result.messages[0].source.kind).toBe('kujira:slang');
 
       manager.dispose();
     });
@@ -205,113 +241,118 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       const manager = new SnapshotManager(mockCtx);
 
       const unregister = manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
         provide: () => 'test',
       });
-      expect(manager.getProvider('napcat:slang')).toBeDefined();
+      expect(manager.getProvider('kujira:slang')).toBeDefined();
 
       unregister();
-      expect(manager.getProvider('napcat:slang')).toBeUndefined();
+      expect(manager.getProvider('kujira:slang')).toBeUndefined();
 
       manager.registerProvider({
-        name: 'napcat:session_rules',
+        name: 'kujira:session_rules',
         order: 40,
         provide: () => 'rules',
       });
       manager.registerProvider({
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: () => 'face',
       });
 
-      // 预先填充 retained
       await manager.handlePreStep(
-        { agent: { session: { id: 'group_1000000001' } }, messages: [] },
+        { agent: { session: { id: peerA } }, messages: [] },
         async () => ({ kind: 'enter', messages: [] })
       );
-      expect(manager.getRetained('group_1000000001', 'napcat:session_rules')).toBe('rules');
+      expect(manager.getRetained(peerA, 'kujira:session_rules')).toBe('rules');
 
       manager.dispose();
-      expect(manager.getProvider('napcat:session_rules')).toBeUndefined();
-      expect(manager.getRetained('group_1000000001', 'napcat:session_rules')).toBeUndefined();
+      expect(manager.getProvider('kujira:session_rules')).toBeUndefined();
+      expect(manager.getRetained(peerA, 'kujira:session_rules')).toBeUndefined();
     });
   });
 
-  describe('契约 5: setupSnapshotHub 装配 6 大独立原子通道规范', () => {
-    it('5.1 准确装配 6 个原子通道，且每个通道输出均遵循 ## 规范', () => {
-      const mockDb: any = {
-        getActiveFacesForContext: vi.fn().mockReturnValue({
-          total: 2,
-          faces: [
-            { id: 'face_1', mood: '开心', tags: ['大笑'], enabled: true },
-            { id: 'face_2', mood: '调侃', tags: ['摊手'], enabled: true },
-          ],
-        }),
-        getActiveUsers: vi.fn().mockReturnValue([{ user_id: '1000000001', sender_name: '测试用户' }]),
-      };
+  describe('契约 5: setupSnapshotHub 装配 6 大独立原子通道规范与单聊强隔离', () => {
+    it('5.1 准确装配 6 个 kujira:* 原子通道，按 session.peer 单聊强隔离注入且不调用 db.getActiveUsers', async () => {
+      const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-hub-mem-'));
+      try {
+        const memoryStorage = new MemoryStorage(tmpDir);
+        await memoryStorage.writeSessionMemory(peerA, '约定：回答保持精简');
+        await memoryStorage.writeUserProfile(peerA, '用户 A 偏好使用 TypeScript');
+        await memoryStorage.writeUserProfile(peerB, '用户 B 的隔离画像');
 
-      const mockSlangStorage: any = {
-        getRawMarkdownSync: vi.fn().mockReturnValue('- **词条一**：解释一'),
-      };
+        const mockDb: any = {
+          getActiveFacesForContext: vi.fn().mockReturnValue({
+            total: 2,
+            faces: [
+              { id: 'face_1', mood: '开心', tags: ['大笑'], enabled: true },
+              { id: 'face_2', mood: '调侃', tags: ['摊手'], enabled: true },
+            ],
+          }),
+        };
 
-      const mockMemoryStorage: any = {
-        getSessionRulesSnapshotSync: vi.fn().mockReturnValue('### Session 约定\n- 约定条目'),
-        getUserProfilesSnapshotSync: vi.fn().mockReturnValue('### 测试用户 (1000000001)\n- 用户偏好'),
-      };
+        const mockSlangStorage: any = {
+          getRawMarkdownSync: vi.fn().mockReturnValue('- 词条一：触发场景一'),
+        };
 
-      const hub = setupSnapshotHub({
-        ctx: mockCtx,
-        db: mockDb,
-        memoryStorage: mockMemoryStorage,
-        slangStorage: mockSlangStorage,
-        getPersona: () => '自定义人格设定',
-        getBehavior: () => '自定义行为准则',
-        getFaceEnabled: () => true,
-        getSlangEnabled: () => true,
-      });
+        const hub = setupSnapshotHub({
+          ctx: mockCtx,
+          db: mockDb,
+          memoryStorage,
+          slangStorage: mockSlangStorage,
+          getPersona: () => '自定义人格设定',
+          getBehavior: () => '',
+          getFaceEnabled: () => true,
+          getSlangEnabled: () => true,
+        });
 
-      // 验证仅装配 6 个清晰的独立原子通道
-      expect(hub.getProvider('napcat:persona')).toBeDefined();
-      expect(hub.getProvider('napcat:behavior')).toBeDefined();
-      expect(hub.getProvider('napcat:session_rules')).toBeDefined();
-      expect(hub.getProvider('napcat:user_profiles')).toBeDefined();
-      expect(hub.getProvider('napcat:slang')).toBeDefined();
-      expect(hub.getProvider('napcat:face_summary')).toBeDefined();
+        expect(hub.getProvider('kujira:persona')).toBeDefined();
+        expect(hub.getProvider('kujira:behavior')).toBeDefined();
+        expect(hub.getProvider('kujira:session_rules')).toBeDefined();
+        expect(hub.getProvider('kujira:user_profiles')).toBeDefined();
+        expect(hub.getProvider('kujira:slang')).toBeDefined();
+        expect(hub.getProvider('kujira:face_summary')).toBeDefined();
 
-      // 验证彻底剔除了历史复合通道
-      expect(hub.getProvider('napcat:memory')).toBeUndefined();
-      expect(hub.getProvider('napcat:behavior_persona')).toBeUndefined();
+        expect(hub.getProvider('napcat:persona')).toBeUndefined();
+        expect(hub.getProvider('kujira:memory')).toBeUndefined();
+        expect(hub.getProvider('kujira:behavior_persona')).toBeUndefined();
 
-      const qqSession = { peer: 'group_1000000001', qq: 'default', isGroup: true, isPrivate: false };
-      const assembleCtx = { session: { id: 'qq-group-1000000001' } };
+        const kujiraSessionA = { peer: peerA, userId: hashA };
+        const assembleCtxA = { session: { id: sessionBaseA } };
 
-      // 1. 人格
-      expect(hub.getProvider('napcat:persona')?.provide(qqSession, assembleCtx)).toContain(
-        '## 人格设定 (Persona)\n\n自定义人格设定'
-      );
-      // 2. 行为准则
-      expect(hub.getProvider('napcat:behavior')?.provide(qqSession, assembleCtx)).toContain(
-        '## 行为准则 (Behavior Guidelines)\n\n自定义行为准则'
-      );
-      // 3. 会话规则
-      expect(hub.getProvider('napcat:session_rules')?.provide(qqSession, assembleCtx)).toContain(
-        '## 会话规则与约定 (Session Rules & Conventions)'
-      );
-      // 4. 用户画像
-      expect(hub.getProvider('napcat:user_profiles')?.provide(qqSession, assembleCtx)).toContain(
-        '## 用户画像与群成员 (User Profiles & Members)'
-      );
-      // 5. 黑话
-      expect(hub.getProvider('napcat:slang')?.provide(qqSession, assembleCtx)).toContain(
-        '## 社群黑话知识库 (Slang & Memes)'
-      );
-      // 6. 表情包
-      expect(hub.getProvider('napcat:face_summary')?.provide(qqSession, assembleCtx)).toContain(
-        '## 本地表情包库存 (Sticker & Meme Library)'
-      );
+        // 1. 人格
+        expect(hub.getProvider('kujira:persona')?.provide(kujiraSessionA, assembleCtxA)).toBe(
+          '## 人格设定 (Persona)\n\n自定义人格设定'
+        );
+        // 2. 行为准则（未配置时默认回退 DEFAULT_BEHAVIOR 且声明支持 Markdown）
+        const behaviorOut = hub.getProvider('kujira:behavior')?.provide(kujiraSessionA, assembleCtxA) || '';
+        expect(behaviorOut).toContain('## 行为准则 (Behavior Guidelines)');
+        expect(behaviorOut).toContain(DEFAULT_BEHAVIOR);
+        expect(behaviorOut).toContain('Markdown');
+        // 3. 会话规则
+        const rulesOut = hub.getProvider('kujira:session_rules')?.provide(kujiraSessionA, assembleCtxA) || '';
+        expect(rulesOut).toContain('## 会话规则与约定 (Session Rules & Conventions)');
+        expect(rulesOut).toContain('约定：回答保持精简');
+        // 4. 用户画像（单聊强隔离，绝不含群成员字样与 peerB 画像）
+        const profileOut = hub.getProvider('kujira:user_profiles')?.provide(kujiraSessionA, assembleCtxA) || '';
+        expect(profileOut).toContain('## 用户画像与偏好 (User Profile)');
+        expect(profileOut).toContain('### 用户画像\n用户 A 偏好使用 TypeScript');
+        expect(profileOut).not.toContain('群成员');
+        expect(profileOut).not.toContain('用户 B 的隔离画像');
+        // 5. 黑话
+        const slangOut = hub.getProvider('kujira:slang')?.provide(kujiraSessionA, assembleCtxA) || '';
+        expect(slangOut).toContain('## 黑话与梗知识库 (Slang & Memes)');
+        expect(slangOut).not.toContain('社群');
+        // 6. 表情包
+        expect(hub.getProvider('kujira:face_summary')?.provide(kujiraSessionA, assembleCtxA)).toContain(
+          '## 本地表情包库存 (Sticker & Meme Library)'
+        );
 
-      hub.dispose();
+        hub.dispose();
+      } finally {
+        await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      }
     });
 
     it('5.2 setupSnapshotHub 传递 getFaceStoreMax 时，表情包查询上限严格遵循该配置', () => {
@@ -329,8 +370,8 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
         getFaceStoreMax: () => 250,
       });
 
-      const qqSession = { peer: 'group_1000000001', qq: 'default', isGroup: true, isPrivate: false };
-      hub.getProvider('napcat:face_summary')?.provide(qqSession, {});
+      const kujiraSession = { peer: peerA, userId: hashA };
+      hub.getProvider('kujira:face_summary')?.provide(kujiraSession, {});
 
       expect(mockDb.getActiveFacesForContext).toHaveBeenCalledWith(250);
 
@@ -343,17 +384,17 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       const manager = new SnapshotManager(mockCtx);
 
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
-        provide: () => '## 社群黑话\n- 词条A: 释义A',
+        provide: () => '## 黑话与梗知识库 (Slang & Memes)\n- 词条A: 释义A',
       });
       manager.registerProvider({
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: () => '## 本地表情包库存\n- face_1',
       });
 
-      const sessionObj = { id: 'qq-group-1000000001' };
+      const sessionObj = { id: sessionBaseA };
       const preStepArgs = {
         agent: { session: sessionObj },
         messages: [{ role: 'user', content: [{ type: 'text', text: '你好' }] }],
@@ -365,21 +406,20 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       }));
 
       expect(result.kind).toBe('enter');
-      // 原消息 1 条 + 2 个通道的独立快照
       expect(result.messages.length).toBe(3);
 
-      const slangMsg = result.messages.find((m: any) => m.source?.kind === 'napcat:slang');
+      const slangMsg = result.messages.find((m: any) => m.source?.kind === 'kujira:slang');
       expect(slangMsg).toBeDefined();
       expect(slangMsg.source.form).toBe('snapshot');
-      expect(slangMsg.source.sections[0].name).toBe('napcat:slang');
+      expect(slangMsg.source.sections[0].name).toBe('kujira:slang');
       expect(slangMsg.source.sections[0].text).toContain('词条A');
       expect(slangMsg.content[0].text).toContain('<system-reminder>');
-      expect(slangMsg.content[0].text).toContain('Current runtime context: napcat:slang');
+      expect(slangMsg.content[0].text).toContain('Current runtime context: kujira:slang');
 
-      const faceMsg = result.messages.find((m: any) => m.source?.kind === 'napcat:face_summary');
+      const faceMsg = result.messages.find((m: any) => m.source?.kind === 'kujira:face_summary');
       expect(faceMsg).toBeDefined();
       expect(faceMsg.source.form).toBe('snapshot');
-      expect(faceMsg.source.sections[0].name).toBe('napcat:face_summary');
+      expect(faceMsg.source.sections[0].name).toBe('kujira:face_summary');
       expect(faceMsg.source.sections[0].text).toContain('face_1');
 
       manager.dispose();
@@ -389,26 +429,22 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
       const manager = new SnapshotManager(mockCtx);
 
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
-        provide: () => '## 社群黑话\n- 词条A: 释义A',
+        provide: () => '## 黑话与梗知识库 (Slang & Memes)\n- 词条A: 释义A',
       });
       manager.registerProvider({
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: () => '## 本地表情包库存\n- face_1',
       });
 
-      const sessionObj = { id: 'qq-group-1000000001' };
-      const preStepArgs1 = {
-        agent: { session: sessionObj },
-        messages: [],
-      };
+      const sessionObj = { id: sessionBaseA };
+      await manager.handlePreStep(
+        { agent: { session: sessionObj }, messages: [] },
+        async () => ({ kind: 'enter', messages: [] })
+      );
 
-      // 第一轮注入
-      await manager.handlePreStep(preStepArgs1, async () => ({ kind: 'enter', messages: [] }));
-
-      // 第二轮同样的内容触发
       const preStepArgs2 = {
         agent: { session: sessionObj },
         messages: [{ role: 'user', content: [{ type: 'text', text: '第二轮发言' }] }],
@@ -418,7 +454,6 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
         messages: preStepArgs2.messages,
       }));
 
-      // 仅包含原本的消息，未追加任何快照！
       expect(result2.messages.length).toBe(1);
       expect(result2.messages[0].content[0].text).toBe('第二轮发言');
 
@@ -428,56 +463,51 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
     it('6.3 仅某一个通道（如黑话）变动时，仅为该通道生成新快照，表情包等大块通道绝不重发', async () => {
       const manager = new SnapshotManager(mockCtx);
 
-      let slangContent = '## 社群黑话\n- 词条1: 释义1';
+      let slangContent = '## 黑话与梗知识库 (Slang & Memes)\n- 词条1: 释义1';
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
         provide: () => slangContent,
       });
       manager.registerProvider({
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: () => '## 本地表情包库存\n- face_1\n- face_2',
       });
 
-      const sessionObj = { id: 'qq-group-1000000001' };
+      const sessionObj = { id: sessionBaseA };
 
-      // 第一轮
       await manager.handlePreStep(
         { agent: { session: sessionObj }, messages: [] },
         async () => ({ kind: 'enter', messages: [] })
       );
 
-      // 黑话发生更新，而表情包库存未变
-      slangContent = '## 社群黑话\n- 词条1: 释义1\n- 词条2: 新增词条';
+      slangContent = '## 黑话与梗知识库 (Slang & Memes)\n- 词条1: 释义1\n- 词条2: 新增词条';
 
       const result = await manager.handlePreStep(
         { agent: { session: sessionObj }, messages: [] },
         async () => ({ kind: 'enter', messages: [] })
       );
 
-      // 仅注入 1 条消息，且正是 napcat:slang！
       expect(result.messages.length).toBe(1);
       const injected = result.messages[0];
-      expect(injected.source.kind).toBe('napcat:slang');
+      expect(injected.source.kind).toBe('kujira:slang');
       expect(injected.source.sections[0].text).toContain('词条2: 新增词条');
-
-      // 验证表情包通道绝对没有被触发重发
-      expect(result.messages.some((m: any) => m.source?.kind === 'napcat:face_summary')).toBe(false);
+      expect(result.messages.some((m: any) => m.source?.kind === 'kujira:face_summary')).toBe(false);
 
       manager.dispose();
     });
 
-    it('6.4 非 QQ 会话（如 Web UI）触发 pre-step，严格 Fail-Closed 阻断，0 条注入', async () => {
+    it('6.4 非 Kujira 会话（如 Web UI）触发 pre-step，严格 Fail-Closed 阻断，0 条注入', async () => {
       const manager = new SnapshotManager(mockCtx);
 
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
-        provide: () => '私密社群黑话',
+        provide: () => '私密黑话',
       });
       manager.registerProvider({
-        name: 'napcat:face_summary',
+        name: 'kujira:face_summary',
         order: 48,
         provide: () => '私密表情包库存',
       });
@@ -493,7 +523,6 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
         messages: preStepArgs.messages,
       }));
 
-      // 完全原样返回，没有任何 QQ 上下文泄露注入
       expect(result.messages.length).toBe(1);
       expect(result.messages[0].content[0].text).toBe('Web端提问');
 
@@ -503,23 +532,23 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
     it('6.5 会话重连与历史恢复：当会话历史中已存在某通道相同快照时，不重复注入', async () => {
       const manager = new SnapshotManager(mockCtx);
 
-      const existingSlang = '## 社群黑话\n- 历史已学黑话';
+      const existingSlang = '## 黑话与梗知识库 (Slang & Memes)\n- 历史已学黑话';
       manager.registerProvider({
-        name: 'napcat:slang',
+        name: 'kujira:slang',
         order: 45,
         provide: () => existingSlang,
       });
 
       const mockSession = {
-        id: 'qq-group-1000000001',
+        id: sessionBaseA,
         snapshotEvents: () => [
           {
             type: 'user/message',
             data: {
               source: {
-                kind: 'napcat:slang',
+                kind: 'kujira:slang',
                 form: 'snapshot',
-                sections: [{ name: 'napcat:slang', text: existingSlang }],
+                sections: [{ name: 'kujira:slang', text: existingSlang }],
               },
             },
           },
@@ -531,7 +560,6 @@ describe('契约测试: 多通道独立运行时快照管理器 (SnapshotManager
         async () => ({ kind: 'enter', messages: [] })
       );
 
-      // 成功恢复状态，不再重复注入
       expect(result.messages.length).toBe(0);
 
       manager.dispose();

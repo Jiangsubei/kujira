@@ -1,19 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import { PerPeerSerialSender } from '../../src/outbound/queue.js';
-import { NapCatQuestionProvider } from '../../src/approval/question-provider.js';
-import { NapCatApprovalResponder } from '../../src/approval/tool-approval.js';
 
-describe('契约测试: 共享 per-peer 串行发送器保序 (Spec §7.3 / P-02, A-3)', () => {
-  const PEER = 'group_3000000001';
-  const QQ_AGENT = { session: { id: 'qq-group-3000000001' } } as any;
+describe('契约测试: 共享 per-peer 串行发送器保序 (Kujira 单聊)', () => {
+  const PEER = 'user_a1b2c3d4e5f60708';
+  const PEER_ALT = 'user_0011223344556677';
 
-  it('A3-契约 1: 同一 peer 任务严格按入队顺序执行（前置任务延迟不插队）', async () => {
-    const order: string[] = [];
+  it('契约 1: 同一 peer 任务严格按入队顺序执行（前置任务延迟不插队）', async () => {
+    const order: number[] = [];
     const sender = new PerPeerSerialSender();
 
     const tasks = [1, 2, 3].map((n) =>
       sender.enqueue(PEER, async () => {
-        // 前置任务人为制造延迟，验证队列强制等待
         await new Promise((r) => setTimeout(r, n === 1 ? 40 : 5));
         order.push(n);
       })
@@ -23,24 +20,23 @@ describe('契约测试: 共享 per-peer 串行发送器保序 (Spec §7.3 / P-02
     expect(order).toEqual([1, 2, 3]);
   });
 
-  it('A3-契约 2: 不同 peer 互不阻塞（独立队列）', async () => {
+  it('契约 2: 不同 peer 互不阻塞（独立队列）', async () => {
     const order: string[] = [];
     const sender = new PerPeerSerialSender();
 
-    const p1 = sender.enqueue('group_1', async () => {
+    const p1 = sender.enqueue(PEER, async () => {
       await new Promise((r) => setTimeout(r, 40));
-      order.push('group_1');
+      order.push(PEER);
     });
-    const p2 = sender.enqueue('group_2', async () => {
-      order.push('group_2');
+    const p2 = sender.enqueue(PEER_ALT, async () => {
+      order.push(PEER_ALT);
     });
 
     await Promise.all([p1, p2]);
-    // group_2 不等待 group_1 的延迟任务
-    expect(order[0]).toBe('group_2');
+    expect(order[0]).toBe(PEER_ALT);
   });
 
-  it('A3-契约 3: 前置任务失败不阻塞后续任务，且调用方仍收到拒绝', async () => {
+  it('契约 3: 前置任务失败不阻塞后续任务，且调用方仍收到拒绝', async () => {
     const order: string[] = [];
     const sender = new PerPeerSerialSender();
 
@@ -56,81 +52,31 @@ describe('契约测试: 共享 per-peer 串行发送器保序 (Spec §7.3 / P-02
     expect(order).toEqual(['after-failure']);
   });
 
-  it('A3-契约 4: 正文 → 提问 → 审批 经同一队列严格保序（先文本后提问、先提问后审批）', async () => {
+  it('契约 4: 正文 -> 提问 -> 审批 经同一队列严格保序', async () => {
     const order: string[] = [];
-    const gateway = {
-      sendMsg: async (_peer: string, msg: any) => {
-        order.push(typeof msg === 'string' ? msg : JSON.stringify(msg));
-        return { status: 'ok', retcode: 0, data: { message_id: 1 } };
-      },
-    };
-    const sessionManager = {
-      sessionIdToPeer: (id: string) => `group_${id.slice(9)}`,
-    } as any;
-
     const sender = new PerPeerSerialSender();
-    const provider = new NapCatQuestionProvider({
-      gateway: gateway as any,
-      sessionManager,
-      sender,
-    });
-    const responder = new NapCatApprovalResponder({
-      gateway: gateway as any,
-      sessionManager,
-      sender,
-      admins: ['10001'],
-    });
 
-    // 1. 正文回复（出站桥接器使用同一 sender 契约）——首任务带 30ms 延迟，验证队列强制等待
     const textPromise = sender.enqueue(PEER, async () => {
       await new Promise((r) => setTimeout(r, 30));
-      await gateway.sendMsg(PEER, '正文回复内容');
+      order.push('正文回复内容');
+    });
+    const askPromise = sender.enqueue(PEER, async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      order.push('【请回答问题】');
+    });
+    const approvalPromise = sender.enqueue(PEER, async () => {
+      order.push('【审批请求】');
     });
 
-    // 2. 提问（不等待完成，立即发起）
-    const askPromise = provider.ask({
-      questions: [{ id: 'q1', prompt: '请选择部署环境', options: [{ label: '生产' }, { label: '测试' }] }],
-      agent: QQ_AGENT,
-      signal: new AbortController().signal,
-    } as any);
-
-    // 3. 审批（立即发起）
-    const approvalPromise = responder.handleApprovalRequest({
-      peer: PEER,
-      toolName: 'execute_bash',
-      reason: '清理缓存',
-      applicantId: '10001',
-      signal: new AbortController().signal,
-    });
-
-    // 等待消息全部抵达后再应答
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    responder.handleInboundReply(PEER, 'y');
-    // 群聊引用锚定（用户拍板方案 A）：回复必须引用提问卡片那条消息 (message_id=1)
-    provider.handleInboundReply(PEER, '1', { replyId: 1 });
-
-    await textPromise;
-    await askPromise;
-    await approvalPromise;
-
-    const textIdx = order.findIndex((m) => m.includes('正文回复内容'));
-    const questionIdx = order.findIndex((m) => m.includes('【请回答问题】'));
-    const approvalIdx = order.findIndex((m) => m.includes('【审批请求】'));
-
-    expect(textIdx).toBeGreaterThanOrEqual(0);
-    expect(questionIdx).toBeGreaterThan(textIdx); // 先文本后提问
-    expect(approvalIdx).toBeGreaterThan(questionIdx); // 先提问后审批
+    await Promise.all([textPromise, askPromise, approvalPromise]);
+    expect(order).toEqual(['正文回复内容', '【请回答问题】', '【审批请求】']);
   });
 
-  it('B7-契约 5: 任务 settle 后自动清理空闲 chains 映射，防止内存泄漏', async () => {
+  it('契约 5: 任务 settle 后自动清理空闲 chains 映射，防止内存泄漏', async () => {
     const sender = new PerPeerSerialSender();
-    await sender.enqueue(PEER, async () => {
-      return 42;
-    });
+    await sender.enqueue(PEER, async () => 42);
 
-    // 等待 microtask 清理微任务
     await new Promise((resolve) => setTimeout(resolve, 5));
-    // 任务完成后，内部链应当已经从 chains 映射中移除
     expect((sender as any).chains.has(PEER)).toBe(false);
   });
 });

@@ -1,21 +1,11 @@
 /**
- * dsh-napcat-bridge: 数据库表结构初始化与平滑迁移 (Schema & Migration)
+ * kujira: 数据库表结构初始化 (QQ 官方 Bot API v2 合规单聊)
  */
 
-import { backfillAttachmentJson } from '../attachment/store.js';
-
-/** 存量附件描述符一次性回填标记（完成后不再扫描全表） */
-export const ATTACHMENTS_BACKFILL_KEY = 'messages_attachments_backfill_v1';
-
-export interface KvAccess {
-  getPluginConfig(key: string): string | null;
-  setPluginConfig(key: string, value: string): void;
-}
-
-export function initDatabaseSchema(db: any, kv?: KvAccess): void {
+export function initDatabaseSchema(db: any): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
-      msg_id INTEGER PRIMARY KEY,
+      msg_id TEXT PRIMARY KEY,
       peer TEXT NOT NULL,
       user_id TEXT NOT NULL,
       sender_name TEXT NOT NULL,
@@ -23,21 +13,53 @@ export function initDatabaseSchema(db: any, kv?: KvAccess): void {
       type TEXT NOT NULL,
       content TEXT NOT NULL,
       raw TEXT NOT NULL,
+      ref_idx TEXT,
       file_id TEXT,
-      busid INTEGER,
       local_path TEXT,
       fingerprint TEXT,
       recalled INTEGER NOT NULL DEFAULT 0,
       self INTEGER NOT NULL DEFAULT 0,
-      reply_to INTEGER,
+      reply_to TEXT,
       source TEXT NOT NULL DEFAULT 'qq',
       attachments TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_messages_peer_user_time ON messages (peer, user_id, time);
     CREATE INDEX IF NOT EXISTS idx_messages_peer_time ON messages (peer, time);
+    CREATE INDEX IF NOT EXISTS idx_messages_peer_user_time ON messages (peer, user_id, time);
+    CREATE INDEX IF NOT EXISTS idx_messages_ref_idx ON messages (ref_idx);
     CREATE INDEX IF NOT EXISTS idx_messages_file_id ON messages (file_id);
     CREATE INDEX IF NOT EXISTS idx_messages_fingerprint ON messages (fingerprint);
+    CREATE INDEX IF NOT EXISTS idx_messages_peer_source_time ON messages (peer, source, time);
+
+    CREATE TABLE IF NOT EXISTS peer_openid_map (
+      peer TEXT PRIMARY KEY,
+      openid TEXT UNIQUE NOT NULL,
+      remark TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS inbound_reply_slots (
+      msg_id TEXT PRIMARY KEY,
+      peer TEXT NOT NULL,
+      openid TEXT NOT NULL,
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      received_at INTEGER NOT NULL,
+      invalidated INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_inbound_slots_peer_valid
+      ON inbound_reply_slots (peer, invalidated, received_at DESC);
+
+    CREATE TABLE IF NOT EXISTS media_upload_cache (
+      openid TEXT NOT NULL,
+      md5 TEXT NOT NULL,
+      file_type INTEGER NOT NULL,
+      file_info TEXT NOT NULL,
+      file_uuid TEXT,
+      expires_at INTEGER NOT NULL,
+      PRIMARY KEY (openid, md5, file_type)
+    );
 
     CREATE TABLE IF NOT EXISTS session_states (
       peer TEXT PRIMARY KEY,
@@ -46,7 +68,8 @@ export function initDatabaseSchema(db: any, kv?: KvAccess): void {
       cleared_version INTEGER NOT NULL DEFAULT 1,
       updated_at INTEGER NOT NULL,
       model_provider TEXT,
-      model_name TEXT
+      model_name TEXT,
+      model_reasoning_effort TEXT
     );
 
     CREATE TABLE IF NOT EXISTS plugin_kv (
@@ -107,72 +130,4 @@ export function initDatabaseSchema(db: any, kv?: KvAccess): void {
     CREATE INDEX IF NOT EXISTS idx_slang_query_count ON slang_entries (query_count);
     CREATE INDEX IF NOT EXISTS idx_slang_updated_at ON slang_entries (updated_at);
   `);
-
-  // 平滑升级已有数据库
-  try {
-    db.prepare('ALTER TABLE session_states ADD COLUMN model_provider TEXT').run();
-  } catch {}
-  try {
-    db.prepare('ALTER TABLE session_states ADD COLUMN model_name TEXT').run();
-  } catch {}
-  try {
-    db.prepare('ALTER TABLE session_states ADD COLUMN model_reasoning_effort TEXT').run();
-  } catch {}
-  try {
-    db.prepare('ALTER TABLE faces ADD COLUMN deleted_at INTEGER').run();
-  } catch {}
-
-  // 消息来源列（qq = 真实 QQ 消息 / agent = Agent 内部协同通讯），存量数据默认 'qq'
-  try {
-    db.prepare("ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'qq'").run();
-  } catch {}
-  // 统一附件描述符列（存量记录保持 NULL，读取时从 raw 回退解析，不回填）
-  try {
-    db.prepare('ALTER TABLE messages ADD COLUMN attachments TEXT').run();
-  } catch {}
-  try {
-    db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_peer_source_time ON messages (peer, source, time)').run();
-  } catch {}
-
-  if (kv) {
-    backfillAttachmentsOnce(db, kv);
-  }
-}
-
-/**
- * 存量消息附件描述符一次性回填。
- *
- * - 能回填就回填：优先解析 raw 消息段；raw 不可用时用结构化列保守合成；
- * - 无法确认任何附件事实的记录保持 NULL；
- * - 完成后写入 plugin_kv 标记，后续启动不再扫描全表；
- * - 任何异常都不阻断启动（失败时不写标记，下次启动重试）。
- */
-export function backfillAttachmentsOnce(db: any, kv: KvAccess): void {
-  try {
-    if (kv.getPluginConfig(ATTACHMENTS_BACKFILL_KEY) === '1') return;
-
-    const rows = db
-      .prepare(
-        `SELECT msg_id, peer, self, type, content, raw, file_id, busid, local_path
-         FROM messages WHERE attachments IS NULL`
-      )
-      .all() as any[];
-
-    if (rows.length > 0) {
-      const update = db.prepare(
-        'UPDATE messages SET attachments = ? WHERE msg_id = ? AND attachments IS NULL'
-      );
-      const run = db.transaction((items: any[]) => {
-        for (const row of items) {
-          const json = backfillAttachmentJson(row);
-          if (json) update.run(json, row.msg_id);
-        }
-      });
-      run(rows);
-    }
-
-    kv.setPluginConfig(ATTACHMENTS_BACKFILL_KEY, '1');
-  } catch {
-    // 静默降级：不阻断启动，下次启动重试
-  }
 }

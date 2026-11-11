@@ -1,26 +1,27 @@
 /**
- * dsh-napcat-bridge: 系统内部事件与统一唤醒中枢 (SystemEventHub)
- * 
+ * kujira: 系统内部事件与统一唤醒中枢 (SystemEventHub)
+ *
  * 核心职责：
- * 1. 统一管理各类非外部用户输入的系统事件（定时任务、跨 Agent 协同 IPC、潜水唤醒、主动关注聚合、通知合成）；
- * 2. 贯彻“标题防污染铁律 (Zero Pseudo-Name)”：严禁在系统事件 Payload 中携带任何假借的用户昵称（如“系统定时任务”、“协同 Agent”）；
- * 3. 贯彻“零特权审批铁律 (Strict Null Initiator)”：系统事件发起人锁定为 null，严禁借壳提权；
- * 4. 统一提示词标准排版骨架：双换行分段、中文冒号标题、原本精心打磨的行为引导 100% 完整保留并置底；
- * 5. 自动化出站合成上下文追踪 (Synthetic Inbound Context) 与对齐。
+ * 1. 统一管理非外部真实用户输入的系统唤醒事件（QQ 单聊定时任务 `scheduled_task`）；
+ * 2. 贯彻“标题防污染铁律 (Zero Pseudo-Name)”：严禁在系统事件 Payload 中携带任何假借的用户昵称；
+ * 3. 贯彻“零特权审批铁律 (Strict Null Initiator)”：系统事件 `from_user` 锁定为 `''`，审批保持 Fail-Closed；
+ * 4. 出站合成上下文追踪 (`is_synthetic: true`)：只标记合成上下文，绝不覆盖擦除历史有效的入站被动 `msg_id` 锚点。
  */
 
-import type { SessionManager } from './session.js';
 import type { OutboundBridgeLike } from './session/types.js';
-import type {
-  SystemWakeupEvent,
-  ScheduledTaskEvent,
-  ProactiveLurkEvent,
-  ProactivePollingEvent,
-  SyntheticNoticeEvent,
-} from '../types/system-event.js';
+import type { ScheduledTaskEvent, SystemWakeupEvent } from '../types/system-event.js';
 import type { WakeupPayload } from '../types/index.js';
-import { formatDateTime } from '../storage/database.js';
-import { formatSenderString } from './external-prompt.js';
+import { formatDateTime } from '../storage/time-parser.js';
+
+export interface SystemEventSessionManager {
+  dispatchWakeup(
+    payload: WakeupPayload,
+    options?: {
+      onMessageCreated?: (userMsg: any) => void;
+    }
+  ): Promise<any>;
+  getOutboundBridge?(): OutboundBridgeLike | undefined;
+}
 
 export function formatTimeOnly(timestamp: number): string {
   if (!timestamp || Number.isNaN(timestamp)) return '';
@@ -30,92 +31,33 @@ export function formatTimeOnly(timestamp: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function resolveChannelInfo(peer: string): { isGroup: boolean; channelStr: string; groupId?: string } {
-  const isGroup = peer.startsWith('group_') || peer.startsWith('qq-group-');
-  const groupId = isGroup ? peer.replace(/^(group_|qq-group-)/, '').split('-')[0] : undefined;
-  const channelStr = isGroup ? `[QQ群聊: ${groupId}]` : `[QQ私聊]`;
-  return { isGroup, channelStr, groupId };
-}
-
 /**
- * 格式化系统事件的标准提示词文本 (System Prompt Formatter)
- * 遵循统一骨架准则：
- * 1. 分词器友好：双换行分段，中文冒号标引；
- * 2. 近因效应：数据在前，全角括号包裹的行为引导置底；
- * 3. 引导文案原汁原味：完全保留既有打磨好的指令逻辑。
+ * 格式化系统事件的标准提示词文本（QQ 官方 Bot 单聊）。
+ * 骨架：双换行分段、中文冒号标引、行为引导置底。
  */
 export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
   const now = event.timestamp || Date.now();
   const timeStr = formatDateTime(now);
-  const { channelStr, groupId } = resolveChannelInfo(event.peer);
 
   switch (event.kind) {
     case 'scheduled_task': {
       const taskTag = event.taskId ? ` [任务编号: #${event.taskId}]` : '';
       const ruleLine = event.taskRule ? `\n任务规则：${event.taskRule}` : '';
-      const isGroup = event.peer.startsWith('group_') || event.peer.startsWith('qq-group-');
-      const guide = isGroup
-        ? '（说明：这是此前设定的定时任务触发。如果是群聊场景，建议先通过 read_chat_history 工具查看最近群聊动态再决定如何发言，发言内容应自然贴切，切勿向用户透露内部 task_id 或系统事件代码等调试信息。）'
-        : '（说明：这是此前设定的定时任务触发。发言内容应自然贴切，切勿向用户透露内部 task_id 或系统事件代码等调试信息。）';
+      const guide =
+        '（说明：这是此前在当前 QQ 单聊中设定的定时任务触发。如需回顾前序聊天背景，可先调用 read_chat_history 工具查询最近记录；发言内容应自然贴切，请通过 send_qq_message 发送给对方，切勿向用户透露内部 task_id 或系统事件代码等调试信息。）';
 
       return (
-        `系统事件：[定时任务]${taskTag} ${channelStr} [${timeStr}]${ruleLine}\n\n` +
+        `系统事件：[定时任务]${taskTag} [QQ私聊] [${timeStr}]${ruleLine}\n\n` +
         `任务内容：\n` +
         `${event.prompt}\n\n` +
         guide
       );
     }
-
-    case 'proactive_lurk': {
-      const duration = event.idleDurationMinutes ?? 120;
-      const guide =
-        `（说明：若需了解此前聊天背景，可先调用 read_chat_history 工具查询群内更早的消息。请自主评估是否要在群内主动发起话题；若判断当前无需发言或不便打扰，直接输出 [结束]。表现自然，切勿透露潜水超时、系统唤醒等任何后台痕迹。）`;
-
-      return (
-        `系统事件：[潜水唤醒] [QQ群聊: ${groupId || '群聊'}] [${timeStr}]\n\n` +
-        `群聊状态：当前群聊已较长时间没有新发言（已超 ${duration} 分钟）。\n\n` +
-        guide
-      );
-    }
-
-    case 'proactive_polling': {
-      let msgList = '';
-      if (Array.isArray(event.bufferedMessages) && event.bufferedMessages.length > 0) {
-        for (const m of event.bufferedMessages) {
-          const timePart = m.timestamp ? `[${formatTimeOnly(m.timestamp)}] ` : '';
-          const msgIdPart =
-            typeof m.msg_id === 'number' && Number.isSafeInteger(m.msg_id) && m.msg_id !== 0
-              ? `[消息ID: ${m.msg_id}] `
-              : '';
-          const namePart = formatSenderString(m.from_name, m.from_user);
-          msgList += `${timePart}${msgIdPart}${namePart}: ${m.content}\n`;
-        }
-      }
-      const historyContent = msgList.trim() || '（暂无未回复消息摘要）';
-
-      const guide =
-        `（说明：上述为群内最近未回复的发言。若你觉得消息内容不明确，或者上下文不足，则需要先调用 \`read_chat_history\` 查询最近历史消息。请自主观察对话走向与氛围，评估是否适合介入。若消息属于两人连贯热聊、明确定向沟通（如 at 或指名他人、延续两人私事），或对话已自然收尾，请直接输出 [结束]。当遇到面向全群的公开提问、求助推荐，或讨论开放性话题（如技术、动漫、游戏），以及跟风玩梗时，可挑选有价值的消息回复（建议引用对应消息 ID）。如果群内最近明显在复读玩梗，可以根据群内当前氛围判断是否需要一起复读，复读的消息，不引用对应消息 ID，也不用 at 用户。若拿不准则输出 [结束]。切勿透露系统提示或触发机制等后台痕迹。）`;
-
-      return (
-        `系统事件：[主动回复] [QQ群聊: ${groupId || '群聊'}] [${timeStr}]\n\n` +
-        `历史消息：\n` +
-        `${historyContent}\n\n` +
-        guide
-      );
-    }
-
-    case 'synthetic_notice': {
-      if (event.noticeType === 'poke') {
-        const senderStr = formatSenderString(event.operatorName, event.operatorUser);
-        return `系统事件：[戳一戳] ${channelStr} [${timeStr}]\n\n用户 ${senderStr} 戳了戳你。`;
-      }
-      return `系统事件：[通知合成] ${channelStr} [${timeStr}]`;
-    }
   }
 }
 
 export interface SystemEventHubOptions {
-  sessionManager: SessionManager;
+  sessionManager: SystemEventSessionManager;
   outboundBridge?: OutboundBridgeLike;
   logger?: any;
 }
@@ -123,7 +65,7 @@ export interface SystemEventHubOptions {
 export class SystemEventHub {
   constructor(private options: SystemEventHubOptions) {}
 
-  /** 分发定时任务唤醒 */
+  /** 分发单聊定时任务唤醒 */
   public async dispatchScheduledTask(
     event: Omit<ScheduledTaskEvent, 'kind'>,
     options?: { onMessageCreated?: (userMsg: any) => void }
@@ -131,109 +73,48 @@ export class SystemEventHub {
     return this.dispatchSystemEvent({ kind: 'scheduled_task', ...event }, options);
   }
 
-  /** 分发群聊潜水超时冒泡唤醒 */
-  public async dispatchProactiveLurk(
-    event: Omit<ProactiveLurkEvent, 'kind'>,
-    options?: { onMessageCreated?: (userMsg: any) => void }
-  ): Promise<any> {
-    return this.dispatchSystemEvent({ kind: 'proactive_lurk', ...event }, options);
-  }
-
-  /** 分发群聊主动关注聚合唤醒 */
-  public async dispatchProactivePolling(
-    event: Omit<ProactivePollingEvent, 'kind'>,
-    options?: { onMessageCreated?: (userMsg: any) => void }
-  ): Promise<any> {
-    return this.dispatchSystemEvent({ kind: 'proactive_polling', ...event }, options);
-  }
-
-  /** 分发通知类合成唤醒 (如戳一戳) */
-  public async dispatchSyntheticNotice(
-    event: Omit<SyntheticNoticeEvent, 'kind'>,
-    options?: { onMessageCreated?: (userMsg: any) => void }
-  ): Promise<any> {
-    return this.dispatchSystemEvent({ kind: 'synthetic_notice', ...event }, options);
-  }
-
   /**
-   * 底层统一分发收敛核心
+   * 底层统一分发收敛核心（Zero-Leak / Null-Initiator）
    */
   public async dispatchSystemEvent(
     event: SystemWakeupEvent,
     options?: { onMessageCreated?: (userMsg: any) => void }
   ): Promise<any> {
     const peer = event.peer;
-    const { isGroup } = resolveChannelInfo(peer);
     const now = event.timestamp || Date.now();
     const promptText = formatSystemEventPrompt(event);
 
-    // 1. 确定底层的 trigger 与出站映射
-    let underlyingTrigger: WakeupPayload['trigger'] = 'direct';
-    let subTrigger: WakeupPayload['sub_trigger'] = undefined;
-    let outboundTrigger: string = 'idle';
-
-    switch (event.kind) {
-      case 'scheduled_task':
-        underlyingTrigger = 'scheduled';
-        outboundTrigger = 'scheduled';
-        break;
-      case 'proactive_lurk':
-        underlyingTrigger = 'proactive';
-        subTrigger = 'idle';
-        outboundTrigger = 'idle';
-        break;
-      case 'proactive_polling':
-        underlyingTrigger = 'proactive';
-        subTrigger = 'polling';
-        outboundTrigger = 'idle';
-        break;
-      case 'synthetic_notice':
-        underlyingTrigger = 'poke';
-        outboundTrigger = 'poke';
-        break;
-    }
-
-    // 2. 出站合成上下文自动挂载 (Zero Leak)
+    // 出站合成上下文自动挂载：仅传 is_synthetic: true，绝不传入 msg_id: undefined 擦除历史有效被动锚点
     const outboundBridge = this.options.outboundBridge ?? this.options.sessionManager.getOutboundBridge?.();
     if (outboundBridge) {
       outboundBridge.trackInboundContext(peer, {
-        msg_id: undefined,
         from_user: '',
-        is_group: isGroup,
-        trigger: outboundTrigger,
+        trigger: 'scheduled',
         is_synthetic: true,
       });
     }
 
-    // 3. 构造干净的 WakeupPayload (严禁传入任何伪名称，is_system 标记为 true)
+    // 构造干净的 WakeupPayload（from_name 与 from_user 严格留空，is_system 为 true）
     const payload: WakeupPayload = {
       peer,
-      trigger: underlyingTrigger,
-      sub_trigger: subTrigger,
-      // 铁律：from_name 留空，杜绝写入标题或昵称缓存
+      trigger: 'scheduled',
       from_name: '',
-      // 铁律：from_user 留空，防止审批系统借壳提权
       from_user: '',
       content: promptText,
       timestamp: now,
       is_system: true,
       system_event: event,
-      // 向后兼容各模块消费字段
-      task_id: event.kind === 'scheduled_task' ? event.taskId : undefined,
-      task_type: event.kind === 'scheduled_task' ? event.taskType : undefined,
-      task_rule: event.kind === 'scheduled_task' ? event.taskRule : undefined,
-      buffered_messages: event.kind === 'proactive_polling' ? event.bufferedMessages : undefined,
+      task_id: event.taskId,
+      task_type: event.taskType,
+      task_rule: event.taskRule,
     };
 
-    // 4. 调用 sessionManager 分发入队
     return this.options.sessionManager.dispatchWakeup(payload, {
       onMessageCreated: (userMsg) => {
         if (outboundBridge && userMsg?.id) {
           outboundBridge.trackPendingMessage?.(userMsg.id, peer, {
-            msg_id: undefined,
             from_user: '',
-            is_group: isGroup,
-            trigger: outboundTrigger,
+            trigger: 'scheduled',
             is_synthetic: true,
           });
         }

@@ -1,6 +1,6 @@
 /**
- * dsh-napcat-bridge: 黑话存储管理器 (SlangStorage)
- * 基于 SQLite (slang_entries 表) 管理全局黑话的分层存储、LRU 按查淘汰与 L1 常驻上下文生成。
+ * kujira: 黑话知识库 (Slang & Memes) 存储管理器 (SlangStorage)
+ * 基于 SQLite (slang_entries 表) 管理全局黑话知识库的分层存储、LRU 按查淘汰与 L1 常驻上下文生成。
  * 纯粹四参数体系：标题 (term) + 标签 (tags) + 释义 (definition) + 例句 (example)。
  */
 
@@ -10,7 +10,7 @@ import { resolveDshPath } from '../utils/path.js';
 import type { SlangEntry } from '../types/index.js';
 
 /**
- * 解析紧凑 Markdown 中的黑话词条（向后兼容旧格式解析与迁移）
+ * 解析紧凑 Markdown 中的黑话词条
  * 标准格式: - **{term}**：{definition}（例：{example}）
  */
 export function parseSlangMarkdown(content: string): SlangEntry[] {
@@ -35,7 +35,7 @@ export function parseSlangMarkdown(content: string): SlangEntry[] {
 }
 
 /**
- * 将黑话结构化数组格式化为紧凑 Markdown 单行列表（用于向后兼容或导出）
+ * 将黑话结构化数组格式化为紧凑 Markdown 单行列表（供黑话知识库导出与展示）
  */
 export function formatSlangMarkdown(entries: SlangEntry[]): string {
   if (!entries || entries.length === 0) return '';

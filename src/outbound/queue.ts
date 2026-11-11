@@ -1,7 +1,7 @@
 /**
- * dsh-napcat-bridge: 共享 per-peer 串行发送器 (Spec §7.3)
- * 正文回复、提问卡片、审批通知、主动发文件均须经由同一条 per-peer 串行队列下发，
- * 彻底根治同 turn 内"提问卡片先于正文到达"的竞发乱序问题 (P-02)。
+ * kujira: 共享 per-peer 串行发送器
+ * 正文回复、提问卡片、审批通知、主动发文件及 msg_seq 分配均须经由同一条 per-peer 串行队列下发，
+ * 彻底根治同 turn 内消息与交互卡片竞发乱序及 msg_seq 碰撞问题。
  * 每个 peer 维护单一 Promise 链，任务依入队顺序依次执行；单任务失败不会阻塞后续任务。
  */
 
@@ -20,7 +20,7 @@ export class PerPeerSerialSender implements SerialSender {
     const prev = this.chains.get(peer) ?? Promise.resolve();
     const run = prev.then(() => task());
     // 链上以"已消化结果"的 promise 接续，保证前置任务 reject 也不阻塞后续任务；
-    // 任务 settle 后若队列未追加新任务，则自动回收该 peer 的 chains 条目（B7 防泄漏）
+    // 任务 settle 后若队列未追加新任务，则自动回收该 peer 的 chains 条目（防内存泄漏）
     const next: Promise<unknown> = run
       .then(
         () => undefined,

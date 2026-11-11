@@ -1,114 +1,192 @@
 /**
  * tests/contract/attachment-descriptor.test.ts
  *
- * 契约测试: 统一附件描述符 (Attachment Descriptor)
+ * 契约测试: QQ 官方 Bot v2 单聊统一附件描述符 (Attachment Descriptor)
  *
- * 背景:
- * 入站/出站各自推导 kind / file_id / local_path / 渲染文本，导致
- *  - 出站表情只落 file:/// URI，历史里没有 face_id 与情绪；
- *  - 远端 file_id（自带 .png 伪后缀）与本地魔数格式（jpg）混为一谈。
- *
- * 本契约锁定唯一事实源：
- * 1. classifySegment 是唯一 kind 判定；
- * 2. 远端 fileId 与本地 format 彻底解耦；
- * 3. renderAttachment 是唯一渲染入口，入站/出站文案一致；
- * 4. serializeAttachments / deserializeAttachments 无损往返；
- * 5. describeMessage / toMessageMediaFields 与入站落库口径一致。
+ * 覆盖契约：
+ * 1. `classifyAttachment` / `describeInboundAttachments` 基于官方 `content_type` 分类，去除 `group_file` 与 `busid`；
+ * 2. `.png` 文件以 `content_type === 'file'` 下发时保留 `'file'` 分类与安全文件名；
+ * 3. `voice` 附件提取 `voice_wav_url` 与 `asr_refer_text`；
+ * 4. `buildOutboundMediaAttachment` 与 `buildOutboundFaceAttachment(face, localPath)` 无 `subType`，Lossless JSON；
+ * 5. `renderAttachment` 唯一渲染入口：严禁暴露带 query 凭证的 `remote.url`，支持语音转写与 `.png` 文件路径展示；
+ * 6. `serializeAttachments` / `deserializeAttachments` / `descriptorsFromRaw` 无损往返与官方事件解析。
  */
 
 import { describe, it, expect } from 'vitest';
 import {
-  classifySegment,
-  describeSegment,
-  describeMessage,
+  classifyAttachment,
+  describeAttachment,
+  describeInboundAttachments,
+  resolveLocalMediaPath,
+  sanitizeAttachmentFileName,
   toMessageMediaFields,
 } from '../../src/attachment/classify.js';
+import {
+  buildOutboundFaceAttachment,
+  buildOutboundMediaAttachment,
+} from '../../src/attachment/outbound.js';
 import { renderAttachment } from '../../src/attachment/render.js';
 import {
-  serializeAttachments,
+  compact,
   deserializeAttachments,
+  descriptorsFromRaw,
+  isAttachmentKind,
+  serializeAttachments,
 } from '../../src/attachment/store.js';
 import type { AttachmentDescriptor } from '../../src/attachment/types.js';
+import type { FaceRecord, QQC2CMessageCreateEvent } from '../../src/types/index.js';
 
-const GROUP = { isGroup: true };
-const PRIVATE = { isGroup: false };
+const MOCK_OPENID = 'A1B2C3D4E5F60123456789ABCDEF0001';
 
-describe('契约测试: 附件 kind 判定唯一化', () => {
-  it('契约 1: image / sticker / file / group_file / record / video / forward 判定一致', () => {
-    expect(classifySegment({ type: 'image', data: {} }, GROUP)).toBe('image');
-    expect(classifySegment({ type: 'image', data: { sub_type: 1 } }, GROUP)).toBe('sticker');
-    expect(classifySegment({ type: 'image', data: { emoji_package_id: 123 } }, GROUP)).toBe('sticker');
-    expect(classifySegment({ type: 'file', data: {} }, GROUP)).toBe('group_file');
-    expect(classifySegment({ type: 'file', data: {} }, PRIVATE)).toBe('file');
-    expect(classifySegment({ type: 'record', data: {} }, GROUP)).toBe('record');
-    expect(classifySegment({ type: 'video', data: {} }, GROUP)).toBe('video');
-    expect(classifySegment({ type: 'forward', data: {} }, GROUP)).toBe('forward');
-    expect(classifySegment({ type: 'text', data: { text: 'hi' } }, GROUP)).toBeNull();
-    expect(classifySegment({ type: 'at', data: { qq: '1' } }, GROUP)).toBeNull();
-  });
-});
+function makeEvent(overrides: Partial<QQC2CMessageCreateEvent> = {}): QQC2CMessageCreateEvent {
+  return {
+    id: 'ROBOT1.0_inbound_msg_001',
+    content: '',
+    timestamp: '2026-11-11T18:28:47+08:00',
+    author: { user_openid: MOCK_OPENID, username: '' },
+    message_type: 0,
+    ...overrides,
+  };
+}
 
-describe('契约测试: 远端标识与本地事实解耦', () => {
-  it('契约 2: file:/// URI 转为 OS 路径，且不写入 remote.fileId', () => {
-    const d = describeSegment(
-      {
-        type: 'image',
-        data: { file: 'file:///C:/tmp/outbound-image.png', local_format: 'png' },
-      },
-      { origin: 'outbound', isGroup: true }
-    )!;
+describe('契约测试: 官方附件分类与去 OneBot/群文件化', () => {
+  it('契约 1: image / voice / video / file 官方 content_type 判定准确，且已剔除 group_file', () => {
+    expect(isAttachmentKind('image')).toBe(true);
+    expect(isAttachmentKind('sticker')).toBe(true);
+    expect(isAttachmentKind('file')).toBe(true);
+    expect(isAttachmentKind('record')).toBe(true);
+    expect(isAttachmentKind('video')).toBe(true);
+    expect(isAttachmentKind('forward')).toBe(true);
+    expect(isAttachmentKind('group_file')).toBe(false);
 
-    expect(d.kind).toBe('image');
-    expect(d.local?.path?.endsWith('outbound-image.png')).toBe(true);
-    expect(d.local?.path?.startsWith('file:///')).toBe(false);
-    expect(d.remote?.fileId).toBeUndefined();
+    expect(classifyAttachment({ content_type: 'image/png' })).toBe('image');
+    expect(classifyAttachment({ content_type: 'image/gif' })).toBe('image');
+    expect(classifyAttachment({ content_type: 'voice' })).toBe('record');
+    expect(classifyAttachment({ content_type: 'video/mp4' })).toBe('video');
+    expect(classifyAttachment({ content_type: 'file', filename: 'photo.png' })).toBe('file');
   });
 
-  it('契约 3: file_id 带 .png 伪后缀、本地魔数实际为 jpg → 两者分别保留', () => {
-    const d = describeSegment(
+  it('契约 2: 语音附件提取 voice_wav_url 与 asr_refer_text，文件名执行路径穿越净化', () => {
+    const desc = describeAttachment({
+      content_type: 'voice',
+      filename: '../../dir\\95C5A03B7A.amr',
+      url: 'https://multimedia.nt.qq.com.cn/download?rkey=SECRET_AMR',
+      voice_wav_url: 'https://qqbot.ugcimg.cn/v1/voice.wav?sig=SECRET_WAV',
+      asr_refer_text: '晚上一起吃火锅吗',
+    });
+
+    expect(desc.kind).toBe('record');
+    expect(desc.origin).toBe('inbound');
+    expect(desc.fileName).toBe('95C5A03B7A.amr');
+    expect(desc.remote?.contentType).toBe('voice');
+    expect(desc.remote?.voiceWavUrl).toBe('https://qqbot.ugcimg.cn/v1/voice.wav?sig=SECRET_WAV');
+    expect(desc.remote?.asrReferText).toBe('晚上一起吃火锅吗');
+    expect(sanitizeAttachmentFileName('..\\..\\evil:name?.png')).toBe('evil_name_.png');
+  });
+
+  it('契约 3: describeInboundAttachments 与 toMessageMediaFields 不包含 busid 字段', () => {
+    const event = makeEvent({
+      attachments: [
+        {
+          content_type: 'file',
+          filename: 'screenshot.png',
+          size: 457027,
+          url: 'https://grouptalk.c2c.qq.com/download?rkey=SECRET',
+        },
+      ],
+    });
+    const resolved: AttachmentDescriptor[] = [
       {
-        type: 'image',
-        data: {
-          file: 'ABCDEF0123456789ABCDEF0123456789.png',
-          local_path: '/data/downloads/image/group_1/abc.jpg',
-          local_format: 'jpg',
-          file_size: 4567,
+        kind: 'file',
+        origin: 'inbound',
+        fileName: 'screenshot.png',
+        remote: {
+          fileUuid: 'uuid_file_001',
+          contentType: 'file',
+          url: 'https://grouptalk.c2c.qq.com/download?rkey=SECRET',
+        },
+        local: {
+          path: '/dsh/kujira/downloads/files/user_abc/screenshot.png',
+          format: 'png',
+          fingerprint: 'fp-png-001',
         },
       },
-      { origin: 'inbound', isGroup: true }
-    )!;
+    ];
 
-    expect(d.remote?.fileId).toBe('ABCDEF0123456789ABCDEF0123456789.png');
-    expect(d.local?.path).toBe('/data/downloads/image/group_1/abc.jpg');
-    expect(d.local?.format).toBe('jpg');
-    expect(d.local?.size).toBe(4567);
+    const summary = describeInboundAttachments(event, resolved);
+    expect(summary.type).toBe('file');
+    expect(summary.attachments).toHaveLength(1);
+
+    const fields = toMessageMediaFields(summary);
+    expect(fields).toEqual({
+      type: 'file',
+      file_id: 'uuid_file_001',
+      local_path: '/dsh/kujira/downloads/files/user_abc/screenshot.png',
+      fingerprint: 'fp-png-001',
+    });
+    expect('busid' in fields).toBe(false);
   });
 
-  it('契约 4: 出站 data.file 为 file:/// 时不会被误当成远端 file_id', () => {
-    const d = describeSegment(
-      { type: 'file', data: { file: 'file:///C:/tmp/report.pdf' } },
-      { origin: 'outbound', isGroup: false }
-    )!;
-
-    expect(d.kind).toBe('file');
-    expect(d.remote?.fileId).toBeUndefined();
-    expect(d.local?.path?.endsWith('report.pdf')).toBe(true);
+  it('契约 4: resolveLocalMediaPath 将 file:/// URI 转为 OS 路径，HTTP/相对路径返回 null', () => {
+    const winOrPosix = resolveLocalMediaPath('file:///C:/tmp/outbound-image.png');
+    expect(winOrPosix?.endsWith('outbound-image.png')).toBe(true);
+    expect(winOrPosix?.startsWith('file:///')).toBe(false);
+    expect(resolveLocalMediaPath('https://example.com/a.png')).toBeNull();
+    expect(resolveLocalMediaPath('relative/a.png')).toBeNull();
   });
 });
 
-describe('契约测试: 唯一渲染入口', () => {
+describe('契约测试: 出站附件描述符构造（无 subType 与 Lossless JSON）', () => {
+  it('契约 5: buildOutboundFaceAttachment 直接标注 kind=sticker + face，无需 subType', () => {
+    const face: FaceRecord = {
+      id: 'face_x',
+      file_path: '/faces/face_x.png',
+      md5: '0123456789abcdef0123456789abcdef',
+      added_at: 1700000000000,
+      source: 'collect',
+      tags: ['猫猫'],
+      mood: '嘲讽',
+      enabled: true,
+      size: 1234,
+      format: 'png',
+      use_count: 1,
+    };
+
+    const desc = buildOutboundFaceAttachment(face, 'file:///C:/faces/face_x.png');
+    expect(desc.kind).toBe('sticker');
+    expect(desc.origin).toBe('outbound');
+    expect(desc.local?.path.startsWith('file:///')).toBe(false);
+    expect(desc.face).toEqual({ id: 'face_x', mood: '嘲讽', tags: ['猫猫'] });
+    expect(JSON.stringify(desc)).not.toContain('undefined');
+  });
+
+  it('契约 6: buildOutboundMediaAttachment 规范化 voice/file/image 并剥离 undefined 键', () => {
+    const voiceDesc = buildOutboundMediaAttachment({
+      kind: 'voice',
+      localPath: '/tmp/voice_reply.wav',
+      fileUuid: 'uuid_v1',
+      fileInfo: 'file_info_v1',
+    });
+    expect(voiceDesc.kind).toBe('record');
+    expect(voiceDesc.origin).toBe('outbound');
+    expect(voiceDesc.fileName).toBe('voice_reply.wav');
+    expect(voiceDesc.remote).toEqual({ fileUuid: 'uuid_v1', fileInfo: 'file_info_v1' });
+    expect(Object.keys(voiceDesc.local!).every((k) => (voiceDesc.local as any)[k] !== undefined)).toBe(true);
+  });
+});
+
+describe('契约测试: 唯一安全渲染入口 (renderAttachment)', () => {
   function render(d: AttachmentDescriptor): string {
     const text = renderAttachment(d);
     expect(text).not.toBeNull();
     return text as string;
   }
 
-  it('契约 5: 命中表情库时入站/出站文案完全一致（face_id + 情绪 + 路径）', () => {
+  it('契约 7: 命中表情库时入站/出站文案完全一致，不暴露 file:///', () => {
     const base = {
       kind: 'sticker' as const,
       local: { path: '/faces/face_x.png', format: 'png' },
       face: { id: 'face_x', mood: '嘲讽' },
-      summary: '滑稽',
     };
     const inbound = render({ ...base, origin: 'inbound' });
     const outbound = render({ ...base, origin: 'outbound' });
@@ -117,174 +195,147 @@ describe('契约测试: 唯一渲染入口', () => {
     expect(outbound).toBe(inbound);
   });
 
-  it('契约 6: 未命中表情库但有本地路径 → 规范路径展示且清洗方括号，不展示 file:///', () => {
-    const text = render({
-      kind: 'sticker',
-      origin: 'outbound',
-      summary: '滑稽',
-      local: { path: '/faces/funny.png' },
-    });
-    expect(text).toBe('[表情包: 滑稽 路径: /faces/funny.png]');
-    expect(text).not.toContain('file:///');
-
-    // 嵌套方括号清洗验证：[动画表情] -> 动画表情
-    const textNested = render({
-      kind: 'sticker',
-      origin: 'inbound',
-      summary: '[动画表情]',
-      local: { path: '/faces/c393b.jpg' },
-    });
-    expect(textNested).toBe('[表情包: 动画表情 路径: /faces/c393b.jpg]');
-  });
-
-  it('契约 7: 普通图片本地路径优先，file:/// 转为 OS 路径', () => {
-    const text = render({
+  it('契约 8: renderImage 严禁暴露带 query 凭证的 remote.url；仅展示安全占位', () => {
+    const secretUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=TOP_SECRET_KEY';
+    const renderedNoLocal = render({
       kind: 'image',
-      origin: 'outbound',
-      local: { path: '/tmp/outbound-image.png' },
-      remote: { url: 'https://example.com/a.png' },
+      origin: 'inbound',
+      fileName: '95C5A03B7A.png',
+      remote: { url: secretUrl },
+      unavailable: 'download_failed',
     });
-    expect(text).toBe('[图片:/tmp/outbound-image.png]');
-    expect(text).not.toContain('file:///');
+    expect(renderedNoLocal).toBe('[图片:95C5A03B7A.png (入站落盘失败)]');
+    expect(renderedNoLocal).not.toContain('TOP_SECRET_KEY');
+    expect(renderedNoLocal).not.toContain('multimedia.nt.qq.com.cn');
+
+    const renderedBare = render({
+      kind: 'image',
+      origin: 'inbound',
+      remote: { url: secretUrl },
+    });
+    expect(renderedBare).toBe('[图片]');
+    expect(renderedBare).not.toContain('TOP_SECRET_KEY');
   });
 
-  it('契约 8: 无本地文件时普通图片优先展示远程 URL', () => {
-    expect(
-      render({
-        kind: 'image',
-        origin: 'inbound',
-        remote: { fileId: 'ABC.png', url: 'https://multimedia.example/a' },
-      })
-    ).toBe('[图片:https://multimedia.example/a]');
-  });
-
-  it('契约 9: 私聊文件落盘失败如实标注；群文件保留 ID 占位', () => {
-    expect(
-      render({
-        kind: 'file',
-        origin: 'inbound',
-        fileName: '报告.pdf',
-        unavailable: 'inbound_failed',
-      })
-    ).toBe('[文件:报告.pdf (入站落盘失败)]');
-
-    expect(
-      render({
-        kind: 'group_file',
-        origin: 'inbound',
-        fileName: '周报.pdf',
-        remote: { fileId: 'group-file-1', busid: 102 },
-      })
-    ).toBe('[群文件:周报.pdf (ID:group-file-1)]');
-  });
-
-  it('契约 10: 私聊文件有本地路径 → 已保存真实路径', () => {
+  it('契约 9: content_type=file 的 .png 文件明确展示路径；语音结合 local.path 与 asrReferText 渲染', () => {
     expect(
       render({
         kind: 'file',
         origin: 'inbound',
-        fileName: '报告.pdf',
-        local: { path: '/data/downloads/file/user_1/report.pdf' },
+        fileName: 'ABCD.png',
+        local: { path: '/dsh/kujira/downloads/files/user_1/ABCD.png', format: 'png' },
       })
-    ).toBe('[文件:报告.pdf 已保存: /data/downloads/file/user_1/report.pdf]');
-  });
+    ).toBe('[文件:ABCD.png 已保存: /dsh/kujira/downloads/files/user_1/ABCD.png]');
 
-  it('契约 11: 语音 / 视频 / 合并转发保持既有占位', () => {
+    expect(
+      render({
+        kind: 'record',
+        origin: 'inbound',
+        local: { path: '/dsh/kujira/downloads/voice/user_1/v1.wav', format: 'wav' },
+        remote: { asrReferText: '帮我查一下明天的天气' },
+      })
+    ).toBe('[语音 已保存: /dsh/kujira/downloads/voice/user_1/v1.wav (语音转文字: "帮我查一下明天的天气")]');
+
+    expect(
+      render({
+        kind: 'record',
+        origin: 'inbound',
+        remote: { asrReferText: '语音转写文本' },
+        unavailable: 'timeout',
+      })
+    ).toBe('[语音 (语音转文字: "语音转写文本") (入站落盘失败)]');
+
+    expect(
+      render({
+        kind: 'record',
+        origin: 'inbound',
+        remote: { asrReferText: '仅转写文本' },
+      })
+    ).toBe('[语音 (语音转文字: "仅转写文本")]');
+
     expect(render({ kind: 'record', origin: 'inbound' })).toBe('[语音]');
-    expect(render({ kind: 'video', origin: 'inbound' })).toBe('[视频]');
-    expect(render({ kind: 'forward', origin: 'inbound', remote: { forwardId: 'fw_1' } })).toBe(
-      '[合并转发 (ID:fw_1)]'
+  });
+
+  it('契约 10: 合并转发与视频渲染适配官方结构，未知 group_file 返回 null', () => {
+    expect(render({ kind: 'forward', origin: 'inbound' })).toBe('[合并转发]');
+    expect(render({ kind: 'forward', origin: 'inbound', summary: '群聊的聊天记录' })).toBe(
+      '[合并转发: 群聊的聊天记录]'
     );
+    expect(
+      render({
+        kind: 'video',
+        origin: 'inbound',
+        fileName: 'clip.mp4',
+        local: { path: '/dsh/kujira/downloads/video/user_1/clip.mp4' },
+      })
+    ).toBe('[视频:clip.mp4 已保存: /dsh/kujira/downloads/video/user_1/clip.mp4]');
+
+    expect(renderAttachment({ kind: 'group_file' as any, origin: 'inbound' })).toBeNull();
   });
 });
 
-describe('契约测试: 描述符落库映射与序列化', () => {
-  it('契约 12: describeMessage 与入站主导类型/媒体字段口径一致', () => {
-    const summary = describeMessage(
-      [
-        { type: 'text', data: { text: '看图' } },
-        {
-          type: 'image',
-          data: {
-            file: 'REMOTE_IMAGE.png',
-            local_path: '/data/downloads/image/group_1/real.jpg',
-            local_format: 'jpg',
-            fingerprint: 'fp-1',
-          },
-        },
-        {
-          type: 'file',
-          data: { file_id: 'group-file-1', file_name: '周报.pdf', busid: 102 },
-        },
-      ],
-      { origin: 'inbound', isGroup: true }
-    );
-
-    // 与既有入站口径一致：file 段无条件覆盖主导类型（即便前面已有图片）
-    expect(summary.type).toBe('group_file');
-    expect(summary.attachments).toHaveLength(2);
-    expect(summary.attachments[0].kind).toBe('image');
-    expect(summary.attachments[1].kind).toBe('group_file');
-
-    const fields = toMessageMediaFields(summary);
-    expect(fields.file_id).toBe('REMOTE_IMAGE.png');
-    expect(fields.local_path).toBe('/data/downloads/image/group_1/real.jpg');
-    expect(fields.fingerprint).toBe('fp-1');
-    expect(fields.busid).toBe(102);
-  });
-
-  it('契约 13: 非附件段主导类型（reply/at/poke/json）保持既有口径', () => {
-    expect(
-      describeMessage([{ type: 'reply', data: { id: 1 } }, { type: 'text', data: { text: 'x' } }], {
-        origin: 'inbound',
-        isGroup: true,
-      }).type
-    ).toBe('reply');
-    expect(
-      describeMessage([{ type: 'at', data: { qq: '1' } }], { origin: 'inbound', isGroup: true }).type
-    ).toBe('at');
-    expect(
-      describeMessage([{ type: 'poke', data: {} }], { origin: 'inbound', isGroup: true }).type
-    ).toBe('poke');
-    expect(
-      describeMessage([{ type: 'json', data: {} }], { origin: 'inbound', isGroup: true }).type
-    ).toBe('json');
-  });
-
-  it('契约 14: serializeAttachments / deserializeAttachments 无损往返且非法 JSON 回退空数组', () => {
-    const descriptors: AttachmentDescriptor[] = [
+describe('契约测试: 序列化与官方 raw 事件解析 (store.ts)', () => {
+  it('契约 11: serializeAttachments / deserializeAttachments 无损往返，compact 剥离 undefined', () => {
+    const input = [
       {
-        kind: 'sticker',
-        origin: 'outbound',
-        local: { path: '/faces/a.png', format: 'png', md5: 'abc' },
-        face: { id: 'face_a', mood: '开心', tags: ['猫猫'] },
-        summary: '猫',
-      },
-      {
-        kind: 'group_file',
-        origin: 'inbound',
-        fileName: '周报.pdf',
-        remote: { fileId: 'gf-1', busid: 102 },
+        kind: 'record' as const,
+        origin: 'inbound' as const,
+        fileName: 'voice.amr',
+        remote: {
+          contentType: 'voice',
+          asrReferText: '你好',
+          fileUuid: undefined,
+        },
+        local: {
+          path: '/downloads/voice/user_1/voice.wav',
+          format: 'wav',
+        },
       },
     ];
 
-    const json = serializeAttachments(descriptors);
-    expect(typeof json).toBe('string');
-    const restored = deserializeAttachments(json);
-    expect(restored).toEqual(descriptors);
+    const compacted = compact(input);
+    expect('fileUuid' in compacted[0]!.remote!).toBe(false);
 
-    expect(deserializeAttachments(null)).toEqual([]);
-    expect(deserializeAttachments('')).toEqual([]);
-    expect(deserializeAttachments('{not-json')).toEqual([]);
-    expect(deserializeAttachments('{"foo":1}')).toEqual([]);
+    const json = serializeAttachments(input);
+    expect(typeof json).toBe('string');
+    expect(json).not.toContain('undefined');
+
+    const restored = deserializeAttachments(json);
+    expect(restored).toHaveLength(1);
+    expect(restored[0]!.remote?.asrReferText).toBe('你好');
+
+    // 旧版 group_file 记录反序列化时直接过滤剔除
+    expect(
+      deserializeAttachments(JSON.stringify([{ kind: 'group_file', origin: 'inbound' }]))
+    ).toEqual([]);
+    expect(deserializeAttachments('{invalid')).toEqual([]);
   });
 
-  it('契约 15: 描述符 JSON 中不出现 undefined 字段', () => {
-    const json = serializeAttachments([
-      { kind: 'image', origin: 'outbound', local: { path: '/tmp/a.png' } },
-    ])!;
-    const parsed = JSON.parse(json);
-    expect(JSON.stringify(parsed)).not.toContain('undefined');
-    expect(Object.keys(parsed[0]).sort()).toEqual(['kind', 'local', 'origin']);
+  it('契约 12: descriptorsFromRaw 解析持久化 QQC2CMessageCreateEvent JSON，拒绝旧版段数组', () => {
+    const officialEvent = makeEvent({
+      attachments: [
+        {
+          content_type: 'image/png',
+          filename: '95C5A03B7A.png',
+          url: 'https://multimedia.nt.qq.com.cn/download?rkey=SECRET',
+        },
+        {
+          content_type: 'voice',
+          filename: 'A1B2.amr',
+          voice_wav_url: 'https://qqbot.ugcimg.cn/voice.wav',
+          asr_refer_text: '收到',
+        },
+      ],
+    });
+
+    const parsed = descriptorsFromRaw(JSON.stringify(officialEvent));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]!.kind).toBe('image');
+    expect(parsed[0]!.fileName).toBe('95C5A03B7A.png');
+    expect(parsed[1]!.kind).toBe('record');
+    expect(parsed[1]!.remote?.asrReferText).toBe('收到');
+
+    // 旧版 OneBot 段数组 JSON 不兼容，返回空数组
+    expect(descriptorsFromRaw(JSON.stringify([{ type: 'image', data: { file: 'a.png' } }]))).toEqual([]);
   });
 });

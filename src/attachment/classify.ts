@@ -1,44 +1,37 @@
 /**
- * 附件分类与段内事实提取（唯一判定入口）。
+ * kujira: 附件分类与入站事实提取（唯一判定入口）。
  *
- * 入站 / 出站 / 离线同步 / 自记录都必须走这里，禁止各自再写一套
- * `sub_type` / `emoji_package_id` / `file_id` 推导。
+ * 严格遵循 QQ 官方 Bot API v2 实测行为：
+ * - 基于 `QQC2CMessageCreateEvent.attachments[]` 的 `content_type` 判定类型；
+ * - 语音严格以 `content_type === 'voice'` 为准，提取 `voice_wav_url` 与 `asr_refer_text`；
+ * - 注意实测存在 `.png` 文件以 `content_type === 'file'` 下发，保持 `'file'` 分类并保留真实扩展名。
  */
 
+import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
 import type {
   AttachmentDescriptor,
-  AttachmentFaceMeta,
   AttachmentKind,
-  AttachmentLocalMeta,
   AttachmentOrigin,
   AttachmentRemoteMeta,
 } from './types.js';
 
-export interface SegmentContext {
-  isGroup: boolean;
-}
-
-export interface DescribeContext extends SegmentContext {
-  origin: AttachmentOrigin;
-}
-
 export interface MessageDescription {
-  /** 与既有落库口径一致的主导类型。 */
+  /** 主导消息类型（'text' | 'image' | 'sticker' | 'file' | 'record' | 'video' | 'forward' | 'card' | 'reply'） */
   type: string;
-  /** 按消息段顺序排列的附件描述符。 */
+  /** 按附件顺序排列的附件描述符 */
   attachments: AttachmentDescriptor[];
 }
 
 export interface MessageMediaFields {
   type: string;
   file_id: string | null;
-  busid: number | null;
   local_path: string | null;
   fingerprint: string | null;
 }
 
-const NON_LOCAL_SCHEME = /^(file:|https?:|data:|base64:)/i;
+const IMAGE_FILE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
 
 function nonEmptyString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -46,26 +39,9 @@ function nonEmptyString(value: unknown): string | undefined {
   return trimmed === '' ? undefined : trimmed;
 }
 
-/** 图片段是否为表情包（既有落库口径）。 */
-export function isStickerSegment(data: any): boolean {
-  return Boolean(data && (data.sub_type === 1 || data.emoji_package_id));
-}
-
 /**
- * 是否像 OneBot / NapCat 的远端媒体标识（而非本地路径、URL、base64）。
- * 注意：`file:///` 是本地路径，不能当作远端 file_id。
- */
-export function isRemoteMediaId(value: unknown): value is string {
-  const v = nonEmptyString(value);
-  if (!v) return false;
-  if (NON_LOCAL_SCHEME.test(v)) return false;
-  if (/^[a-zA-Z]:[\\/]/.test(v) || v.startsWith('/') || v.startsWith('\\\\')) return false;
-  return true;
-}
-
-/**
- * 把 file:// URI 或本地绝对路径解析为可读 OS 路径。
- * URL / base64 / 相对路径一律返回 null，绝不伪造本地路径。
+ * 把 `file://` URI 或本地绝对路径解析为可读 OS 路径。
+ * HTTP URL / base64 / 相对路径一律返回 null，绝不伪造本地路径。
  */
 export function resolveLocalMediaPath(value: unknown): string | null {
   const raw = nonEmptyString(value);
@@ -75,8 +51,6 @@ export function resolveLocalMediaPath(value: unknown): string | null {
     try {
       return fileURLToPath(raw);
     } catch {
-      // Windows 上 file:///tmp/a.png 这类无盘符 URI 会让 fileURLToPath 抛错，
-      // 退回取 URL pathname，至少保留可读的绝对路径而不丢附件事实。
       try {
         const pathname = decodeURIComponent(new URL(raw).pathname);
         return pathname.startsWith('/') ? pathname : null;
@@ -88,253 +62,151 @@ export function resolveLocalMediaPath(value: unknown): string | null {
   if (/^[a-zA-Z]:[\\/]/.test(raw) || raw.startsWith('/') || raw.startsWith('\\\\')) {
     return raw;
   }
-  // WSL 路径（NapCat 侧常见）：/mnt/c/... 已由 startsWith('/') 覆盖。
   return null;
 }
 
-function isHttpUrl(value: unknown): value is string {
-  return typeof value === 'string' && /^https?:\/\//i.test(value.trim());
+/**
+ * 对外部传入的附件文件名执行跨平台 `basename` 与危险字符净化，防止路径穿越。
+ */
+export function sanitizeAttachmentFileName(value: unknown): string | undefined {
+  const raw = nonEmptyString(value);
+  if (!raw) return undefined;
+
+  const segments = raw.split(/[\\/]+/).filter(Boolean);
+  const base = segments[segments.length - 1] ?? '';
+  if (!base || base === '.' || base === '..') return undefined;
+
+  const cleaned = base
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/^\.+/, '')
+    .trim();
+
+  if (!cleaned || cleaned === '.' || cleaned === '..') return undefined;
+  return cleaned;
 }
 
-function baseName(filePath: string): string {
-  const parts = filePath.split(/[\\/]/).filter(Boolean);
-  return parts[parts.length - 1] || filePath;
+/** 判断路径或文件名扩展名是否为常见位图图片格式。 */
+export function isImageFileExt(fileNameOrPath?: string | null): boolean {
+  if (!fileNameOrPath || typeof fileNameOrPath !== 'string') return false;
+  const ext = path.extname(fileNameOrPath).replace(/^\./, '').toLowerCase();
+  return IMAGE_FILE_EXTENSIONS.has(ext);
 }
 
-function fileNameFromHttpUrl(url: string): string | undefined {
-  try {
-    const parsed = new URL(url);
-    const last = parsed.pathname.split('/').filter(Boolean).pop();
-    if (!last) return undefined;
-    return decodeURIComponent(last);
-  } catch {
+/** 根据官方 `QQAttachment.content_type` 判定统一附件类别。 */
+export function classifyAttachment(attachment: QQAttachment | null | undefined): AttachmentKind {
+  if (!attachment || typeof attachment !== 'object') return 'file';
+  const ct = nonEmptyString(attachment.content_type)?.toLowerCase() ?? '';
+
+  if (ct.includes('image/') || ct === 'image') {
+    return 'image';
+  }
+  if (ct === 'voice' || ct.startsWith('audio/')) {
+    return 'record';
+  }
+  if (ct.includes('video/') || ct === 'video') {
+    return 'video';
+  }
+  if (ct === 'file') {
+    return 'file';
+  }
+
+  if (nonEmptyString(attachment.voice_wav_url) || nonEmptyString(attachment.asr_refer_text)) {
+    return 'record';
+  }
+  return 'file';
+}
+
+function buildInboundRemoteMeta(attachment: QQAttachment): AttachmentRemoteMeta | undefined {
+  const contentType = nonEmptyString(attachment.content_type);
+  const url = nonEmptyString(attachment.url);
+  const voiceWavUrl = nonEmptyString(attachment.voice_wav_url);
+  const asrReferText = nonEmptyString(attachment.asr_refer_text);
+
+  if (!contentType && !url && !voiceWavUrl && !asrReferText) {
     return undefined;
   }
-}
 
-/** 统一的文件名推导：本地路径取 basename，URL 取 pathname 尾段，远端伪名原样。 */
-export function resolveAttachmentFileName(data: any): string | undefined {
-  const explicit = nonEmptyString(data?.file_name) || nonEmptyString(data?.name);
-  if (explicit) return explicit;
-
-  const file = nonEmptyString(data?.file);
-  if (file) {
-    const local = resolveLocalMediaPath(file);
-    if (local) return baseName(local);
-    if (isHttpUrl(file)) return fileNameFromHttpUrl(file);
-    if (!/^(base64:|data:)/i.test(file)) return file;
-  }
-
-  return nonEmptyString(data?.file_id);
-}
-
-/** 唯一的附件 kind 判定。 */
-export function classifySegment(
-  seg: Record<string, any> | null | undefined,
-  ctx: SegmentContext
-): AttachmentKind | null {
-  if (!seg || typeof seg !== 'object') return null;
-  const data = seg.data || {};
-
-  switch (seg.type) {
-    case 'image':
-      return isStickerSegment(data) ? 'sticker' : 'image';
-    case 'file':
-      return ctx.isGroup ? 'group_file' : 'file';
-    case 'record':
-      return 'record';
-    case 'video':
-      return 'video';
-    case 'forward':
-      return 'forward';
-    default:
-      return null;
-  }
-}
-
-function buildFace(data: any): AttachmentFaceMeta | undefined {
-  const id = nonEmptyString(data?.face?.id);
-  if (!id) return undefined;
-  const mood = nonEmptyString(data.face.mood);
-  const tags =
-    Array.isArray(data.face.tags) && data.face.tags.length > 0
-      ? data.face.tags.map((tag: unknown) => String(tag))
-      : undefined;
   return {
-    id,
-    ...(mood ? { mood } : {}),
-    ...(tags ? { tags } : {}),
+    ...(contentType ? { contentType } : {}),
+    ...(url ? { url } : {}),
+    ...(voiceWavUrl ? { voiceWavUrl } : {}),
+    ...(asrReferText ? { asrReferText } : {}),
   };
 }
 
-function buildRemote(kind: AttachmentKind, data: any): AttachmentRemoteMeta | undefined {
-  const remote: AttachmentRemoteMeta = {};
-
-  if (kind === 'forward') {
-    const forwardId = nonEmptyString(data.id) || nonEmptyString(data.forward_id);
-    if (forwardId) remote.forwardId = forwardId;
-  } else {
-    const explicitId = nonEmptyString(data.file_id);
-    if (explicitId) {
-      remote.fileId = explicitId;
-    } else if (kind !== 'file' && kind !== 'group_file' && isRemoteMediaId(data.file)) {
-      // 文件段的 data.file 通常是「文件名」而非远端 ID（如 report.pdf），
-      // 只有 image/record/video 等才可用 data.file 作为远端标识。
-      remote.fileId = String(data.file).trim();
-    }
-
-    if (data.busid !== undefined && data.busid !== null && Number.isFinite(Number(data.busid))) {
-      remote.busid = Number(data.busid);
-    }
-
-    const url = nonEmptyString(data.url) || (isHttpUrl(data.file) ? String(data.file).trim() : undefined);
-    if (url) remote.url = url;
-  }
-
-  return Object.keys(remote).length > 0 ? remote : undefined;
-}
-
-function buildLocal(data: any): AttachmentLocalMeta | undefined {
-  const pathValue = resolveLocalMediaPath(data?.local_path) || resolveLocalMediaPath(data?.file);
-  if (!pathValue) return undefined;
-
-  const format = nonEmptyString(data?.local_format);
-  const md5 = nonEmptyString(data?.md5);
-  const fingerprint = nonEmptyString(data?.fingerprint);
-  const sizeValue = data?.file_size ?? data?.size;
-  const size =
-    sizeValue !== undefined && sizeValue !== null && Number.isFinite(Number(sizeValue))
-      ? Number(sizeValue)
-      : undefined;
-
-  return {
-    path: pathValue,
-    ...(format ? { format } : {}),
-    ...(size !== undefined ? { size } : {}),
-    ...(md5 ? { md5 } : {}),
-    ...(fingerprint ? { fingerprint } : {}),
-  };
-}
-
-/** 从单个消息段提取附件描述符；非附件段返回 null。 */
-export function describeSegment(
-  seg: Record<string, any> | null | undefined,
-  ctx: DescribeContext
-): AttachmentDescriptor | null {
-  const kind = classifySegment(seg, ctx);
-  if (!kind) return null;
-
-  const data = seg!.data || {};
-  const remote = buildRemote(kind, data);
-  const local = buildLocal(data);
-  const face = buildFace(data);
-  const fileName = resolveAttachmentFileName(data);
-  const summary = nonEmptyString(data.summary);
-  const unavailable = data.dl_failed
-    ? 'inbound_failed'
-    : nonEmptyString(data.unavailable_reason) || nonEmptyString(data.unavailable);
+/** 从单个官方入站 `QQAttachment` 提取附件描述符。 */
+export function describeAttachment(
+  attachment: QQAttachment,
+  origin: AttachmentOrigin = 'inbound'
+): AttachmentDescriptor {
+  const kind = classifyAttachment(attachment);
+  const remote = buildInboundRemoteMeta(attachment);
+  const fileName = sanitizeAttachmentFileName(attachment.filename);
 
   return {
     kind,
-    origin: ctx.origin,
+    origin,
     ...(remote ? { remote } : {}),
-    ...(local ? { local } : {}),
-    ...(face ? { face } : {}),
     ...(fileName ? { fileName } : {}),
-    ...(summary ? { summary } : {}),
-    ...(unavailable ? { unavailable } : {}),
   };
-}
-
-/** 按消息段顺序提取全部附件描述符。 */
-export function describeSegments(
-  segments: ReadonlyArray<Record<string, any>>,
-  ctx: DescribeContext
-): AttachmentDescriptor[] {
-  const descriptors: AttachmentDescriptor[] = [];
-  for (const seg of segments) {
-    const descriptor = describeSegment(seg, ctx);
-    if (descriptor) descriptors.push(descriptor);
-  }
-  return descriptors;
 }
 
 /**
- * 推导消息主导类型，保持既有落库口径：
- * 首个有意义的非文本段决定类型；file / forward / record / video / poke / shake /
- * json / xml 无条件覆盖，reply / at / image 仅在仍为 text 时生效。
+ * 推导官方 C2C 入站事件主导消息类型。
  */
-export function inferDominantType(
-  segments: ReadonlyArray<Record<string, any>>,
-  ctx: SegmentContext
+export function inferInboundMessageType(
+  event: QQC2CMessageCreateEvent,
+  descriptors: ReadonlyArray<AttachmentDescriptor> = []
 ): string {
-  let type = 'text';
+  if (event.message_type === 102) return 'forward';
+  if (event.message_type === 3 || event.ark_data) return 'card';
 
-  for (const seg of segments) {
-    if (!seg || typeof seg !== 'object') continue;
-    const data = seg.data || {};
-
-    switch (seg.type) {
-      case 'image':
-        if (type === 'text') type = isStickerSegment(data) ? 'sticker' : 'image';
-        break;
-      case 'file':
-        type = ctx.isGroup ? 'group_file' : 'file';
-        break;
-      case 'forward':
-        type = 'forward';
-        break;
-      case 'record':
-        type = 'record';
-        break;
-      case 'video':
-        type = 'video';
-        break;
-      case 'poke':
-        type = 'poke';
-        break;
-      case 'shake':
-        type = 'shake';
-        break;
-      case 'json':
-      case 'xml':
-        type = seg.type;
-        break;
-      case 'reply':
-        if (type === 'text') type = 'reply';
-        break;
-      case 'at':
-        if (type === 'text') type = 'at';
-        break;
-      default:
-        break;
-    }
+  if (descriptors.length > 0) {
+    if (descriptors.some((d) => d.kind === 'file')) return 'file';
+    if (descriptors.some((d) => d.kind === 'forward')) return 'forward';
+    if (descriptors.some((d) => d.kind === 'record')) return 'record';
+    if (descriptors.some((d) => d.kind === 'video')) return 'video';
+    if (descriptors.some((d) => d.kind === 'sticker' || Boolean(d.face?.id))) return 'sticker';
+    return 'image';
   }
 
-  return type;
+  if (event.message_type === 103) return 'reply';
+  return 'text';
 }
 
-/** 一次性得到主导类型与附件描述符。 */
-export function describeMessage(
-  segments: ReadonlyArray<Record<string, any>>,
-  ctx: DescribeContext
+/**
+ * 从官方 `QQC2CMessageCreateEvent` 提取主导消息类型与附件描述符列表。
+ * 若外部已通过 `resolveInboundAttachments` 完成落盘与表情匹配，可传入 `resolvedDescriptors` 直接复用本地事实。
+ */
+export function describeInboundAttachments(
+  event: QQC2CMessageCreateEvent,
+  resolvedDescriptors?: AttachmentDescriptor[]
 ): MessageDescription {
+  const attachments: AttachmentDescriptor[] = Array.isArray(resolvedDescriptors)
+    ? resolvedDescriptors
+    : Array.isArray(event?.attachments)
+      ? event.attachments
+          .filter((att): att is QQAttachment => Boolean(att) && typeof att === 'object')
+          .map((att) => describeAttachment(att, 'inbound'))
+      : [];
+
   return {
-    type: inferDominantType(segments, ctx),
-    attachments: describeSegments(segments, ctx),
+    type: inferInboundMessageType(event, attachments),
+    attachments,
   };
 }
 
-/** 描述符 → messages 表的媒体字段（file_id / busid / local_path / fingerprint）。 */
+/** 描述符 → `messages` 表的媒体字段（无 `busid`）。 */
 export function toMessageMediaFields(description: MessageDescription): MessageMediaFields {
-  const firstRemote = description.attachments.find((item) => item.remote?.fileId)?.remote;
-  const firstBusid = description.attachments.find((item) => item.remote?.busid !== undefined)?.remote;
+  const firstRemote = description.attachments.find(
+    (item) => item.remote?.fileUuid || item.remote?.fileInfo || item.remote?.fileId
+  )?.remote;
   const firstLocal = description.attachments.find((item) => item.local?.path)?.local;
 
   return {
     type: description.type,
-    file_id: firstRemote?.fileId ?? null,
-    busid: firstBusid?.busid ?? null,
+    file_id: firstRemote?.fileUuid ?? firstRemote?.fileInfo ?? firstRemote?.fileId ?? null,
     local_path: firstLocal?.path ?? null,
     fingerprint: firstLocal?.fingerprint ?? null,
   };

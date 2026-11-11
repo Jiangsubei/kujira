@@ -3,17 +3,27 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { MediaStorageManager, cleanExpiredMedia, startMediaCleanupTask } from '../../src/storage/media.js';
+import {
+  MediaStorageManager,
+  cleanExpiredMedia,
+  startMediaCleanupTask,
+  detectBufferExt,
+  sanitizeUrlForLog,
+} from '../../src/storage/media.js';
 import { MessageDatabase } from '../../src/storage/database.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
-describe('契约测试: 入站媒体 TTL 清理与去重活跃续期 (Media TTL Cleanup Contract)', () => {
+const MOCK_OPENID = '0123456789ABCDEF0123456789ABCDEF';
+const MOCK_PEER = openidToPeer(MOCK_OPENID);
+
+describe('契约测试: 入站媒体 TTL 清理、魔数识别与 URL 脱敏 (Media TTL & Security Contract)', () => {
   let tmpDir: string;
   let dbPath: string;
   let db: MessageDatabase;
   let mediaManager: MediaStorageManager;
 
   beforeEach(async () => {
-    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-media-ttl-test-'));
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-media-ttl-test-'));
     dbPath = path.join(tmpDir, 'test-msg.db');
     db = new MessageDatabase(dbPath);
     mediaManager = new MediaStorageManager({
@@ -24,6 +34,7 @@ describe('契约测试: 入站媒体 TTL 清理与去重活跃续期 (Media TTL 
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     try {
       db.close();
     } catch {}
@@ -36,40 +47,36 @@ describe('契约测试: 入站媒体 TTL 清理与去重活跃续期 (Media TTL 
     const pngBuffer = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02]);
     const fileId = 'file_dedup_l1_test';
 
-    // 1. 初次保存落盘
-    const res1 = await mediaManager.saveBuffer(pngBuffer, { fileId, type: 'image' });
+    const res1 = await mediaManager.saveBuffer(pngBuffer, { fileId, type: 'image', sessionId: MOCK_PEER });
     expect(res1.deduplicated).toBe(false);
     expect(fs.existsSync(res1.localPath)).toBe(true);
 
-    // 数据库存入带该 fileId 与 localPath 的消息记录
     db.saveMessage({
-      msg_id: 1001,
-      peer: 'peer_1',
-      user_id: '12345',
+      msg_id: 'ROBOT1.0_1001',
+      peer: MOCK_PEER,
+      user_id: MOCK_OPENID,
       sender_name: 'test',
-      time: Math.floor(Date.now() / 1000),
+      time: Date.now(),
       type: 'image',
       content: '[图片]',
-      raw: {},
+      raw: '{}',
       file_id: fileId,
       local_path: res1.localPath,
       fingerprint: res1.fingerprint,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
     });
 
-    // 2. 将文件的 mtime 回拨到 5 天前 (仍在 7 天 TTL 内，但已老化)
     const fiveDaysAgoSec = (Date.now() - 5 * 24 * 3600 * 1000) / 1000;
     await fsp.utimes(res1.localPath, fiveDaysAgoSec, fiveDaysAgoSec);
-    const statBefore = await fsp.stat(res1.localPath);
-    expect(Math.abs(statBefore.mtimeMs - (Date.now() - 5 * 24 * 3600 * 1000))).toBeLessThan(5000);
 
-    // 3. 再次保存相同 fileId（触发一级去重）
     const beforeSaveNow = Date.now();
-    const res2 = await mediaManager.saveBuffer(pngBuffer, { fileId, type: 'image' });
+    const res2 = await mediaManager.saveBuffer(pngBuffer, { fileId, type: 'image', sessionId: MOCK_PEER });
     expect(res2.deduplicated).toBe(true);
     expect(res2.level).toBe(1);
     expect(res2.localPath).toBe(res1.localPath);
 
-    // 4. 断言：mtime 必须被刷新到当前时间附近（刷新成功）
     const statAfter = await fsp.stat(res1.localPath);
     expect(statAfter.mtimeMs).toBeGreaterThanOrEqual(beforeSaveNow - 1000);
   });
@@ -77,37 +84,35 @@ describe('契约测试: 入站媒体 TTL 清理与去重活跃续期 (Media TTL 
   it('契约 2: 二级指纹去重命中时自动刷新文件 mtime，实现 TTL 活跃续期', async () => {
     const pngBuffer = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x09, 0x08]);
 
-    // 1. 初次保存（不传 fileId）
-    const res1 = await mediaManager.saveBuffer(pngBuffer, { type: 'image' });
+    const res1 = await mediaManager.saveBuffer(pngBuffer, { type: 'image', sessionId: MOCK_PEER });
     expect(res1.deduplicated).toBe(false);
 
-    // 数据库存入该 fingerprint 的记录
     db.saveMessage({
-      msg_id: 2001,
-      peer: 'peer_2',
-      user_id: '12345',
+      msg_id: 'ROBOT1.0_2001',
+      peer: MOCK_PEER,
+      user_id: MOCK_OPENID,
       sender_name: 'test',
-      time: Math.floor(Date.now() / 1000),
+      time: Date.now(),
       type: 'image',
       content: '[图片]',
-      raw: {},
+      raw: '{}',
       file_id: 'origin_fid',
       local_path: res1.localPath,
       fingerprint: res1.fingerprint,
+      recalled: 0,
+      self: 0,
+      reply_to: null,
     });
 
-    // 2. 将文件的 mtime 回拨到 6 天前
     const sixDaysAgoSec = (Date.now() - 6 * 24 * 3600 * 1000) / 1000;
     await fsp.utimes(res1.localPath, sixDaysAgoSec, sixDaysAgoSec);
 
-    // 3. 再次保存相同字节内容（无相同 fileId，触发 SHA-256 二级去重）
     const beforeSaveNow = Date.now();
     const res2 = await mediaManager.saveBuffer(pngBuffer, { fileId: 'different_fid_2', type: 'image' });
     expect(res2.deduplicated).toBe(true);
     expect(res2.level).toBe(2);
     expect(res2.localPath).toBe(res1.localPath);
 
-    // 4. 断言：mtime 必须被刷新到当前时间附近（刷新成功）
     const statAfter = await fsp.stat(res1.localPath);
     expect(statAfter.mtimeMs).toBeGreaterThanOrEqual(beforeSaveNow - 1000);
   });
@@ -121,49 +126,50 @@ describe('契约测试: 入站媒体 TTL 清理与去重活跃续期 (Media TTL 
     await fsp.writeFile(expiredFile, 'expired-data');
     await fsp.writeFile(freshFile, 'fresh-data');
 
-    // 记录到数据库
     db.saveMessage({
-      msg_id: 3001,
-      peer: 'peer_3',
-      user_id: '12345',
+      msg_id: 'ROBOT1.0_3001',
+      peer: MOCK_PEER,
+      user_id: MOCK_OPENID,
       sender_name: 'test',
-      time: Math.floor(Date.now() / 1000),
+      time: Date.now(),
       type: 'image',
       content: '[图片]',
-      raw: {},
+      raw: '{}',
       file_id: 'fid_expired',
       local_path: expiredFile,
       fingerprint: 'hash_expired',
+      recalled: 0,
+      self: 0,
+      reply_to: null,
     });
     db.saveMessage({
-      msg_id: 3002,
-      peer: 'peer_3',
-      user_id: '12345',
+      msg_id: 'ROBOT1.0_3002',
+      peer: MOCK_PEER,
+      user_id: MOCK_OPENID,
       sender_name: 'test',
-      time: Math.floor(Date.now() / 1000),
+      time: Date.now(),
       type: 'image',
       content: '[图片]',
-      raw: {},
+      raw: '{}',
       file_id: 'fid_fresh',
       local_path: freshFile,
       fingerprint: 'hash_fresh',
+      recalled: 0,
+      self: 0,
+      reply_to: null,
     });
 
-    // expiredFile 设为 8 天前 (超过 7 天 TTL)
     const eightDaysAgoSec = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
     await fsp.utimes(expiredFile, eightDaysAgoSec, eightDaysAgoSec);
 
-    // freshFile 设为 2 天前
     const twoDaysAgoSec = (Date.now() - 2 * 24 * 3600 * 1000) / 1000;
     await fsp.utimes(freshFile, twoDaysAgoSec, twoDaysAgoSec);
 
-    // 执行清理
     const result = await cleanExpiredMedia(tmpDir, 7, db);
     expect(result.deletedFiles).toBe(1);
     expect(fs.existsSync(expiredFile)).toBe(false);
     expect(fs.existsSync(freshFile)).toBe(true);
 
-    // 校验数据库记录中的 local_path 已被清理
     const expiredRecord = db.getByFileId('fid_expired');
     expect(expiredRecord?.local_path).toBeFalsy();
     const freshRecord = db.getByFileId('fid_fresh');
@@ -189,15 +195,103 @@ describe('契约测试: 入站媒体 TTL 清理与去重活跃续期 (Media TTL 
       },
     };
 
-    // 传入 20ms 的 initialDelayMs
     const stop = startMediaCleanupTask(mockCtx, mockManager, 60000, 20);
     expect(cleanCalled).toBe(0);
 
-    // 等待 60ms，首轮清理应当被触发
     await new Promise((r) => setTimeout(r, 60));
     expect(cleanCalled).toBe(1);
 
-    // 触发销毁
     stop();
+  });
+
+  it('契约 5: detectBufferExt 与 saveBuffer 正确识别 WAV / AMR / OGG / M4A / MP4 魔数及 voice/video 目录', async () => {
+    const wavBuf = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(8)]);
+    const amrBuf = Buffer.from('#!AMR\n\x00\x01\x02\x03');
+    const oggBuf = Buffer.from('OggS\x00\x02\x00\x00');
+    const m4aBuf = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from('ftypM4A '), Buffer.alloc(8)]);
+    const mp4Buf = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from('ftypisom'), Buffer.alloc(8)]);
+
+    expect(detectBufferExt(wavBuf)).toBe('wav');
+    expect(detectBufferExt(amrBuf)).toBe('amr');
+    expect(detectBufferExt(oggBuf)).toBe('ogg');
+    expect(detectBufferExt(m4aBuf)).toBe('m4a');
+    expect(detectBufferExt(mp4Buf)).toBe('mp4');
+
+    const savedWav = await mediaManager.saveBuffer(wavBuf, { type: 'voice', sessionId: MOCK_PEER });
+    expect(savedWav.localPath).toContain(path.join('voice', MOCK_PEER));
+    expect(savedWav.localPath.endsWith('.wav')).toBe(true);
+
+    const savedAmr = await mediaManager.saveBuffer(amrBuf, {
+      type: 'voice',
+      sessionId: MOCK_PEER,
+      filename: 'voice_clip.mp3',
+    });
+    expect(savedAmr.localPath.endsWith('.amr')).toBe(true);
+
+    const savedMp4 = await mediaManager.saveBuffer(mp4Buf, { type: 'video', sessionId: MOCK_PEER });
+    expect(savedMp4.localPath).toContain(path.join('video', MOCK_PEER));
+    expect(savedMp4.localPath.endsWith('.mp4')).toBe(true);
+  });
+
+  it('契约 6: downloadAndSave 裸 GET 下载（不带鉴权头）、不采信错误 Content-Type，且异常与日志严禁暴露 query 凭证', async () => {
+    expect(
+      sanitizeUrlForLog('https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=SECRET_RKEY_999&spec=0#hash')
+    ).toBe('https://multimedia.nt.qq.com.cn/download');
+
+    // 场景 A: 服务端返回错误的 audio/mp3 Content-Type，但实际字节流为 #!AMR
+    const amrBytes = Buffer.from('#!AMR\n\x04\x05\x06');
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'audio/mp3' }),
+      arrayBuffer: async () => amrBytes.buffer.slice(amrBytes.byteOffset, amrBytes.byteOffset + amrBytes.byteLength),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const signedUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=TOP_SECRET_KEY';
+    const saved = await mediaManager.downloadAndSave(signedUrl, {
+      type: 'voice',
+      sessionId: MOCK_PEER,
+      filename: 'raw_voice.amr',
+    });
+
+    // 验证裸 GET（无 second options 参数 / 无 Authorization 头）
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]).toEqual([signedUrl]);
+    expect(saved.localPath.endsWith('.amr')).toBe(true);
+
+    // 场景 B: HTTP 下载失败时，异常消息必须剥离 ?rkey=... 凭证
+    const failFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      headers: new Headers(),
+    });
+    vi.stubGlobal('fetch', failFetch);
+
+    await expect(mediaManager.downloadAndSave(signedUrl, { type: 'image' })).rejects.toThrow(
+      /https:\/\/multimedia\.nt\.qq\.com\.cn\/download/
+    );
+    await expect(mediaManager.downloadAndSave(signedUrl, { type: 'image' })).rejects.not.toThrow(/TOP_SECRET_KEY|rkey=/);
+  });
+
+  it('契约 7: 落盘文件名执行 path.basename 与危险字符净化，并基于 path.relative 拦截路径穿越', async () => {
+    const buf = Buffer.from('safe-content');
+    const res = await mediaManager.saveBuffer(buf, {
+      type: 'files',
+      sessionId: MOCK_PEER,
+      filename: '../../etc/sub\\report:2026?.txt',
+    });
+
+    const expectedDir = path.resolve(mediaManager.getDownloadDir('files', MOCK_PEER));
+    expect(path.dirname(res.localPath)).toBe(expectedDir);
+    expect(path.basename(res.localPath)).toBe('report_2026_.txt');
+
+    await expect(
+      mediaManager.saveBuffer(buf, {
+        type: 'files',
+        sessionId: MOCK_PEER,
+        filename: '..',
+      })
+    ).rejects.toThrow(/路径穿越/);
   });
 });

@@ -1,35 +1,31 @@
 /**
  * tests/contract/face-dynamic-prompt.test.ts
- * 契约测试: 表情包动态情绪锚点 System Prompt 上下文注入
+ * 契约测试: 表情包动态情绪锚点 System Prompt 上下文注入 (Kujira C2C)
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { registerFacePromptContext } from '../../src/prompt/dynamic.js';
 import { SnapshotManager } from '../../src/prompt/snapshot.js';
+import { openidToSessionBaseId } from '../../src/utils/peer.js';
 
 describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注入', () => {
   let tmpDir: string;
   let db: MessageDatabase;
-  let registeredPrompts: Map<string, any>;
-  let mockSystemPrompt: any;
   let mockCtx: any;
+  const kujiraSessionId = openidToSessionBaseId('MOCK_OPENID_FACE_USER_01');
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-prompt-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-face-prompt-'));
     db = new MessageDatabase(path.join(tmpDir, 'test.db'));
 
-    registeredPrompts = new Map();
     const snapshotManager = new SnapshotManager({} as any);
     mockCtx = {
       snapshotManager,
-      get: (name: string) => {
-        if (name === 'systemPrompt') return mockSystemPrompt;
-        return undefined;
-      },
+      get: () => undefined,
     };
   });
 
@@ -42,20 +38,19 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     } catch {}
   });
 
-  it('契约 1: registerFacePromptContext 正确注册 napcat:face_summary 且 order 为 48', () => {
+  it('契约 1: registerFacePromptContext 正确注册 kujira:face_summary 且 order 为 48', () => {
     const unregister = registerFacePromptContext(mockCtx, db, () => true);
 
-    const promptObj = mockCtx.snapshotManager.getProvider('napcat:face_summary');
+    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
     expect(promptObj).toBeDefined();
     expect(promptObj.order).toBe(48);
-
-    // 释放检查
-    unregister();
     expect(mockCtx.snapshotManager.getProvider('napcat:face_summary')).toBeUndefined();
+
+    unregister();
+    expect(mockCtx.snapshotManager.getProvider('kujira:face_summary')).toBeUndefined();
   });
 
-  it('契约 2: QQ 会话且库内有表情时，注入总数与 Top 情绪分布概览', () => {
-    // 注入测试表情
+  it('契约 2: Kujira 单聊会话且库内有表情时，注入总数与 Top 情绪分布概览', () => {
     db.insertFace({
       id: 'f1',
       file_path: '/path/f1.png',
@@ -91,11 +86,11 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     });
 
     registerFacePromptContext(mockCtx, db, () => true);
-    const promptObj = mockCtx.snapshotManager.getProvider('napcat:face_summary');
+    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {
       agent: {
-        session: { id: 'qq-group-3000000014' },
+        session: { id: kujiraSessionId },
       },
     };
 
@@ -110,13 +105,13 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     expect(text).toContain('send_face(face_id="..."');
   });
 
-  it('契约 3: QQ 会话且库为空时，注入友好收录引导文案', () => {
+  it('契约 3: Kujira 单聊会话且库为空时，注入友好收录引导文案', () => {
     registerFacePromptContext(mockCtx, db, () => true);
-    const promptObj = mockCtx.snapshotManager.getProvider('napcat:face_summary');
+    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {
       agent: {
-        session: { id: 'qq-user-2000000021' },
+        session: { id: `${kujiraSessionId}-r1-1-a1b2c3` },
       },
     };
 
@@ -139,12 +134,12 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
       format: 'png',
     });
 
-    registerFacePromptContext(mockCtx, db, () => false); // 禁用
-    const promptObj = mockCtx.snapshotManager.getProvider('napcat:face_summary');
+    registerFacePromptContext(mockCtx, db, () => false);
+    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {
       agent: {
-        session: { id: 'qq-group-3000000014' },
+        session: { id: kujiraSessionId },
       },
     };
 
@@ -152,7 +147,7 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     expect(text).toBe('');
   });
 
-  it('契约 5: 非 QQ 会话（如 Web UI）时静默，输出为空字符串', () => {
+  it('契约 5: 非 Kujira 单聊会话（Web UI 及旧群聊格式）静默，输出为空字符串', () => {
     db.insertFace({
       id: 'f1',
       file_path: '/path/f1.png',
@@ -166,16 +161,11 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     });
 
     registerFacePromptContext(mockCtx, db, () => true);
-    const promptObj = mockCtx.snapshotManager.getProvider('napcat:face_summary');
+    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
-    const assembleCtx = {
-      agent: {
-        session: { id: 'web-assistant-session-999' },
-      },
-    };
-
-    const text = promptObj.text(assembleCtx);
-    expect(text).toBe('');
+    expect(promptObj.text({ agent: { session: { id: 'web-assistant-session-999' } } })).toBe('');
+    expect(promptObj.text({ agent: { session: { id: 'qq-group-3000000014' } } })).toBe('');
+    expect(promptObj.text({ agent: { session: { id: 'group_3000000014' } } })).toBe('');
   });
 
   it('契约 6: 上下文注入上限动态遵循 getFaceStoreMax 配置', () => {
@@ -193,13 +183,12 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
       });
     }
 
-    // 配置上限为 2
     registerFacePromptContext(mockCtx, db, () => true, () => 2);
-    const promptObj = mockCtx.snapshotManager.getProvider('napcat:face_summary');
+    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {
       agent: {
-        session: { id: 'qq-group-3000000014' },
+        session: { id: kujiraSessionId },
       },
     };
 

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { stripMarkdown } from '../../src/outbound/render.js';
+import {
+  normalizeQqMarkdown,
+  splitByUtf8Bytes,
+  stripMarkdown,
+} from '../../src/outbound/render.js';
 
 describe('契约测试: stripMarkdown 误伤防护（数学/标识符/字面链接等普通文本不被误剥）', () => {
   it('防误伤: 数字间的乘号 `3 * 4 * 5 = 60` 原样保留', () => {
@@ -90,7 +94,7 @@ describe('契约测试: stripMarkdown 剥离功能保留（确凿 markdown 正�
   });
 });
 
-describe('契约测试: stripMarkdown 既有 6 类综合回归（规格 §7.2）', () => {
+describe('契约测试: stripMarkdown 综合回归与技术标签保护', () => {
   it('标题/粗斜体/代码/链接/表格/引用分割线 综合样例剥离正常', () => {
     const md = `### 系统运行报告
 **状态**: 正常运行
@@ -111,39 +115,114 @@ pnpm test
 
     const plain = stripMarkdown(md);
 
-    // 标题转【】
     expect(plain).toContain('【系统运行报告】');
-    // 粗体/斜体符号去除
     expect(plain).toContain('状态: 正常运行');
     expect(plain).toContain('详情: 当前 CPU 负载 20%');
     expect(plain).not.toContain('**');
-    // 行内代码/代码块反引号去除
     expect(plain).not.toContain('`npm test`');
     expect(plain).toContain('npm test');
     expect(plain).not.toContain('```');
     expect(plain).toContain('pnpm run build');
-    // 链接展开
     expect(plain).toContain('官方文档 (https://deepseek.com)');
-    // 表格分隔符清理，行不粘连
     expect(plain).not.toContain('|---|---|');
     expect(plain).toContain('服务 | 状态');
     expect(plain).toContain('Gateway | 在线');
   });
 
-  describe('契约测试: 代码块与正文中的 <think> 技术示例完整保留不被误伤 (Preserve Technical Examples)', () => {
-    it('代码块中的 <think>...</think> 示例完整保留，不被误伤清空', () => {
-      const input = '这是一个示例：\n```xml\n<think>\n示例内部推理\n</think>\n```';
-      const plain = stripMarkdown(input);
-      expect(plain).toContain('<think>');
-      expect(plain).toContain('示例内部推理');
-      expect(plain).toContain('</think>');
-    });
+  it('代码块中的 <think>...</think> 示例完整保留，不被误伤清空', () => {
+    const input = '这是一个示例：\n```xml\n<think>\n示例内部推理\n</think>\n```';
+    const plain = stripMarkdown(input);
+    expect(plain).toContain('<think>');
+    expect(plain).toContain('示例内部推理');
+    expect(plain).toContain('</think>');
+  });
 
-    it('行内提及未闭合的 <think> 标签时，后续正文不被吞噬', () => {
-      const input = 'Prompt 中你可以使用 `<think>` 标签作为思考标记，后续输出正式答复。';
-      const plain = stripMarkdown(input);
-      expect(plain).toContain('<think>');
-      expect(plain).toContain('后续输出正式答复。');
-    });
+  it('行内提及未闭合的 <think> 标签时，后续正文不被吞噬', () => {
+    const input = 'Prompt 中你可以使用 `<think>` 标签作为思考标记，后续输出正式答复。';
+    const plain = stripMarkdown(input);
+    expect(plain).toContain('<think>');
+    expect(plain).toContain('后续输出正式答复。');
+  });
+});
+
+describe('契约测试: normalizeQqMarkdown 标题修补与代码块隔离', () => {
+  it('修补代码块外的行首无空格 #标题 -> # 标题（支持 1~6 级）', () => {
+    const md = '#一级标题\n##二级标题\n######六级标题\n# 已有空格\n#######七个井号不改\n普通行 #非行首';
+    expect(normalizeQqMarkdown(md)).toBe(
+      '# 一级标题\n## 二级标题\n###### 六级标题\n# 已有空格\n#######七个井号不改\n普通行 #非行首'
+    );
+  });
+
+  it('围栏代码块（``` 与 ~~~）内部保持原样，绝不改写 #注释 或 #define', () => {
+    const md = [
+      '#外层标题',
+      '```python',
+      '#这是Python注释',
+      '##双井号注释',
+      '```',
+      '~~~c',
+      '#define MAX 100',
+      '~~~',
+      '##外层副标题',
+    ].join('\n');
+
+    expect(normalizeQqMarkdown(md)).toBe(
+      [
+        '# 外层标题',
+        '```python',
+        '#这是Python注释',
+        '##双井号注释',
+        '```',
+        '~~~c',
+        '#define MAX 100',
+        '~~~',
+        '## 外层副标题',
+      ].join('\n')
+    );
+  });
+
+  it('清洗孤立代理项与 C0 控制字符，保留合法换行/制表符且不截断超长正文', () => {
+    const longLine = '正文'.repeat(12000);
+    const input = `#标题\u0000\t内容\uD800\n${longLine}`;
+    const out = normalizeQqMarkdown(input);
+    expect(out.startsWith('# 标题\t内容\uFFFD\n')).toBe(true);
+    expect(out.endsWith(longLine)).toBe(true);
+  });
+});
+
+describe('契约测试: splitByUtf8Bytes 字节上限切分与码点/代理对保护', () => {
+  it('严格按 UTF-8 字节上限切分，绝不静默丢字', () => {
+    const text = '第一行\n第二行很长很长需要切分\n第三行 hello world foo bar\n😀🚀✨';
+    const parts = splitByUtf8Bytes(text, 12);
+    expect(parts.join('')).toBe(text);
+    for (const part of parts) {
+      expect(Buffer.byteLength(part, 'utf8')).toBeLessThanOrEqual(12);
+    }
+  });
+
+  it('优先在换行与空格边界切分，不从多字节汉字或 UTF-16 代理对中间切断', () => {
+    const lineBreakSample = 'aaaa\nbbbb\ncccc';
+    expect(splitByUtf8Bytes(lineBreakSample, 10)).toEqual(['aaaa\nbbbb\n', 'cccc']);
+
+    const spaceSample = 'alpha beta gamma';
+    expect(splitByUtf8Bytes(spaceSample, 11)).toEqual(['alpha beta ', 'gamma']);
+
+    const emojiSample = 'a😀b🚀c';
+    const emojiParts = splitByUtf8Bytes(emojiSample, 5);
+    expect(emojiParts).toEqual(['a😀', 'b🚀', 'c']);
+    expect(emojiParts.join('')).toBe(emojiSample);
+    for (const part of emojiParts) {
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(part)).toBe(false);
+    }
+  });
+
+  it('maxBytes 小于单个 4 字节 emoji 时仍推进完整码点不死循环', () => {
+    const parts = splitByUtf8Bytes('😀中a', 2);
+    expect(parts).toEqual(['😀', '中', 'a']);
+    expect(parts.join('')).toBe('😀中a');
+  });
+
+  it('空串返回空数组', () => {
+    expect(splitByUtf8Bytes('', 100)).toEqual([]);
   });
 });

@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 领域 Repositories 统一导出
+ * kujira: 领域 Repositories 统一导出
  */
 
 export * from './kv.repo.js';

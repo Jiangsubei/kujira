@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 动态提示词与上下文注入模块
+ * kujira: 动态提示词与上下文注入模块
  * 统一委托至 SnapshotManager，全面贯彻 Fail-Closed 白名单防御。
  */
 
@@ -22,17 +22,16 @@ import {
 export * from './snapshot.js';
 
 /**
- * 注册 QQ 会话专属动态提示词段 (napcat:qq_scenario)
- * 保留空实现以兼容干净度契约断言 (不产生脏注入)
+ * 提示词干净度兼容空桩 (不向 systemPrompt 注入任何场景段)
  */
 export function registerQQScenarioDynamicPrompt(_ctx: Context): () => void {
   return () => {};
 }
 
 /**
- * 注册 NapCat 动态上下文快照 (委托至 SnapshotManager)
+ * 注册 Kujira 动态上下文快照 (委托至 SnapshotManager)
  */
-export function registerNapCatDynamicPrompt(
+export function registerKujiraDynamicPrompt(
   ctx: Context,
   getPersona: () => string,
   getBehavior: () => string,
@@ -43,7 +42,7 @@ export function registerNapCatDynamicPrompt(
     (ctx as any).reflect.provide('snapshotManager', manager);
   }
   const unreg1 = manager.registerProvider({
-    name: 'napcat:persona',
+    name: 'kujira:persona',
     order: 30,
     qqOnly: false,
     provide: (_session: any, assembleCtx: any) => {
@@ -52,7 +51,7 @@ export function registerNapCatDynamicPrompt(
     },
   });
   const unreg2 = manager.registerProvider({
-    name: 'napcat:behavior',
+    name: 'kujira:behavior',
     order: 35,
     qqOnly: false,
     provide: (_session: any, assembleCtx: any) => {
@@ -88,7 +87,7 @@ export function registerFacePromptContext(
     (ctx as any).reflect.provide('snapshotManager', manager);
   }
   return manager.registerProvider({
-    name: 'napcat:face_summary',
+    name: 'kujira:face_summary',
     order: 48,
     provide: () => {
       if (!getEnabled()) {

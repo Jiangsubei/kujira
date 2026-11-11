@@ -1,249 +1,127 @@
 /**
  * tests/contract/system-event-hub.test.ts
  *
- * 契约测试: 系统内部事件与统一唤醒中枢 (SystemEventHub)
+ * 契约测试: 单聊系统内部事件与统一唤醒中枢 (SystemEventHub)
  *
  * 验证目标:
- * 1. 统一格式化标准: 双换行分段、中文冒号标题、原本精心打磨的行为引导 100% 完整保留并置底;
- * 2. 标题防污染铁律: 任何系统事件经由 Hub 分发，底层 Payload 的 from_name 绝不含系统伪昵称，绝对不触发私聊重命名与昵称缓存;
- * 3. 零特权审批铁律: 系统事件底层 Payload 的 from_user 严格为空，杜绝借壳提权;
- * 4. 出站上下文自动挂载: 自动向 OutboundBridge 挂载 is_synthetic: true 的上下文，且 trigger 映射准确。
+ * 1. 面向 QQ 官方 Bot 单聊的 `scheduled_task` 提示词骨架（无群聊、无主动插话/戳一戳）；
+ * 2. Zero-Leak / Null-Initiator 铁律: `from_name === ''`、`from_user === ''`、`is_system === true`；
+ * 3. 出站合成上下文追踪 (`is_synthetic: true`) 与历史有效被动 `msg_id` 锚点绝不被擦除。
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import { promises as fsp } from 'node:fs';
-import { SessionManager } from '../../src/gateway/session.js';
+import { describe, it, expect, vi } from 'vitest';
 import { SystemEventHub, formatSystemEventPrompt } from '../../src/gateway/system-event-hub.js';
-import type {
-  ScheduledTaskEvent,
-  ProactiveLurkEvent,
-  ProactivePollingEvent,
-  SyntheticNoticeEvent,
-} from '../../src/types/system-event.js';
+import { OutboundStreamBridge } from '../../src/outbound/stream.js';
+import type { ScheduledTaskEvent } from '../../src/types/system-event.js';
+import type { WakeupPayload } from '../../src/types/index.js';
 
-const PEER_USER = 'user_1000000001';
-const PEER_GROUP = 'group_8000000001';
-const SESSION_ID = 'qq-user-1000000001';
-const NEUTRAL_TITLE = '私聊: 1000000001 #1';
+const PEER_USER = 'user_a1b2c3d4e5f60708';
 
-describe('契约测试: 系统事件与统一唤醒中枢 (SystemEventHub)', () => {
-  let tmpHome: string;
-  let sessionManager: SessionManager;
-  let currentTitle: string;
-  let rename: any;
-  let followup: any;
-  let mockAgent: any;
-  let mockOutboundBridge: any;
-  let systemEventHub: SystemEventHub;
-
-  beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-system-event-hub-'));
-    currentTitle = NEUTRAL_TITLE;
-    rename = vi.fn((_session: any, title: string) => {
-      currentTitle = title;
-    });
-    followup = vi.fn();
-    mockAgent = {
-      status: 'idle',
-      followup,
-      steer: vi.fn(),
-      session: { id: SESSION_ID },
+describe('契约测试: 单聊系统事件与统一唤醒中枢 (SystemEventHub)', () => {
+  it('契约 1: 定时任务提示词采用单聊骨架（含任务编号、规则、内容与置底引导，不含群聊文案）', () => {
+    const event: ScheduledTaskEvent = {
+      kind: 'scheduled_task',
+      peer: PEER_USER,
+      taskId: 'task_999',
+      taskType: 'recurring',
+      taskRule: '每天 18:00 执行',
+      prompt: '提醒用户下班并通报天气',
+      timestamp: 1794000000000,
     };
 
-    const mockCtx: any = {
-      get: vi.fn((key: string) => {
-        if (key === 'agents') {
-          return { get: () => mockAgent };
-        }
-        if (key === 'sessionTitle') {
-          return {
-            get: () => ({ title: currentTitle }),
-            rename,
-          };
-        }
-        return undefined;
-      }),
-      logger: () => ({
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-        debug: vi.fn(),
+    const prompt = formatSystemEventPrompt(event);
+
+    expect(prompt).toContain('系统事件：[定时任务] [任务编号: #task_999] [QQ私聊]');
+    expect(prompt).toContain('任务规则：每天 18:00 执行');
+    expect(prompt).toContain('\n\n任务内容：\n提醒用户下班并通报天气\n\n');
+    expect(prompt).toContain('QQ 单聊中设定的定时任务触发');
+    expect(prompt).toContain('切勿向用户透露内部 task_id 或系统事件代码等调试信息');
+    expect(prompt).not.toContain('群聊');
+  });
+
+  it('契约 2: Zero-Leak 与 Null-Initiator 铁律（from_name 与 from_user 严格为空，is_system=true）', async () => {
+    let capturedPayload: WakeupPayload | undefined;
+    const mockSessionManager = {
+      dispatchWakeup: vi.fn(async (payload: WakeupPayload, opts?: { onMessageCreated?: (msg: any) => void }) => {
+        capturedPayload = payload;
+        opts?.onMessageCreated?.({ id: 'dsh_msg_1' });
+        return { ok: true };
       }),
     };
-
-    sessionManager = new SessionManager(mockCtx, tmpHome);
-
-    mockOutboundBridge = {
+    const mockOutboundBridge = {
       trackInboundContext: vi.fn(),
       trackPendingMessage: vi.fn(),
     };
 
-    systemEventHub = new SystemEventHub({
-      sessionManager,
+    const hub = new SystemEventHub({
+      sessionManager: mockSessionManager,
       outboundBridge: mockOutboundBridge,
     });
+
+    await hub.dispatchScheduledTask({
+      peer: PEER_USER,
+      taskId: 'task_001',
+      taskType: 'once',
+      prompt: '提醒喝水',
+      creator: '1000000001',
+    });
+
+    expect(capturedPayload).toBeDefined();
+    expect(capturedPayload!.is_system).toBe(true);
+    expect(capturedPayload!.trigger).toBe('scheduled');
+    expect(capturedPayload!.from_name).toBe('');
+    expect(capturedPayload!.from_user).toBe('');
+    expect(capturedPayload!.task_id).toBe('task_001');
+
+    expect(mockOutboundBridge.trackInboundContext).toHaveBeenCalledWith(
+      PEER_USER,
+      expect.objectContaining({
+        from_user: '',
+        trigger: 'scheduled',
+        is_synthetic: true,
+      })
+    );
+    // 绝不显式传递 msg_id: undefined 去覆盖擦除历史锚点
+    const ctxArg = mockOutboundBridge.trackInboundContext.mock.calls[0]?.[1];
+    expect(Object.hasOwn(ctxArg, 'msg_id')).toBe(false);
+    expect(mockOutboundBridge.trackPendingMessage).toHaveBeenCalledWith(
+      'dsh_msg_1',
+      PEER_USER,
+      expect.objectContaining({
+        trigger: 'scheduled',
+        is_synthetic: true,
+      })
+    );
   });
 
-  afterEach(async () => {
-    await sessionManager?.dispose().catch(() => {});
-    await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
-  });
+  it('契约 3: 与真实 OutboundStreamBridge 协同，系统事件下发绝不覆盖擦除历史有效入站 msg_id 锚点', async () => {
+    const outboundBridge = new OutboundStreamBridge({} as any, {});
+    // 先记录一条真实用户的入站被动锚点
+    outboundBridge.trackInboundContext(PEER_USER, {
+      msg_id: 'ROBOT1.0_REAL_INBOUND_001',
+      ref_idx: 'REFIDX_REAL_001',
+      from_user: 'a1b2c3d4e5f60708',
+    });
+    expect(outboundBridge.resolvePassiveMsgId(PEER_USER)).toBe('ROBOT1.0_REAL_INBOUND_001');
 
-  describe('1. 提示词标准骨架格式化契约 (formatSystemEventPrompt)', () => {
-    it('1.1 定时任务唤醒: 包含统一头部、任务编号、规则、内容以及置底的打磨说明', () => {
-      const event: ScheduledTaskEvent = {
-        kind: 'scheduled_task',
-        peer: PEER_GROUP,
-        taskId: 'task_999',
-        taskType: 'recurring',
-        taskRule: '每天 18:00 执行',
-        prompt: '提醒大家下班打卡并通报天气',
-        timestamp: 1794000000000,
-      };
+    const mockSessionManager = {
+      dispatchWakeup: vi.fn(async (_payload: WakeupPayload, opts?: { onMessageCreated?: (msg: any) => void }) => {
+        opts?.onMessageCreated?.({ id: 'dsh_msg_2' });
+      }),
+      getOutboundBridge: () => outboundBridge,
+    };
 
-      const prompt = formatSystemEventPrompt(event);
-
-      // 验证双换行分段结构
-      expect(prompt).toContain('系统事件：[定时任务] [任务编号: #task_999] [QQ群聊: 8000000001]');
-      expect(prompt).toContain('任务规则：每天 18:00 执行');
-      expect(prompt).toContain('\n\n任务内容：\n提醒大家下班打卡并通报天气\n\n');
-      // 验证原本打磨好的引导文案完整保留在末尾
-      expect(prompt.endsWith(
-        '（说明：这是此前设定的定时任务触发。如果是群聊场景，建议先通过 read_chat_history 工具查看最近群聊动态再决定如何发言，发言内容应自然贴切，切勿向用户透露内部 task_id 或系统事件代码等调试信息。）'
-      )).toBe(true);
+    const hub = new SystemEventHub({ sessionManager: mockSessionManager });
+    await hub.dispatchScheduledTask({
+      peer: PEER_USER,
+      taskId: 'task_002',
+      taskType: 'once',
+      prompt: '定时问候',
     });
 
-    it('1.3 潜水超时冒泡: 包含时长与置底的 [结束] 决策指引', () => {
-      const event: ProactiveLurkEvent = {
-        kind: 'proactive_lurk',
-        peer: PEER_GROUP,
-        idleDurationMinutes: 120,
-        timestamp: 1794000000000,
-      };
-
-      const prompt = formatSystemEventPrompt(event);
-
-      expect(prompt).toContain('系统事件：[潜水唤醒] [QQ群聊: 8000000001]');
-      expect(prompt).toContain('\n\n群聊状态：当前群聊已较长时间没有新发言（已超 120 分钟）。\n\n');
-      expect(prompt).toContain('若判断当前无需发言或不便打扰，直接输出 [结束]。表现自然，切勿透露潜水超时、系统唤醒等任何后台痕迹。');
-    });
-
-    it('1.4 主动回复未读聚合: 消息列表前置，包含消息ID，原本的复读/接梗说明置底', () => {
-      const event: ProactivePollingEvent = {
-        kind: 'proactive_polling',
-        peer: PEER_GROUP,
-        bufferedMessages: [
-          {
-            timestamp: 1794000001000,
-            from_user: '1000000001',
-            from_name: '张三',
-            content: '大家晚上吃什么',
-            msg_id: 66601,
-          },
-          {
-            timestamp: 1794000002000,
-            from_user: '1000000002',
-            from_name: '李四',
-            content: '吃烤肉吧',
-            msg_id: 66602,
-          },
-        ],
-        timestamp: 1794000003000,
-      };
-
-      const prompt = formatSystemEventPrompt(event);
-
-      expect(prompt).toContain('系统事件：[主动回复] [QQ群聊: 8000000001]');
-      expect(prompt).toContain('\n\n历史消息：\n');
-      expect(prompt).toContain('[消息ID: 66601] [张三 (QQ: 1000000001)]: 大家晚上吃什么');
-      expect(prompt).toContain('[消息ID: 66602] [李四 (QQ: 1000000002)]: 吃烤肉吧');
-      expect(prompt).toContain('如果群内最近明显在复读玩梗，可以根据群内当前氛围判断是否需要一起复读');
-      expect(prompt).toContain('若拿不准则输出 [结束]。切勿透露系统提示或触发机制等后台痕迹。');
-    });
-
-    it('1.5 戳一戳通知合成: 标准头部与戳一戳描述', () => {
-      const event: SyntheticNoticeEvent = {
-        kind: 'synthetic_notice',
-        peer: PEER_USER,
-        noticeType: 'poke',
-        operatorUser: '1000000001',
-        operatorName: '测试好友',
-        timestamp: 1794000000000,
-      };
-
-      const prompt = formatSystemEventPrompt(event);
-
-      expect(prompt).toContain('系统事件：[戳一戳] [QQ私聊]');
-      expect(prompt).toContain('用户 [测试好友 (QQ: 1000000001)] 戳了戳你。');
-    });
-  });
-
-  describe('2. 标题防污染与零特权审批契约', () => {
-    it('2.1 定时任务通过 Hub 分发: 绝不修改会话标题，绝不写入昵称缓存，底层 from_name/from_user 为空', async () => {
-      let capturedPayload: any;
-      const originalDispatch = sessionManager.dispatchWakeup.bind(sessionManager);
-      sessionManager.dispatchWakeup = vi.fn(async (payload, opts) => {
-        capturedPayload = payload;
-        return originalDispatch(payload, opts);
-      });
-
-      await systemEventHub.dispatchScheduledTask({
-        peer: PEER_USER,
-        taskId: 'task_001',
-        taskType: 'once',
-        prompt: '提醒喝水',
-        creator: '1000000001',
-      });
-
-      // 验证捕获到的 payload
-      expect(capturedPayload.is_system).toBe(true);
-      expect(capturedPayload.from_name).toBe('');
-      expect(capturedPayload.from_user).toBe('');
-      expect(capturedPayload.trigger).toBe('scheduled');
-
-      // 验证标题未被污染
-      expect(rename).not.toHaveBeenCalled();
-      expect(currentTitle).toBe(NEUTRAL_TITLE);
-      expect(sessionManager.getPeerName(PEER_USER)).toBeUndefined();
-    });
-  });
-
-  describe('3. 出站合成上下文自动追踪契约', () => {
-    it('3.1 系统事件分发时自动向 OutboundBridge 挂载 is_synthetic: true 与对应 trigger', async () => {
-      await systemEventHub.dispatchScheduledTask({
-        peer: PEER_GROUP,
-        taskId: 'task_002',
-        taskType: 'once',
-        prompt: '群早报',
-      });
-
-      expect(mockOutboundBridge.trackInboundContext).toHaveBeenCalledWith(
-        PEER_GROUP,
-        expect.objectContaining({
-          msg_id: undefined,
-          from_user: '',
-          is_group: true,
-          trigger: 'scheduled',
-          is_synthetic: true,
-        })
-      );
-    });
-
-    it('3.2 潜水唤醒自动标记 trigger=idle 且 is_synthetic: true', async () => {
-      await systemEventHub.dispatchProactiveLurk({
-        peer: PEER_GROUP,
-        idleDurationMinutes: 120,
-      });
-
-      expect(mockOutboundBridge.trackInboundContext).toHaveBeenCalledWith(
-        PEER_GROUP,
-        expect.objectContaining({
-          trigger: 'idle',
-          is_synthetic: true,
-        })
-      );
-    });
+    // 历史有效入站被动 msg_id 必须完好保留，且当前活跃上下文保留 is_synthetic=true
+    expect(outboundBridge.resolvePassiveMsgId(PEER_USER)).toBe('ROBOT1.0_REAL_INBOUND_001');
+    expect(outboundBridge.getActiveTurnContext(PEER_USER)?.is_synthetic).toBe(true);
+    expect(outboundBridge.getActiveTurnContext(PEER_USER)?.msg_id).toBe('ROBOT1.0_REAL_INBOUND_001');
   });
 });

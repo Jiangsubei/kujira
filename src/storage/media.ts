@@ -1,6 +1,6 @@
 /**
- * dsh-napcat-bridge: 本地资源下载、两级去重与 7 天 TTL 清理模块
- * 管理图片、表情包与文件的本地缓存落盘、两级去重（file_id 索引 + SHA-256 指纹）以及过期文件清理。
+ * kujira: 本地资源下载、两级去重与 7 天 TTL 清理模块
+ * 管理图片、表情包、语音、视频与文件的本地缓存落盘、两级去重（file_id 索引 + SHA-256 指纹）以及过期文件清理。
  */
 
 import * as fs from 'node:fs';
@@ -13,6 +13,8 @@ import type { MessageDatabase } from './database.js';
 import { DEFAULT_DOWNLOAD_ROOT } from '../constants/index.js';
 import { resolveDshPath } from '../utils/path.js';
 
+export type MediaResourceType = 'image' | 'sticker' | 'files' | 'file' | 'voice' | 'video';
+
 export interface MediaStorageOptions {
   dshHome?: string;
   downloadDir?: string;
@@ -21,7 +23,7 @@ export interface MediaStorageOptions {
 }
 
 export interface SaveResourceOptions {
-  type?: 'image' | 'sticker' | 'files' | 'file';
+  type?: MediaResourceType;
   sessionId?: string;
   fileId?: string | null;
   filename?: string;
@@ -37,9 +39,25 @@ export interface SaveResourceResult {
 }
 
 /**
- * 根据文件头魔数推断文件扩展名
- * 支持: GIF (GIF89a/GIF87a), PNG (\x89PNG), JPEG (\xFF\xD8), WebP (RIFF....WEBP)
+ * 对 URL 执行日志/异常输出脱敏：仅保留 protocol + host + pathname，彻底剥离 query 参数与凭证信息。
  */
+export function sanitizeUrlForLog(rawUrl: string): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    const qIndex = trimmed.indexOf('?');
+    const hIndex = trimmed.indexOf('#');
+    let cut = trimmed.length;
+    if (qIndex !== -1) cut = Math.min(cut, qIndex);
+    if (hIndex !== -1) cut = Math.min(cut, hIndex);
+    return trimmed.slice(0, cut);
+  }
+}
+
 /**
  * 计算 Buffer 的 MD5 十六进制字符串
  */
@@ -61,44 +79,9 @@ export function computeFileMd5(filePath: string): string | null {
 }
 
 /**
- * 检测 Buffer 是否为 NTQQ 本地缓存的商城表情 (marketface) 混淆加密数据
- *
- * 机制：NTQQ 在本地 Emoji/marketface 目录下缓存的动图主文件，
- * 会采用 50 字节周期异或混淆（每 50 字节前 20 字节异或 0xFF，后 30 字节明文不变）。
- * 导致标准 GIF89a / GIF87a 头被混淆为：
- *   'G'(0x47) ^ 0xFF = 0xB8
- *   'I'(0x49) ^ 0xFF = 0xB6
- *   'F'(0x46) ^ 0xFF = 0xB9
- *   '8'(0x38) ^ 0xFF = 0xC7
- *   '9'(0x39) ^ 0xFF = 0xC6  或  '7'(0x37) ^ 0xFF = 0xC8
- *   'a'(0x61) ^ 0xFF = 0x9E
+ * 根据字节流魔数推断真实文件扩展名（不信任外部响应头或伪后缀）。
+ * 支持: gif, png, jpg, webp, wav, amr, ogg, m4a, mp4
  */
-export function isEncryptedNtqqMarketFace(buffer: Buffer): boolean {
-  if (!buffer || buffer.length < 6) return false;
-  return (
-    buffer[0] === 0xb8 &&
-    buffer[1] === 0xb6 &&
-    buffer[2] === 0xb9 &&
-    buffer[3] === 0xc7 &&
-    (buffer[4] === 0xc6 || buffer[4] === 0xc8) &&
-    buffer[5] === 0x9e
-  );
-}
-
-/**
- * 解密 NTQQ 商城表情 (marketface) 混淆数据为标准 GIF89a/GIF87a
- *
- * 算法：(offset % 50 < 20) ? (byte ^ 0xFF) : byte
- * 注：该变换为对合运算（Involution），解密与加密操作完全同构且对称。
- */
-export function decryptNtqqMarketFace(buffer: Buffer): Buffer {
-  const decrypted = Buffer.allocUnsafe(buffer.length);
-  for (let i = 0; i < buffer.length; i++) {
-    decrypted[i] = i % 50 < 20 ? buffer[i] ^ 0xff : buffer[i];
-  }
-  return decrypted;
-}
-
 export function detectBufferExt(buffer: Buffer): string | undefined {
   if (!buffer || buffer.length < 2) return undefined;
 
@@ -114,9 +97,9 @@ export function detectBufferExt(buffer: Buffer): string | undefined {
   if (
     buffer.length >= 4 &&
     buffer[0] === 0x89 &&
-    buffer[1] === 0x50 && // P
-    buffer[2] === 0x4e && // N
-    buffer[3] === 0x47    // G
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
   ) {
     return 'png';
   }
@@ -126,16 +109,84 @@ export function detectBufferExt(buffer: Buffer): string | undefined {
     return 'jpg';
   }
 
-  // WebP (RIFF....WEBP)
-  if (
-    buffer.length >= 12 &&
-    buffer.toString('ascii', 0, 4) === 'RIFF' &&
-    buffer.toString('ascii', 8, 12) === 'WEBP'
-  ) {
-    return 'webp';
+  // RIFF 容器: WebP (RIFF....WEBP) 或 WAV (RIFF....WAVE)
+  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF') {
+    const riffType = buffer.toString('ascii', 8, 12);
+    if (riffType === 'WEBP') return 'webp';
+    if (riffType === 'WAVE') return 'wav';
+  }
+
+  // AMR (#!AMR / #!AMR-WB)
+  if (buffer.length >= 5 && buffer.toString('ascii', 0, 5) === '#!AMR') {
+    return 'amr';
+  }
+
+  // Ogg (OggS)
+  if (buffer.length >= 4 && buffer.toString('ascii', 0, 4) === 'OggS') {
+    return 'ogg';
+  }
+
+  // ISO BMFF (....ftyp<brand>): m4a / mp4
+  if (buffer.length >= 12 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buffer.toString('ascii', 8, 12);
+    if (brand === 'M4A ' || brand === 'M4B ' || brand === 'M4P ') {
+      return 'm4a';
+    }
+    return 'mp4';
   }
 
   return undefined;
+}
+
+function sanitizeTextUrls(text: string): string {
+  return text.replace(/https?:\/\/[^\s'"]+/gi, (match) => sanitizeUrlForLog(match));
+}
+
+function sanitizeFilename(rawName?: string): { name?: string; traversalLiteral?: boolean } {
+  if (!rawName || typeof rawName !== 'string') return {};
+  const normalized = rawName.trim().replace(/\\/g, '/');
+  if (!normalized) return {};
+  const base = path.basename(normalized).trim();
+  if (!base) return {};
+  if (base === '.' || base === '..') {
+    return { name: base, traversalLiteral: true };
+  }
+  const cleaned = base
+    .replace(/[\u0000-\u001f\u007f]/g, '_')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .trim();
+  if (!cleaned) return {};
+  if (cleaned === '.' || cleaned === '..') {
+    return { name: cleaned, traversalLiteral: true };
+  }
+  return { name: cleaned };
+}
+
+function sanitizePathSegment(rawSegment: string, fallback = 'common'): string {
+  const sanitized = sanitizeFilename(rawSegment);
+  if (!sanitized.name || sanitized.traversalLiteral) return fallback;
+  return sanitized.name;
+}
+
+function assertPathWithinDir(baseDir: string, targetPath: string, displayName: string): void {
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedTarget = path.resolve(targetPath);
+  const rel = path.relative(resolvedBase, resolvedTarget);
+  if (
+    !rel ||
+    rel === '.' ||
+    rel === '..' ||
+    rel.startsWith(`..${path.sep}`) ||
+    rel.startsWith('../') ||
+    rel.startsWith('..\\') ||
+    path.isAbsolute(rel)
+  ) {
+    throw new Error(`[MediaStorageManager] 非法文件名检测到路径穿越: ${displayName}`);
+  }
+}
+
+function shouldAlignExtensionWithMagic(type: string): boolean {
+  return type === 'image' || type === 'sticker' || type === 'voice' || type === 'video';
 }
 
 export class MediaStorageManager {
@@ -154,9 +205,10 @@ export class MediaStorageManager {
     this.db = db;
   }
 
-  getDownloadDir(type: 'image' | 'sticker' | 'files' | 'file', sessionId = 'common'): string {
+  getDownloadDir(type: MediaResourceType, sessionId = 'common'): string {
     const normalizedType = type === 'file' ? 'files' : type;
-    return path.join(this.downloadRoot, normalizedType, sessionId);
+    const safeSession = sanitizePathSegment(sessionId, 'common');
+    return path.join(this.downloadRoot, normalizedType, safeSession);
   }
 
   computeHash(buffer: Buffer): string {
@@ -165,7 +217,6 @@ export class MediaStorageManager {
 
   /**
    * 一级去重只读查询：file_id 命中且文件仍在 → 返回现有落盘路径。
-   * 供入站图片解析在调用 NapCat 之前短路（避免重复取图）。
    */
   lookupCached(fileId?: string | null): { localPath: string; fingerprint: string } | null {
     if (!fileId || !this.db) return null;
@@ -176,44 +227,33 @@ export class MediaStorageManager {
     return null;
   }
 
+  private async tryReuseByFileId(fileId?: string | null): Promise<SaveResourceResult | null> {
+    if (!fileId || !this.db) return null;
+    const record = this.db.getByFileId(fileId);
+    if (record?.local_path && fs.existsSync(record.local_path)) {
+      const now = new Date();
+      await fsp.utimes(record.local_path, now, now).catch(() => {});
+      return {
+        localPath: record.local_path,
+        fingerprint: record.fingerprint || '',
+        deduplicated: true,
+        level: 1,
+        md5: computeFileMd5(record.local_path) || undefined,
+      };
+    }
+    return null;
+  }
+
   /**
    * 两级去重并落盘保存 Buffer 数据
    */
   async saveBuffer(buffer: Buffer, options: SaveResourceOptions = {}): Promise<SaveResourceResult> {
-    // 0. NTQQ 商城表情 (marketface) 混淆自愈解密：进入指纹计算与魔数推断前还原为明文 GIF
-    if (isEncryptedNtqqMarketFace(buffer)) {
-      buffer = decryptNtqqMarketFace(buffer);
-    }
-
     const sessionId = options.sessionId || 'common';
     const type = options.type === 'file' ? 'files' : options.type || 'image';
 
     // 1. 一级去重: file_id 查库
-    if (options.fileId && this.db) {
-      const record = this.db.getByFileId(options.fileId);
-      if (record?.local_path && fs.existsSync(record.local_path)) {
-        // 自动自愈：若历史已落盘文件不幸为未解密的混淆格式，自动就地解密自愈
-        try {
-          const rawBytes = await fsp.readFile(record.local_path);
-          if (isEncryptedNtqqMarketFace(rawBytes)) {
-            const fixed = decryptNtqqMarketFace(rawBytes);
-            await fsp.writeFile(record.local_path, fixed);
-            const newFingerprint = this.computeHash(fixed);
-            this.db.updateLocalPathByFileId(options.fileId, record.local_path, newFingerprint);
-          }
-        } catch {}
-        // 活跃引用刷新 mtime 续期 TTL
-        const now = new Date();
-        await fsp.utimes(record.local_path, now, now).catch(() => {});
-        return {
-          localPath: record.local_path,
-          fingerprint: record.fingerprint || '',
-          deduplicated: true,
-          level: 1,
-          md5: computeFileMd5(record.local_path) || undefined,
-        };
-      }
-    }
+    const l1Hit = await this.tryReuseByFileId(options.fileId);
+    if (l1Hit) return l1Hit;
 
     // 2. 二级去重: SHA-256 指纹去重
     const fingerprint = this.computeHash(buffer);
@@ -224,15 +264,19 @@ export class MediaStorageManager {
       const record = this.db.getByFingerprint(fingerprint);
       if (record?.local_path && fs.existsSync(record.local_path)) {
         let validPath = record.local_path;
-        // 自动自愈：若历史已落盘的文件后缀与真实魔数不一致（如历史假 .jpg 实为 .png），自动重命名纠偏
-        if (detectedExt && (type === 'image' || type === 'sticker')) {
+        // 自动自愈：若已落盘媒体文件后缀与真实魔数不一致，自动重命名纠偏
+        if (detectedExt && shouldAlignExtensionWithMagic(type)) {
           const currentExt = path.extname(validPath).replace(/^\./, '').toLowerCase();
           if (currentExt && currentExt !== detectedExt) {
             const correctedPath = validPath.slice(0, -currentExt.length) + detectedExt;
             try {
               await fsp.rename(validPath, correctedPath);
               validPath = correctedPath;
-              this.db.updateLocalPathByFileId(record.file_id || options.fileId || '', correctedPath, fingerprint);
+              this.db.updateLocalPathByFileId(
+                record.file_id || options.fileId || '',
+                correctedPath,
+                fingerprint
+              );
             } catch {}
           }
         }
@@ -241,7 +285,6 @@ export class MediaStorageManager {
             this.db.updateLocalPathByFileId(options.fileId, validPath, fingerprint);
           } catch {}
         }
-        // 活跃引用刷新 mtime 续期 TTL
         const now = new Date();
         await fsp.utimes(validPath, now, now).catch(() => {});
         return {
@@ -254,25 +297,26 @@ export class MediaStorageManager {
       }
     }
 
-    // 3. 落盘写入文件
-    // 魔数优先：真实字节流魔数是唯一客观标准，优先于外部传入的伪后缀（如 QQ/NapCat 默认附带的 .jpg）；
-    // 仅当魔数无法识别（如非图片未知格式）时，才回退 options.ext 或默认扩展名。
-    const ext = (detectedExt || options.ext || (type === 'image' || type === 'sticker' ? 'png' : 'dat'))
-      .replace(/^\./, '')
-      .toLowerCase();
+    // 3. 落盘写入文件（魔数优先于外部扩展名与响应头）
+    const fallbackExt = type === 'image' || type === 'sticker' ? 'png' : 'dat';
+    const ext = (detectedExt || options.ext || fallbackExt).replace(/^\./, '').toLowerCase();
     const targetDir = this.getDownloadDir(type, sessionId);
     await fsp.mkdir(targetDir, { recursive: true });
 
-    let fileName = options.filename
-      ? path.basename(options.filename).trim().replace(/[\\/:*?"<>|\0]/g, '_')
-      : undefined;
+    const sanitizedName = sanitizeFilename(options.filename);
+    if (sanitizedName.traversalLiteral) {
+      throw new Error(`[MediaStorageManager] 非法文件名检测到路径穿越: ${sanitizedName.name}`);
+    }
+
+    let fileName = sanitizedName.name;
     if (!fileName) {
       if (type === 'image' || type === 'sticker') {
         fileName = `${fingerprint}.${ext}`;
       } else {
-        fileName = `${options.fileId || fingerprint}.${ext}`;
+        const safeIdPart = options.fileId ? sanitizePathSegment(options.fileId, fingerprint) : fingerprint;
+        fileName = `${safeIdPart}.${ext}`;
       }
-    } else if ((type === 'image' || type === 'sticker') && detectedExt) {
+    } else if (shouldAlignExtensionWithMagic(type) && detectedExt) {
       const parsed = path.parse(fileName);
       if (parsed.ext.replace(/^\./, '').toLowerCase() !== detectedExt) {
         fileName = `${parsed.name}.${detectedExt}`;
@@ -280,10 +324,9 @@ export class MediaStorageManager {
     }
 
     const resolvedDir = path.resolve(targetDir);
-    const targetPath = path.resolve(targetDir, fileName);
-    if (!targetPath.startsWith(resolvedDir)) {
-      throw new Error(`[MediaStorageManager] 非法文件名检测到路径穿越: ${fileName}`);
-    }
+    const targetPath = path.resolve(resolvedDir, fileName);
+    assertPathWithinDir(resolvedDir, targetPath, fileName);
+
     await fsp.writeFile(targetPath, buffer);
 
     if (options.fileId && this.db) {
@@ -299,41 +342,21 @@ export class MediaStorageManager {
   }
 
   /**
-   * 从 URL 或现有本地路径下载并落盘
+   * 从 URL 或现有本地路径裸 GET 下载并落盘（绝不在异常/日志中暴露带 query 凭证的完整 URL，
+   * 且不附加任何鉴权头、不信任下载响应头 Content-Type）。
    */
   async downloadAndSave(
     urlOrPath: string,
     options: SaveResourceOptions = {}
   ): Promise<SaveResourceResult> {
     // 1. 一级去重先行校验
-    if (options.fileId && this.db) {
-      const record = this.db.getByFileId(options.fileId);
-      if (record?.local_path && fs.existsSync(record.local_path)) {
-        // 自动自愈：若历史已落盘文件不幸为未解密的混淆格式，自动就地解密自愈
-        try {
-          const rawBytes = await fsp.readFile(record.local_path);
-          if (isEncryptedNtqqMarketFace(rawBytes)) {
-            const fixed = decryptNtqqMarketFace(rawBytes);
-            await fsp.writeFile(record.local_path, fixed);
-            const newFingerprint = this.computeHash(fixed);
-            this.db.updateLocalPathByFileId(options.fileId, record.local_path, newFingerprint);
-          }
-        } catch {}
-        return {
-          localPath: record.local_path,
-          fingerprint: record.fingerprint || '',
-          deduplicated: true,
-          level: 1,
-          md5: computeFileMd5(record.local_path) || undefined,
-        };
-      }
-    }
+    const l1Hit = await this.tryReuseByFileId(options.fileId);
+    if (l1Hit) return l1Hit;
 
     let buffer: Buffer;
 
     // 2. 处理本地路径或 file:// URI
     if (urlOrPath.startsWith('file://')) {
-      // fileURLToPath 同时处理 file:///C:/… 与 URI 百分号编码（%20 等）
       buffer = await fsp.readFile(fileURLToPath(urlOrPath));
     } else if (path.isAbsolute(urlOrPath)) {
       if (fs.existsSync(urlOrPath)) {
@@ -342,15 +365,21 @@ export class MediaStorageManager {
         throw new Error(`本地源文件不存在: ${urlOrPath}`);
       }
     } else if (/^https?:\/\//i.test(urlOrPath)) {
-      // 3. HTTP(S) 下载
-      const response = await fetch(urlOrPath);
+      // 3. HTTP(S) 裸 GET 下载（不附加任何鉴权 Header，不采信响应头 Content-Type）
+      let response: Response;
+      try {
+        response = await fetch(urlOrPath);
+      } catch (err: any) {
+        const reason = err?.message ? sanitizeTextUrls(String(err.message)) : 'network error';
+        throw new Error(`HTTP 下载异常 (${sanitizeUrlForLog(urlOrPath)}): ${reason}`);
+      }
       if (!response.ok) {
-        throw new Error(`HTTP 下载失败 (status: ${response.status}): ${urlOrPath}`);
+        throw new Error(`HTTP 下载失败 (status: ${response.status}): ${sanitizeUrlForLog(urlOrPath)}`);
       }
       const arrayBuffer = await response.arrayBuffer();
       buffer = Buffer.from(arrayBuffer);
     } else {
-      throw new Error(`不支持的 URL 格式: ${urlOrPath}`);
+      throw new Error(`不支持的 URL 格式: ${sanitizeUrlForLog(urlOrPath)}`);
     }
 
     return this.saveBuffer(buffer, options);
@@ -437,10 +466,6 @@ export async function cleanExpiredMedia(
 
 /**
  * 启动媒体 TTL 清理定时任务
- * @param ctx 上下文对象
- * @param manager 媒体存储管理器
- * @param intervalMs 周期性清理间隔，默认 24 小时 (24 * 60 * 60 * 1000)
- * @param initialDelayMs 启动后初次执行延迟（毫秒），默认 5000ms（5 秒后自动执行首轮清理，清理离线停机期间积累的超期文件）
  */
 export function startMediaCleanupTask(
   ctx: Context | any,
@@ -457,7 +482,6 @@ export function startMediaCleanupTask(
     });
   };
 
-  // 1. 启动初期延迟执行首轮清理（避开插件启动瞬间的 I/O 竞争，清理停机期间过期的旧文件）
   if (initialDelayMs >= 0) {
     initialTimer = setTimeout(() => {
       initialTimer = null;
@@ -465,7 +489,6 @@ export function startMediaCleanupTask(
     }, initialDelayMs);
   }
 
-  // 2. 周期定时清理
   timer = setInterval(runCleanup, intervalMs);
 
   const stop = () => {

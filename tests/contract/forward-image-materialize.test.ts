@@ -1,272 +1,224 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import {
-  expandForwardMessage,
-  registerAgentTools,
-  resetGlobalToolContext,
-} from '../../src/tools/index.js';
-
 /**
- * 契约测试: 合并转发内层图片即时落盘 (FC-1: Forward Image Materialization)
+ * tests/contract/forward-image-materialize.test.ts
  *
- * 背景：合并转发展开走 NapCat get_forward_msg（该 action 可用），内层 image 段自带
- * multimedia.nt.qq.com.cn 直链（带 rkey，有时效）。而 NapCat 的 get_file /
- * get_private_file_url 在 packetBackend 不可用时整体失效（QQ 版本不匹配），
- * 因此本链路只走 HTTP 直链、完全不依赖 NapCat 取文件；rkey 有时效，必须展开当下立刻下载。
+ * 契约测试: 官方 message_type=102 合并转发内嵌图片裸 GET 落盘与凭证 URL 脱敏替换
  *
- * 测试引用 src 真实模块，仅桩掉 NapCat gateway 与媒体落盘，不造桩自测。
+ * 背景（实测报告 #5 §4）：
+ *   QQ 官方 Bot API v2 下发合并转发 (`message_type: 102`) 时，服务端已直接把聊天记录展开至
+ *   `d.content` 纯文本，其中内嵌图片以 `[附件k] 类型:图片 ... URL:https://...&rkey=...` 形式出现。
+ *   入站处理必须限量直接裸 GET 落盘（不传 Authorization 头），并将含 `rkey` 的明文 URL 从正文
+ *   替换为 `[图片:<local_path>]` 或 `[图片(链接已脱敏)]`，杜绝凭据注入模型上下文或日志。
  */
 
-const PEER = 'group_8000000001';
-const REAL_URL =
-  'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=EhSka0exFitjNgOnKTIe_VV-svbx7BjhnAEg_goo1I_zrtzjlgMyBHByb2RQgLsvWhCUL_LAUZ4g__iruLcLy0MGegLHA4IBAmd6&rkey=CAESME6mnVREHwuSVZv78aWttT6VVDccNb5ZD1zxH3SogcO-6oCwYA0EBxpacEXRv7XQXg';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { promises as fsp } from 'node:fs';
+import * as http from 'node:http';
+import { MediaStorageManager } from '../../src/storage/media.js';
+import {
+  resolveEmbeddedForwardImages,
+  sanitizeForwardContentUrls,
+} from '../../src/gateway/inbound-media.js';
+import { shouldWakeup } from '../../src/gateway/wakeup.js';
+import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
-function node(
-  content: unknown,
-  opts: { time?: number; nick?: string; uid?: string; useMessage?: boolean } = {}
-): any {
-  const base = {
-    sender: { nickname: opts.nick || '考生', user_id: opts.uid || '10001' },
-    time: opts.time ?? 1788999540,
-  };
-  return opts.useMessage
-    ? { ...base, message: content }
-    : { ...base, content: typeof content === 'string' ? content : JSON.stringify(content) };
-}
+const MOCK_OPENID = 'A1B2C3D4E5F60123456789ABCDEF0006';
+const PEER = openidToPeer(MOCK_OPENID);
 
-function stubGateway(messages: any[]): any {
-  return {
-    getForwardMsg: async (_id: string) => ({ status: 'ok', retcode: 0, data: { messages } }),
-  };
-}
+const PNG_BYTES = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(32, 0x11),
+]);
+const GIF_BYTES = Buffer.concat([Buffer.from('GIF89a'), Buffer.alloc(24, 0x22)]);
 
-function stubMedia(opts: { failWhen?: (url: string, index: number) => boolean } = {}) {
-  const calls: Array<{ url: string; opts: any }> = [];
-  const mediaManager = {
-    downloadAndSave: async (url: string, saveOpts: any) => {
-      calls.push({ url, opts: saveOpts });
-      if (opts.failWhen?.(url, calls.length)) {
-        throw new Error('HTTP 403');
-      }
-      return {
-        localPath: `/tmp/media/image/${PEER}/img_${calls.length}.png`,
-        fingerprint: `fp-${calls.length}`,
-        deduplicated: false,
-      };
-    },
-  };
-  return { mediaManager: mediaManager as any, calls };
-}
+describe('契约测试: message_type=102 合并转发内嵌图片裸 GET 落盘与脱敏', () => {
+  let tmpHome: string;
+  let manager: MediaStorageManager;
+  let servers: http.Server[] = [];
 
-const imgSeg = (data: any = {}) => ({ type: 'image', data });
-const textSeg = (text: string) => ({ type: 'text', data: { text } });
-
-describe('契约测试: 合并转发内层图片即时落盘 (FC-1)', () => {
-  it('FC-1 契约 1: 内层 image 段带 http 直链 → 走 downloadAndSave 落盘，段内写入 local_path 供 read_image 直读', async () => {
-    const segs = [
-      textSeg('我必须立刻分享这段代码'),
-      imgSeg({ file: 'ABC.png', url: REAL_URL, file_size: '20065' }),
-      textSeg('笑死'),
-    ];
-    const gateway = stubGateway([node(segs, { nick: '测试用户D' })]);
-    const { mediaManager, calls } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_1' }, { peer: PEER, gateway, mediaManager });
-
-    expect(res.success).toBe(true);
-    expect(res.images_downloaded).toBe(1);
-    expect(calls).toHaveLength(1);
-    // 落盘参数契约：类型 image / 会话 peer / file_id 透传
-    expect(calls[0].opts.type).toBe('image');
-    expect(calls[0].opts.sessionId).toBe(PEER);
-    expect(calls[0].opts.fileId).toBe('ABC.png');
-
-    const parsed = JSON.parse(res.messages![0].content);
-    expect(parsed[1].data.local_path).toContain('/tmp/media/image/');
-    // 文本段原样保留，未被改写
-    expect(parsed[0].data.text).toBe('我必须立刻分享这段代码');
-    expect(parsed[2].data.text).toBe('笑死');
-  });
-
-  it('FC-1 契约 2: 真实 multimedia 直链（含 & 与 rkey）逐字透传给下载层，不做 query 改写', async () => {
-    const gateway = stubGateway([node([imgSeg({ url: REAL_URL })])]);
-    const { mediaManager, calls } = stubMedia();
-
-    await expandForwardMessage({ forward_id: 'fwd_2' }, { peer: PEER, gateway, mediaManager });
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe(REAL_URL);
-    // rkey 必须完整保留，否则 CDN 侧直接 403
-    expect(calls[0].url).toContain('rkey=CAESME6mnVREHwuSVZv78aWttT6VVDccNb5ZD1zxH3SogcO-6oCwYA0EBxpacEXRv7XQXg');
-  });
-
-  it('FC-1 契约 3: 表情包段（sub_type=1 或 emoji_package_id）按 sticker 落盘', async () => {
-    const gateway = stubGateway([
-      node([imgSeg({ url: REAL_URL, sub_type: 1 }), imgSeg({ url: REAL_URL, emoji_package_id: 5 })]),
-    ]);
-    const { mediaManager, calls } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_3' }, { peer: PEER, gateway, mediaManager });
-
-    expect(res.images_downloaded).toBe(2);
-    expect(calls.map((c) => c.opts.type)).toEqual(['sticker', 'sticker']);
-  });
-
-  it('FC-1 契约 4: url 缺失或非 http（仅有伪后缀 data.file）→ 跳过下载，content 原样返回且不报错', async () => {
-    const segs = [imgSeg({ file: 'MD5.jpg' }), imgSeg({ url: '/tmp/local/path.jpg' })];
-    const gateway = stubGateway([node(segs)]);
-    const { mediaManager, calls } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_4' }, { peer: PEER, gateway, mediaManager });
-
-    expect(res.success).toBe(true);
-    expect(res.images_downloaded).toBeUndefined();
-    expect(calls).toHaveLength(0);
-    // 无落盘即不回写段内容，保持既有输出形态
-    expect(res.messages![0].content).toBe(JSON.stringify(segs));
-  });
-
-  it('FC-1 契约 5: 单次展开最多落盘 10 张，超出的段保留原始 url 不阻断', async () => {
-    const segs = Array.from({ length: 11 }, (_v, i) => imgSeg({ url: `${REAL_URL}&i=${i}` }));
-    const gateway = stubGateway([node(segs)]);
-    const { mediaManager, calls } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_5' }, { peer: PEER, gateway, mediaManager });
-
-    expect(calls).toHaveLength(10);
-    expect(res.images_downloaded).toBe(10);
-    const parsed = JSON.parse(res.messages![0].content);
-    expect(parsed[9].data.local_path).toBeDefined();
-    expect(parsed[10].data.local_path).toBeUndefined();
-    expect(parsed[10].data.url).toContain('i=10');
-  });
-
-  it('FC-1 契约 6: 单张下载失败不阻断整次展开，其余节点照常落盘', async () => {
-    const first = [imgSeg({ url: `${REAL_URL}&bad=1` })];
-    const second = [imgSeg({ url: `${REAL_URL}&ok=1` })];
-    const gateway = stubGateway([node(first, { nick: 'A' }), node(second, { nick: 'B' })]);
-    const { mediaManager, calls } = stubMedia({ failWhen: (url) => url.includes('bad=1') });
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_6' }, { peer: PEER, gateway, mediaManager });
-
-    expect(res.success).toBe(true);
-    expect(calls).toHaveLength(2);
-    expect(res.images_downloaded).toBe(1);
-    // 失败节点保持原样，成功节点带 local_path
-    expect(res.messages![0].content).toBe(JSON.stringify(first));
-    expect(JSON.parse(res.messages![1].content)[0].data.local_path).toBeDefined();
-  });
-
-  it('FC-1 契约 7: 无 mediaManager 时展开仍成功且不下载（向后兼容）', async () => {
-    const segs = [imgSeg({ url: REAL_URL })];
-    const gateway = stubGateway([node(segs)]);
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_7' }, { peer: PEER, gateway });
-
-    expect(res.success).toBe(true);
-    expect(res.images_downloaded).toBeUndefined();
-    expect(res.messages![0].content).toBe(JSON.stringify(segs));
-  });
-
-  it('FC-1 契约 8: content 为纯文本原样返回；message 数组形态同样支持落盘', async () => {
-    const plain = '哈哈哈哈哈';
-    const arrNode = [imgSeg({ url: REAL_URL })];
-    const gateway = stubGateway([node(plain, { nick: 'A' }), node(arrNode, { nick: 'B', useMessage: true })]);
-    const { mediaManager, calls } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_8' }, { peer: PEER, gateway, mediaManager });
-
-    expect(calls).toHaveLength(1);
-    expect(res.messages![0].content).toBe(plain);
-    expect(JSON.parse(res.messages![1].content)[0].data.local_path).toBeDefined();
-  });
-
-  it('FC-1 契约 9: 段内已有 local_path 不重复下载', async () => {
-    const segs = [imgSeg({ url: REAL_URL, local_path: '/tmp/already/there.png' })];
-    const gateway = stubGateway([node(segs)]);
-    const { mediaManager, calls } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_9' }, { peer: PEER, gateway, mediaManager });
-
-    expect(calls).toHaveLength(0);
-    expect(res.images_downloaded).toBeUndefined();
-    expect(JSON.parse(res.messages![0].content)[0].data.local_path).toBe('/tmp/already/there.png');
-  });
-
-  it('FC-1 契约 10: 节点 sender/user_id/秒级时间戳映射保持既有契约（回归）', async () => {
-    const gateway = stubGateway([node([textSeg('hi')], { nick: '测试用户D', uid: '1000000013', time: 1788999540 })]);
-    const { mediaManager } = stubMedia();
-
-    const res = await expandForwardMessage({ forward_id: 'fwd_10' }, { peer: PEER, gateway, mediaManager });
-
-    expect(res.messages![0].sender_name).toBe('测试用户D');
-    expect(res.messages![0].user_id).toBe('1000000013');
-    expect(res.messages![0].time).toBe(1788999540000);
-  });
-});
-
-describe('契约测试: 转发展开工具的 peer 接线 (FC-1 注册层装配契约)', () => {
-  afterEach(() => {
-    resetGlobalToolContext();
-  });
-
-  function fakeRegistry() {
-    const registered: any[] = [];
-    const registry = {
-      register: (tool: any) => {
-        registered.push(tool);
-        return () => {};
-      },
-    };
-    return { registry, registered };
+  async function startServer(
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const srv = http.createServer(handler);
+      srv.on('error', reject);
+      servers.push(srv);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address() as any;
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
   }
 
-  it('FC-1 装配契约 1: execute 从 exec.agent.session.id 归一化 peer，落盘目录为 image/<peer>/ 而非 common', async () => {
-    const { registry, registered } = fakeRegistry();
-    const ctx = {
-      get: (key: string) => (key === 'tools' ? registry : undefined),
-      on: () => {},
-    } as any;
-    const gateway = stubGateway([node([imgSeg({ url: REAL_URL })])]);
-    const { mediaManager, calls } = stubMedia();
-
-    const unregister = registerAgentTools(ctx, { db: {} as any, gateway, mediaManager });
-
-    const tool = registered.find((t: any) => t.name === 'expand_forward_message');
-    expect(tool).toBeDefined();
-    expect(typeof tool.execute).toBe('function');
-
-    // 会话 id 带轮次后缀，必须归一化为 group_<id>
-    const res = await tool.execute(
-      { forward_id: 'fwd_wire' },
-      { agent: { session: { id: 'qq-group-3000000001-2' } } }
-    );
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0].opts.sessionId).toBe('group_3000000001');
-    expect(res.images_downloaded).toBe(1);
-    expect(JSON.parse(res.messages[0].content)[0].data.local_path).toBeDefined();
-
-    unregister();
+  beforeEach(async () => {
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-forward-materialize-'));
+    manager = new MediaStorageManager({ dshHome: tmpHome, downloadDir: 'downloads' });
+    servers = [];
   });
 
-  it('FC-1 装配契约 2: execute 携带 mediaManager，无 peer 时回退 common 不报错', async () => {
-    const { registry, registered } = fakeRegistry();
-    const ctx = {
-      get: (key: string) => (key === 'tools' ? registry : undefined),
-      on: () => {},
-    } as any;
-    const gateway = stubGateway([node([imgSeg({ url: REAL_URL })])]);
-    const { mediaManager, calls } = stubMedia();
+  afterEach(async () => {
+    for (const s of servers) {
+      await new Promise<void>((r) => s.close(() => r())).catch(() => {});
+    }
+    await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
+  });
 
-    const unregister = registerAgentTools(ctx, { db: {} as any, gateway, mediaManager });
-    const tool = registered.find((t: any) => t.name === 'expand_forward_message');
+  it('FC-1 契约 1: 提取 [附件k] ... URL:https://... 裸 GET 落盘（不带 Authorization 头）并脱敏正文', async () => {
+    const requestedUrls: string[] = [];
+    const seenAuthHeaders: Array<string | undefined> = [];
+    const base = await startServer((req, res) => {
+      requestedUrls.push(req.url || '');
+      seenAuthHeaders.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
 
-    const res = await tool.execute({ forward_id: 'fwd_wire_2' }, { agent: { session: { id: '' } } });
+    const imgUrl = `${base}/download?appid=1406&fileid=FILE_A&rkey=SECRET_RKEY_001&spec=0`;
+    const forwardText = [
+      '[群聊的聊天记录]',
+      '=== 消息 1 ===',
+      '[消息内容] 大家看看这张截图',
+      '[发送者] 群友A',
+      '',
+      '=== 消息 2 ===',
+      '[发送者] 群友B',
+      `[附件1] 类型:图片 文件名:shot.png 尺寸:1440x1920 大小:360.8KB URL:${imgUrl}`,
+    ].join('\n');
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0].opts.sessionId).toBe('common');
-    expect(res.images_downloaded).toBe(1);
+    const res = await resolveEmbeddedForwardImages(forwardText, PEER, manager);
 
-    unregister();
+    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls[0]).toContain('rkey=SECRET_RKEY_001');
+    expect(seenAuthHeaders[0]).toBeUndefined();
+
+    expect(res.localPaths).toHaveLength(1);
+    const localPath = res.localPaths[0]!;
+    expect(fs.existsSync(localPath)).toBe(true);
+    expect(localPath.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
+
+    expect(res.replacements.get(imgUrl)).toBe(`[图片:${localPath}]`);
+    expect(res.sanitizedContent).toContain(`[图片:${localPath}]`);
+    expect(res.sanitizedContent).not.toContain('SECRET_RKEY_001');
+    expect(res.sanitizedContent).not.toContain('URL:');
+    expect(res.entries[0]!.sanitizedUrl).toBe(`${base}/download`);
+    expect(JSON.stringify(res.entries)).not.toContain('SECRET_RKEY_001');
+  });
+
+  it('FC-1 契约 2: 动图/表情附件按 sticker 或 image 落盘并保留其余文本与多张顺序', async () => {
+    const base = await startServer((req, res) => {
+      if (req.url?.includes('sticker')) {
+        res.writeHead(200, { 'Content-Type': 'image/gif' });
+        res.end(GIF_BYTES);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+
+    const stickerUrl = `${base}/download?kind=sticker&rkey=RKEY_STICKER`;
+    const photoUrl = `${base}/download?kind=photo&rkey=RKEY_PHOTO`;
+
+    const content = [
+      '=== 消息 1 ===',
+      '[消息内容] <faceType=6,faceId="0",ext="abc">',
+      `[附件1] 类型:表情 文件名:emoji.gif 尺寸:240x240 大小:120KB URL:${stickerUrl}`,
+      '=== 消息 2 ===',
+      `[附件1] 类型:动图 文件名:anim.gif 尺寸:240x240 大小:1.3MB URL:${photoUrl}`,
+    ].join('\n');
+
+    const res = await resolveEmbeddedForwardImages(content, PEER, manager);
+
+    expect(res.localPaths).toHaveLength(2);
+    expect(res.localPaths[0]!.startsWith(path.join(tmpHome, 'downloads', 'sticker', PEER))).toBe(true);
+    expect(res.localPaths[1]!.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
+    expect(res.sanitizedContent).not.toContain('RKEY_STICKER');
+    expect(res.sanitizedContent).not.toContain('RKEY_PHOTO');
+  });
+
+  it('FC-1 契约 3: 限量下载（默认上限 10；支持自定义 limit），超出上限仍强制脱敏 URL', async () => {
+    let downloadCalls = 0;
+    const base = await startServer((_req, res) => {
+      downloadCalls++;
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+
+    const lines = Array.from({ length: 12 }, (_v, i) => {
+      const u = `${base}/download?i=${i}&rkey=LIMIT_RKEY_${i}`;
+      return `[附件${i + 1}] 类型:图片 文件名:p_${i}.png URL:${u}`;
+    }).join('\n');
+
+    const res = await resolveEmbeddedForwardImages(lines, PEER, manager);
+
+    expect(downloadCalls).toBe(10);
+    expect(res.entries).toHaveLength(12);
+    expect(res.entries.filter((e) => e.downloaded)).toHaveLength(10);
+    expect(res.entries.filter((e) => !e.downloaded)).toHaveLength(2);
+    expect(res.sanitizedContent).toContain('[图片(链接已脱敏)]');
+    expect(res.sanitizedContent).not.toContain('LIMIT_RKEY_');
+  });
+
+  it('FC-1 契约 4: 单张下载失败不阻断其余图片落盘，且错误与日志绝不泄露 rkey', async () => {
+    const base = await startServer((req, res) => {
+      if (req.url?.includes('bad=1')) {
+        res.writeHead(403);
+        res.end('expired');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+
+    const badUrl = `${base}/download?bad=1&rkey=LEAK_CHECK_BAD`;
+    const okUrl = `${base}/download?ok=1&rkey=LEAK_CHECK_OK`;
+    const warnLogs: string[] = [];
+
+    const content = [
+      `[附件1] 类型:图片 文件名:bad.png URL:${badUrl}`,
+      `[附件2] 类型:图片 文件名:ok.png URL:${okUrl}`,
+    ].join('\n');
+
+    const res = await resolveEmbeddedForwardImages(content, PEER, manager, 10, {
+      warn: (...args: any[]) => warnLogs.push(args.map(String).join(' ')),
+    });
+
+    expect(res.localPaths).toHaveLength(1);
+    expect(res.sanitizedContent).toContain('[图片(链接已脱敏)]');
+    expect(res.sanitizedContent).toContain(`[图片:${res.localPaths[0]!}]`);
+    expect(res.sanitizedContent).not.toContain('LEAK_CHECK_');
+    expect(res.entries[0]!.error).toBeTruthy();
+    expect(res.entries[0]!.error).not.toContain('LEAK_CHECK_BAD');
+    expect(warnLogs.join('\n')).not.toContain('LEAK_CHECK_BAD');
+  });
+
+  it('FC-1 契约 5: 与 shouldWakeup 联动 — message_type=102 合并转发完整落盘并注入 payload.images', async () => {
+    const base = await startServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+
+    const imgUrl = `${base}/download?appid=1406&rkey=WAKEUP_FWD_SECRET`;
+    const event: QQC2CMessageCreateEvent = {
+      id: 'ROBOT1.0_fwd_wakeup_001',
+      content: `[群聊的聊天记录]\n=== 消息 1 ===\n[附件1] 类型:图片 文件名:img.png URL:${imgUrl}`,
+      timestamp: '2026-11-11T18:45:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 102,
+    };
+
+    const embedded = await resolveEmbeddedForwardImages(event.content, PEER, manager);
+    const decision = await shouldWakeup(event, {
+      forwardImages: embedded.localPaths,
+      sanitizeForwardContent: (raw) => sanitizeForwardContentUrls(raw, embedded.replacements),
+    });
+
+    expect(decision.wakeup).toBe(true);
+    expect(decision.trigger).toBe('direct');
+    expect(decision.payload?.images).toEqual(embedded.localPaths);
+    expect(decision.payload?.content).toContain(`[图片:${embedded.localPaths[0]!}]`);
+    expect(decision.payload?.content).not.toContain('WAKEUP_FWD_SECRET');
   });
 });

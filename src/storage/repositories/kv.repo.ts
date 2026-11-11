@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 插件通用键值持久化仓库 (plugin_kv)
+ * kujira: 插件通用键值持久化仓库 (plugin_kv)
  */
 
 export class KvRepository {

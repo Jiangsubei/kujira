@@ -1,17 +1,23 @@
 /**
- * dsh-napcat-bridge: 消息段归一化模块
- * 专职 OneBot 消息段 AST 归一化、表情/附件渲染与 MD5 提取。
+ * kujira: QQ 官方 Bot 单聊消息内容归一化模块
+ *
+ * 彻底移除 OneBot 段 AST、`[CQ:*]` 与 `resolveAtNicknames`，专职：
+ * - `message_type === 102`（合并转发）：结合内嵌图片脱敏置换回调安全呈现正文，绝不泄露带 `rkey` 的 URL；
+ * - `message_type === 3`（卡片）：优先通过 `extractArkDataContent` 渲染结构化 `ark_data`；
+ * - 入站附件描述符：自动计算本地落盘图片 MD5 匹配已收藏表情库，升格为语义占位符 `[表情包: <id> ...]`；
+ * - 引用索引与 `msg_elements` 要素提取，供 `wakeup.ts` 精确还原引用消息。
  */
 
-import type { OneBotMessageEvent, FaceRecord } from '../types/index.js';
-import { computeFileMd5 } from '../storage/media.js';
-import { describeSegment, resolveLocalMediaPath } from '../attachment/classify.js';
+import type { FaceRecord, QQC2CMessageCreateEvent } from '../types/index.js';
+import type { AttachmentDescriptor } from '../attachment/types.js';
 import {
   formatFacePlaceholder as renderFacePlaceholder,
   renderAttachment,
-  cleanStickerSummary,
+  renderAttachments,
 } from '../attachment/render.js';
-import { extractCardContent } from './card-parser.js';
+import { computeFileMd5 } from '../storage/media.js';
+import { extractArkDataContent } from './card-parser.js';
+import { sanitizeForwardContentUrls } from './inbound-media.js';
 
 export interface MatchedFaceInfo {
   id: string;
@@ -19,282 +25,168 @@ export interface MatchedFaceInfo {
   tags?: string[] | null;
 }
 
+export interface ParseNormalizedContentOptions {
+  /** 入站图片匹配本地表情库查询器 */
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
+  /** 合并转发文本 URL 脱敏替换函数（通常由 `resolveEmbeddedForwardImages` 提供） */
+  sanitizeForwardContent?: (content: string) => string;
+}
+
 /**
  * 格式化已收藏表情包在聊天上下文中的语义占位符。
- * 格式示例：[表情包: face_12345678 (情绪: 嘲讽)] 或 [表情包: face_12345678]
- * 说明：SystemPrompt 中已全量注入表情库各 ID 对应的详细标签，入站仅需保留 face_id 与情绪意图，避免重复注入标签。
+ * 格式示例：`[表情包: face_12345678 (情绪: 嘲讽)]` 或 `[表情包: face_12345678 路径: /path]`
  */
 export function formatFacePlaceholder(face: MatchedFaceInfo, localPath?: string | null): string {
   return renderFacePlaceholder(face, localPath);
 }
 
-export interface ParseNormalizedContentOptions {
-  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
-}
-
 /**
- * EN-001: 把 at 段归一化文本中的裸 @QQ号 替换为 @昵称(QQ号)。
- * - 仅替换由 at 段产生的 "@<qq>" 字面（纯文本手敲的 "@昵称" 不含数字，保持原样）；
- * - 同一 qq 去重，一次解析多次替换；
- * - 解析器缺失/失败/查无昵称时保持裸 @QQ号，绝不中断或抛错。
+ * 从 `event.message_scene.ext` 数组提取指定 `key=value` 字段值。
  */
-export async function resolveAtNicknames(
-  content: string,
-  atQQs: string[],
-  groupId: number | string | undefined,
-  resolveNickname?: (groupId: number | string, qq: string) => Promise<string | undefined>
-): Promise<string> {
-  if (!resolveNickname || !Array.isArray(atQQs) || atQQs.length === 0 || groupId === undefined) {
-    return content;
-  }
-  let out = content;
-  for (const qq of new Set(atQQs)) {
-    try {
-      const nickname = await resolveNickname(groupId, qq);
-      if (nickname && nickname.trim() !== '') {
-        out = out.split(`@${qq}`).join(`@${nickname.trim()}(${qq})`);
-      }
-    } catch {
-      // 单次解析失败回退裸 @QQ号
-    }
-  }
-  return out;
-}
+export function extractSceneExtValue(
+  event: QQC2CMessageCreateEvent | null | undefined,
+  key: string
+): string | undefined {
+  const extList = event?.message_scene?.ext;
+  if (!Array.isArray(extList) || !key) return undefined;
 
-/**
- * 推导图片段可用于表情库查询的 MD5：
- * 1. 段内显式 md5；
- * 2. 本地路径（含 file:/// URI）的字节 MD5；
- * 3. 纯 MD5 文件名（可带扩展名）。
- */
-function resolveImageMd5(data: any): string | undefined {
-  if (typeof data?.md5 === 'string' && data.md5.trim()) {
-    return data.md5.trim().toLowerCase();
+  for (const entry of extList) {
+    if (typeof entry !== 'string') continue;
+    const eqIdx = entry.indexOf('=');
+    if (eqIdx <= 0) continue;
+    if (entry.slice(0, eqIdx).trim() !== key) continue;
+    const val = entry.slice(eqIdx + 1).trim();
+    if (val) return val;
   }
-
-  const localPath =
-    resolveLocalMediaPath(data?.local_path) || resolveLocalMediaPath(data?.file);
-  if (localPath) {
-    const md5 = computeFileMd5(localPath);
-    if (md5) return md5.toLowerCase();
-  }
-
-  if (typeof data?.file === 'string') {
-    const base = data.file.split(/[\\/]/).pop() || '';
-    const match = base.match(/^([a-fA-F0-9]{32})(?:\.[a-zA-Z0-9]+)?$/);
-    if (match) return match[1].toLowerCase();
-  }
-
   return undefined;
 }
 
+/** 提取本条入站消息自身的引用索引 `msg_idx`（通常为 `REFIDX_...`）。 */
+export function extractMessageRefIdx(
+  event: QQC2CMessageCreateEvent | null | undefined
+): string | undefined {
+  return extractSceneExtValue(event, 'msg_idx');
+}
+
+/** 提取被引用目标消息索引 `ref_msg_idx`（`REFIDX_...` 或复合引用的 `TMP_...`）。 */
+export function extractQuotedRefIdx(
+  event: QQC2CMessageCreateEvent | null | undefined
+): string | undefined {
+  const fromScene = extractSceneExtValue(event, 'ref_msg_idx');
+  if (fromScene) return fromScene;
+
+  if (Array.isArray(event?.msg_elements)) {
+    for (const el of event.msg_elements) {
+      if (typeof el?.msg_idx === 'string' && el.msg_idx.trim()) {
+        return el.msg_idx.trim();
+      }
+    }
+  }
+  return undefined;
+}
+
+/** 判断索引是否为永久可查库索引（`REFIDX_...`），排除临时索引 `TMP_...`。 */
+export function isPermanentRefIdx(refIdx?: string | null): refIdx is string {
+  return typeof refIdx === 'string' && refIdx.trim().startsWith('REFIDX_');
+}
+
+/**
+ * 从 `event.msg_elements[]`（及必要时 `parallel_message.msg_nodes[]`）提取并脱敏被引用原文。
+ */
+export function extractMsgElementsText(
+  event: QQC2CMessageCreateEvent | null | undefined
+): string | undefined {
+  const parts: string[] = [];
+
+  if (Array.isArray(event?.msg_elements)) {
+    for (const el of event.msg_elements) {
+      if (typeof el?.content === 'string' && el.content.trim()) {
+        parts.push(sanitizeForwardContentUrls(el.content.trim()));
+      }
+    }
+  }
+
+  if (parts.length === 0 && Array.isArray(event?.parallel_message?.msg_nodes)) {
+    for (const node of event.parallel_message.msg_nodes) {
+      if (typeof node?.content === 'string' && node.content.trim()) {
+        parts.push(sanitizeForwardContentUrls(node.content.trim()));
+      }
+    }
+  }
+
+  const joined = parts.join('\n').trim();
+  return joined || undefined;
+}
+
+function enrichDescriptorsWithFaces(
+  descriptors: AttachmentDescriptor[],
+  getFaceByMd5?: (md5: string) => FaceRecord | null | undefined
+): void {
+  if (!getFaceByMd5 || descriptors.length === 0) return;
+
+  for (const descriptor of descriptors) {
+    if (descriptor.face?.id) continue;
+    if (descriptor.kind !== 'image' && descriptor.kind !== 'sticker') continue;
+
+    const md5 =
+      descriptor.local?.md5?.trim().toLowerCase() ||
+      (descriptor.local?.path ? computeFileMd5(descriptor.local.path)?.toLowerCase() : undefined);
+    if (!md5) continue;
+
+    const matched = getFaceByMd5(md5);
+    if (matched && matched.enabled && !matched.deleted_at) {
+      descriptor.face = {
+        id: matched.id,
+        ...(matched.mood ? { mood: matched.mood } : {}),
+        ...(matched.tags && matched.tags.length > 0 ? { tags: matched.tags } : {}),
+      };
+    }
+  }
+}
+
+/**
+ * 将官方 `QQC2CMessageCreateEvent` 与已解析附件描述符列表归一化为安全的纯文本内容。
+ */
 export function parseNormalizedContent(
-  event: OneBotMessageEvent,
+  event: QQC2CMessageCreateEvent,
+  descriptors: AttachmentDescriptor[] = [],
   options?: ParseNormalizedContentOptions
-): {
-  content: string;
-  images: string[];
-  replyId?: number;
-  atQQs: string[];
-} {
-  const images: string[] = [];
-  const atQQs: string[] = [];
-  let replyId: number | undefined;
+): string {
+  enrichDescriptorsWithFaces(descriptors, options?.getFaceByMd5);
 
-  if (Array.isArray(event.message) && event.message.length > 0) {
-    const textParts: string[] = [];
-    let pendingStickerSummary: string | null = null;
-    const isGroup = (event as any).message_type === 'group' || Boolean((event as any).group_id);
+  const renderedAttachments = renderAttachments(descriptors);
+  const rawContent = typeof event?.content === 'string' ? event.content : '';
 
-    for (const seg of event.message) {
-      if (!seg || typeof seg !== 'object') continue;
-      const type = seg.type;
-      const data = seg.data || {};
-
-      if (type !== 'text') {
-        pendingStickerSummary = null;
-      }
-
-      switch (type) {
-        case 'text': {
-          const rawText = data.text ? String(data.text) : '';
-          if (rawText) {
-            const cleanText = cleanStickerSummary(rawText);
-            if (
-              pendingStickerSummary &&
-              pendingStickerSummary !== '表情' &&
-              cleanText === pendingStickerSummary
-            ) {
-              // 属于紧随前序表情包之后的 NapCat 纯降级冗余文本段（如 [拿捏] / 拿捏），予以跳过
-              pendingStickerSummary = null;
-              break;
-            }
-            textParts.push(rawText);
-          }
-          pendingStickerSummary = null;
-          break;
-        }
-
-        case 'at':
-          if (data.qq !== undefined) {
-            atQQs.push(String(data.qq));
-            textParts.push(`@${data.qq}`);
-          }
-          break;
-
-        case 'reply':
-          if (data.id !== undefined) {
-            replyId = Number(data.id);
-          }
-          break;
-
-        case 'face':
-          if (data.raw && data.raw.faceText) {
-            textParts.push(`[表情:${data.raw.faceText}]`);
-          } else if (data.id !== undefined) {
-            textParts.push(`[表情:id=${data.id}]`);
-          } else {
-            textParts.push('[表情]');
-          }
-          break;
-
-        case 'image': {
-          const imgPath = data.local_path || data.file || data.url || '';
-          if (imgPath) images.push(imgPath);
-
-          const descriptor = describeSegment(seg, { origin: 'inbound', isGroup })!;
-          if (!descriptor.face && options?.getFaceByMd5) {
-            const md5 = resolveImageMd5(data);
-            if (md5) {
-              const matched = options.getFaceByMd5(md5);
-              if (matched && matched.enabled && !matched.deleted_at) {
-                const face = {
-                  id: matched.id,
-                  ...(matched.mood ? { mood: matched.mood } : {}),
-                  ...(matched.tags && matched.tags.length > 0 ? { tags: matched.tags } : {}),
-                };
-                descriptor.face = face;
-                data.face = face;
-              }
-            }
-          }
-
-          if (descriptor.kind === 'sticker') {
-            const rawSummary = descriptor.summary || data.summary;
-            const clean = cleanStickerSummary(rawSummary);
-            pendingStickerSummary = clean !== '表情' ? clean : null;
-          } else {
-            pendingStickerSummary = null;
-          }
-
-          textParts.push(renderAttachment(descriptor) ?? '[表情包]');
-          break;
-        }
-
-        case 'file': {
-          const descriptor = describeSegment(seg, { origin: 'inbound', isGroup })!;
-          textParts.push(renderAttachment(descriptor) ?? '[文件]');
-          break;
-        }
-
-        case 'forward':
-          textParts.push(`[合并转发 (ID:${data.id || data.forward_id || ''})]`);
-          break;
-
-        case 'record':
-          textParts.push('[语音]');
-          break;
-
-        case 'video':
-          const descriptor = describeSegment(seg, { origin: 'inbound', isGroup })!;
-          textParts.push(renderAttachment(descriptor) ?? '[视频]');
-          break;
-
-        case 'shake':
-          textParts.push('[窗口抖动]');
-          break;
-
-        case 'poke':
-          textParts.push('[戳一戳]');
-          break;
-
-        case 'json':
-        case 'xml': {
-          const card = extractCardContent(data, type);
-          textParts.push(card.text);
-          if (card.cover && !images.includes(card.cover)) {
-            images.push(card.cover);
-          }
-          break;
-        }
-
-        case 'rps':
-          textParts.push('[猜拳]');
-          break;
-
-        case 'dice':
-          textParts.push('[骰子]');
-          break;
-
-        case 'lightapp':
-        case 'share':
-          textParts.push(data.title ? `[分享:${data.title}]` : '[分享卡片]');
-          break;
-
-        case 'music':
-          textParts.push('[音乐分享]');
-          break;
-
-        case 'location':
-          textParts.push(data.title ? `[位置:${data.title}]` : '[位置]');
-          break;
-
-        case 'contact':
-          textParts.push('[联系人推荐]');
-          break;
-
-        case 'anonymous':
-          textParts.push('[匿名消息]');
-          break;
-
-        default:
-          if (data.text) {
-            textParts.push(data.text);
-          } else {
-            // Spec v1.0 未列出的消息段类型：保留占位，防止静默丢段
-            textParts.push(`[未知消息段:${type}]`);
-          }
-          break;
-      }
+  // 1. 合并转发消息（message_type === 102）
+  if (event?.message_type === 102) {
+    const customSanitized = options?.sanitizeForwardContent
+      ? options.sanitizeForwardContent(rawContent)
+      : rawContent;
+    const safeForwardText = sanitizeForwardContentUrls(customSanitized);
+    const parts = [safeForwardText, ...renderedAttachments].filter((p) => p !== '');
+    if (parts.length > 0) {
+      return parts.join('\n');
     }
-
-    return {
-      content: textParts.join(''),
-      images,
-      replyId,
-      atQQs,
-    };
+    return renderAttachment({ kind: 'forward', origin: 'inbound' }) ?? '[合并转发]';
   }
 
-  // Fallback to raw_message parsing if segments are not available
-  const raw = event.raw_message || '';
-  const atMatch = raw.match(/\[CQ:at,qq=(\d+)\]/g);
-  if (atMatch) {
-    for (const match of atMatch) {
-      const qq = match.replace(/\[CQ:at,qq=(\d+)\]/, '$1');
-      atQQs.push(qq);
-    }
+  // 2. 卡片 / 小程序消息（message_type === 3 或存在 ark_data）
+  if (event?.message_type === 3 || event?.ark_data) {
+    const cardText = extractArkDataContent(event.ark_data, rawContent);
+    const parts = [cardText, ...renderedAttachments].filter((p) => p !== '');
+    return parts.join(' ');
   }
 
-  const replyMatch = raw.match(/\[CQ:reply,id=(\d+)\]/);
-  if (replyMatch) {
-    replyId = Number(replyMatch[1]);
+  // 3. 普通文本 / 富媒体 / 引用回复（message_type === 0 / 103）
+  const parts: string[] = [];
+  if (rawContent !== '') {
+    parts.push(rawContent);
+  }
+  if (renderedAttachments.length > 0) {
+    parts.push(...renderedAttachments);
   }
 
-  return {
-    content: raw,
-    images,
-    replyId,
-    atQQs,
-  };
+  if (parts.length === 0) return '';
+  if (parts.length === 1) return parts[0]!;
+  return parts.join(' ');
 }

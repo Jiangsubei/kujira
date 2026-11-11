@@ -1,40 +1,29 @@
 /**
- * dsh-napcat-bridge: 出站消息自记录 (Outbound Self Record)
+ * kujira: 出站消息自记录 (Outbound Self Record)
  *
- * 出站消息不依赖 NapCat 的 `reportSelfMessage` 上报：只要 OneBot 应答成功且返回
- * message_id，就立即把这条自身消息写入本地 messages 表（self = 1）。
- * 发送失败或无有效 message_id 时不落库，避免写入无法寻址的幽灵记录。
+ * QQ 官方 Bot REST 发送成功并拿到响应体 `body.id` (`ROBOT1.0_...`) 与可选 `ext_info.ref_idx` (`REFIDX_...`) 后，
+ * 立即将自身消息写入本地 SQLite `messages` 表（`self = 1`）。
  *
- * 附件事实统一来自 `src/attachment/`：发送方可通过 `attachments` 旁路携带
- * face_id / 情绪 / 本地真实格式；未携带时从消息段推导。
+ * 严格红线：
+ * - 失败或缺失有效字符串 `msgId` 时绝不落库，避免写入无法寻址的幽灵记录；
+ * - 严禁将出站 `body.id` 写入 `inbound_reply_slots`（严格三 ID 隔离，防 `40034024`）；
+ * - 零 OneBot 段伪装、零 `busid`、零 `isGroup`、零 `get_msg` 回查。
  */
 
-import {
-  describeMessage,
-  inferDominantType as inferTypeFromSegments,
-  resolveLocalMediaPath,
-  toMessageMediaFields,
-  type MessageDescription,
-  type MessageMediaFields,
-} from '../attachment/classify.js';
-import { normalizeOutboundSegments } from '../attachment/outbound.js';
-import {
-  deserializeAttachments,
-  serializeAttachments,
-} from '../attachment/store.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
-import { parseNormalizedContent } from '../gateway/wakeup.js';
+import type { OutboundSentEvent } from '../gateway/server.js';
 import type { MessageRecord } from '../types/index.js';
-import type { OutboundSentEvent, NapCatGatewayServer } from '../gateway/server.js';
+
+export interface SelfRecordDb {
+  saveMessageIfNotExists(record: MessageRecord): boolean;
+}
 
 export interface SelfRecordDeps {
-  db: {
-    saveMessageIfNotExists(record: MessageRecord): boolean;
-    updateMessageMedia?(msgId: number, patch: Record<string, any>): void;
-  };
-  botQQ: string;
+  db: SelfRecordDb;
+  /** 机器人自身标识（来自 READY d.user.id，过渡期兼容 botQQ 键名） */
+  botId?: string;
+  botQQ?: string;
   senderName: string;
-  getFaceByMd5?: (md5: string) => any;
   logger?: {
     debug?: (...args: any[]) => void;
     warn?: (...args: any[]) => void;
@@ -42,159 +31,160 @@ export interface SelfRecordDeps {
 }
 
 export interface BuildSelfRecordOptions {
-  botQQ: string;
+  botId?: string;
+  botQQ?: string;
   senderName: string;
-  getFaceByMd5?: (md5: string) => any;
 }
 
-export interface OutboundMediaMeta {
-  file_id: string | null;
-  busid: number | null;
-  local_path: string | null;
-}
-
-export { normalizeOutboundSegments, resolveLocalMediaPath };
-
-/** 出站消息是否携带需要异步补全元数据的媒体段 */
-export function hasOutboundMedia(segments: Array<Record<string, any>>): boolean {
-  return segments.some((seg) =>
-    ['image', 'file', 'record', 'video', 'forward'].includes(String(seg?.type || ''))
-  );
-}
-
-/** 从出站消息段提取媒体元数据（payload 版本）。 */
-export function extractOutboundMediaMeta(
-  segments: Array<Record<string, any>>
-): OutboundMediaMeta {
-  const description = describeMessage(segments, {
-    origin: 'outbound',
-    isGroup: false,
-  });
-  const fields = toMessageMediaFields(description);
-  return {
-    file_id: fields.file_id,
-    busid: fields.busid,
-    local_path: fields.local_path,
-  };
-}
-
-/** 推导出站消息主导类型（与入站落库口径共用同一规则）。 */
-export function inferOutboundMessageType(
-  segments: Array<Record<string, any>>,
-  isGroup: boolean
-): string {
-  return inferTypeFromSegments(segments, { isGroup });
-}
-
-/**
- * 把旁路描述符中的本地事实回填到消息段，供统一渲染读取。
- * 只补 local / face / summary / unavailable，不改变发送给 NapCat 的原始 payload。
- */
-function applyDescriptorsToSegments(
-  segments: Array<Record<string, any>>,
-  descriptors: AttachmentDescriptor[]
-): Array<Record<string, any>> {
-  if (descriptors.length === 0) return segments;
-
-  const queue = [...descriptors];
-  return segments.map((seg) => {
-    if (!['image', 'file', 'record', 'video', 'forward'].includes(String(seg?.type || ''))) {
-      return seg;
-    }
-    const descriptor = queue.shift();
-    if (!descriptor) return seg;
-
-    const data: Record<string, any> = { ...(seg.data || {}) };
-    if (descriptor.local?.path) {
-      data.local_path = descriptor.local.path;
-      if (descriptor.local.format) data.local_format = descriptor.local.format;
-      if (descriptor.local.md5) data.md5 = descriptor.local.md5;
-      if (descriptor.local.fingerprint) data.fingerprint = descriptor.local.fingerprint;
-    }
-    if (descriptor.face) data.face = descriptor.face;
-    if (descriptor.summary) data.summary = descriptor.summary;
-    if (descriptor.unavailable) data.dl_failed = true;
-    if (descriptor.fileName && !data.file_name) data.file_name = descriptor.fileName;
-    if (descriptor.remote?.fileId) data.file_id = descriptor.remote.fileId;
-    if (descriptor.remote?.url) data.url = descriptor.remote.url;
-    if (descriptor.remote?.busid !== undefined) data.busid = descriptor.remote.busid;
-
-    return { ...seg, data };
-  });
-}
-
-function describeOutbound(
-  segments: Array<Record<string, any>>,
-  isGroup: boolean,
-  provided?: AttachmentDescriptor[]
-): MessageDescription {
-  const derived = describeMessage(segments, { origin: 'outbound', isGroup });
-  if (provided && provided.length > 0) {
-    return { type: derived.type, attachments: provided };
+function compactValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => (item === undefined ? null : compactValue(item)));
   }
-  return derived;
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      out[k] = compactValue(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function serializeAttachmentDescriptors(descriptors: ReadonlyArray<AttachmentDescriptor>): string | null {
+  if (!Array.isArray(descriptors) || descriptors.length === 0) return null;
+  return JSON.stringify(compactValue(descriptors));
+}
+
+function formatFaceText(face: { id: string; mood?: string | null }, localPath?: string | null): string {
+  const moodPart = face.mood && face.mood.trim() ? ` (情绪: ${face.mood.trim()})` : '';
+  const pathPart = localPath && localPath.trim() ? ` 路径: ${localPath.trim()}` : '';
+  return `[表情包: ${face.id}${moodPart}${pathPart}]`;
+}
+
+function renderOutboundAttachment(descriptor: AttachmentDescriptor): string | null {
+  if (!descriptor) return null;
+  switch (descriptor.kind) {
+    case 'sticker': {
+      if (descriptor.face?.id) {
+        return formatFaceText(descriptor.face, descriptor.local?.path);
+      }
+      const summary = (descriptor.summary || '表情').replace(/^\[+|\]+$/g, '').trim() || '表情';
+      return descriptor.local?.path
+        ? `[表情包: ${summary} 路径: ${descriptor.local.path}]`
+        : `[表情包: ${summary}]`;
+    }
+    case 'image': {
+      if (descriptor.face?.id) {
+        return formatFaceText(descriptor.face, descriptor.local?.path);
+      }
+      const target =
+        descriptor.local?.path || descriptor.remote?.url || descriptor.remote?.fileUuid || descriptor.remote?.fileId || '';
+      return target ? `[图片:${target}]` : '[图片]';
+    }
+    case 'file': {
+      const name = descriptor.fileName || '未知文件';
+      return descriptor.local?.path ? `[文件:${name} 已保存: ${descriptor.local.path}]` : `[文件:${name}]`;
+    }
+    case 'record':
+      return '[语音]';
+    case 'video': {
+      const name = descriptor.fileName?.trim() || '';
+      const fileId = (descriptor.remote?.fileUuid || descriptor.remote?.fileId || '').trim();
+      const namePart = name && name !== fileId ? `:${name}` : '';
+      return descriptor.local?.path ? `[视频${namePart} 已保存: ${descriptor.local.path}]` : `[视频${namePart}]`;
+    }
+    default:
+      return null;
+  }
 }
 
 /**
- * 由出站发送事件构造 self = 1 的消息记录。
- * 无有效内容时返回 null（不落库）。
+ * 由 QQ 官方 Bot 出站发送事件构造 `self = 1` 的消息记录。
+ * 缺有效字符串 `msgId`、缺 `peer` 或正文为空时返回 `null`（不落库）。
  */
 export function buildSelfMessageRecord(
   event: OutboundSentEvent,
   options: BuildSelfRecordOptions
 ): MessageRecord | null {
-  const segments = normalizeOutboundSegments(event.message);
-  if (segments.length === 0) return null;
+  const msgId = typeof event.msgId === 'string' ? event.msgId.trim() : '';
+  const peer = typeof event.peer === 'string' ? event.peer.trim() : '';
+  if (!msgId || !peer) return null;
 
-  const isGroup = event.peer.startsWith('group_') || event.peer.startsWith('qq-group-');
-  const description = describeOutbound(segments, isGroup, event.attachments);
+  const attachments = Array.isArray(event.attachments) ? event.attachments : [];
+  const rawText = typeof event.text === 'string' ? event.text : '';
+  const hasText = rawText.trim() !== '';
 
-  const parsed = parseNormalizedContent(
-    {
-      message: applyDescriptorsToSegments(segments, description.attachments),
-      message_type: isGroup ? 'group' : 'private',
-    } as any,
-    {
-      getFaceByMd5: options.getFaceByMd5,
-    }
-  );
+  const attachmentLines = attachments
+    .map(renderOutboundAttachment)
+    .filter((line): line is string => Boolean(line));
 
-  if (!parsed.content || parsed.content.trim() === '') return null;
+  let content = '';
+  if (hasText && attachmentLines.length > 0) {
+    content = `${rawText}\n${attachmentLines.join('\n')}`;
+  } else if (hasText) {
+    content = rawText;
+  } else if (attachmentLines.length > 0) {
+    content = attachmentLines.join('\n');
+  }
 
-  const media: MessageMediaFields = toMessageMediaFields(description);
+  if (content.trim() === '') return null;
+
+  const firstAttachment = attachments[0];
+  const dominantType = firstAttachment ? firstAttachment.kind : event.replyTo ? 'reply' : 'text';
+
+  const remoteHolder = attachments.find((a) => a.remote?.fileUuid || a.remote?.fileId)?.remote;
+  const fileId = remoteHolder?.fileUuid ?? remoteHolder?.fileId ?? null;
+  const localPath = attachments.find((a) => a.local?.path)?.local?.path ?? null;
+  const fingerprint = attachments.find((a) => a.local?.fingerprint)?.local?.fingerprint ?? null;
+
+  const replyTo = typeof event.replyTo === 'string' && event.replyTo.trim() !== '' ? event.replyTo.trim() : null;
+  const refIdx = typeof event.refIdx === 'string' && event.refIdx.trim() !== '' ? event.refIdx.trim() : null;
+  const botUserId = (options.botId || options.botQQ || 'bot').trim() || 'bot';
+  const raw =
+    typeof event.payload === 'string'
+      ? event.payload
+      : JSON.stringify(
+          event.payload ?? {
+            msg_type: event.msgType,
+            text: content,
+            ...(attachments.length > 0 ? { attachments } : {}),
+          }
+        );
 
   return {
-    msg_id: event.msgId,
-    peer: event.peer,
-    user_id: options.botQQ,
-    sender_name: options.senderName,
-    time: event.time,
-    type: media.type,
-    content: parsed.content,
-    raw: JSON.stringify(segments),
-    file_id: media.file_id,
-    busid: media.busid,
-    local_path: media.local_path,
-    fingerprint: media.fingerprint,
+    msg_id: msgId,
+    peer,
+    user_id: botUserId,
+    sender_name: options.senderName || '',
+    time: Number.isFinite(event.time) ? event.time : Date.now(),
+    type: dominantType,
+    content,
+    raw,
+    file_id: fileId,
+    local_path: localPath,
+    fingerprint,
     recalled: 0,
     self: 1,
-    reply_to: parsed.replyId ?? null,
-    attachments: serializeAttachments(description.attachments),
+    reply_to: replyTo,
+    ref_idx: refIdx,
+    source: 'qq',
+    attachments: serializeAttachmentDescriptors(attachments),
   };
 }
 
 /**
  * 出站发送成功后的落库入口。
- * 使用 saveMessageIfNotExists 保证与可能的 `message_sent` 上报幂等。
+ * 仅写入 `messages` 表，绝不写入 `inbound_reply_slots`。
  */
 export function recordOutboundSelfMessage(
   event: OutboundSentEvent,
   deps: SelfRecordDeps
 ): MessageRecord | null {
   const record = buildSelfMessageRecord(event, {
+    botId: deps.botId,
     botQQ: deps.botQQ,
     senderName: deps.senderName,
-    getFaceByMd5: deps.getFaceByMd5,
   });
 
   if (!record) return null;
@@ -203,101 +193,12 @@ export function recordOutboundSelfMessage(
     const inserted = deps.db.saveMessageIfNotExists(record);
     if (inserted) {
       deps.logger?.debug?.(
-        `[Plugin] 出站消息已落库 (peer: ${record.peer}, msg_id: ${record.msg_id})`
+        `[Kujira] 出站消息已落库 (peer: ${record.peer}, msg_id: ${record.msg_id}${record.ref_idx ? `, ref_idx: ${record.ref_idx}` : ''})`
       );
     }
     return record;
   } catch (err) {
-    deps.logger?.warn?.('[Plugin] 出站消息落库失败:', err);
+    deps.logger?.warn?.('[Kujira] 出站消息落库失败:', err);
     return null;
-  }
-}
-
-/** 合并远端事实：只补 remote，不触碰 local / face / kind / origin。 */
-function mergeRemote(
-  existing: AttachmentDescriptor,
-  fetched: AttachmentDescriptor | undefined
-): AttachmentDescriptor {
-  if (!fetched?.remote) return existing;
-  const remote = {
-    ...(existing.remote || {}),
-    ...(fetched.remote.fileId ? { fileId: fetched.remote.fileId } : {}),
-    ...(fetched.remote.busid !== undefined ? { busid: fetched.remote.busid } : {}),
-    ...(fetched.remote.url ? { url: fetched.remote.url } : {}),
-    ...(fetched.remote.forwardId ? { forwardId: fetched.remote.forwardId } : {}),
-  };
-  return { ...existing, remote };
-}
-
-/**
- * 异步回查 get_msg 补全出站媒体元数据（file_id / busid / raw / attachments.remote）。
- *
- * - 仅对含媒体段的消息触发；
- * - 5s 超时，任何失败只记 debug；
- * - 只补 remote；local_path 仅在 payload 版本缺失时兜底；
- * - 绝不覆盖发送方旁路携带的 local / face / kind。
- */
-export async function enrichOutboundMediaRecord(
-  gateway: Pick<NapCatGatewayServer, 'getMsg'>,
-  db: SelfRecordDeps['db'],
-  record: MessageRecord,
-  logger?: SelfRecordDeps['logger']
-): Promise<void> {
-  if (!db.updateMessageMedia) return;
-
-  let payloadSegments: Array<Record<string, any>> = [];
-  try {
-    payloadSegments = normalizeOutboundSegments(JSON.parse(record.raw || '[]'));
-  } catch {
-    payloadSegments = [];
-  }
-  if (!hasOutboundMedia(payloadSegments)) return;
-
-  try {
-    const res = await gateway.getMsg(record.msg_id, 5000);
-    if (res?.status !== 'ok' && res?.retcode !== 0) return;
-
-    const fetched = (res as any)?.data;
-    const segments: Array<Record<string, any>> = Array.isArray(fetched?.message)
-      ? fetched.message.filter((s: any) => s && typeof s === 'object')
-      : [];
-    if (segments.length === 0) return;
-
-    const isGroup = record.peer.startsWith('group_') || record.peer.startsWith('qq-group-');
-    const fetchedDescription = describeMessage(segments, { origin: 'outbound', isGroup });
-    const media = toMessageMediaFields(fetchedDescription);
-
-    const patch: {
-      file_id?: string | null;
-      busid?: number | null;
-      local_path?: string | null;
-      raw?: string;
-      attachments?: string | null;
-    } = { raw: JSON.stringify(segments) };
-
-    if (media.file_id && media.file_id !== record.file_id) patch.file_id = media.file_id;
-    if (media.busid !== null && media.busid !== record.busid) patch.busid = media.busid;
-    // payload 解析出的本地路径最可靠（就是发送源文件），仅在缺失时用回查结果兜底
-    if (!record.local_path && media.local_path) patch.local_path = media.local_path;
-
-    const existingAttachments = deserializeAttachments(record.attachments);
-    const baseAttachments =
-      existingAttachments.length > 0
-        ? existingAttachments
-        : describeMessage(payloadSegments, { origin: 'outbound', isGroup }).attachments;
-
-    if (baseAttachments.length > 0) {
-      const merged = baseAttachments.map((descriptor, index) =>
-        mergeRemote(descriptor, fetchedDescription.attachments[index])
-      );
-      patch.attachments = serializeAttachments(merged);
-    }
-
-    db.updateMessageMedia(record.msg_id, patch);
-  } catch (err: any) {
-    logger?.debug?.(
-      `[Plugin] 出站媒体元数据回查失败 (msg_id: ${record.msg_id}):`,
-      err?.message || err
-    );
   }
 }

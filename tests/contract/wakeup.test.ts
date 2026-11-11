@@ -1,1285 +1,340 @@
+/**
+ * tests/contract/wakeup.test.ts
+ *
+ * 契约测试: QQ 官方 Bot v2 C2C 单聊唤醒门控与载荷解析 (Wakeup Gate Contract)
+ *
+ * 覆盖实测契约（仅依赖 Batch 1 与 Batch 2 模块）：
+ * 1. `shouldWakeup` 基于 `openidToPeer` 映射 `user_<hash16>`、`from_user` 透传 `openid`、解析 ISO-8601 时间戳；
+ * 2. 自循环防护 (`author.bot === true`)、非法 openid 拒绝、纯空消息过滤（纯空格保留唤醒）；
+ * 3. `message_scene.ext` 提取 `msg_idx=REFIDX_...` 与 `ref_msg_idx=REFIDX_.../TMP_...`；
+ * 4. 入站引用精确还原 (`message_type === 103`)：优先凭 `REFIDX_` 查本地库，未命中或遇 `TMP_` 时由 `msg_elements[]` 回退；
+ * 5. 入站卡片 (`message_type === 3` + `ark_data`) 与传统 JSON/XML 卡片解析 (`extractArkDataContent` / `extractCardContent`)；
+ * 6. 入站语音 (`voice_wav_url` + `asr_refer_text`) 与合并转发 (`message_type === 102`) 唤醒闭环。
+ */
+
 import { describe, it, expect } from 'vitest';
 import {
-  shouldWakeup,
+  extractArkDataContent,
+  extractCardContent,
+  extractMessageRefIdx,
+  extractMsgElementsText,
+  extractQuotedRefIdx,
+  isPermanentRefIdx,
   parseNormalizedContent,
-  resolveAtNicknames,
+  shouldWakeup,
 } from '../../src/gateway/wakeup.js';
-import { formatWakeupPrompt } from '../../src/gateway/session.js';
-import type { OneBotMessageEvent, OneBotNoticeEvent } from '../../src/types/index.js';
+import type { AttachmentDescriptor } from '../../src/attachment/types.js';
+import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
-describe('契约测试: 唤醒门控与唤醒包构造 (Wakeup Gate Contract)', () => {
-  const BOT_QQ = '1000000001';
-  const BOT_NICKNAME = '智能小助手';
-  const ALIASES = ['小助手', '助手酱'];
+const MOCK_OPENID = '9F8E7D6C5B4A32109F8E7D6C5B4A3210';
+const EXPECTED_PEER = openidToPeer(MOCK_OPENID);
 
-  it('契约 1: 私聊普通消息应直接触发唤醒', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 1001,
-      user_id: 2000000001,
-      time: 1788045525,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [{ type: 'text', data: { text: '你好呀' } }],
-      raw_message: '你好呀',
-    };
+function makeEvent(overrides: Partial<QQC2CMessageCreateEvent> = {}): QQC2CMessageCreateEvent {
+  return {
+    id: 'ROBOT1.0_c2c_inbound_001',
+    content: '你好呀',
+    timestamp: '2026-11-11T18:28:47+08:00',
+    author: {
+      bot: false,
+      id: '',
+      union_openid: '',
+      user_openid: MOCK_OPENID,
+      username: '',
+    },
+    message_type: 0,
+    ...overrides,
+  };
+}
 
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
+describe('契约测试: C2C 单聊基础唤醒与三索引提取', () => {
+  it('契约 1: C2C 普通文本消息直接唤醒，计算方案 A peer 并解析 ISO-8601 时间戳与 ref_idx', async () => {
+    const event = makeEvent({
+      id: 'ROBOT1.0_msg_direct_101',
+      content: '今天深圳天气如何？',
+      timestamp: '2026-11-11T18:28:47+08:00',
+      message_scene: {
+        ext: ['msg_idx=REFIDX_inbound_self_001'],
+        source: 'c2c',
+      },
     });
 
+    const decision = await shouldWakeup(event, { senderRemark: '小李' });
+
     expect(decision.wakeup).toBe(true);
+    expect(decision.trigger).toBe('direct');
     expect(decision.payload).toBeDefined();
-    expect(decision.payload?.peer).toBe('user_2000000001');
-    expect(decision.payload?.from_user).toBe('2000000001');
-    expect(decision.payload?.content).toBe('你好呀');
+    expect(decision.payload?.peer).toBe(EXPECTED_PEER);
+    expect(decision.payload?.peer.startsWith('user_')).toBe(true);
+    expect(decision.payload?.from_user).toBe(MOCK_OPENID);
+    expect(decision.payload?.from_name).toBe('小李');
+    expect(decision.payload?.msg_id).toBe('ROBOT1.0_msg_direct_101');
+    expect(decision.payload?.ref_idx).toBe('REFIDX_inbound_self_001');
+    expect(decision.payload?.content).toBe('今天深圳天气如何？');
+    expect(decision.payload?.timestamp).toBe(Date.parse('2026-11-11T18:28:47+08:00'));
   });
 
-  it('契约 2: 群聊中 @机器人 应触发唤醒 (trigger: at)', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 1002,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045737,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '张三', card: '张三群名片' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 今天天气怎么样' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}] 今天天气怎么样`,
-    };
+  it('契约 2: 自循环防护与非法 openid 拒绝唤醒', async () => {
+    const botEvent = makeEvent({
+      author: { bot: true, user_openid: MOCK_OPENID, username: 'kujira' },
+    });
+    expect((await shouldWakeup(botEvent)).wakeup).toBe(false);
 
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
+    const invalidOpenidEvent = makeEvent({
+      author: { bot: false, user_openid: 'bad openid with space', username: '' },
+    });
+    expect((await shouldWakeup(invalidOpenidEvent)).wakeup).toBe(false);
+
+    const emptyOpenidEvent = makeEvent({
+      author: { bot: false, user_openid: '', username: '' },
+    });
+    expect((await shouldWakeup(emptyOpenidEvent)).wakeup).toBe(false);
+  });
+
+  it('契约 3: 完全空内容且无附件/引用/卡片不唤醒；纯空格有效字符正常唤醒', async () => {
+    const emptyEvent = makeEvent({ content: '' });
+    const emptyDecision = await shouldWakeup(emptyEvent);
+    expect(emptyDecision.wakeup).toBe(false);
+    expect(emptyDecision.payload).toBeUndefined();
+
+    const spaceEvent = makeEvent({ content: '   ' });
+    const spaceDecision = await shouldWakeup(spaceEvent);
+    expect(spaceDecision.wakeup).toBe(true);
+    expect(spaceDecision.trigger).toBe('direct');
+    expect(spaceDecision.payload?.content).toBe('   ');
+  });
+});
+
+describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
+  it('契约 4: ref_msg_idx=REFIDX_... 命中本地数据库 → trigger=quote 且合并引用图片', async () => {
+    const event = makeEvent({
+      id: 'ROBOT1.0_quote_001',
+      content: '这张图真好看',
+      message_type: 103,
+      message_scene: {
+        ext: ['ref_msg_idx=REFIDX_target_db_001', 'msg_idx=REFIDX_quote_self_001'],
+      },
+      msg_elements: [
+        {
+          content: '[图片]',
+          message_type: 103,
+          msg_idx: 'REFIDX_target_db_001',
+        },
+      ],
     });
 
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('at');
-    expect(decision.payload?.peer).toBe('group_3000000001');
-    expect(decision.payload?.from_user).toBe('2000000001');
-  });
-
-  it('契约 3: 群聊中文本点名机器人昵称/别名应触发唤醒 (trigger: mention)', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 1003,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045750,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '李四' },
-      message: [{ type: 'text', data: { text: '小助手 在吗' } }],
-      raw_message: '小助手 在吗',
-    };
+    expect(extractMessageRefIdx(event)).toBe('REFIDX_quote_self_001');
+    expect(extractQuotedRefIdx(event)).toBe('REFIDX_target_db_001');
+    expect(isPermanentRefIdx('REFIDX_target_db_001')).toBe(true);
+    expect(isPermanentRefIdx('TMP_1234-5678')).toBe(false);
 
     const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('mention');
-    expect(decision.payload?.content).toBe('小助手 在吗');
-  });
-
-  it('契约 4: 群聊中引用回复机器人发出的消息应触发唤醒 (trigger: quote)', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 1004,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045814,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '王五' },
-      message: [
-        { type: 'reply', data: { id: 999 } },
-        { type: 'text', data: { text: '你刚才说的很有道理' } },
-      ],
-      raw_message: '[CQ:reply,id=999]你刚才说的很有道理',
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      isQuotingBot: async (replyMsgId: number) => replyMsgId === 999,
+      botName: 'Kujira助手',
+      getMessageByRefIdx: async (refIdx) => {
+        if (refIdx === 'REFIDX_target_db_001') {
+          return {
+            msg_id: 'ROBOT1.0_bot_out_888',
+            ref_idx: 'REFIDX_target_db_001',
+            user_id: 'bot',
+            sender_name: '',
+            self: 1,
+            type: 'image',
+            content: '[图片:/dsh/kujira/downloads/image/user_1/cat.png]',
+            local_path: '/dsh/kujira/downloads/image/user_1/cat.png',
+          };
+        }
+        return null;
+      },
     });
 
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('quote');
-    expect(decision.payload?.quoted).toBeDefined();
-    expect(decision.payload?.quoted?.msg_id).toBe(999);
-  });
-
-  it('契约 5: 群聊/私聊中戳一戳机器人应触发唤醒 (trigger: poke)', async () => {
-    const pokeNotice: OneBotNoticeEvent = {
-      post_type: 'notice',
-      notice_type: 'notify',
-      sub_type: 'poke',
-      time: 1788045714,
-      self_id: BOT_QQ,
-      target_id: BOT_QQ,
-      user_id: 2000000001,
-      group_id: 3000000001,
-    };
-
-    const decision = await shouldWakeup(pokeNotice, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
+    expect(decision.payload?.ref_idx).toBe('REFIDX_quote_self_001');
+    expect(decision.payload?.quoted).toEqual({
+      msg_id: 'ROBOT1.0_bot_out_888',
+      ref_idx: 'REFIDX_target_db_001',
+      user_id: 'bot',
+      from_name: 'Kujira助手',
+      text: '[图片:/dsh/kujira/downloads/image/user_1/cat.png]',
+      images: ['/dsh/kujira/downloads/image/user_1/cat.png'],
     });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('poke');
-    expect(decision.payload?.peer).toBe('group_3000000001');
-    expect(decision.payload?.from_user).toBe('2000000001');
+    expect(decision.payload?.images).toEqual(['/dsh/kujira/downloads/image/user_1/cat.png']);
   });
 
-  it('契约 6: 自循环防护 — 机器人自身发出的消息绝对不触发唤醒', async () => {
-    const selfMsgEvent: OneBotMessageEvent = {
-      post_type: 'message_sent',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 1005,
-      group_id: 3000000001,
-      user_id: BOT_QQ, // 机器人自身 QQ
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: BOT_QQ, nickname: BOT_NICKNAME },
-      message: [{ type: 'text', data: { text: '这是我发出的消息' } }],
-      raw_message: '这是我发出的消息',
-    };
-
-    const decision = await shouldWakeup(selfMsgEvent, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-    });
-
-    expect(decision.wakeup).toBe(false);
-  });
-
-  it('C3-契约 7: Spec 未列消息段类型 (share/music/location/contact/anonymous/lightapp) 保留占位不静默丢段', () => {
-    // parseNormalizedContent 真实解析含未映射段的混合消息
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 2001,
-      group_id: 3000000001,
-      user_id: '2000000001',
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: '2000000001', nickname: '测试用户' },
-      message: [
-        { type: 'text', data: { text: '看看这个' } },
-        { type: 'share', data: { title: '分享标题' } },
-        { type: 'music', data: {} },
-        { type: 'location', data: { title: '杭州' } },
-        { type: 'contact', data: {} },
-        { type: 'anonymous', data: {} },
-        { type: 'lightapp', data: { title: '小程序' } },
-      ],
-      raw_message: '',
-    };
-
-    const { content } = parseNormalizedContent(event);
-    expect(content).toContain('看看这个');
-    expect(content).toContain('[分享:分享标题]');
-    expect(content).toContain('[音乐分享]');
-    expect(content).toContain('[位置:杭州]');
-    expect(content).toContain('[联系人推荐]');
-    expect(content).toContain('[匿名消息]');
-    expect(content).toContain('[分享:小程序]');
-  });
-
-  it('EN-001-契约 8: at 段归一化输出 @昵称(QQ号)（唤醒包 content 统一昵称+QQ号格式）', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 2002,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '张三', card: '张三群名片' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'at', data: { qq: 2000000001 } },
-        { type: 'text', data: { text: ' 帮忙看看这个链接' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}][CQ:at,qq=2000000001] 帮忙看看这个链接`,
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      resolveNickname: async (_groupId, qq) => {
-        if (qq === BOT_QQ) return 'BotNickname';
-        if (qq === '2000000001') return '张三';
-        return undefined;
+  it('契约 5: ref_msg_idx 为 TMP_... 或查库未命中时，直接从 msg_elements[] 提取原文兜底', async () => {
+    let dbQueried = false;
+    const tmpEvent = makeEvent({
+      id: 'ROBOT1.0_quote_tmp_002',
+      content: '继续展开说说',
+      message_type: 103,
+      message_scene: {
+        ext: ['ref_msg_idx=TMP_8d1a9f0c-1122-3344-5566-778899aabbcc', 'msg_idx=REFIDX_self_002'],
       },
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('at');
-    expect(decision.payload?.content).toBe('@BotNickname(1000000001)@张三(2000000001) 帮忙看看这个链接');
-    // from_name 用发送者 sender 字段（card 优先）
-    expect(decision.payload?.from_name).toBe('张三群名片');
-  });
-
-  it('EN-001-契约 9: 解析器查不到昵称时回退为裸 @QQ号，不中断', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 2003,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '张三' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 你好' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}] 你好`,
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      resolveNickname: async () => undefined,
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.payload?.content).toBe(`@${BOT_QQ} 你好`);
-  });
-
-  it('EN-001-契约 10: 纯文本字面的 @昵称 保持原样（用户手敲，非 CQ:at 段）', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 2004,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '张三' },
-      message: [
-        { type: 'text', data: { text: '@BotNickname ' } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 在吗' } },
-      ],
-      raw_message: '@BotNickname [CQ:at,qq=${BOT_QQ}] 在吗',
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      resolveNickname: async () => 'BotNickname',
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.payload?.content).toBe('@BotNickname @BotNickname(1000000001) 在吗');
-  });
-
-  it('EN-001-契约 11: resolveAtNicknames 单元 — 多 at 去重、失败不抛出', async () => {
-    const resolved = await resolveAtNicknames(
-      '@123 @456 文本 @123',
-      ['123', '456', '123'],
-      3000000001,
-      async (_gid, qq) => (qq === '123' ? '猫猫' : undefined)
-    );
-    expect(resolved).toBe('@猫猫(123) @456 文本 @猫猫(123)');
-
-    // 无 resolver / 无 at / 无 groupId 时原样返回
-    expect(await resolveAtNicknames('x @123', ['123'], 1, undefined)).toBe('x @123');
-    expect(await resolveAtNicknames('x @123', [], 1, async () => 'y')).toBe('x @123');
-    expect(await resolveAtNicknames('x @123', ['123'], undefined, async () => 'y')).toBe('x @123');
-
-    // resolver 抛错时回退原样，不中断
-    expect(
-      await resolveAtNicknames('x @123', ['123'], 1, async () => {
-        throw new Error('boom');
-      })
-    ).toBe('x @123');
-  });
-
-  it('契约 12: sticker + local_path + summary -> content 包含 local_path 且格式为 [表情包: 动画表情 路径: /...]', () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 3001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
+      msg_elements: [
         {
-          type: 'image',
-          data: {
-            file: 'f36ee0e.gif',
-            sub_type: 1,
-            summary: '[动画表情]',
-            local_path: '/dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif',
-          },
+          content: '=== 消息 1 ===\n[消息内容] 复合引用前文内容\n[消息类型] 引用消息',
+          message_type: 103,
         },
       ],
-      raw_message: '',
-    };
-
-    const { content, images } = parseNormalizedContent(event);
-    expect(content).toBe('[表情包: 动画表情 路径: /dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif]');
-    expect(content).toContain('路径:');
-    expect(content).toContain('/dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif');
-    expect(images).toEqual(['/dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif']);
-  });
-
-  it('契约 13: sticker + local_path 无 summary -> 包含路径，格式 [表情包: 表情 路径: /...]', () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 3002,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        {
-          type: 'image',
-          data: {
-            file: 'f36ee0e.gif',
-            sub_type: 1,
-            local_path: '/dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif',
-          },
-        },
-      ],
-      raw_message: '',
-    };
-
-    const { content, images } = parseNormalizedContent(event);
-    expect(content).toBe('[表情包: 表情 路径: /dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif]');
-    expect(content).toContain('路径:');
-    expect(content).toContain('/dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif');
-    expect(images).toEqual(['/dsh/workspace/napcat_download/sticker/user_2000000001/f36ee0e.gif']);
-  });
-
-  it('契约 14: sticker 无 local_path 有 summary -> 清洗括号保持 [表情包: 动画表情] 不丢', () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 3003,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        {
-          type: 'image',
-          data: {
-            file: 'http://example.com/sticker.png',
-            sub_type: 1,
-            summary: '[动画表情]',
-          },
-        },
-      ],
-      raw_message: '',
-    };
-
-    const { content, images } = parseNormalizedContent(event);
-    expect(content).toBe('[表情包: 动画表情]');
-    expect(images).toEqual(['http://example.com/sticker.png']);
-  });
-
-  it('契约 15: 普通 image 保持 [图片:/path] 格式不回归', () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 3004,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        {
-          type: 'image',
-          data: {
-            file: 'photo.jpg',
-            local_path: '/dsh/workspace/napcat_download/image/common/photo.jpg',
-          },
-        },
-      ],
-      raw_message: '',
-    };
-
-    const { content, images } = parseNormalizedContent(event);
-    expect(content).toBe('[图片:/dsh/workspace/napcat_download/image/common/photo.jpg]');
-    expect(images).toEqual(['/dsh/workspace/napcat_download/image/common/photo.jpg']);
-  });
-
-  it('契约 16: formatWakeupPrompt 群聊消息应包含 [QQ群聊: <群号>] [YYYY-MM-DD HH:mm:ss] 发送者信息', () => {
-    // 2026-08-31 04:00:56 本地时间测试时间戳: 构造固定时间以验证格式
-    const fixedDate = new Date(2026, 7, 31, 4, 0, 56);
-    const ts = fixedDate.getTime();
-
-    const prompt = formatWakeupPrompt({
-      trigger: 'at',
-      peer: 'group_3000000001',
-      from_user: '2000000001',
-      from_name: '张三',
-      content: '今天天气怎么样',
-      timestamp: ts,
     });
 
-    expect(prompt).toBe(
-      '[QQ群聊: 3000000001] [2026-08-31 04:00:56] [张三 (QQ: 2000000001)]: 今天天气怎么样'
-    );
-  });
-
-  it('契约 17: formatWakeupPrompt 私聊消息应包含 [QQ私聊] [YYYY-MM-DD HH:mm:ss] 发送者信息', () => {
-    const fixedDate = new Date(2026, 7, 31, 4, 0, 56);
-    const ts = fixedDate.getTime();
-
-    const prompt = formatWakeupPrompt({
-      trigger: 'at',
-      peer: 'user_2000000001',
-      from_user: '2000000001',
-      from_name: '李四',
-      content: '你好呀',
-      timestamp: ts,
-    });
-
-    expect(prompt).toBe(
-      '[QQ私聊] [2026-08-31 04:00:56] [李四 (QQ: 2000000001)]: 你好呀'
-    );
-  });
-
-  it('契约 18: formatWakeupPrompt 戳一戳通知应包含 [YYYY-MM-DD HH:mm:ss] 时间戳', () => {
-    const fixedDate = new Date(2026, 7, 31, 4, 0, 56);
-    const ts = fixedDate.getTime();
-
-    const groupPoke = formatWakeupPrompt({
-      trigger: 'poke',
-      peer: 'group_3000000001',
-      from_user: '2000000001',
-      from_name: '王五',
-      content: '[戳一戳]',
-      timestamp: ts,
-    });
-    expect(groupPoke).toBe(
-      '[QQ群聊: 3000000001] [2026-08-31 04:00:56] 用户 [王五 (QQ: 2000000001)] 戳了戳你。'
-    );
-
-    const privatePoke = formatWakeupPrompt({
-      trigger: 'poke',
-      peer: 'user_2000000001',
-      from_user: '2000000001',
-      from_name: '王五',
-      content: '[戳一戳]',
-      timestamp: ts,
-    });
-    expect(privatePoke).toBe(
-      '[QQ私聊] [2026-08-31 04:00:56] 用户 [王五 (QQ: 2000000001)] 戳了戳你。'
-    );
-  });
-
-  it('契约 19: formatWakeupPrompt 引用回复消息带时间戳与引用元数据', () => {
-    const fixedDate = new Date(2026, 7, 31, 4, 0, 56);
-    const ts = fixedDate.getTime();
-
-    const prompt = formatWakeupPrompt({
-      trigger: 'quote',
-      peer: 'group_3000000001',
-      from_user: '2000000001',
-      from_name: '张三',
-      quoted: {
-        msg_id: 888,
-        user_id: '1000000001',
-        from_name: '智能小助手',
-        text: '这是之前的一条回复',
-      },
-      content: '对这条回复有疑问',
-      timestamp: ts,
-    });
-
-    expect(prompt).toBe(
-      '[QQ群聊: 3000000001] [2026-08-31 04:00:56] [张三 (QQ: 2000000001)]：[引用回复 智能小助手 (QQ: 1000000001): "这是之前的一条回复"] 对这条回复有疑问'
-    );
-  });
-
-  it('契约 20: 群聊戳一戳应通过 resolveNickname 异步解析戳人者群名片/昵称并填入 payload.from_name', async () => {
-    const pokeNotice: OneBotNoticeEvent = {
-      post_type: 'notice',
-      notice_type: 'notify',
-      sub_type: 'poke',
-      time: 1788045714,
-      self_id: BOT_QQ,
-      target_id: BOT_QQ,
-      user_id: 2000000001,
-      group_id: 3000000001,
-    };
-
-    const decision = await shouldWakeup(pokeNotice, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      resolveNickname: async (gid, qq) => {
-        if (String(gid) === '3000000001' && String(qq) === '2000000001') {
-          return '群管张三';
-        }
-        return undefined;
-      },
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('poke');
-    expect(decision.payload?.peer).toBe('group_3000000001');
-    expect(decision.payload?.from_user).toBe('2000000001');
-    expect(decision.payload?.from_name).toBe('群管张三');
-  });
-
-  it('契约 21: 群聊消息当 sender.card 与 sender.nickname 为空时，应通过 resolveNickname 兜底解析群昵称', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 2001,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045737,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 测试无昵称兜底' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}] 测试无昵称兜底`,
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      resolveNickname: async (gid, qq) => {
-        if (String(gid) === '3000000001' && String(qq) === '2000000001') {
-          return '群管张三';
-        }
-        return undefined;
-      },
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.payload?.from_name).toBe('群管张三');
-  });
-
-  it('契约 22: 完全为空的私聊消息（无字符无图片附件，如文件下载回执）在 shouldWakeup 中必须返回 wakeup: false', async () => {
-    const emptyPrivateEvent: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 4001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [],
-      raw_message: '',
-    };
-
-    const decision = await shouldWakeup(emptyPrivateEvent, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-    });
-
-    expect(decision.wakeup).toBe(false);
-    expect(decision.payload).toBeUndefined();
-  });
-
-  it('契约 23: 完全为空的群聊消息在 shouldWakeup 中必须返回 wakeup: false', async () => {
-    const emptyGroupEvent: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 4002,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [],
-      raw_message: '',
-    };
-
-    const decision = await shouldWakeup(emptyGroupEvent, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-    });
-
-    expect(decision.wakeup).toBe(false);
-    expect(decision.payload).toBeUndefined();
-  });
-
-  it('契约 24: 单纯只有空格的私聊消息含有有效字符，必须正常触发唤醒 (wakeup: true)，不可误过滤', async () => {
-    const spacePrivateEvent: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 4003,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [{ type: 'text', data: { text: '   ' } }],
-      raw_message: '   ',
-    };
-
-    const decision = await shouldWakeup(spacePrivateEvent, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.payload).toBeDefined();
-    expect(decision.payload?.content).toBe('   ');
-  });
-
-  it('契约 25: 群聊中 @机器人 并带有纯空格文本，必须正常触发唤醒 (wakeup: true)', async () => {
-    const spaceGroupEvent: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 4004,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: '  ' } },
-      ],
-      raw_message: `[CQ:at,qq=${BOT_QQ}]  `,
-    };
-
-    const decision = await shouldWakeup(spaceGroupEvent, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('at');
-  });
-
-  it('契约 26: 群聊中同时包含 @机器人 + 引用回复群友图片，必须完整携带 quoted 并将图片合并至 images', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 5001,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户C', card: '测试用户C' },
-      message: [
-        { type: 'reply', data: { id: 12345 } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 说的这个图' } },
-      ],
-      raw_message: `[CQ:reply,id=12345][CQ:at,qq=${BOT_QQ}] 说的这个图`,
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      resolveNickname: async (_gid, qq) => (qq === BOT_QQ ? 'BotNickname' : '测试用户A'),
-      getQuotedMessage: async (repId: number) => {
-        if (repId === 12345) {
-          return {
-            user_id: '1000000011',
-            sender_name: '测试用户A',
-            content: '[图片:/dsh/workspace/napcat_download/image/common/abc.jpg]',
-            images: ['/dsh/workspace/napcat_download/image/common/abc.jpg'],
-          };
-        }
+    const decision = await shouldWakeup(tmpEvent, {
+      getMessageByRefIdx: async () => {
+        dbQueried = true;
         return null;
       },
     });
 
+    // TMP_ 临时索引不查本地 SQLite，直接走 msg_elements 兜底
+    expect(dbQueried).toBe(false);
     expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('at');
-    expect(decision.payload).toBeDefined();
-    expect(decision.payload?.quoted).toBeDefined();
-    expect(decision.payload?.quoted?.msg_id).toBe(12345);
-    expect(decision.payload?.quoted?.user_id).toBe('1000000011');
-    expect(decision.payload?.quoted?.from_name).toBe('测试用户A');
-    expect(decision.payload?.quoted?.text).toBe('[图片:/dsh/workspace/napcat_download/image/common/abc.jpg]');
-    // 引用中的图片合并进入 payload.images
-    expect(decision.payload?.images).toContain('/dsh/workspace/napcat_download/image/common/abc.jpg');
+    expect(decision.trigger).toBe('quote');
+    expect(decision.payload?.quoted?.ref_idx).toBe('TMP_8d1a9f0c-1122-3344-5566-778899aabbcc');
+    expect(decision.payload?.quoted?.text).toContain('复合引用前文内容');
+
+    // REFIDX_ 存在但查库未命中时，同样回退 msg_elements
+    const missedDbEvent = makeEvent({
+      id: 'ROBOT1.0_quote_miss_003',
+      content: '补充一下',
+      message_type: 103,
+      message_scene: {
+        ext: ['ref_msg_idx=REFIDX_not_in_db_003'],
+      },
+      msg_elements: [{ content: '服务端下发的原始引用内容', message_type: 103 }],
+    });
+
+    const missedDecision = await shouldWakeup(missedDbEvent, {
+      getMessageByRefIdx: async () => null,
+    });
+    expect(missedDecision.trigger).toBe('quote');
+    expect(missedDecision.payload?.quoted?.text).toBe('服务端下发的原始引用内容');
+    expect(extractMsgElementsText(missedDbEvent)).toBe('服务端下发的原始引用内容');
   });
 
-  it('契约 27: 群聊中点名机器人别名 + 引用回复，必须完整携带 quoted', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 5002,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        { type: 'reply', data: { id: 67890 } },
-        { type: 'text', data: { text: '小助手 评价一下这个' } },
-      ],
-      raw_message: '[CQ:reply,id=67890]小助手 评价一下这个',
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      getQuotedMessage: async (repId: number) => {
-        if (repId === 67890) {
-          return {
-            user_id: '998877',
-            sender_name: '群友老王',
-            content: '我觉得这个方案不太行',
-          };
-        }
-        return null;
+  it('契约 6: 引用既未命中库又无 msg_elements 时优雅降级占位，不中断唤醒', async () => {
+    const emptyQuoteEvent = makeEvent({
+      id: 'ROBOT1.0_quote_empty_004',
+      content: '你说的是这个吗',
+      message_type: 103,
+      message_scene: {
+        ext: ['ref_msg_idx=REFIDX_expired_004'],
       },
     });
 
-    expect(decision.wakeup).toBe(true);
-    expect(decision.trigger).toBe('mention');
-    expect(decision.payload?.quoted).toBeDefined();
-    expect(decision.payload?.quoted?.msg_id).toBe(67890);
-    expect(decision.payload?.quoted?.user_id).toBe('998877');
-    expect(decision.payload?.quoted?.from_name).toBe('群友老王');
-    expect(decision.payload?.quoted?.text).toBe('我觉得这个方案不太行');
-  });
-
-  it('契约 28: 私聊中引用历史消息，必须完整携带 quoted', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: 5003,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        { type: 'reply', data: { id: 112233 } },
-        { type: 'text', data: { text: '请基于这个继续写' } },
-      ],
-      raw_message: '[CQ:reply,id=112233]请基于这个继续写',
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      getQuotedMessage: async (repId: number) => {
-        if (repId === 112233) {
-          return {
-            user_id: BOT_QQ,
-            sender_name: BOT_NICKNAME,
-            content: '第一章：开始...',
-          };
-        }
-        return null;
-      },
+    const decision = await shouldWakeup(emptyQuoteEvent, {
+      getMessageByRefIdx: async () => null,
     });
 
     expect(decision.wakeup).toBe(true);
-    expect(decision.payload?.quoted).toBeDefined();
-    expect(decision.payload?.quoted?.msg_id).toBe(112233);
-    expect(decision.payload?.quoted?.text).toBe('第一章：开始...');
-  });
-
-  it('契约 29: 引用历史消息查不到内容时，必须优雅降级为占位提示且不中断唤醒', async () => {
-    const event: OneBotMessageEvent = {
-      post_type: 'message',
-      message_type: 'group',
-      sub_type: 'normal',
-      message_id: 5004,
-      group_id: 3000000001,
-      user_id: 2000000001,
-      time: 1788045820,
-      self_id: BOT_QQ,
-      sender: { user_id: 2000000001, nickname: '测试用户' },
-      message: [
-        { type: 'reply', data: { id: 999999 } },
-        { type: 'at', data: { qq: BOT_QQ } },
-        { type: 'text', data: { text: ' 这个怎么看' } },
-      ],
-      raw_message: `[CQ:reply,id=999999][CQ:at,qq=${BOT_QQ}] 这个怎么看`,
-    };
-
-    const decision = await shouldWakeup(event, {
-      bot_qq: BOT_QQ,
-      bot_nickname: BOT_NICKNAME,
-      aliases: ALIASES,
-      getQuotedMessage: async () => null, // 模拟查不到
-    });
-
-    expect(decision.wakeup).toBe(true);
-    expect(decision.payload?.quoted).toBeDefined();
-    expect(decision.payload?.quoted?.msg_id).toBe(999999);
-    expect(decision.payload?.quoted?.text).toBe('〔历史引用消息：内容已过期或无法获取〕');
-  });
-
-  it('契约 30: formatWakeupPrompt 优雅降级引用消息格式化渲染', () => {
-    const fixedDate = new Date(2026, 7, 31, 11, 37, 55);
-    const ts = fixedDate.getTime();
-
-    const prompt = formatWakeupPrompt({
-      trigger: 'at',
-      peer: 'group_3000000001',
-      from_user: '2000000001',
-      from_name: '测试用户C',
-      quoted: {
-        msg_id: 12345,
-        user_id: '1000000011',
-        from_name: '测试用户A',
-        text: '[图片:/dsh/workspace/napcat_download/image/common/abc.jpg]',
-      },
-      content: '@BotNickname(1000000001) 说的这个图',
-      timestamp: ts,
-    });
-
-    expect(prompt).toBe(
-      '[QQ群聊: 3000000001] [2026-08-31 11:37:55] [测试用户C (QQ: 2000000001)]：' +
-      '[引用回复 测试用户A (QQ: 1000000011): "[图片:/dsh/workspace/napcat_download/image/common/abc.jpg]"] ' +
-      '@BotNickname(1000000001) 说的这个图'
-    );
-
-    const fallbackPrompt = formatWakeupPrompt({
-      trigger: 'at',
-      peer: 'group_3000000001',
-      from_user: '2000000001',
-      from_name: '测试用户C',
-      quoted: {
-        msg_id: 999999,
-        user_id: '',
-        from_name: '',
-        text: '〔历史引用消息：内容已过期或无法获取〕',
-      },
-      content: '@BotNickname(1000000001) 说的这个图',
-      timestamp: ts,
-    });
-
-    expect(fallbackPrompt).toBe(
-      '[QQ群聊: 3000000001] [2026-08-31 11:37:55] [测试用户C (QQ: 2000000001)]：' +
-      '[引用回复 消息ID: 999999: "〔历史引用消息：内容已过期或无法获取〕"] ' +
-      '@BotNickname(1000000001) 说的这个图'
-    );
-  });
-
-  describe('EN-004: 卡片消息通用内容提取器 (JSON/XML/多源卡片/封面图)', () => {
-    it('EN-004-契约 31: Bilibili 小程序卡片 (meta.detail_1: qqdocurl 优先 + title + preview 封面)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 3001,
-        group_id: 3000000001,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                app: 'com.tencent.miniapp',
-                desc: '',
-                prompt: '[QQ小程序]哔哩哔哩',
-                meta: {
-                  detail_1: {
-                    appid: '1000000005',
-                    title: '【深度学习】Transformer 从零手写实现',
-                    desc: '视频简介内容',
-                    preview: 'https://i0.hdslb.com/bfs/archive/12345.jpg',
-                    url: 'https://m.q.qq.com/a/s/xxx',
-                    qqdocurl: 'https://b23.tv/av123456',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe(
-        '[卡片消息:【深度学习】Transformer 从零手写实现](https://b23.tv/av123456) [封面:https://i0.hdslb.com/bfs/archive/12345.jpg]'
-      );
-      expect(images).toEqual(['https://i0.hdslb.com/bfs/archive/12345.jpg']);
-    });
-
-    it('EN-004-契约 32: QQ超级会员小程序卡片 (meta.miniapp: jumpUrl + title + preview 封面)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'private',
-        sub_type: 'friend',
-        message_id: 3002,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                app: 'com.tencent.miniapp',
-                prompt: '[QQ小程序]超级会员',
-                meta: {
-                  miniapp: {
-                    title: '腾讯视频 VIP 年卡 5 折特惠',
-                    desc: '限时特惠',
-                    preview: 'https://imgcache.qq.com/vip/banner.png',
-                    jumpUrl: 'https://vip.qq.com/act/xxx',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe(
-        '[卡片消息:腾讯视频 VIP 年卡 5 折特惠](https://vip.qq.com/act/xxx) [封面:https://imgcache.qq.com/vip/banner.png]'
-      );
-      expect(images).toEqual(['https://imgcache.qq.com/vip/banner.png']);
-    });
-
-    it('EN-004-契约 33: 仅 prompt 无 title 的分享卡片 (退回 prompt)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 3003,
-        group_id: 3000000001,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                app: 'com.tencent.share',
-                prompt: '[分享] bilibili',
-                meta: {
-                  detail_1: {
-                    qqdocurl: 'https://b23.tv/xxxxx',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe('[卡片消息:[分享] bilibili](https://b23.tv/xxxxx)');
-      expect(images).toEqual([]);
-    });
-
-    it('EN-004-契约 34: 无链接纯公告卡片 (仅 title 无任何 url 字段)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 3004,
-        group_id: 3000000001,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                app: 'com.tencent.card',
-                prompt: '[公告] 维护通知',
-                meta: {
-                  detail_1: {
-                    title: '系统维护通知',
-                    desc: '今晚进行例行升级维护',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe('[卡片消息:系统维护通知]');
-      expect(images).toEqual([]);
-    });
-
-    it('EN-004-契约 35: XML 音乐分享卡片解析 (<title> + picture cover + url)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 3005,
-        group_id: 3000000001,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'xml',
-            data: {
-              data: `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><msg serviceID="1" templateID="1" action="web" brief="[分享] 晴天" url="https://i.y.qq.com/v8/playsong.html?songmid=003aAPSN040BEs"><item layout="2"><picture cover="http://y.gtimg.cn/music/photo_new/xxx.jpg" /><title>晴天</title><summary>周杰伦</summary></item></msg>`,
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe(
-        '[卡片消息:晴天](https://i.y.qq.com/v8/playsong.html?songmid=003aAPSN040BEs) [封面:http://y.gtimg.cn/music/photo_new/xxx.jpg]'
-      );
-      expect(images).toEqual(['http://y.gtimg.cn/music/photo_new/xxx.jpg']);
-    });
-
-    it('EN-004-契约 36: XML 实体反转义与损坏 JSON 容错降级', () => {
-      // 1. XML 实体反转义
-      const xmlEvent: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 3006,
-        group_id: 3000000001,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'xml',
-            data: {
-              data: `<msg action="web" url="https://example.com/test?a=1&amp;b=2"><item><title>Tom &amp; Jerry &quot;Show&quot;</title><picture cover="https://example.com/img.png?x=1&amp;y=2"/></item></msg>`,
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content: xmlContent, images: xmlImages } = parseNormalizedContent(xmlEvent);
-      expect(xmlContent).toBe(
-        '[卡片消息:Tom & Jerry "Show"](https://example.com/test?a=1&b=2) [封面:https://example.com/img.png?x=1&y=2]'
-      );
-      expect(xmlImages).toEqual(['https://example.com/img.png?x=1&y=2']);
-
-      // 2. 损坏 JSON 容错
-      const corruptEvent: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 3007,
-        group_id: 3000000001,
-        user_id: 2000000001,
-        time: 1788045820,
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: 'invalid json {{{',
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content: corruptContent } = parseNormalizedContent(corruptEvent);
-      expect(corruptContent).toBe('[卡片消息:卡片消息]');
-    });
-
-    it('EN-004-契约 37: 真实私聊收到卡片消息唤醒 Prompt 组装闭环', async () => {
-      const fixedDate = new Date(2026, 8, 1, 16, 20, 0);
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'private',
-        sub_type: 'friend',
-        message_id: 3008,
-        user_id: 2000000001,
-        time: Math.floor(fixedDate.getTime() / 1000),
-        self_id: BOT_QQ,
-        sender: { user_id: 2000000001, nickname: '张三' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                app: 'com.tencent.miniapp',
-                prompt: '[QQ小程序]哔哩哔哩',
-                meta: {
-                  detail_1: {
-                    title: '【深度学习】Transformer 从零手写实现',
-                    preview: 'https://i0.hdslb.com/bfs/archive/12345.jpg',
-                    qqdocurl: 'https://b23.tv/av123456',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const decision = await shouldWakeup(event, {
-        bot_qq: BOT_QQ,
-        bot_nickname: BOT_NICKNAME,
-        aliases: ALIASES,
-      });
-
-      expect(decision.wakeup).toBe(true);
-      expect(decision.payload).toBeDefined();
-      expect(decision.payload?.images).toEqual(['https://i0.hdslb.com/bfs/archive/12345.jpg']);
-
-      const prompt = formatWakeupPrompt(decision.payload!);
-      expect(prompt).toContain(
-        '[卡片消息:【深度学习】Transformer 从零手写实现](https://b23.tv/av123456) [封面:https://i0.hdslb.com/bfs/archive/12345.jpg]'
-      );
-    });
-
-    it('EN-004-契约 38: 真实实机 B站小程序卡片 (样本 1684979878: 转义斜杠 + prompt/desc 标题提纯 + qqdocurl 直链)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 1684979878,
-        group_id: 3000000001,
-        user_id: 1000000003,
-        time: 1788246335,
-        self_id: BOT_QQ,
-        sender: { user_id: 1000000003, nickname: '在这' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                ver: '1.0.0.19',
-                prompt: '[QQ小程序]我讨厌黑色，却选择了墨岩',
-                app: 'com.tencent.miniapp_01',
-                meta: {
-                  detail_1: {
-                    appid: '1000000005',
-                    title: '哔哩哔哩',
-                    desc: '我讨厌黑色，却选择了墨岩',
-                    icon: 'https://open.gtimg.cn/open/app_icon/00/95/17/76/100951776_100_m.png?t=1787736665',
-                    preview: 'https://qq.ugcimg.cn/v1/08du1gpgshmqa998g5mlbujmlkihsgd9vu9u6p9j5bn4oidqqmvdvugn2t6ml1rtfb7sj0cgm9hj5ur7vp0oaj09op7kdinskflecr3akp7rkl4q05o5rmvabpqq7bnesngql8egougd5r0fupvhe3tl04/e9vf2tsqr6j29hl2kodb3vahlc',
-                    url: 'm.q.qq.com/a/s/3b0f15c1f5e3bb76a5439fd09397295e',
-                    qqdocurl: 'https://b23.tv/qSGBhv4?share_medium=android&share_source=qq&bbid=XXD8605D2B9502CF7816EC606686E7F683D68&ts=1788246331916',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe(
-        '[卡片消息:[QQ小程序]我讨厌黑色，却选择了墨岩](https://b23.tv/qSGBhv4?share_medium=android&share_source=qq&bbid=XXD8605D2B9502CF7816EC606686E7F683D68&ts=1788246331916) [封面:https://qq.ugcimg.cn/v1/08du1gpgshmqa998g5mlbujmlkihsgd9vu9u6p9j5bn4oidqqmvdvugn2t6ml1rtfb7sj0cgm9hj5ur7vp0oaj09op7kdinskflecr3akp7rkl4q05o5rmvabpqq7bnesngql8egougd5r0fupvhe3tl04/e9vf2tsqr6j29hl2kodb3vahlc]'
-      );
-      expect(images).toEqual([
-        'https://qq.ugcimg.cn/v1/08du1gpgshmqa998g5mlbujmlkihsgd9vu9u6p9j5bn4oidqqmvdvugn2t6ml1rtfb7sj0cgm9hj5ur7vp0oaj09op7kdinskflecr3akp7rkl4q05o5rmvabpqq7bnesngql8egougd5r0fupvhe3tl04/e9vf2tsqr6j29hl2kodb3vahlc',
-      ]);
-    });
-
-    it('EN-004-契约 39: 真实实机 QQ经典农场小程序卡片 (样本 811158342: 无 qqdocurl + 裸域名 url 自动补全 https:// 协议头)', () => {
-      const event: OneBotMessageEvent = {
-        post_type: 'message',
-        message_type: 'group',
-        sub_type: 'normal',
-        message_id: 811158342,
-        group_id: 3000000001,
-        user_id: 4000000001,
-        time: 1788204857,
-        self_id: BOT_QQ,
-        sender: { user_id: 4000000001, nickname: 'UserA' },
-        message: [
-          {
-            type: 'json',
-            data: {
-              data: JSON.stringify({
-                app: 'com.tencent.miniapp_01',
-                prompt: '[QQ小程序]免费午餐小善大爱，和农场共赴公益之约。',
-                meta: {
-                  detail_1: {
-                    appid: '1112386029',
-                    title: 'QQ经典农场',
-                    desc: '免费午餐小善大爱，和农场共赴公益之约。',
-                    preview: 'https://mmocgame.qpic.cn/wechatgame/u7rpbMopeABOSFryx0zgnDSbhc0MZswh2bXRO0TtFhQ1aaLLQky6EJUhCnqIEnU6/0',
-                    url: 'm.q.qq.com/a/s/f3d277bbdf5faf296c189faacee73717',
-                  },
-                },
-              }),
-            },
-          },
-        ],
-        raw_message: '',
-      };
-
-      const { content, images } = parseNormalizedContent(event);
-      expect(content).toBe(
-        '[卡片消息:[QQ小程序]免费午餐小善大爱，和农场共赴公益之约。](https://m.q.qq.com/a/s/f3d277bbdf5faf296c189faacee73717) [封面:https://mmocgame.qpic.cn/wechatgame/u7rpbMopeABOSFryx0zgnDSbhc0MZswh2bXRO0TtFhQ1aaLLQky6EJUhCnqIEnU6/0]'
-      );
-      expect(images).toEqual([
-        'https://mmocgame.qpic.cn/wechatgame/u7rpbMopeABOSFryx0zgnDSbhc0MZswh2bXRO0TtFhQ1aaLLQky6EJUhCnqIEnU6/0',
-      ]);
+    expect(decision.trigger).toBe('quote');
+    expect(decision.payload?.quoted).toEqual({
+      ref_idx: 'REFIDX_expired_004',
+      text: '〔历史引用消息：内容已过期或无法获取〕',
     });
   });
 });
 
+describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/转发唤醒', () => {
+  it('契约 7: message_type=3 优先解析 d.ark_data（含 fields.title / source / preview / prompt）', async () => {
+    const cardEvent = makeEvent({
+      id: 'ROBOT1.0_card_001',
+      message_type: 3,
+      content: '[卡片消息] 小程序\n摘要: [QQ小程序]测试\ntitle: 测试标题',
+      ark_data: {
+        ark_name: '小程序',
+        ark_type: 'miniapp',
+        fields: {
+          preview: 'https://qq.ugcimg.cn/v1/card_preview.png',
+          source: '哔哩哔哩',
+          source_logo: 'https://open.gtimg.cn/logo.png',
+          title: '【深度学习】Transformer 从零手写实现',
+          qqdocurl: 'https://b23.tv/av123456',
+        },
+        prompt: '[QQ小程序]哔哩哔哩',
+      },
+    });
 
+    const formatted = extractArkDataContent(cardEvent.ark_data, cardEvent.content);
+    expect(formatted).toContain('[卡片消息:【深度学习】Transformer 从零手写实现](https://b23.tv/av123456)');
+    expect(formatted).toContain('[类型:小程序]');
+    expect(formatted).toContain('[来源:哔哩哔哩]');
+    expect(formatted).toContain('[封面:https://qq.ugcimg.cn/v1/card_preview.png]');
+
+    const decision = await shouldWakeup(cardEvent);
+    expect(decision.wakeup).toBe(true);
+    expect(decision.trigger).toBe('direct');
+    expect(decision.payload?.content).toBe(formatted);
+
+    // 无 ark_data 时回退 content
+    expect(extractArkDataContent(undefined, '[卡片消息] fallback')).toBe('[卡片消息] fallback');
+
+    // 保留旧版 extractCardContent 解析兼容性
+    const legacyJsonCard = extractCardContent(
+      {
+        data: JSON.stringify({
+          prompt: '[QQ小程序]B站',
+          meta: { detail_1: { title: '视频标题', qqdocurl: 'b23.tv/abc', preview: '//qq.ugcimg.cn/a.png' } },
+        }),
+      },
+      'json'
+    );
+    expect(legacyJsonCard.link).toBe('https://b23.tv/abc');
+    expect(legacyJsonCard.cover).toBe('https://qq.ugcimg.cn/a.png');
+  });
+
+  it('契约 8: 语音附件渲染结合本地 WAV 路径与官方 asr_refer_text', async () => {
+    const event = makeEvent({
+      id: 'ROBOT1.0_voice_001',
+      content: '',
+      attachments: [
+        {
+          content_type: 'voice',
+          filename: 'voice_01.amr',
+          voice_wav_url: 'https://qqbot.ugcimg.cn/voice_01.wav',
+          asr_refer_text: '明天上午十点开会',
+        },
+      ],
+    });
+    const descriptors: AttachmentDescriptor[] = [
+      {
+        kind: 'record',
+        origin: 'inbound',
+        fileName: 'voice_01.amr',
+        remote: {
+          contentType: 'voice',
+          voiceWavUrl: 'https://qqbot.ugcimg.cn/voice_01.wav',
+          asrReferText: '明天上午十点开会',
+        },
+        local: {
+          path: '/dsh/kujira/downloads/voice/user_mock/voice_01.wav',
+          format: 'wav',
+        },
+      },
+    ];
+
+    const decision = await shouldWakeup(event, { descriptors });
+    expect(decision.wakeup).toBe(true);
+    expect(decision.payload?.content).toBe(
+      '[语音 已保存: /dsh/kujira/downloads/voice/user_mock/voice_01.wav (语音转文字: "明天上午十点开会")]'
+    );
+  });
+
+  it('契约 9: message_type=102 合并转发经 parseNormalizedContent 自动脱敏 URL 凭证', () => {
+    const forwardEvent = makeEvent({
+      id: 'ROBOT1.0_fwd_001',
+      message_type: 102,
+      content: [
+        '[群聊的聊天记录]',
+        '=== 消息 1 ===',
+        '[消息内容] 看看这张截图',
+        '[附件1] 类型:图片 文件名:shot.png 尺寸:800x600 大小:120KB URL:https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=TOP_SECRET_FORWARD_RKEY&spec=0',
+      ].join('\n'),
+    });
+
+    const sanitized = parseNormalizedContent(forwardEvent, []);
+    expect(sanitized).toContain('[消息内容] 看看这张截图');
+    expect(sanitized).toContain('[图片(链接已脱敏)]');
+    expect(sanitized).not.toContain('TOP_SECRET_FORWARD_RKEY');
+    expect(sanitized).not.toContain('https://multimedia.nt.qq.com.cn');
+  });
+});

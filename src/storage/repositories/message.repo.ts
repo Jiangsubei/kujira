@@ -1,40 +1,56 @@
 /**
- * dsh-napcat-bridge: 消息记录与群文件持久化仓库 (messages)
+ * kujira: 消息记录、被动回复槽位与富媒体上传缓存持久化仓库
+ * (messages, inbound_reply_slots, media_upload_cache)
  */
 
 import type {
   ChatMessageSummary,
+  InboundReplySlot,
+  MediaUploadCacheRecord,
   MessageRecord,
   ReadChatHistoryParams,
   ReadChatHistoryResult,
-  FaceRecord,
 } from '../../types/index.js';
 import { formatDateTime, parseTimeValue } from '../time-parser.js';
-import {
-  GROUP_FILE_DEDUPE_WINDOW_MS,
-  parseGroupFileRowInfo,
-} from '../group-file-helper.js';
 
 export class MessageRepository {
-  constructor(
-    private getDb: () => any,
-    private getFaceById?: (id: string, options?: { includeDeleted?: boolean }) => FaceRecord | null
-  ) {}
+  constructor(private getDb: () => any) {}
 
-  saveMessage(record: MessageRecord): void {
-    const db = this.getDb();
-    const stmt = db.prepare(`
-      INSERT OR REPLACE INTO messages (
-        msg_id, peer, user_id, sender_name, time, type, content, raw,
-        file_id, busid, local_path, fingerprint, recalled, self, reply_to, source, attachments
-      ) VALUES (
-        @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
-        @file_id, @busid, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
-      )
-    `);
+  private safeParseAttachmentsField(raw: unknown): string | null {
+    if (typeof raw !== 'string' || raw.trim() === '') return null;
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) || (parsed && typeof parsed === 'object') ? raw : null;
+    } catch {
+      return null;
+    }
+  }
 
-    stmt.run({
-      msg_id: record.msg_id,
+  private mapMessageRow(row: any): MessageRecord {
+    return {
+      msg_id: String(row.msg_id),
+      peer: String(row.peer),
+      user_id: String(row.user_id),
+      sender_name: String(row.sender_name ?? ''),
+      time: Number(row.time),
+      type: String(row.type),
+      content: String(row.content ?? ''),
+      raw: String(row.raw ?? ''),
+      ref_idx: row.ref_idx ?? null,
+      file_id: row.file_id ?? null,
+      local_path: row.local_path ?? null,
+      fingerprint: row.fingerprint ?? null,
+      recalled: Number(row.recalled ?? 0),
+      self: Number(row.self ?? 0),
+      reply_to: row.reply_to !== null && row.reply_to !== undefined ? String(row.reply_to) : null,
+      source: 'qq',
+      attachments: this.safeParseAttachmentsField(row.attachments),
+    };
+  }
+
+  private buildMessageBindings(record: MessageRecord): Record<string, any> {
+    return {
+      msg_id: String(record.msg_id),
       peer: record.peer,
       user_id: String(record.user_id),
       sender_name: record.sender_name || '',
@@ -42,30 +58,44 @@ export class MessageRepository {
       type: record.type,
       content: record.content,
       raw: typeof record.raw === 'string' ? record.raw : JSON.stringify(record.raw),
+      ref_idx: record.ref_idx ?? null,
       file_id: record.file_id ?? null,
-      busid: record.busid ?? null,
       local_path: record.local_path ?? null,
       fingerprint: record.fingerprint ?? null,
       recalled: record.recalled ? 1 : 0,
       self: record.self ? 1 : 0,
-      reply_to: record.reply_to ?? null,
+      reply_to: record.reply_to !== undefined && record.reply_to !== null ? String(record.reply_to) : null,
       source: record.source ?? 'qq',
       attachments: record.attachments ?? null,
-    });
+    };
+  }
+
+  saveMessage(record: MessageRecord): void {
+    const db = this.getDb();
+    const stmt = db.prepare(`
+      INSERT OR REPLACE INTO messages (
+        msg_id, peer, user_id, sender_name, time, type, content, raw,
+        ref_idx, file_id, local_path, fingerprint, recalled, self, reply_to, source, attachments
+      ) VALUES (
+        @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
+        @ref_idx, @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
+      )
+    `);
+    stmt.run(this.buildMessageBindings(record));
   }
 
   /**
    * 检查指定消息 ID 是否已存在
    */
-  hasMessage(msgId: number): boolean {
+  hasMessage(msgId: string): boolean {
+    if (!msgId) return false;
     const db = this.getDb();
-    const row = db.prepare('SELECT 1 FROM messages WHERE msg_id = ? LIMIT 1').get(msgId);
+    const row = db.prepare('SELECT 1 FROM messages WHERE msg_id = ? LIMIT 1').get(String(msgId));
     return Boolean(row);
   }
 
   /**
    * 获取指定会话 peer 在本地数据库中的最新一条消息时间戳（毫秒）
-   * 若该 peer 尚无任何历史消息，返回 null
    */
   getLatestMessageTime(peer: string): number | null {
     const db = this.getDb();
@@ -76,41 +106,20 @@ export class MessageRepository {
   }
 
   /**
-   * 离线补全安全入库：仅在消息不存在时插入，已存在时幂等忽略且绝不覆盖已有记录（保护已有 local_path 等）
-   * @returns true 表示成功插入新记录，false 表示已存在而忽略
+   * 幂等插入消息：仅在 msg_id 不存在时插入，已存在时忽略且绝不覆盖已有字段（保护已有 local_path 等）
    */
   saveMessageIfNotExists(record: MessageRecord): boolean {
     const db = this.getDb();
     const stmt = db.prepare(`
       INSERT OR IGNORE INTO messages (
         msg_id, peer, user_id, sender_name, time, type, content, raw,
-        file_id, busid, local_path, fingerprint, recalled, self, reply_to, source, attachments
+        ref_idx, file_id, local_path, fingerprint, recalled, self, reply_to, source, attachments
       ) VALUES (
         @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
-        @file_id, @busid, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
+        @ref_idx, @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @source, @attachments
       )
     `);
-
-    const result = stmt.run({
-      msg_id: record.msg_id,
-      peer: record.peer,
-      user_id: String(record.user_id),
-      sender_name: record.sender_name || '',
-      time: record.time,
-      type: record.type,
-      content: record.content,
-      raw: typeof record.raw === 'string' ? record.raw : JSON.stringify(record.raw),
-      file_id: record.file_id ?? null,
-      busid: record.busid ?? null,
-      local_path: record.local_path ?? null,
-      fingerprint: record.fingerprint ?? null,
-      recalled: record.recalled ? 1 : 0,
-      self: record.self ? 1 : 0,
-      reply_to: record.reply_to ?? null,
-      source: record.source ?? 'qq',
-      attachments: record.attachments ?? null,
-    });
-
+    const result = stmt.run(this.buildMessageBindings(record));
     return result.changes > 0;
   }
 
@@ -119,25 +128,19 @@ export class MessageRepository {
     const conditions: string[] = ['peer = ?'];
     const sqlParams: any[] = [peer];
 
-    // 1. 发送者 QQ 精确匹配 (带 trim 容错)
-    if (params.user_id !== undefined && String(params.user_id).trim() !== '') {
-      conditions.push('user_id = ?');
-      sqlParams.push(String(params.user_id).trim());
-    }
-
-    // 2. 发送者昵称/群名片模糊搜索
+    // 1. 发送者展示名模糊搜索
     if (params.sender_name !== undefined && params.sender_name.trim() !== '') {
       conditions.push('sender_name LIKE ?');
       sqlParams.push(`%${params.sender_name.trim()}%`);
     }
 
-    // 3. 消息内容关键词模糊搜索
+    // 2. 消息内容关键词模糊搜索
     if (params.keyword !== undefined && params.keyword.trim() !== '') {
       conditions.push('content LIKE ?');
       sqlParams.push(`%${params.keyword.trim()}%`);
     }
 
-    // 4. 消息类型筛选 (支持单类型或类型数组，且查询 text 时兼顾带引用的回复文本 reply)
+    // 3. 消息类型筛选 (支持单类型或类型数组，且查询 text 时兼顾带引用的回复文本 reply)
     if (params.type !== undefined) {
       if (Array.isArray(params.type)) {
         const types = params.type.filter((t) => typeof t === 'string' && t.trim() !== '');
@@ -164,7 +167,7 @@ export class MessageRepository {
       }
     }
 
-    // 5. 友好时间解析与范围筛选
+    // 4. 友好时间解析与范围筛选
     let sinceTs = parseTimeValue(params.since, false);
     const untilTs = parseTimeValue(params.until, true);
 
@@ -189,18 +192,20 @@ export class MessageRepository {
       sqlParams.push(untilTs);
     }
 
-    // 6. 附件/多媒体存在性筛选
+    // 5. 附件/多媒体存在性筛选
     if (params.has_file) {
-      conditions.push('(local_path IS NOT NULL OR file_id IS NOT NULL)');
+      conditions.push(
+        "(local_path IS NOT NULL OR file_id IS NOT NULL OR (attachments IS NOT NULL AND attachments != '' AND attachments != '[]'))"
+      );
     }
 
-    // 7. 回复链关系筛选
-    if (params.reply_to !== undefined && params.reply_to !== null) {
+    // 6. 回复链关系筛选
+    if (params.reply_to !== undefined && params.reply_to !== null && String(params.reply_to).trim() !== '') {
       conditions.push('reply_to = ?');
-      sqlParams.push(Number(params.reply_to));
+      sqlParams.push(String(params.reply_to).trim());
     }
 
-    // 8. 机器人自身消息过滤
+    // 7. 机器人自身消息过滤
     if (params.exclude_self) {
       conditions.push('self = 0');
     }
@@ -208,19 +213,10 @@ export class MessageRepository {
       conditions.push('self = 1');
     }
 
-    // 9. 消息来源筛选 (qq = 真实 QQ 消息 / agent = Agent 内部协同通讯)
-    if (params.source !== undefined) {
-      const rawSources = Array.isArray(params.source) ? params.source : [params.source];
-      const sources = rawSources.filter(
-        (s): s is 'qq' | 'agent' => s === 'qq' || s === 'agent'
-      );
-      if (sources.length === 1) {
-        conditions.push('source = ?');
-        sqlParams.push(sources[0]);
-      } else if (sources.length > 1) {
-        conditions.push(`source IN (${sources.map(() => '?').join(', ')})`);
-        sqlParams.push(...sources);
-      }
+    // 8. 消息来源筛选 (单聊仅支持 'qq')
+    if (params.source === 'qq') {
+      conditions.push('source = ?');
+      sqlParams.push('qq');
     }
 
     const whereClause = conditions.join(' AND ');
@@ -236,65 +232,27 @@ export class MessageRepository {
     const rows = db.prepare(`
       SELECT * FROM messages
       WHERE ${whereClause}
-      ORDER BY time ${order}
+      ORDER BY time ${order}, rowid ${order}
       LIMIT ? OFFSET ?
     `).all(...sqlParams, limit, offset) as any[];
 
-    const messages: ChatMessageSummary[] = rows.map((row) => {
-      let localPath = row.local_path ?? null;
-      let content = row.content;
-
-      // 针对存量或未记录 local_path 的表情包记录进行兜底补全
-      if (!localPath && content) {
-        const faceMatch = content.match(/\[表情包:\s*([^ (\]]+)/);
-        if (faceMatch && faceMatch[1]) {
-          const face = this.getFaceById ? this.getFaceById(faceMatch[1].trim()) : null;
-          if (face && face.file_path) {
-            localPath = face.file_path;
-          }
-        }
-      }
-
-      // 存量历史消息格式归一化与路径补齐：
-      // 1) 库内表情旧格式 [表情包: face_xxx (情绪: yyy)] -> 补齐 " 路径: <localPath>"
-      // 2) 普通表情旧格式 [表情包:[动画表情] 已保存: <path>] -> 清洗嵌套方括号与已保存 -> [表情包: 动画表情 路径: <path>]
-      // 3) 普通表情旧格式 [表情包:滑稽 已保存: <path>] -> [表情包: 滑稽 路径: <path>]
-      if (content && localPath && !content.includes(' 路径: ')) {
-        if (content.includes('已保存: ')) {
-          content = content.replace(
-            /\[表情包:(?:\[(.*?)\]|([^ \]]+))\s+已保存:\s*([^\]]+)\]/g,
-            (_m: string, p1?: string, p2?: string, p3?: string) => `[表情包: ${(p1 || p2 || '表情').trim()} 路径: ${(p3 || '').trim()}]`
-          );
-        } else {
-          content = content.replace(
-            /\[表情包:\s*([^\]]+?)\]/g,
-            (_m: string, inner: string) => `[表情包: ${inner.trim()} 路径: ${localPath}]`
-          );
-        }
-      } else if (content && content.includes('已保存: ')) {
-        content = content.replace(
-          /\[表情包:(?:\[(.*?)\]|([^ \]]+))\s+已保存:\s*([^\]]+)\]/g,
-          (_m: string, p1?: string, p2?: string, p3?: string) => `[表情包: ${(p1 || p2 || '表情').trim()} 路径: ${(p3 || '').trim()}]`
-        );
-      }
-
-      return {
-        msg_id: Number(row.msg_id),
-        user_id: String(row.user_id),
-        sender_name: row.sender_name,
-        time: Number(row.time),
-        formatted_time: formatDateTime(Number(row.time)),
-        type: row.type,
-        content,
-        recalled: row.recalled === 1,
-        self: row.self === 1,
-        reply_to: row.reply_to !== null && row.reply_to !== undefined ? Number(row.reply_to) : null,
-        local_path: localPath,
-        file_id: row.file_id ?? null,
-        attachments: row.attachments ?? null,
-        source: row.source === 'agent' ? 'agent' : 'qq',
-      };
-    });
+    const messages: ChatMessageSummary[] = rows.map((row) => ({
+      msg_id: String(row.msg_id),
+      user_id: String(row.user_id),
+      sender_name: String(row.sender_name ?? ''),
+      time: Number(row.time),
+      formatted_time: formatDateTime(Number(row.time)),
+      type: String(row.type),
+      content: String(row.content ?? ''),
+      recalled: row.recalled === 1,
+      self: row.self === 1,
+      reply_to: row.reply_to !== null && row.reply_to !== undefined ? String(row.reply_to) : null,
+      ref_idx: row.ref_idx ?? null,
+      local_path: row.local_path ?? null,
+      file_id: row.file_id ?? null,
+      attachments: this.safeParseAttachmentsField(row.attachments),
+      source: 'qq',
+    }));
 
     return {
       messages,
@@ -307,171 +265,81 @@ export class MessageRepository {
   }
 
   /**
-   * 查找同一次群文件上传产生的消息段兄弟记录（file_id 为 /uuid 形态）。
-   * 用于 SnowLuma 兼容垫片：notice 事件只带 32 位 hex file_id，需换回可用形态。
-   */
-  findGroupFileSibling(
-    peer: string,
-    fileName: string,
-    time: number,
-    size?: number
-  ): MessageRecord | null {
-    if (!peer || !fileName || !Number.isFinite(time)) return null;
-    const db = this.getDb();
-    const targetName = fileName.trim();
-    if (!targetName) return null;
-
-    const rows = db.prepare(`
-      SELECT * FROM messages
-      WHERE peer = ? AND type = 'group_file' AND file_id LIKE '/%'
-      ORDER BY ABS(time - ?) ASC
-      LIMIT 50
-    `).all(peer, time) as any[];
-
-    for (const row of rows) {
-      if (Math.abs(Number(row.time) - time) > GROUP_FILE_DEDUPE_WINDOW_MS) break;
-      const info = parseGroupFileRowInfo(row);
-      if (info.fileName !== targetName) continue;
-      if (size !== undefined && info.size !== undefined && info.size !== size) continue;
-      return this.getMessage(Number(row.msg_id));
-    }
-
-    return null;
-  }
-
-  /**
-   * 获取指定 peer 在过去特定时间内（默认 7 天）活跃发言的非机器人用户列表，按最后发言时间降序排列
-   */
-  getActiveUsers(peer: string, days = 7, limit = 20): Array<{ user_id: string; sender_name: string; last_active: number }> {
-    const db = this.getDb();
-    const sinceTime = Date.now() - days * 24 * 3600 * 1000;
-    const rows = db.prepare(`
-      SELECT user_id, sender_name, MAX(time) as last_active
-      FROM messages
-      WHERE peer = ? AND self = 0 AND time >= ?
-      GROUP BY user_id
-      ORDER BY last_active DESC
-      LIMIT ?
-    `).all(peer, sinceTime, limit) as any[];
-
-    return rows.map((r) => ({
-      user_id: String(r.user_id),
-      sender_name: r.sender_name ? String(r.sender_name).trim() : String(r.user_id),
-      last_active: Number(r.last_active),
-    }));
-  }
-
-  /**
-   * 检查指定 peer 在特定 msg_id 之后是否有新到达的用户图片/贴图消息 (严格限制 self = 0)
-   */
-  hasNewImageMessages(peer: string, sinceMsgId: number = 0): { hasNew: boolean; latestMsgId: number } {
-    const db = this.getDb();
-    const row = db.prepare(`
-      SELECT COUNT(*) as cnt, COALESCE(MAX(msg_id), ?) as max_id
-      FROM messages
-      WHERE peer = ? AND self = 0 AND msg_id > ? AND (
-        type IN ('image', 'sticker') OR
-        content LIKE '%[图片]%' OR
-        content LIKE '%[动画表情]%' OR
-        content LIKE '%CQ:image%' OR
-        (raw LIKE '%"type":"image"%' OR raw LIKE '%CQ:image%')
-      )
-    `).get(sinceMsgId, peer, sinceMsgId) as any;
-
-    const count = Number(row?.cnt ?? 0);
-    const latestMsgId = Number(row?.max_id ?? sinceMsgId);
-    return {
-      hasNew: count > 0,
-      latestMsgId,
-    };
-  }
-
-  /**
-   * 获取指定 peer 的最大 msg_id (用于初始化最后巡检位置)
-   */
-  getLatestMsgId(peer: string): number {
-    const db = this.getDb();
-    const row = db.prepare(`SELECT MAX(msg_id) as max_id FROM messages WHERE peer = ?`).get(peer) as any;
-    return Number(row?.max_id ?? 0);
-  }
-
-  /**
    * 标记消息已撤回。
-   * - 机器人自身消息：仅置 recalled=1，保留原文（上下文压缩后仍能回溯自己说过什么）；
-   * - 他人消息：内容替换为占位符（不保留被撤回者原文）。
+   * - 机器人自身消息：仅置 recalled=1，保留原文；
+   * - 他人消息：内容替换为占位符。
    */
-  markRecalled(msgId: number): void {
+  markRecalled(msgId: string): void {
+    if (!msgId) return;
     const db = this.getDb();
     db.prepare(
       `UPDATE messages
          SET recalled = 1,
              content = CASE WHEN self = 1 THEN content ELSE '〔已撤回〕' END
        WHERE msg_id = ?`
-    ).run(msgId);
+    ).run(String(msgId));
   }
 
-  getMessage(msgId: number): MessageRecord | null {
+  getMessage(msgId: string): MessageRecord | null {
+    if (!msgId) return null;
     const db = this.getDb();
-    const row = db.prepare(`SELECT * FROM messages WHERE msg_id = ?`).get(msgId) as any;
-    if (!row) return null;
+    const row = db.prepare(`SELECT * FROM messages WHERE msg_id = ?`).get(String(msgId)) as any;
+    return row ? this.mapMessageRow(row) : null;
+  }
 
-    return {
-      msg_id: Number(row.msg_id),
-      peer: row.peer,
-      user_id: String(row.user_id),
-      sender_name: row.sender_name,
-      time: Number(row.time),
-      type: row.type,
-      content: row.content,
-      raw: row.raw,
-      file_id: row.file_id ?? null,
-      busid: row.busid !== null && row.busid !== undefined ? Number(row.busid) : null,
-      local_path: row.local_path ?? null,
-      fingerprint: row.fingerprint ?? null,
-      recalled: Number(row.recalled),
-      self: Number(row.self),
-      reply_to: row.reply_to !== null && row.reply_to !== undefined ? Number(row.reply_to) : null,
-      attachments: row.attachments ?? null,
-    };
+  getMessageByRefIdx(refIdx: string): MessageRecord | null {
+    const trimmed = typeof refIdx === 'string' ? refIdx.trim() : '';
+    if (!trimmed) return null;
+    const db = this.getDb();
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE ref_idx = ? ORDER BY time DESC, rowid DESC LIMIT 1`)
+      .get(trimmed) as any;
+    return row ? this.mapMessageRow(row) : null;
   }
 
   getByFileId(fileId: string): MessageRecord | null {
+    if (!fileId) return null;
     const db = this.getDb();
     const row = db.prepare(`SELECT * FROM messages WHERE file_id = ? LIMIT 1`).get(fileId) as any;
-    if (!row) return null;
-    return this.getMessage(row.msg_id);
+    return row ? this.mapMessageRow(row) : null;
   }
 
   getByFingerprint(fingerprint: string): MessageRecord | null {
+    if (!fingerprint) return null;
     const db = this.getDb();
     const row = db.prepare(`SELECT * FROM messages WHERE fingerprint = ? LIMIT 1`).get(fingerprint) as any;
-    if (!row) return null;
-    return this.getMessage(row.msg_id);
+    return row ? this.mapMessageRow(row) : null;
   }
 
-  updateLocalPath(msgId: number, localPath: string, fingerprint?: string | null): void {
+  updateLocalPath(msgId: string, localPath: string, fingerprint?: string | null): void {
+    if (!msgId) return;
     const db = this.getDb();
     if (fingerprint !== undefined) {
-      db.prepare(`UPDATE messages SET local_path = ?, fingerprint = ? WHERE msg_id = ?`).run(localPath, fingerprint, msgId);
+      db.prepare(`UPDATE messages SET local_path = ?, fingerprint = ? WHERE msg_id = ?`).run(
+        localPath,
+        fingerprint,
+        String(msgId)
+      );
     } else {
-      db.prepare(`UPDATE messages SET local_path = ? WHERE msg_id = ?`).run(localPath, msgId);
+      db.prepare(`UPDATE messages SET local_path = ? WHERE msg_id = ?`).run(localPath, String(msgId));
     }
   }
 
   /**
-   * 出站媒体元数据补全：仅更新传入的字段（file_id / busid / local_path / raw / attachments），
-   * 绝不覆盖未传入的已有值，保证 get_msg 回填失败时 payload 版本仍然可用。
+   * 出站媒体元数据补全：仅更新传入的字段（file_id / local_path / raw / attachments / ref_idx），
+   * 绝不覆盖未传入的已有值。
    */
   updateMessageMedia(
-    msgId: number,
+    msgId: string,
     patch: {
       file_id?: string | null;
-      busid?: number | null;
       local_path?: string | null;
       raw?: string;
       attachments?: string | null;
+      ref_idx?: string | null;
     }
   ): void {
+    if (!msgId) return;
     const db = this.getDb();
     const sets: string[] = [];
     const values: any[] = [];
@@ -479,10 +347,6 @@ export class MessageRepository {
     if (patch.file_id !== undefined) {
       sets.push('file_id = ?');
       values.push(patch.file_id ?? null);
-    }
-    if (patch.busid !== undefined) {
-      sets.push('busid = ?');
-      values.push(patch.busid ?? null);
     }
     if (patch.local_path !== undefined) {
       sets.push('local_path = ?');
@@ -496,23 +360,237 @@ export class MessageRepository {
       sets.push('attachments = ?');
       values.push(patch.attachments ?? null);
     }
+    if (patch.ref_idx !== undefined) {
+      sets.push('ref_idx = ?');
+      values.push(patch.ref_idx ?? null);
+    }
     if (sets.length === 0) return;
 
-    values.push(msgId);
+    values.push(String(msgId));
     db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE msg_id = ?`).run(...values);
   }
 
   updateLocalPathByFileId(fileId: string, localPath: string, fingerprint?: string | null): void {
+    if (!fileId) return;
     const db = this.getDb();
     if (fingerprint !== undefined) {
-      db.prepare(`UPDATE messages SET local_path = ?, fingerprint = ? WHERE file_id = ?`).run(localPath, fingerprint, fileId);
+      db.prepare(`UPDATE messages SET local_path = ?, fingerprint = ? WHERE file_id = ?`).run(
+        localPath,
+        fingerprint,
+        fileId
+      );
     } else {
       db.prepare(`UPDATE messages SET local_path = ? WHERE file_id = ?`).run(localPath, fileId);
     }
   }
 
   clearLocalPath(localPath: string): void {
+    if (!localPath) return;
     const db = this.getDb();
     db.prepare(`UPDATE messages SET local_path = NULL WHERE local_path = ?`).run(localPath);
+  }
+
+  // ==================== 入站被动回复槽位与 msg_seq 持久化 ====================
+
+  /**
+   * 登记入站被动回复锚点（仅来自 C2C_MESSAGE_CREATE d.id）。
+   * 若已存在则仅刷新 received_at 与 updated_at，绝不回退 last_seq。
+   */
+  recordInboundReplySlot(msgId: string, peer: string, openid: string, receivedAt?: number): void {
+    const cleanMsgId = String(msgId || '').trim();
+    const cleanPeer = String(peer || '').trim();
+    const cleanOpenid = String(openid || '').trim();
+    if (!cleanMsgId || !cleanPeer || !cleanOpenid) {
+      throw new Error('[MessageRepository] recordInboundReplySlot requires non-empty msgId, peer, and openid');
+    }
+
+    const db = this.getDb();
+    const now = Date.now();
+    const ts = typeof receivedAt === 'number' && Number.isFinite(receivedAt) ? receivedAt : now;
+
+    db.prepare(`
+      INSERT INTO inbound_reply_slots (
+        msg_id, peer, openid, last_seq, received_at, invalidated, updated_at
+      ) VALUES (?, ?, ?, 0, ?, 0, ?)
+      ON CONFLICT(msg_id) DO UPDATE SET
+        peer = excluded.peer,
+        openid = excluded.openid,
+        received_at = excluded.received_at,
+        updated_at = excluded.updated_at
+    `).run(cleanMsgId, cleanPeer, cleanOpenid, ts, now);
+  }
+
+  /**
+   * 事务内原子递增并持久化 msg_seq。
+   * 遇未登记 ID 且未提供 seed 时直接抛错，严防误将出站 body.id 当作被动锚点。
+   */
+  allocateNextMsgSeq(msgId: string, seed?: { peer: string; openid: string }): number {
+    const cleanMsgId = String(msgId || '').trim();
+    if (!cleanMsgId) {
+      throw new Error('[MessageRepository] allocateNextMsgSeq requires non-empty msgId');
+    }
+
+    const db = this.getDb();
+    const run = db.transaction((): number => {
+      const now = Date.now();
+      const row = db
+        .prepare('SELECT last_seq FROM inbound_reply_slots WHERE msg_id = ?')
+        .get(cleanMsgId) as { last_seq: number } | undefined;
+
+      if (!row) {
+        const cleanPeer = seed?.peer ? String(seed.peer).trim() : '';
+        const cleanOpenid = seed?.openid ? String(seed.openid).trim() : '';
+        if (!cleanPeer || !cleanOpenid) {
+          throw new Error(
+            `[MessageRepository] Unregistered inbound msg_id "${cleanMsgId}": refusing to allocate msg_seq without seed`
+          );
+        }
+        db.prepare(`
+          INSERT INTO inbound_reply_slots (
+            msg_id, peer, openid, last_seq, received_at, invalidated, updated_at
+          ) VALUES (?, ?, ?, 1, ?, 0, ?)
+        `).run(cleanMsgId, cleanPeer, cleanOpenid, now, now);
+        return 1;
+      }
+
+      const nextSeq = Number(row.last_seq ?? 0) + 1;
+      db.prepare('UPDATE inbound_reply_slots SET last_seq = ?, updated_at = ? WHERE msg_id = ?').run(
+        nextSeq,
+        now,
+        cleanMsgId
+      );
+      return nextSeq;
+    });
+
+    return run();
+  }
+
+  /**
+   * 40054005 跨天去重残留重试跳槽持久化：将槽位推进至至少 minNextSeq 并返回新分配的 msg_seq。
+   */
+  advanceMsgSeq(msgId: string, minNextSeq: number): number {
+    const cleanMsgId = String(msgId || '').trim();
+    if (!cleanMsgId) {
+      throw new Error('[MessageRepository] advanceMsgSeq requires non-empty msgId');
+    }
+
+    const db = this.getDb();
+    const run = db.transaction((): number => {
+      const row = db
+        .prepare('SELECT last_seq FROM inbound_reply_slots WHERE msg_id = ?')
+        .get(cleanMsgId) as { last_seq: number } | undefined;
+
+      if (!row) {
+        throw new Error(`[MessageRepository] Unregistered inbound msg_id "${cleanMsgId}": cannot advance msg_seq`);
+      }
+
+      const floorMin = Number.isFinite(minNextSeq) ? Math.max(1, Math.floor(minNextSeq)) : 1;
+      const nextSeq = Math.max(Number(row.last_seq ?? 0) + 1, floorMin);
+      db.prepare('UPDATE inbound_reply_slots SET last_seq = ?, updated_at = ? WHERE msg_id = ?').run(
+        nextSeq,
+        Date.now(),
+        cleanMsgId
+      );
+      return nextSeq;
+    });
+
+    return run();
+  }
+
+  /**
+   * 标记指定入站锚点已失效（如平台返回窗口超限或无效锚点错误）
+   */
+  markInboundSlotInvalidated(msgId: string): void {
+    const cleanMsgId = typeof msgId === 'string' ? msgId.trim() : '';
+    if (!cleanMsgId) return;
+    const db = this.getDb();
+    db.prepare('UPDATE inbound_reply_slots SET invalidated = 1, updated_at = ? WHERE msg_id = ?').run(
+      Date.now(),
+      cleanMsgId
+    );
+  }
+
+  /**
+   * 获取指定 peer 最近一条仍有效的入站被动回复槽位
+   */
+  getLatestValidInboundSlot(peer: string): InboundReplySlot | null {
+    const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
+    if (!cleanPeer) return null;
+    const db = this.getDb();
+    const row = db
+      .prepare(`
+        SELECT msg_id, peer, openid, last_seq, received_at, invalidated, updated_at
+        FROM inbound_reply_slots
+        WHERE peer = ? AND invalidated = 0
+        ORDER BY received_at DESC, updated_at DESC, rowid DESC
+        LIMIT 1
+      `)
+      .get(cleanPeer) as any;
+
+    if (!row) return null;
+    return {
+      msg_id: String(row.msg_id),
+      peer: String(row.peer),
+      openid: String(row.openid),
+      last_seq: Number(row.last_seq ?? 0),
+      received_at: Number(row.received_at),
+      invalidated: Number(row.invalidated ?? 0),
+      updated_at: Number(row.updated_at),
+    };
+  }
+
+  // ==================== 富媒体四步上传 file_info 缓存 ====================
+
+  getCachedMediaUpload(
+    openid: string,
+    md5: string,
+    fileType: number,
+    now: number = Date.now()
+  ): MediaUploadCacheRecord | null {
+    const cleanOpenid = typeof openid === 'string' ? openid.trim() : '';
+    const cleanMd5 = typeof md5 === 'string' ? md5.trim() : '';
+    if (!cleanOpenid || !cleanMd5 || !Number.isFinite(fileType)) {
+      return null;
+    }
+
+    const db = this.getDb();
+    const currentTs = Number.isFinite(now) ? now : Date.now();
+    const row = db
+      .prepare(`
+        SELECT openid, md5, file_type, file_info, file_uuid, expires_at
+        FROM media_upload_cache
+        WHERE openid = ? AND md5 = ? AND file_type = ? AND expires_at > ?
+        LIMIT 1
+      `)
+      .get(cleanOpenid, cleanMd5, fileType, currentTs) as any;
+
+    if (!row) return null;
+
+    return {
+      openid: String(row.openid),
+      md5: String(row.md5),
+      file_type: Number(row.file_type),
+      file_info: String(row.file_info),
+      ...(row.file_uuid ? { file_uuid: String(row.file_uuid) } : {}),
+      expires_at: Number(row.expires_at),
+    };
+  }
+
+  saveCachedMediaUpload(record: MediaUploadCacheRecord): void {
+    const db = this.getDb();
+    db.prepare(`
+      INSERT OR REPLACE INTO media_upload_cache (
+        openid, md5, file_type, file_info, file_uuid, expires_at
+      ) VALUES (
+        @openid, @md5, @file_type, @file_info, @file_uuid, @expires_at
+      )
+    `).run({
+      openid: String(record.openid).trim(),
+      md5: String(record.md5).trim(),
+      file_type: record.file_type,
+      file_info: record.file_info,
+      file_uuid: record.file_uuid ?? null,
+      expires_at: record.expires_at,
+    });
   }
 }

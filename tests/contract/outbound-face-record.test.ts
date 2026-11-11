@@ -1,299 +1,315 @@
 /**
  * tests/contract/outbound-face-record.test.ts
  *
- * 契约测试: 出站表情/附件自记录消费统一描述符
- *
- * 背景:
- * send_face 只给 NapCat 发 file:/// URI + sub_type，不带 face 元信息；
- * 历史渲染只能得到 [表情包:file:///...]，且 get_msg 回查会用远端名覆盖本地事实。
+ * 契约测试: 出站表情/富媒体自记录消费统一描述符与四步分片上传闭环
  *
  * 覆盖规范:
- * 1. sendFace 发送时旁路携带描述符（face.id / face.mood / local path），不塞进消息段；
- * 2. 真实 WS + SQLite 闭环：self=1 记录 content 为 [表情包: face_x (情绪: y)]，attachments 落库；
- * 3. get_msg 回查只补 remote（file_id/url/busid），绝不覆盖 local / face / kind。
+ * 1. 无 OneBot 段与 get_msg 回查，直接消费旁路 `AttachmentDescriptor[]` 落库；
+ * 2. 四步分片上传严格遵循：1-based parts[].index 升序 + 累积 offset + 每片自身 block_size +
+ *    裸 PUT（不附鉴权头）+ upload_part_finish 上报该片真实 block_size + /files；
+ * 3. `(openid, md5, fileType)` 本地 24h `media_upload_cache` 命中复用 `file_info`，未命中绝不假设秒传；
+ * 4. 真实发送成功后立即写入 `messages`（`self=1`、`attachments` 保留 face 与本地事实），且不污染 `inbound_reply_slots`。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import WebSocket from 'ws';
+import Database from 'better-sqlite3';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import { NapCatGatewayServer, type OutboundSentEvent } from '../../src/gateway/server.js';
-import { MessageDatabase } from '../../src/storage/database.js';
-import { sendFace } from '../../src/tools/index.js';
-import {
-  buildSelfMessageRecord,
-  recordOutboundSelfMessage,
-  enrichOutboundMediaRecord,
-} from '../../src/outbound/self-record.js';
-import { buildOutboundAttachments } from '../../src/attachment/outbound.js';
-import { deserializeAttachments } from '../../src/attachment/store.js';
-import type { FaceRecord } from '../../src/types/index.js';
+import { KujiraGatewayClient } from '../../src/gateway/server.js';
+import { buildSelfMessageRecord, recordOutboundSelfMessage } from '../../src/outbound/self-record.js';
+import { OutboundStreamBridge } from '../../src/outbound/stream.js';
+import type { AttachmentDescriptor } from '../../src/attachment/types.js';
+import type { MediaUploadCacheRecord, MessageRecord } from '../../src/types/index.js';
+import { openidToPeer } from '../../src/utils/peer.js';
 
-const BOT_QQ = '1000000000';
-const FRIEND_QQ = '1000000001';
-const GROUP_ID = '8000000001';
+const BOT_ID = '1000000000';
+const TEST_OPENID = '00112233445566778899AABBCCDDEEFF';
+const TEST_PEER = openidToPeer(TEST_OPENID);
 const SENDER_NAME = '测试助手';
 
-function noopLogger(): any {
-  return { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+function pngBytes(size = 32): Buffer {
+  const header = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (size <= header.length) return header;
+  return Buffer.concat([header, Buffer.alloc(size - header.length, 5)]);
 }
 
-function pngBytes(): Buffer {
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    Buffer.alloc(24, 5),
-  ]);
-}
+function createV2MediaDb(dbPath: string) {
+  const raw = new Database(dbPath);
+  raw.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      msg_id TEXT PRIMARY KEY,
+      peer TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      sender_name TEXT NOT NULL,
+      time INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      raw TEXT NOT NULL,
+      file_id TEXT,
+      local_path TEXT,
+      fingerprint TEXT,
+      recalled INTEGER NOT NULL DEFAULT 0,
+      self INTEGER NOT NULL DEFAULT 0,
+      reply_to TEXT,
+      ref_idx TEXT,
+      source TEXT NOT NULL DEFAULT 'qq',
+      attachments TEXT
+    );
+    CREATE TABLE IF NOT EXISTS inbound_reply_slots (
+      msg_id TEXT PRIMARY KEY,
+      peer TEXT NOT NULL,
+      openid TEXT NOT NULL,
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      received_at INTEGER NOT NULL,
+      invalidated INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS media_upload_cache (
+      openid TEXT NOT NULL,
+      md5 TEXT NOT NULL,
+      file_type INTEGER NOT NULL,
+      file_info TEXT NOT NULL,
+      file_uuid TEXT,
+      expires_at INTEGER NOT NULL,
+      PRIMARY KEY (openid, md5, file_type)
+    );
+  `);
 
-function faceRecord(filePath: string, overrides: Partial<FaceRecord> = {}): FaceRecord {
-  return {
-    id: 'face_test_1',
-    file_path: filePath,
-    md5: 'abcdef0123456789abcdef0123456789',
-    added_at: 1793800000000,
-    source: 'manual',
-    tags: ['猫猫'],
-    mood: '嘲讽',
-    enabled: true,
-    size: 32,
-    format: 'png',
-    use_count: 0,
-    ...overrides,
+  const insertMsg = raw.prepare(`
+    INSERT OR IGNORE INTO messages (
+      msg_id, peer, user_id, sender_name, time, type, content, raw,
+      file_id, local_path, fingerprint, recalled, self, reply_to, ref_idx, source, attachments
+    ) VALUES (
+      @msg_id, @peer, @user_id, @sender_name, @time, @type, @content, @raw,
+      @file_id, @local_path, @fingerprint, @recalled, @self, @reply_to, @ref_idx, @source, @attachments
+    )
+  `);
+
+  const db = {
+    getOpenidByPeer: (peer: string) => (peer === TEST_PEER ? TEST_OPENID : null),
+    saveMessageIfNotExists(record: MessageRecord): boolean {
+      const res = insertMsg.run({
+        msg_id: record.msg_id,
+        peer: record.peer,
+        user_id: record.user_id,
+        sender_name: record.sender_name || '',
+        time: record.time,
+        type: record.type,
+        content: record.content,
+        raw: record.raw,
+        file_id: record.file_id ?? null,
+        local_path: record.local_path ?? null,
+        fingerprint: record.fingerprint ?? null,
+        recalled: record.recalled ? 1 : 0,
+        self: record.self ? 1 : 0,
+        reply_to: record.reply_to ?? null,
+        ref_idx: record.ref_idx ?? null,
+        source: record.source ?? 'qq',
+        attachments: record.attachments ?? null,
+      });
+      return res.changes > 0;
+    },
+    getCachedMediaUpload(openid: string, md5: string, fileType: number): MediaUploadCacheRecord | null {
+      const row = raw
+        .prepare('SELECT * FROM media_upload_cache WHERE openid = ? AND md5 = ? AND file_type = ?')
+        .get(openid, md5, fileType) as MediaUploadCacheRecord | undefined;
+      return row ?? null;
+    },
+    saveCachedMediaUpload(record: MediaUploadCacheRecord): void {
+      raw
+        .prepare(
+          `INSERT OR REPLACE INTO media_upload_cache (openid, md5, file_type, file_info, file_uuid, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(record.openid, record.md5, record.file_type, record.file_info, record.file_uuid ?? null, record.expires_at);
+    },
+    getMessage: (msgId: string) => raw.prepare('SELECT * FROM messages WHERE msg_id = ?').get(msgId) as any,
+    listInboundSlots: () => raw.prepare('SELECT * FROM inbound_reply_slots').all() as any[],
   };
+
+  return { raw, db };
 }
 
-describe('契约测试: sendFace 出站描述符旁路', () => {
-  let tmpDir: string;
-
-  beforeEach(async () => {
-    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-send-face-out-'));
-  });
-
-  afterEach(async () => {
-    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-  });
-
-  it('契约 1: 发送表情时旁路携带 face 元信息，消息段保持 NapCat 兼容形态', async () => {
-    const localPath = path.join(tmpDir, 'face.png');
-    await fsp.writeFile(localPath, pngBytes());
-    const face = faceRecord(localPath);
-
-    let capturedMessage: any;
-    let capturedAttachments: any;
-    const gateway: any = {
-      sendGroupMsg: async (_groupId: string, message: any, attachments?: any) => {
-        capturedMessage = message;
-        capturedAttachments = attachments;
-        return { status: 'ok', retcode: 0, data: { message_id: 1001 } };
-      },
-    };
-
-    const res = await sendFace(
-      { face_id: face.id },
+describe('契约测试: 出站表情包描述符自记录 (纯函数)', () => {
+  it('契约 1: 旁路携带 sticker/face 描述符时正确渲染 content 并序列化 attachments', () => {
+    const facePath = path.join('/faces', 'face_x.png');
+    const provided: AttachmentDescriptor[] = [
       {
-        db: {
-          getFaceById: () => face,
-          updateFaceFilePath: () => {},
-          recordFaceUsage: () => {},
-        } as any,
-        gateway,
-        peer: `group_${GROUP_ID}`,
-        groupId: GROUP_ID,
-        faceSubType: 1,
-      }
-    );
-
-    expect(res.success).toBe(true);
-    expect(capturedMessage).toEqual([
-      { type: 'image', data: { file: expect.stringContaining('file:///'), sub_type: 1 } },
-    ]);
-    expect(capturedAttachments).toBeDefined();
-    expect(capturedAttachments).toHaveLength(1);
-    expect(capturedAttachments[0].kind).toBe('sticker');
-    expect(capturedAttachments[0].face.id).toBe(face.id);
-    expect(capturedAttachments[0].face.mood).toBe('嘲讽');
-    expect(capturedAttachments[0].local.path).toBe(localPath);
-  });
-});
-
-describe('契约测试: 出站描述符构造与自记录', () => {
-  it('契约 2: 无旁路描述符时从消息段推导（图片 file:/// → 本地路径）', () => {
-    const attachments = buildOutboundAttachments(
-      [{ type: 'image', data: { file: 'file:///C:/tmp/a.png' } }],
-      { peer: `group_${GROUP_ID}` }
-    );
-
-    expect(attachments).toHaveLength(1);
-    expect(attachments[0].kind).toBe('image');
-    expect(attachments[0].origin).toBe('outbound');
-    expect(attachments[0].local?.path?.endsWith('a.png')).toBe(true);
-    expect(attachments[0].remote?.fileId).toBeUndefined();
-  });
-
-  it('契约 3: 有旁路描述符时自记录直接消费，不再反推 file:///', () => {
-    const attachments = buildOutboundAttachments([], { peer: `group_${GROUP_ID}` });
-    const provided = [
-      {
-        kind: 'sticker' as const,
-        origin: 'outbound' as const,
-        local: { path: path.join('/faces', 'face.png'), format: 'png' },
-        face: { id: 'face_x', mood: '开心', tags: ['猫猫'] },
+        kind: 'sticker',
+        origin: 'outbound',
+        local: { path: facePath, format: 'png', md5: 'abcdef0123456789abcdef0123456789' },
+        face: { id: 'face_x', mood: '嘲讽', tags: ['猫猫'] },
+        remote: { fileId: 'uuid_sticker_1' },
       },
     ];
-    expect(attachments).toHaveLength(0);
 
     const record = buildSelfMessageRecord(
       {
-        peer: `group_${GROUP_ID}`,
-        msgId: 42,
-        message: [{ type: 'image', data: { file: 'file:///faces/face.png', sub_type: 1 } }],
+        peer: TEST_PEER,
+        openid: TEST_OPENID,
+        msgId: 'ROBOT1.0_OUT_STICKER_1',
+        refIdx: 'REFIDX_OUT_STICKER_1',
+        msgType: 7,
         time: 1793800000000,
         attachments: provided,
       },
-      { botQQ: BOT_QQ, senderName: SENDER_NAME }
+      { botId: BOT_ID, senderName: SENDER_NAME }
     )!;
 
     expect(record.type).toBe('sticker');
-    expect(record.content).toBe('[表情包: face_x (情绪: 开心) 路径: /faces/face.png]');
-    expect(record.local_path?.endsWith('face.png')).toBe(true);
-    expect(deserializeAttachments(record.attachments)[0].face?.id).toBe('face_x');
+    expect(record.content).toBe(`[表情包: face_x (情绪: 嘲讽) 路径: ${facePath}]`);
+    expect(record.local_path).toBe(facePath);
+    expect(record.file_id).toBe('uuid_sticker_1');
+    expect(record.ref_idx).toBe('REFIDX_OUT_STICKER_1');
+    expect(JSON.parse(record.attachments!)[0].face.id).toBe('face_x');
   });
 });
 
-describe('契约测试: 出站表情真实 WS + SQLite 闭环', () => {
+describe('契约测试: 四步分片上传 + 24h 本地缓存 + 自记录落库闭环', () => {
   let tmpDir: string;
-  let db: MessageDatabase;
-  let server: NapCatGatewayServer;
-  let client: WebSocket;
-  let received: Array<Record<string, any>> = [];
-  let sentEvents: OutboundSentEvent[] = [];
+  let store: ReturnType<typeof createV2MediaDb>;
 
   beforeEach(async () => {
-    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-outbound-face-'));
-    db = new MessageDatabase(path.join(tmpDir, 'messages.sqlite'));
-    db.init();
-
-    received = [];
-    sentEvents = [];
-    server = new NapCatGatewayServer({
-      port: 0,
-      token: 'test-mock-token',
-      logger: noopLogger(),
-      onMessageSent: (event) => {
-        sentEvents.push(event);
-        const record = recordOutboundSelfMessage(event, {
-          db,
-          botQQ: BOT_QQ,
-          senderName: SENDER_NAME,
-          logger: noopLogger(),
-        });
-        if (record) {
-          void enrichOutboundMediaRecord(server, db, record, noopLogger());
-        }
-      },
-    });
-    await server.start();
-    const addr: any = (server as any).wss.address();
-    client = new WebSocket(`ws://127.0.0.1:${addr.port}?access_token=test-mock-token`);
-    await new Promise<void>((resolve, reject) => {
-      client.once('open', () => resolve());
-      client.once('error', reject);
-    });
-    client.on('message', (data) => {
-      received.push(JSON.parse(data.toString()));
-    });
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-face-record-'));
+    store = createV2MediaDb(path.join(tmpDir, 'messages.sqlite'));
   });
 
   afterEach(async () => {
-    if (client) client.terminate();
-    await server.stop().catch(() => {});
-    db.close();
+    store.raw.close();
     await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  async function respondTo(action: string, data: any): Promise<Record<string, any>> {
-    let pending: Record<string, any> | undefined;
-    for (let i = 0; i < 100 && !pending; i++) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      pending = received.find((r) => r.action === action);
-    }
-    if (!pending) throw new Error(`未收到 action: ${action}, received=${JSON.stringify(received)}`);
-    client.send(JSON.stringify({ echo: pending.echo, status: 'ok', retcode: 0, data }));
-    return pending;
-  }
+  it('契约 2: 1-based 分片乱序返回仍按 index 升序 + 累积 offset + 每片 block_size 裸 PUT，且二次发送命中 24h 本地缓存', async () => {
+    const data = pngBytes(25); // 25 字节，切分为 15B + 10B 两片
+    const localFile = path.join(tmpDir, 'face.png');
+    await fsp.writeFile(localFile, data);
 
-  it('契约 4: 真实发送成功后 content 为 face_id + 情绪，attachments 含 face 元信息', async () => {
-    const attachments = [
-      {
-        kind: 'sticker' as const,
-        origin: 'outbound' as const,
-        local: { path: path.join(tmpDir, 'face.png'), format: 'png' },
-        face: { id: 'face_x', mood: '嘲讽', tags: ['猫猫'] },
+    const calls: Array<{ url: string; method: string; headers: any; bodyLen?: number; bodyJson?: any }> = [];
+    const uploadedBytes: Buffer[] = [];
+    let msgCounter = 0;
+
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? 'GET';
+      if (url.includes('getAppAccessToken')) {
+        return new Response(JSON.stringify({ access_token: 'mock_token', expires_in: 7200 }), { status: 200 });
+      }
+      if (url.includes('cos.accelerate.myqcloud.com')) {
+        const buf = Buffer.from(init?.body as Uint8Array);
+        uploadedBytes.push(buf);
+        calls.push({ url, method, headers: init?.headers, bodyLen: buf.length });
+        // 验证裸 PUT 不含 Authorization 头
+        expect((init?.headers as any)?.Authorization).toBeUndefined();
+        return new Response('', { status: 200 });
+      }
+
+      const jsonBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, headers: init?.headers, bodyJson: jsonBody });
+
+      if (url.endsWith('/upload_prepare')) {
+        // 故意倒序返回 1-based parts (index=2 在前，index=1 在后)，验证排序与累积偏移
+        return new Response(
+          JSON.stringify({
+            upload_id: 'up_001',
+            block_size: 15,
+            parts: [
+              { index: 2, presigned_url: 'https://qqbot-file-upload-1251316161.cos.accelerate.myqcloud.com/p2?sig=secret2', block_size: '10' },
+              { index: 1, presigned_url: 'https://qqbot-file-upload-1251316161.cos.accelerate.myqcloud.com/p1?sig=secret1', block_size: '15' },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/upload_part_finish')) {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      if (url.endsWith('/files')) {
+        return new Response(
+          JSON.stringify({ file_uuid: 'uuid_up_001', file_info: 'FILE_INFO_BASE64_001', ttl: 86400 }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/messages')) {
+        msgCounter += 1;
+        return new Response(
+          JSON.stringify({
+            id: `ROBOT1.0_OUT_FACE_${msgCounter}`,
+            ext_info: { ref_idx: `REFIDX_OUT_FACE_${msgCounter}` },
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('not found', { status: 404 });
+    };
+
+    const gateway = new KujiraGatewayClient({
+      credentials: { appId: 'mock_app_id', appSecret: 'mock_app_secret' },
+      fetchFn: fetchMock,
+      onMessageSent: (event) => {
+        recordOutboundSelfMessage(event, {
+          db: store.db,
+          botId: BOT_ID,
+          senderName: SENDER_NAME,
+        });
       },
-    ];
-
-    const pending = server.sendGroupMsg(
-      GROUP_ID,
-      [{ type: 'image', data: { file: 'file:///tmp/face.png', sub_type: 1 } }],
-      attachments
-    );
-    await respondTo('send_group_msg', { message_id: 2026001 });
-    await pending;
-
-    const msg = db.getMessage(2026001)!;
-    expect(msg.type).toBe('sticker');
-    expect(msg.content).toContain('[表情包: face_x (情绪: 嘲讽) 路径:');
-    expect(msg.local_path?.endsWith('face.png')).toBe(true);
-
-    const stored = deserializeAttachments(msg.attachments);
-    expect(stored).toHaveLength(1);
-    expect(stored[0].face?.id).toBe('face_x');
-    expect(stored[0].face?.mood).toBe('嘲讽');
-
-    expect(sentEvents).toHaveLength(1);
-    expect(sentEvents[0].attachments?.[0].face?.id).toBe('face_x');
-  });
-
-  it('契约 5: get_msg 回查只补 remote，不覆盖 local / face / kind', async () => {
-    const attachments = [
-      {
-        kind: 'sticker' as const,
-        origin: 'outbound' as const,
-        local: { path: path.join(tmpDir, 'face.png'), format: 'png' },
-        face: { id: 'face_x', mood: '嘲讽' },
-      },
-    ];
-    const pending = server.sendGroupMsg(
-      GROUP_ID,
-      [{ type: 'image', data: { file: 'file:///tmp/face.png', sub_type: 1 } }],
-      attachments
-    );
-    await respondTo('send_group_msg', { message_id: 2026002 });
-    await pending;
-
-    await respondTo('get_msg', {
-      message: [
-        {
-          type: 'image',
-          data: { file: '9E64D1403F9FBA2D5F9CB90289AD23F4.jpg', url: 'https://example.com/x' },
-        },
-      ],
     });
 
-    let after = db.getMessage(2026002)!;
-    for (let i = 0; i < 100 && after.file_id === null; i++) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      after = db.getMessage(2026002)!;
-    }
+    const bridge = new OutboundStreamBridge({} as any, {
+      gateway,
+      db: store.db,
+    });
 
-    expect(after.file_id).toBe('9E64D1403F9FBA2D5F9CB90289AD23F4.jpg');
-    expect(after.local_path?.endsWith('face.png')).toBe(true);
-    expect(after.type).toBe('sticker');
-    expect(after.content).toContain('[表情包: face_x (情绪: 嘲讽) 路径:');
-    const stored = deserializeAttachments(after.attachments);
-    expect(stored[0].face?.id).toBe('face_x');
-    expect(stored[0].local?.path?.endsWith('face.png')).toBe(true);
-    expect(stored[0].remote?.fileId).toBe('9E64D1403F9FBA2D5F9CB90289AD23F4.jpg');
+    const descriptor: AttachmentDescriptor = {
+      kind: 'sticker',
+      origin: 'outbound',
+      local: { path: localFile, format: 'png' },
+      face: { id: 'face_x', mood: '嘲讽', tags: ['猫猫'] },
+    };
+
+    // 第一次发送：完整执行四步分片上传 + msg_type=7 发送
+    const res1 = await bridge.sendMediaReply(TEST_PEER, {
+      filePath: localFile,
+      fileType: 1,
+      fileName: 'face.png',
+      attachments: [descriptor],
+    });
+    expect(res1.ok).toBe(true);
+
+    // 校验分片顺序、累积切片字节与每片自身 block_size 上报
+    expect(uploadedBytes).toHaveLength(2);
+    expect(Buffer.concat(uploadedBytes).equals(data)).toBe(true);
+    expect(uploadedBytes[0].length).toBe(15);
+    expect(uploadedBytes[1].length).toBe(10);
+
+    const finishes = calls.filter((c) => c.url.endsWith('/upload_part_finish'));
+    expect(finishes).toHaveLength(2);
+    expect(finishes[0].bodyJson.part_index).toBe(1);
+    expect(finishes[0].bodyJson.block_size).toBe('15');
+    expect(finishes[1].bodyJson.part_index).toBe(2);
+    expect(finishes[1].bodyJson.block_size).toBe('10');
+
+    // 校验自记录写入 messages，且不污染 inbound_reply_slots
+    const row1 = store.db.getMessage('ROBOT1.0_OUT_FACE_1');
+    expect(row1).toBeDefined();
+    expect(row1.self).toBe(1);
+    expect(row1.type).toBe('sticker');
+    expect(row1.content).toContain('[表情包: face_x (情绪: 嘲讽)');
+    expect(row1.ref_idx).toBe('REFIDX_OUT_FACE_1');
+    expect(store.db.listInboundSlots()).toHaveLength(0);
+
+    // 第二次发送同一文件：命中 24h media_upload_cache，跳过 upload_prepare / PUT / files 直接发送 msg_type=7
+    const callCountBeforeSecond = calls.length;
+    const res2 = await bridge.sendMediaReply(TEST_PEER, {
+      filePath: localFile,
+      fileType: 1,
+      fileName: 'face.png',
+      attachments: [descriptor],
+    });
+    expect(res2.ok).toBe(true);
+    const secondCalls = calls.slice(callCountBeforeSecond);
+    expect(secondCalls).toHaveLength(1);
+    expect(secondCalls[0].url.endsWith('/messages')).toBe(true);
+    expect(secondCalls[0].bodyJson.media.file_info).toBe('FILE_INFO_BASE64_001');
   });
 });

@@ -1,57 +1,119 @@
 /**
- * 出站附件描述符构造。
+ * kujira: 出站附件描述符构造（QQ 官方 Bot API v2 合规单聊）。
  *
- * 发送路径允许通过方法可选参数旁路传入描述符（不塞进发给 NapCat 的消息段，
- * 避免依赖「NapCat 忽略未知字段」这一未证实假设）。未提供时从消息段推导。
+ * 官方单聊无 `sub_type` 与群聊维度：
+ * - 普通图片/文件/视频/语音统一经四步上传后以 `msg_type=7` 发出；
+ * - 已收藏表情包本地精准标注 `kind: 'sticker'` + `face` 元信息，无需 `subType`。
  */
 
-import { describeSegments } from './classify.js';
-import type { AttachmentDescriptor } from './types.js';
+import * as path from 'node:path';
 import type { FaceRecord } from '../types/index.js';
+import { resolveLocalMediaPath, sanitizeAttachmentFileName } from './classify.js';
+import type {
+  AttachmentDescriptor,
+  AttachmentKind,
+  AttachmentLocalMeta,
+  AttachmentRemoteMeta,
+} from './types.js';
 
-export function isGroupPeer(peer: string): boolean {
-  return peer.startsWith('group_') || peer.startsWith('qq-group-');
+export interface BuildOutboundMediaAttachmentOptions {
+  kind: 'image' | 'sticker' | 'file' | 'record' | 'video' | 'voice';
+  localPath?: string;
+  fileName?: string;
+  format?: string;
+  size?: number;
+  md5?: string;
+  fingerprint?: string;
+  fileUuid?: string;
+  fileInfo?: string;
+  fileId?: string;
+  contentType?: string;
 }
 
-/** 把出站 payload（纯文本或 OneBot 消息段数组）归一化为消息段数组。 */
-export function normalizeOutboundSegments(message: unknown): Array<Record<string, any>> {
-  if (typeof message === 'string') {
-    return message.trim() !== '' ? [{ type: 'text', data: { text: message } }] : [];
-  }
-  if (Array.isArray(message)) {
-    return message.filter(
-      (seg): seg is Record<string, any> => Boolean(seg) && typeof seg === 'object'
-    );
-  }
-  return [];
+function nonEmpty(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : trimmed;
 }
 
-/** 从出站消息段构造描述符（无旁路信息时的回退路径）。 */
-export function buildOutboundAttachments(
-  message: unknown,
-  options: { peer: string }
-): AttachmentDescriptor[] {
-  const segments = normalizeOutboundSegments(message);
-  if (segments.length === 0) return [];
-  return describeSegments(segments, {
+/** 构造出站富媒体（图片/文件/语音/视频）附件描述符，保证不含 `undefined` 键。 */
+export function buildOutboundMediaAttachment(
+  options: BuildOutboundMediaAttachmentOptions
+): AttachmentDescriptor {
+  const kind: AttachmentKind = options.kind === 'voice' ? 'record' : options.kind;
+  const resolvedPath =
+    resolveLocalMediaPath(options.localPath) ?? nonEmpty(options.localPath);
+
+  const explicitFileName = sanitizeAttachmentFileName(options.fileName);
+  const derivedFileName =
+    explicitFileName ??
+    (resolvedPath && (kind === 'file' || kind === 'video' || kind === 'record')
+      ? sanitizeAttachmentFileName(path.basename(resolvedPath))
+      : undefined);
+
+  const format = nonEmpty(options.format);
+  const md5 = nonEmpty(options.md5);
+  const fingerprint = nonEmpty(options.fingerprint);
+  const hasSize = options.size !== undefined && Number.isFinite(options.size);
+
+  const local: AttachmentLocalMeta | undefined = resolvedPath
+    ? {
+        path: resolvedPath,
+        ...(format ? { format } : {}),
+        ...(hasSize ? { size: Number(options.size) } : {}),
+        ...(md5 ? { md5 } : {}),
+        ...(fingerprint ? { fingerprint } : {}),
+      }
+    : undefined;
+
+  const fileUuid = nonEmpty(options.fileUuid);
+  const fileInfo = nonEmpty(options.fileInfo);
+  const fileId = nonEmpty(options.fileId);
+  const contentType = nonEmpty(options.contentType);
+
+  const remote: AttachmentRemoteMeta | undefined =
+    fileUuid || fileInfo || fileId || contentType
+      ? {
+          ...(fileUuid ? { fileUuid } : {}),
+          ...(fileInfo ? { fileInfo } : {}),
+          ...(fileId ? { fileId } : {}),
+          ...(contentType ? { contentType } : {}),
+        }
+      : undefined;
+
+  return {
+    kind,
     origin: 'outbound',
-    isGroup: isGroupPeer(options.peer),
-  });
+    ...(remote ? { remote } : {}),
+    ...(local ? { local } : {}),
+    ...(derivedFileName ? { fileName: derivedFileName } : {}),
+  };
 }
 
-/** 由已收藏表情构造出站描述符（face 元信息直接来自本地事实）。 */
+/** 由已收藏表情构造出站描述符（官方单聊无 `sub_type`，本地直接精准标注 `kind: 'sticker'` + `face`）。 */
 export function buildOutboundFaceAttachment(
   face: FaceRecord,
   localPath: string,
-  subType: number
+  remote?: AttachmentRemoteMeta
 ): AttachmentDescriptor {
+  const resolvedPath = resolveLocalMediaPath(localPath) ?? localPath;
   const tags = Array.isArray(face.tags) && face.tags.length > 0 ? face.tags : undefined;
 
+  const cleanRemote: AttachmentRemoteMeta | undefined = remote
+    ? {
+        ...(nonEmpty(remote.fileUuid) ? { fileUuid: nonEmpty(remote.fileUuid) } : {}),
+        ...(nonEmpty(remote.fileInfo) ? { fileInfo: nonEmpty(remote.fileInfo) } : {}),
+        ...(nonEmpty(remote.fileId) ? { fileId: nonEmpty(remote.fileId) } : {}),
+        ...(nonEmpty(remote.contentType) ? { contentType: nonEmpty(remote.contentType) } : {}),
+      }
+    : undefined;
+
   return {
-    kind: subType === 1 ? 'sticker' : 'image',
+    kind: 'sticker',
     origin: 'outbound',
+    ...(cleanRemote && Object.keys(cleanRemote).length > 0 ? { remote: cleanRemote } : {}),
     local: {
-      path: localPath,
+      path: resolvedPath,
       ...(face.format ? { format: face.format } : {}),
       ...(face.size ? { size: face.size } : {}),
       ...(face.md5 ? { md5: face.md5 } : {}),

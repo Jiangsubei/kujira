@@ -1,642 +1,452 @@
 /**
- * dsh-napcat-bridge: 入站图片/表情包解析落盘（四段式主路）
+ * kujira: 入站媒体裸 GET 下载、安全文件名净化与合并转发内嵌图片脱敏落盘
  *
- * 背景（devlog/修复方案-媒体直链失效与回退落盘_261030.md）：
- *   QQ 消息段里的 `gchat.qpic.cn/download?appid=…&fileid=…&rkey=…` 直链对第三方进程不成立，
- *   即使刚收到消息也立刻返回 `{"retcode":-5503007,"retmsg":"download url has expired"}`；
- *   而 NapCat 的 get_image / get_file 走 QQ 客户端自己的取图链路，稳定返回本机原图路径。
- *
- * 因此取图不再是「直链失败后顺手探测一下」，而是四段式主路（串行、首个成功即返回）：
- *   1. get_image({file})              → NapCat 本机路径（最可靠，优先）
- *   2. get_file({file_id})            → 同上，兼容不同 NapCat 版本
- *   3. HTTP 直链（段内 url）          → multimedia.nt.qq.com.cn / gchatpic_new 这类仍可用的 host
- *   4. get_msg({message_id}) 刷新直链 → 最后兜底，同时验证「新签发的 rkey 是否可用」
- *
- * 任一路拿到字节后一律经 MediaStorageManager 复制进我们自己的 downloads/<type>/<peer>/，
- * 绝不把 NapCat 缓存路径直接写进消息记录（QQ 清缓存/升级会让它变成死链，且绕过 TTL 与去重体系）。
+ * 严格依据 QQ 官方 Bot API v2 实测行为：
+ * 1. 入站 `event.attachments[]` 所有下载链接均自带访问凭证 query，直接裸 GET 即可（无需 Authorization 头）；
+ * 2. 所有错误、描述符 `unavailable` 与日志输出严禁携带带 query / `rkey` 凭证的完整 URL；
+ * 3. 语音附件严格以 `content_type === 'voice'` 为准（忽略响应头错报 `audio/mp3`），
+ *    优先拉取 `voice_wav_url`（`type: 'voice'`, `ext: 'wav'`），缺失/失败再回退 `url`，始终保留 `asr_refer_text`；
+ * 4. 外部传入的 `filename` 一律先做 `path.basename` 与危险字符净化后再传入存储层；
+ * 5. `message_type=102` 合并转发内嵌 `[附件...] ... URL:https://...` 限量裸 GET 落盘，并从正文彻底剥离/替换含 `rkey` 明文 URL。
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import type { OneBotActionResponse } from '../types/index.js';
-import type { MediaStorageManager, SaveResourceOptions } from '../storage/media.js';
-import { windowsPathToWsl } from '../tools/file-source.js';
+import type { QQAttachment, QQC2CMessageCreateEvent } from '../types/index.js';
+import type { AttachmentDescriptor } from '../attachment/types.js';
+import {
+  describeAttachment,
+  sanitizeAttachmentFileName,
+} from '../attachment/classify.js';
+import {
+  detectBufferExt,
+  sanitizeUrlForLog,
+  type MediaResourceType,
+  type MediaStorageManager,
+  type SaveResourceOptions,
+} from '../storage/media.js';
 
-/** 只用到的 NapCat Action 子集（便于测试注入） */
-export interface InboundImageGateway {
-  getImage?: (file: string) => Promise<OneBotActionResponse>;
-  getFile?: (fileId: string) => Promise<OneBotActionResponse>;
-  getMsg?: (messageId: number | string) => Promise<OneBotActionResponse>;
-}
+export { sanitizeUrlForLog };
 
-export interface InboundImageLogger {
+export interface InboundMediaLogger {
   info?: (...args: any[]) => void;
   warn?: (...args: any[]) => void;
   debug?: (...args: any[]) => void;
   error?: (...args: any[]) => void;
 }
 
-export interface ResolveInboundImageInput {
-  /** 落盘 peer 目录（group_<群号> / user_<QQ>） */
-  peer: string;
-  isSticker: boolean;
-  /** 段内 data.url（QQ 直链，可能对第三方不可用） */
-  url?: string;
-  /** 段内 data.file（QQ 的 MD5 伪文件名，同时是 get_image 的入参） */
-  file?: string;
-  /** 段内 data.file_id（部分版本无此字段，缺省用 data.file 代替） */
-  fileId?: string;
-  /** 段内 data.file_size（用于核对拿到的是否原图） */
-  declaredSize?: number | string;
-  /** 段内 data.local_path（NapCat 已解析到本机的路径，最优先，且不再重复问 NapCat） */
-  localPath?: string;
-  /** 段内消息 ID（get_msg 刷新直链用） */
-  msgId?: number;
-  emojiPackageId?: number | string;
-  emojiId?: string;
-  /** NapCat / NTQQ 数据存储根目录 (同机部署直读缓存) */
-  dataDir?: string;
-  /** Bot 自身 QQ 号 (用于精准匹配 NTQQ 目录) */
-  botQQ?: string;
-  gateway?: InboundImageGateway | null;
-  mediaManager: MediaStorageManager;
-  logger?: InboundImageLogger;
-}
-
-export type InboundImageVia = 'cache' | 'nt_cache' | 'segment_local_path' | 'get_image' | 'get_file' | 'url' | 'get_msg_url';
-
-export interface InboundImageAttempt {
-  via: InboundImageVia;
-  ok: boolean;
-  error?: string;
-}
-
-export interface InboundImageResult {
-  ok: boolean;
+export interface EmbeddedForwardImageEntry {
+  /** 脱敏后的 URL（已剥离 query 与 fragment 凭证） */
+  sanitizedUrl: string;
+  attachmentType?: string;
+  fileName?: string;
   localPath?: string;
   fingerprint?: string;
   md5?: string;
-  via?: InboundImageVia;
-  /** 本地字节数与消息段声明 file_size 不一致（疑似缩略图），仅告警不改选路 */
-  sizeMismatch?: boolean;
-  attempts: InboundImageAttempt[];
+  downloaded: boolean;
   error?: string;
 }
 
-/** 从 url 里猜扩展名（仅作魔数无法识别时的兜底提示） */
-function inferUrlExt(str?: string): string | undefined {
-  if (!str || typeof str !== 'string') return undefined;
-  const clean = str.split('?')[0].split('#')[0];
-  const match = /\.([a-zA-Z0-9]+)$/.exec(clean);
-  return match ? match[1].toLowerCase() : undefined;
+export interface ResolveEmbeddedForwardImagesResult {
+  /** 已将正文内所有含凭证 URL 替换为 `[图片:<local_path>]` 或 `[图片(链接已脱敏)]` 后的安全文本 */
+  sanitizedContent: string;
+  /** 原始 URL → 替换文本映射 */
+  replacements: Map<string, string>;
+  /** 成功落盘的本地图片路径列表（去重，保持出现顺序） */
+  localPaths: string[];
+  /** 每个内嵌附件的脱敏处理明细 */
+  entries: EmbeddedForwardImageEntry[];
+}
+
+const DEFAULT_FORWARD_IMAGE_LIMIT = 10;
+
+function nonEmpty(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : trimmed;
 }
 
 function isHttpUrl(value: unknown): value is string {
   return typeof value === 'string' && /^https?:\/\//i.test(value.trim());
 }
 
-let learnedNtqqDir: string | null = null;
-
-export function setLearnedNtqqDir(dir: string | null): void {
-  learnedNtqqDir = dir;
+/** 对异常信息执行 URL 凭证与敏感参数脱敏，严禁泄露 rkey/token/sig。 */
+export function sanitizeErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '未知错误');
+  const cleaned = raw
+    .replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => sanitizeUrlForLog(match))
+    .replace(/([?&](?:rkey|auth_token|token|sig|sign|key)=)[^&\s"'<>)\]]+/gi, '$1***');
+  return cleaned.slice(0, 200);
 }
 
-export function getLearnedNtqqDir(): string | null {
-  return learnedNtqqDir;
+/** 净化外部传入文件名（防止路径穿越与非法字符）。 */
+export function sanitizeInboundFilename(rawName?: unknown): string | undefined {
+  return sanitizeAttachmentFileName(rawName);
 }
 
-export function extractNtqqRoot(p: string): string | null {
-  if (!p || typeof p !== 'string') return null;
-  const normalized = path.normalize(p);
-  const sep = path.sep;
-  const idx = normalized.toLowerCase().indexOf(`${sep}nt_qq`);
-  if (idx !== -1) {
-    const root = normalized.slice(0, idx);
-    const parent = path.dirname(root);
-    if (/^\d+$/.test(path.basename(root))) {
-      return parent;
-    }
-    return root;
-  }
-  return null;
+function inferExtFromFilename(name?: string): string | undefined {
+  if (!name) return undefined;
+  const ext = path.extname(name).replace(/^\./, '').toLowerCase();
+  return ext || undefined;
 }
 
-export function learnNtqqDirFromPath(filePath: string): void {
-  const root = extractNtqqRoot(filePath);
-  if (root) {
-    try {
-      if (fs.existsSync(root)) {
-        learnedNtqqDir = root;
-      }
-    } catch {}
-  }
+function inferExtFromUrl(rawUrl?: string): string | undefined {
+  if (!rawUrl) return undefined;
+  const clean = sanitizeUrlForLog(rawUrl);
+  const match = /\.([a-zA-Z0-9]+)$/.exec(clean);
+  return match ? match[1]!.toLowerCase() : undefined;
 }
 
-export function detectNtqqUserDataDir(configuredDir?: string): string | null {
-  if (configuredDir && typeof configuredDir === 'string' && configuredDir.trim()) {
-    const trimmed = path.normalize(configuredDir.trim());
-    try {
-      if (fs.existsSync(trimmed)) return trimmed;
-    } catch {}
-  }
-
-  if (learnedNtqqDir) {
-    try {
-      if (fs.existsSync(learnedNtqqDir)) return learnedNtqqDir;
-    } catch {}
-  }
-
-  if (process.env.NAPCAT_QQ_DATA_DIR) {
-    const envDir = path.normalize(process.env.NAPCAT_QQ_DATA_DIR.trim());
-    try {
-      if (fs.existsSync(envDir)) return envDir;
-    } catch {}
-  }
-
-  // 在测试环境下（VITEST 存在）默认不扫描宿主机系统私有目录，保障单测环境纯净与可重现；
-  // 生产环境或显式指定 NAPCAT_PROBE_SYSTEM 时探测系统全局配置。
-  const allowSystemProbe = !process.env.VITEST || process.env.NAPCAT_PROBE_SYSTEM === 'true';
-  if (!allowSystemProbe) {
-    return null;
-  }
-
-  if (process.platform === 'win32') {
-    const iniPath = 'C:\\Users\\Public\\Documents\\Tencent\\QQ\\UserDataInfo.ini';
-    try {
-      if (fs.existsSync(iniPath)) {
-        const content = fs.readFileSync(iniPath, 'utf8');
-        const match = /UserDataSavePath=(.+)/i.exec(content);
-        if (match && match[1]) {
-          const p = path.normalize(match[1].trim());
-          if (fs.existsSync(p)) return p;
-        }
-      }
-    } catch {}
-
-    const defaultWinDocs = path.join(process.env.USERPROFILE || 'C:\\Users\\Default', 'Documents', 'Tencent Files');
-    try {
-      if (fs.existsSync(defaultWinDocs)) return defaultWinDocs;
-    } catch {}
-  }
-
-  if (process.platform === 'linux') {
-    const home = process.env.HOME || '/root';
-    const linuxNtqq = path.join(home, '.config', 'QQ', 'nt_qq');
-    try {
-      if (fs.existsSync(linuxNtqq)) return linuxNtqq;
-    } catch {}
-    const linuxDocs = path.join(home, 'Documents', 'Tencent Files');
-    try {
-      if (fs.existsSync(linuxDocs)) return linuxDocs;
-    } catch {}
-  }
-
-  return null;
+function replaceExtForWav(fileName?: string): string | undefined {
+  if (!fileName) return undefined;
+  const parsed = path.parse(fileName);
+  const stem = parsed.name.trim();
+  return stem ? `${stem}.wav` : 'voice.wav';
 }
 
-function collectNtDataDirs(rootDir: string, botQQ?: string): string[] {
-  if (!rootDir) return [];
-  const results: string[] = [];
-  const normalizedRoot = path.normalize(rootDir);
-
+function detectSavedFormat(localPath: string, fallbackExt?: string): string | undefined {
   try {
-    if (!fs.existsSync(normalizedRoot)) return [];
+    const fd = fs.openSync(localPath, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(64);
+      const bytesRead = fs.readSync(fd, buf, 0, 64, 0);
+      if (bytesRead > 0) {
+        const magic = detectBufferExt(buf.subarray(0, bytesRead));
+        if (magic) return magic;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
-    return [];
+    // 忽略读取异常，回退扩展名
   }
-
-  // 1. rootDir 自身就是 nt_data
-  if ((fs.existsSync(path.join(normalizedRoot, 'Pic')) || fs.existsSync(path.join(normalizedRoot, 'Emoji')))) {
-    results.push(normalizedRoot);
-    return results;
-  }
-  // 2. rootDir/nt_data
-  const subNtData = path.join(normalizedRoot, 'nt_data');
-  if ((fs.existsSync(path.join(subNtData, 'Pic')) || fs.existsSync(path.join(subNtData, 'Emoji')))) {
-    results.push(subNtData);
-    return results;
-  }
-  // 3. rootDir/nt_qq/nt_data
-  const subNtQqData = path.join(normalizedRoot, 'nt_qq', 'nt_data');
-  if ((fs.existsSync(path.join(subNtQqData, 'Pic')) || fs.existsSync(path.join(subNtQqData, 'Emoji')))) {
-    results.push(subNtQqData);
-    return results;
-  }
-
-  // 4. botQQ 子目录
-  if (botQQ) {
-    const botData = path.join(normalizedRoot, String(botQQ), 'nt_qq', 'nt_data');
-    if ((fs.existsSync(path.join(botData, 'Pic')) || fs.existsSync(path.join(botData, 'Emoji')))) {
-      results.push(botData);
-      return results;
-    }
-  }
-
-  // 5. 扫描所有子目录
-  try {
-    const entries = fs.readdirSync(normalizedRoot, { withFileTypes: true });
-    for (const ent of entries) {
-      if (!ent.isDirectory()) continue;
-      const sub = path.join(normalizedRoot, ent.name);
-      const candidate1 = path.join(sub, 'nt_qq', 'nt_data');
-      if ((fs.existsSync(path.join(candidate1, 'Pic')) || fs.existsSync(path.join(candidate1, 'Emoji')))) {
-        results.push(candidate1);
-        continue;
-      }
-      const candidate2 = path.join(sub, 'nt_data');
-      if ((fs.existsSync(path.join(candidate2, 'Pic')) || fs.existsSync(path.join(candidate2, 'Emoji')))) {
-        results.push(candidate2);
-      }
-    }
-  } catch {}
-
-  return results;
+  const ext = path.extname(localPath).replace(/^\./, '').toLowerCase();
+  return ext || fallbackExt;
 }
 
-function generateCandidateFilenames(rawFile: string): string[] {
-  if (!rawFile) return [];
-  const clean = path.basename(rawFile.trim());
-  const baseName = clean.replace(/\.[a-zA-Z0-9]+$/, '');
-  const strippedBase = baseName.replace(/_[0-9]+$/, '');
-  const extensions = ['', '.jpg', '.png', '.gif', '.webp', '.jpeg', '.image'];
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-
-  const add = (name: string) => {
-    if (name && !seen.has(name)) {
-      seen.add(name);
-      candidates.push(name);
-    }
-  };
-
-  add(clean);
-  for (const b of [baseName, strippedBase, `${strippedBase}_0`, `${baseName}_0`]) {
-    for (const ext of extensions) {
-      add(b + ext);
-    }
-  }
-  return candidates;
-}
-
-function getRecentMonthFolders(catDir: string): string[] {
+function readLocalSize(localPath: string, declaredSize?: number): number | undefined {
   try {
-    if (!fs.existsSync(catDir)) return [];
-    const entries = fs.readdirSync(catDir, { withFileTypes: true });
-    return entries
-      .filter((e) => e.isDirectory() && /^\d{4}-\d{2}$/.test(e.name))
-      .map((e) => e.name)
-      .sort()
-      .reverse()
-      .slice(0, 3);
+    const stat = fs.statSync(localPath);
+    if (Number.isFinite(stat.size)) return stat.size;
   } catch {
-    return [];
+    // ignore
   }
+  return declaredSize !== undefined && Number.isFinite(declaredSize) ? declaredSize : undefined;
 }
 
-export interface FindNtqqCachedImageOptions {
-  dataDir?: string;
-  botQQ?: string;
-  file: string;
-  emojiPackageId?: number | string;
-  emojiId?: string;
-  isSticker?: boolean;
-}
+async function resolveSingleInboundAttachment(
+  att: QQAttachment,
+  peer: string,
+  mediaManager: MediaStorageManager,
+  logger?: InboundMediaLogger
+): Promise<AttachmentDescriptor> {
+  const base = describeAttachment(att, 'inbound');
+  const safeName = sanitizeInboundFilename(att.filename);
+  const declaredSize = typeof att.size === 'number' && Number.isFinite(att.size) ? att.size : undefined;
 
-export function findNtqqCachedImage(options: FindNtqqCachedImageOptions): string | null {
-  const { dataDir, botQQ, file, emojiPackageId, emojiId, isSticker } = options;
-  if (!file || typeof file !== 'string') return null;
+  const rawUrl = isHttpUrl(att.url) ? att.url.trim() : undefined;
+  const voiceWavUrl = isHttpUrl(att.voice_wav_url) ? att.voice_wav_url.trim() : undefined;
 
-  const rootDir = detectNtqqUserDataDir(dataDir);
-  if (!rootDir) return null;
+  // 语音特殊规则：忽略响应头错报 audio/mp3，以 content_type === 'voice' 为准，优先拉取 voice_wav_url
+  if (base.kind === 'record') {
+    const candidates: Array<{ url: string; ext: string; filename?: string }> = [];
+    if (voiceWavUrl) {
+      candidates.push({
+        url: voiceWavUrl,
+        ext: 'wav',
+        filename: replaceExtForWav(safeName),
+      });
+    }
+    if (rawUrl) {
+      candidates.push({
+        url: rawUrl,
+        ext: inferExtFromFilename(safeName) || inferExtFromUrl(rawUrl) || 'amr',
+        filename: safeName,
+      });
+    }
 
-  const ntDataDirs = collectNtDataDirs(rootDir, botQQ);
-  if (ntDataDirs.length === 0) return null;
+    if (candidates.length === 0) {
+      return {
+        ...base,
+        unavailable: 'no_download_url',
+      };
+    }
 
-  // 1. 商城官方表情探查 (Emoji/marketface/<pkg>/<id>)
-  if (emojiPackageId) {
-    const pkgStr = String(emojiPackageId);
-    const emojiCandidates: string[] = [];
-    if (emojiId) emojiCandidates.push(emojiId);
-    const clean = path.basename(file.trim()).replace(/\.[a-zA-Z0-9]+$/, '');
-    if (clean && clean !== emojiId) emojiCandidates.push(clean);
-
-    for (const ntData of ntDataDirs) {
-      const marketDir = path.join(ntData, 'Emoji', 'marketface', pkgStr);
-      for (const cand of emojiCandidates) {
-        for (const ext of ['', '.gif', '.png', '.jpg', '_thumb']) {
-          const target = path.join(marketDir, cand + ext);
-          try {
-            if (fs.existsSync(target)) {
-              const stat = fs.statSync(target);
-              if (stat.isFile() && stat.size > 0) return target;
-            }
-          } catch {}
-        }
+    let lastError = 'download_failed';
+    for (const candidate of candidates) {
+      try {
+        const saveOpts: SaveResourceOptions = {
+          type: 'voice',
+          sessionId: peer,
+          ext: candidate.ext,
+          ...(candidate.filename ? { filename: candidate.filename } : {}),
+        };
+        const saved = await mediaManager.downloadAndSave(candidate.url, saveOpts);
+        const format = detectSavedFormat(saved.localPath, candidate.ext);
+        const size = readLocalSize(saved.localPath, declaredSize);
+        return {
+          ...base,
+          local: {
+            path: saved.localPath,
+            ...(format ? { format } : {}),
+            ...(size !== undefined ? { size } : {}),
+            ...(saved.md5 ? { md5: saved.md5 } : {}),
+            ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+          },
+        };
+      } catch (err) {
+        lastError = sanitizeErrorMessage(err);
+        logger?.warn?.(
+          `[InboundMedia] 语音附件下载失败 (peer: ${peer}, url: ${sanitizeUrlForLog(candidate.url)}): ${lastError}`
+        );
       }
     }
+
+    return {
+      ...base,
+      unavailable: lastError,
+    };
   }
 
-  // 2. 常规图片与表情探查 (Pic / Emoji/emoji-recv / Emoji/emoji-custom)
-  const candidates = generateCandidateFilenames(file);
-  if (candidates.length === 0) return null;
-
-  for (const ntData of ntDataDirs) {
-    const catDirs = isSticker
-      ? [
-          path.join(ntData, 'Emoji', 'emoji-recv'),
-          path.join(ntData, 'Emoji', 'emoji-custom'),
-          path.join(ntData, 'Pic'),
-        ]
-      : [
-          path.join(ntData, 'Pic'),
-          path.join(ntData, 'Emoji', 'emoji-recv'),
-          path.join(ntData, 'Emoji', 'emoji-custom'),
-        ];
-
-    for (const catDir of catDirs) {
-      const months = getRecentMonthFolders(catDir);
-      for (const m of months) {
-        const subDirs = ['Ori', 'OriTemp', 'Thumb', 'ThumbTemp'];
-        for (const sub of subDirs) {
-          const folder = path.join(catDir, m, sub);
-          for (const cand of candidates) {
-            const target = path.join(folder, cand);
-            try {
-              if (fs.existsSync(target)) {
-                const stat = fs.statSync(target);
-                if (stat.isFile() && stat.size > 0) {
-                  return target;
-                }
-              }
-            } catch {}
-          }
-        }
-      }
-    }
+  // 图片 / 视频 / 文件（含以 content_type='file' 下发的 .png 等文件）
+  if (!rawUrl) {
+    return {
+      ...base,
+      unavailable: 'no_download_url',
+    };
   }
 
-  return null;
+  const targetType: MediaResourceType =
+    base.kind === 'image' || base.kind === 'sticker'
+      ? 'image'
+      : base.kind === 'video'
+        ? 'video'
+        : 'files';
+
+  const fallbackExt =
+    inferExtFromFilename(safeName) ||
+    inferExtFromUrl(rawUrl) ||
+    (base.kind === 'video' ? 'mp4' : undefined);
+
+  try {
+    const saveOpts: SaveResourceOptions = {
+      type: targetType,
+      sessionId: peer,
+      ...(safeName ? { filename: safeName } : {}),
+      ...(fallbackExt ? { ext: fallbackExt } : {}),
+    };
+    const saved = await mediaManager.downloadAndSave(rawUrl, saveOpts);
+    const format = detectSavedFormat(saved.localPath, fallbackExt);
+    const size = readLocalSize(saved.localPath, declaredSize);
+
+    return {
+      ...base,
+      local: {
+        path: saved.localPath,
+        ...(format ? { format } : {}),
+        ...(size !== undefined ? { size } : {}),
+        ...(saved.md5 ? { md5: saved.md5 } : {}),
+        ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+      },
+    };
+  } catch (err) {
+    const safeError = sanitizeErrorMessage(err);
+    logger?.warn?.(
+      `[InboundMedia] 入站附件下载失败 (peer: ${peer}, kind: ${base.kind}, url: ${sanitizeUrlForLog(rawUrl)}): ${safeError}`
+    );
+    return {
+      ...base,
+      unavailable: safeError,
+    };
+  }
 }
 
 /**
- * 把 NapCat 返回的路径候选归一化为本机可读的实际路径：
- *   - file:// URI → 平台路径（fileURLToPath，含 URI 解码）
- *   - Windows 盘符路径（C:\… 或 C:/…）→ 本机存在则原样，否则尝试 WSL 映射
- *   - POSIX 绝对路径 → 存在才认
- * 不存在的一律返回 null（交给下一段兜底，绝不写死链）。
+ * 并发下载并落盘 `QQC2CMessageCreateEvent.attachments[]` 中的所有入站附件。
+ * - 直接裸 GET（不附加任何 Authorization 头）；
+ * - 任一附件失败只标记 `unavailable`（已剥离 URL query），不阻断其他附件或整条消息处理。
  */
-function normalizeLocalCandidate(raw: string): string | null {
-  const value = raw.trim();
-  if (!value) return null;
-
-  let candidate = value;
-  if (/^file:\/\//i.test(candidate)) {
-    try {
-      candidate = fileURLToPath(candidate);
-    } catch {
-      return null;
-    }
+export async function resolveInboundAttachments(
+  event: QQC2CMessageCreateEvent,
+  peer: string,
+  mediaManager: MediaStorageManager,
+  logger?: InboundMediaLogger
+): Promise<AttachmentDescriptor[]> {
+  if (!Array.isArray(event?.attachments) || event.attachments.length === 0) {
+    return [];
   }
 
-  if (path.isAbsolute(candidate)) {
-    if (fs.existsSync(candidate)) return candidate;
-    // Windows 路径在 WSL 部署下的映射（DSH 在 WSL、NapCat 在 Windows 宿主机）
-    if (/^[a-zA-Z]:[\\/]/.test(candidate)) {
-      const wsl = windowsPathToWsl(candidate.replace(/\//g, '\\'));
-      if (wsl && fs.existsSync(wsl)) return wsl;
-    }
+  const validAttachments = event.attachments.filter(
+    (att): att is QQAttachment => Boolean(att) && typeof att === 'object'
+  );
+  if (validAttachments.length === 0) {
+    return [];
   }
 
-  return null;
+  return Promise.all(
+    validAttachments.map((att) => resolveSingleInboundAttachment(att, peer, mediaManager, logger))
+  );
 }
 
-/** 从 get_image / get_file 响应里取本机路径（data.file 优先，data.url 为本地形态时兜底） */
-function extractNapcatLocalPath(res: OneBotActionResponse | null | undefined): string | null {
-  const data = (res?.data || {}) as any;
-  for (const candidate of [data.file, data.url]) {
-    if (typeof candidate !== 'string' || candidate.trim() === '') continue;
-    if (isHttpUrl(candidate)) continue;
-    const resolved = normalizeLocalCandidate(candidate);
-    if (resolved) return resolved;
-  }
-  return null;
-}
+const EMBEDDED_URL_TOKEN_REGEX = /URL\s*:\s*(https?:\/\/[^\s"'<>)\]]+)/gi;
+const BARE_CREDENTIAL_URL_REGEX = /https?:\/\/[^\s"'<>)\]]*[?&](?:rkey|auth_token|sig)=[^\s"'<>)\]]+/gi;
 
-/** 从 get_msg 响应里取 image 段的新直链 */
-function extractMessageImageUrl(res: OneBotActionResponse | null | undefined): string | null {
-  const data = (res?.data || {}) as any;
-  const segments = Array.isArray(data?.message) ? data.message : Array.isArray(data) ? data : [];
-  for (const seg of segments) {
-    if (seg && seg.type === 'image' && isHttpUrl(seg.data?.url)) return seg.data!.url;
-  }
-  if (isHttpUrl(data?.url)) return data.url;
-  return null;
-}
-
-function summarizeError(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err ?? '未知错误');
-  return message.slice(0, 200);
-}
-
-function checkSizeMismatch(localPath: string, declaredSize: number): boolean {
-  if (!Number.isFinite(declaredSize) || declaredSize <= 0) return false;
-  try {
-    return fs.statSync(localPath).size !== declaredSize;
-  } catch {
+function isDownloadableForwardType(attachmentType?: string): boolean {
+  if (!attachmentType) return true;
+  const normalized = attachmentType.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/视频|音频|语音|file|video|audio|voice/.test(normalized)) {
     return false;
   }
+  return /图|表情|image|sticker|gif|pic/.test(normalized);
+}
+
+function isStickerForwardType(attachmentType?: string): boolean {
+  if (!attachmentType) return false;
+  return /表情|sticker/.test(attachmentType.trim().toLowerCase());
 }
 
 /**
- * 入站图片/表情包解析：四段式取图 + 统一复制落盘。
- * 任何一段失败都只记录原因并继续下一段；四段全失败返回 ok:false（调用方保持既有基线行为）。
+ * 同步脱敏合并转发文本中任何携带访问凭证的 URL（防泄漏兜底）。
+ * 若传入 `replacements` 映射表，优先替换为已落盘的 `[图片:<local_path>]`。
  */
-export async function resolveInboundImage(input: ResolveInboundImageInput): Promise<InboundImageResult> {
-  const { peer, isSticker, mediaManager, gateway, logger } = input;
-  const attempts: InboundImageAttempt[] = [];
+export function sanitizeForwardContentUrls(
+  content: string,
+  replacements?: ReadonlyMap<string, string>
+): string {
+  if (!content || typeof content !== 'string') return '';
 
-  const segmentFile = typeof input.file === 'string' ? input.file.trim() : '';
-  const saveFileId = (input.fileId || segmentFile || '').trim() || undefined;
-  const legacyUrl = isHttpUrl(input.url) ? input.url : isHttpUrl(segmentFile) ? segmentFile : undefined;
-  const urlExt = inferUrlExt(legacyUrl);
-  const saveOpts: SaveResourceOptions = {
-    type: isSticker ? 'sticker' : 'image',
-    sessionId: peer,
-    ...(saveFileId ? { fileId: saveFileId } : {}),
-    ...(urlExt ? { ext: urlExt } : {}),
-  };
-  const declaredSize = Number(input.declaredSize);
-
-  const record = (via: InboundImageVia, ok: boolean, error?: string) => {
-    attempts.push(error ? { via, ok, error } : { via, ok });
-  };
-
-  /** 复制落盘并收敛结果；失败只记录（继续下一段） */
-  const saveSource = async (
-    via: InboundImageVia,
-    source: string,
-    sourceDesc: string
-  ): Promise<InboundImageResult | null> => {
-    try {
-      const saved = await mediaManager.downloadAndSave(source, saveOpts);
-      const sizeMismatch = checkSizeMismatch(saved.localPath, declaredSize);
-      if (sizeMismatch) {
-        logger?.warn?.(
-          `[InboundMedia] 本地字节数与段内 file_size 不一致（疑似缩略图）: ${sourceDesc} -> ${saved.localPath}`
-        );
-      }
-      record(via, true);
-      return {
-        ok: true,
-        localPath: saved.localPath,
-        fingerprint: saved.fingerprint,
-        md5: saved.md5,
-        via,
-        ...(sizeMismatch ? { sizeMismatch: true } : {}),
-        attempts,
-      };
-    } catch (err) {
-      record(via, false, summarizeError(err));
-      return null;
-    }
-  };
-
-  /** 问 NapCat 要本机路径；拿不到就把原因记进 attempts */
-  const probeNapcatPath = async (
-    via: 'get_image' | 'get_file',
-    call: () => Promise<OneBotActionResponse>
-  ): Promise<string | null> => {
-    try {
-      const res = await call();
-      const localPath = res?.status === 'ok' ? extractNapcatLocalPath(res) : null;
-      if (localPath) {
-        learnNtqqDirFromPath(localPath);
-        return localPath;
-      }
-      record(
-        via,
-        false,
-        res?.status === 'ok'
-          ? 'no_local_path'
-          : `status=${res?.status ?? 'unknown'}${res?.wording ? ` ${res.wording}` : ''}`
-      );
-      return null;
-    } catch (err) {
-      record(via, false, summarizeError(err));
-      return null;
-    }
-  };
-
-  // 0. 一级去重先行：同一 file_id 已落盘且文件仍在 → 直接复用，连 NapCat 都不用问
-  if (saveFileId) {
-    const cached = mediaManager.lookupCached(saveFileId);
-    if (cached) {
-      return {
-        ok: true,
-        localPath: cached.localPath,
-        fingerprint: cached.fingerprint,
-        via: 'cache',
-        attempts,
-      };
-    }
-  }
-
-  // 0.2 同机 NTQQ 本地缓存直读（避免进入 NapCat 挂起事件监听 / Action 延迟）
-  const cachedNtFile = findNtqqCachedImage({
-    dataDir: input.dataDir,
-    botQQ: input.botQQ,
-    file: segmentFile || saveFileId || '',
-    emojiPackageId: input.emojiPackageId,
-    emojiId: input.emojiId,
-    isSticker,
+  const withUrlTokensReplaced = content.replace(EMBEDDED_URL_TOKEN_REGEX, (_full, rawUrl: string) => {
+    const mapped = replacements?.get(rawUrl);
+    if (mapped) return mapped;
+    return '[图片(链接已脱敏)]';
   });
-  if (cachedNtFile) {
-    const done = await saveSource('nt_cache', cachedNtFile, `nt_cache:${path.basename(cachedNtFile)}`);
-    if (done) return done;
+
+  return withUrlTokensReplaced.replace(BARE_CREDENTIAL_URL_REGEX, (rawUrl) => {
+    const mapped = replacements?.get(rawUrl);
+    if (mapped) return mapped;
+    return '[图片(链接已脱敏)]';
+  });
+}
+
+/**
+ * 从官方 `message_type=102` 展开文本中提取 `[附件...] ... URL:https://...` 内嵌图片链接并限量裸 GET 落盘，
+ * 返回替换映射与已脱敏正文（所有含 `rkey` 的明文 URL 均替换为 `[图片:<local_path>]` 或 `[图片(链接已脱敏)]`）。
+ */
+export async function resolveEmbeddedForwardImages(
+  content: string,
+  peer: string,
+  mediaManager?: MediaStorageManager,
+  limit: number = DEFAULT_FORWARD_IMAGE_LIMIT,
+  logger?: InboundMediaLogger
+): Promise<ResolveEmbeddedForwardImagesResult> {
+  const replacements = new Map<string, string>();
+  const localPaths: string[] = [];
+  const entries: EmbeddedForwardImageEntry[] = [];
+
+  if (!content || typeof content !== 'string') {
+    return {
+      sanitizedContent: '',
+      replacements,
+      localPaths,
+      entries,
+    };
   }
 
-  // 0.5 段内已带 local_path：NapCat 已经给过本机路径，直接复制，不再重复调用 get_image。
-  // 若该路径当前不可读（QQ 清缓存 / 跨机器路径），也不要再问 NapCat —— get_image 只会返回同一路径，
-  // 反而会把入站消息链路卡在一次 15s Action 超时上；此处快速失败，调用方保持 content 既有路径。
-  const segmentLocalPath = typeof input.localPath === 'string' ? input.localPath.trim() : '';
-  if (segmentLocalPath) {
-    const normalized = normalizeLocalCandidate(segmentLocalPath);
-    if (normalized) {
-      const done = await saveSource('segment_local_path', normalized, 'segment.local_path');
-      if (done) return done;
-    } else {
-      record('segment_local_path', false, 'not_readable');
-    }
-    const detail = attempts.map((a) => `${a.via}=${a.ok ? 'ok' : a.error || 'failed'}`).join('; ');
-    return { ok: false, attempts, error: detail || 'segment.local_path 不可读' };
-  }
+  const maxDownloads = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : DEFAULT_FORWARD_IMAGE_LIMIT;
+  let downloadedCount = 0;
+  const cachedByUrl = new Map<string, { localPath: string; fingerprint?: string; md5?: string }>();
 
-  // 判断是否为商城官方表情 / 静态公开 CDN（NapCat 对此类必无事件响应且必超时，直接快速走 HTTP 直链）
-  const isMarketEmoji = Boolean(input.emojiPackageId) || (legacyUrl && /gxh\.vip\.qq\.com/i.test(legacyUrl));
-  if (isMarketEmoji) {
-    if (legacyUrl) {
-      const done = await saveSource('url', legacyUrl, 'segment.url(market_emoji)');
-      if (done) return done;
-    } else {
-      record('url', false, 'no_http_url');
-    }
-  }
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    EMBEDDED_URL_TOKEN_REGEX.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = EMBEDDED_URL_TOKEN_REGEX.exec(line)) !== null) {
+      const rawUrl = match[1]!;
+      const sanitizedUrl = sanitizeUrlForLog(rawUrl);
 
-  // 1. get_image({file}) —— NapCat 本机路径
-  if (!isMarketEmoji && gateway?.getImage && segmentFile) {
-    const localPath = await probeNapcatPath('get_image', () => gateway.getImage!(segmentFile));
-    if (localPath) {
-      const done = await saveSource('get_image', localPath, `get_image:${segmentFile}`);
-      if (done) return done;
-    }
-  } else if (!isMarketEmoji) {
-    record('get_image', false, 'api_unavailable_or_no_file');
-  }
+      const typeMatch = /类型\s*:\s*([^\s]+)/.exec(line);
+      const attachmentType = nonEmpty(typeMatch?.[1]);
+      const nameMatch = /文件名\s*:\s*([^\s]+)/.exec(line);
+      const fileName = sanitizeInboundFilename(nameMatch?.[1]);
 
-  // 2. get_file({file_id}) —— 与 get_image 同源，兼容不同 NapCat 版本
-  if (!isMarketEmoji && gateway?.getFile && saveFileId) {
-    const localPath = await probeNapcatPath('get_file', () => gateway.getFile!(saveFileId));
-    if (localPath) {
-      const done = await saveSource('get_file', localPath, `get_file:${saveFileId}`);
-      if (done) return done;
-    }
-  } else if (!isMarketEmoji) {
-    record('get_file', false, 'api_unavailable_or_no_file_id');
-  }
-
-  // 3. 段内直链（multimedia.nt.qq.com.cn / gchatpic_new 这类仍可用的 host 靠这段兜住）
-  if (!isMarketEmoji) {
-    if (legacyUrl) {
-      const done = await saveSource('url', legacyUrl, 'segment.url');
-      if (done) return done;
-    } else {
-      record('url', false, 'no_http_url');
-    }
-  }
-
-  // 4. get_msg 刷新直链（最后兜底，同时验证新签发 rkey 是否可用）
-  if (gateway?.getMsg && input.msgId) {
-    try {
-      const res = await gateway.getMsg(input.msgId);
-      const freshUrl = res?.status === 'ok' ? extractMessageImageUrl(res) : null;
-      if (freshUrl) {
-        const done = await saveSource('get_msg_url', freshUrl, 'get_msg.url');
-        if (done) return done;
-      } else {
-        record(
-          'get_msg_url',
-          false,
-          res?.status === 'ok' ? 'no_url_in_message' : `status=${res?.status ?? 'unknown'}`
-        );
+      if (replacements.has(rawUrl)) {
+        const cached = cachedByUrl.get(rawUrl);
+        entries.push({
+          sanitizedUrl,
+          ...(attachmentType ? { attachmentType } : {}),
+          ...(fileName ? { fileName } : {}),
+          ...(cached?.localPath ? { localPath: cached.localPath } : {}),
+          ...(cached?.fingerprint ? { fingerprint: cached.fingerprint } : {}),
+          ...(cached?.md5 ? { md5: cached.md5 } : {}),
+          downloaded: Boolean(cached?.localPath),
+        });
+        continue;
       }
-    } catch (err) {
-      record('get_msg_url', false, summarizeError(err));
+
+      if (!mediaManager || !isDownloadableForwardType(attachmentType) || downloadedCount >= maxDownloads) {
+        replacements.set(rawUrl, '[图片(链接已脱敏)]');
+        entries.push({
+          sanitizedUrl,
+          ...(attachmentType ? { attachmentType } : {}),
+          ...(fileName ? { fileName } : {}),
+          downloaded: false,
+        });
+        continue;
+      }
+
+      const urlExt = inferExtFromFilename(fileName) || inferExtFromUrl(rawUrl);
+      const mediaType: MediaResourceType = isStickerForwardType(attachmentType) ? 'sticker' : 'image';
+
+      try {
+        const saved = await mediaManager.downloadAndSave(rawUrl, {
+          type: mediaType,
+          sessionId: peer,
+          ...(fileName ? { filename: fileName } : {}),
+          ...(urlExt ? { ext: urlExt } : {}),
+        });
+        downloadedCount++;
+        const replacement = `[图片:${saved.localPath}]`;
+        replacements.set(rawUrl, replacement);
+        cachedByUrl.set(rawUrl, {
+          localPath: saved.localPath,
+          fingerprint: saved.fingerprint,
+          md5: saved.md5,
+        });
+        if (!localPaths.includes(saved.localPath)) {
+          localPaths.push(saved.localPath);
+        }
+        entries.push({
+          sanitizedUrl,
+          ...(attachmentType ? { attachmentType } : {}),
+          ...(fileName ? { fileName } : {}),
+          localPath: saved.localPath,
+          ...(saved.fingerprint ? { fingerprint: saved.fingerprint } : {}),
+          ...(saved.md5 ? { md5: saved.md5 } : {}),
+          downloaded: true,
+        });
+      } catch (err) {
+        const safeError = sanitizeErrorMessage(err);
+        logger?.warn?.(
+          `[InboundMedia] 合并转发内嵌图片下载失败 (peer: ${peer}, url: ${sanitizedUrl}): ${safeError}`
+        );
+        replacements.set(rawUrl, '[图片(链接已脱敏)]');
+        entries.push({
+          sanitizedUrl,
+          ...(attachmentType ? { attachmentType } : {}),
+          ...(fileName ? { fileName } : {}),
+          downloaded: false,
+          error: safeError,
+        });
+      }
     }
-  } else {
-    record('get_msg_url', false, gateway?.getMsg ? 'no_msg_id' : 'api_unavailable');
   }
 
-  const detail = attempts.map((a) => `${a.via}=${a.ok ? 'ok' : a.error || 'failed'}`).join('; ');
-  return { ok: false, attempts, error: detail || '全部取图手段不可用' };
+  const sanitizedContent = sanitizeForwardContentUrls(content, replacements);
+  return {
+    sanitizedContent,
+    replacements,
+    localPaths,
+    entries,
+  };
 }

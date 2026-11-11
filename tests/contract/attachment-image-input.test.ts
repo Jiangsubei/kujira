@@ -1,123 +1,151 @@
 /**
  * tests/contract/attachment-image-input.test.ts
  *
- * 契约测试: 入站回归纯文本路径模式（绝不自动注入 ImageBlock，大模型统一通过路径自主按需读图）
+ * 契约测试: 入站媒体回归纯文本本地路径占位模式（绝不暴露含凭证 URL，支持模型按需读图）
  *
- * 背景:
- * 入站若直接塞 ImageBlock，在水群与斗图场景下会巨幅消耗 Vision Token，且入站格式与历史记录 (read_chat_history)
- * 割裂；回归纯文本路径模式后，模型通过文本中的确定性文件路径感知图片，必要时自主调用 read_image。
- *
- * 覆盖规范:
- * 1. 真实 boot 装配下 dispatchWakeup(payload.images) → user message 为纯文本，不注入 image block；
- * 2. 多张图片入站时同样保持纯文本模式，Prompt 保留文本与路径。
+ * 覆盖规范（仅依赖 Batch 1 与 Batch 2 模块）：
+ * 1. 入站 PNG 图片经 `resolveInboundAttachments` 裸 GET 落盘后，`parseNormalizedContent` 与 `shouldWakeup`
+ *    输出纯文本本地路径占位 `[图片:<localPath>]`，且 `payload.images` 收集物理路径；
+ * 2. 多张图片及以 `content_type === 'file'` 下发的 `.png` 文件均保存真实扩展名与确定性本地路径；
+ * 3. 下载失败或无本地路径时，渲染文本绝不回退泄露带 `rkey` query 凭证的 `remote.url`。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
-import { bootDshNapcatBridge, type BootedDsh } from '../../src/boot.js';
-import type { WakeupPayload } from '../../src/types/index.js';
+import * as http from 'node:http';
+import { MediaStorageManager } from '../../src/storage/media.js';
+import { resolveInboundAttachments } from '../../src/gateway/inbound-media.js';
+import { parseNormalizedContent, shouldWakeup } from '../../src/gateway/wakeup.js';
+import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
 
-const BOT_QQ = '1000000000';
-const GROUP_ID = '8000000001';
-
+const MOCK_OPENID = 'A1B2C3D4E5F60123456789ABCDEF0002';
 const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
   'base64'
 );
 
-function wakeupPayload(images: string[]): WakeupPayload {
-  return {
-    peer: `group_${GROUP_ID}`,
-    trigger: 'direct',
-    from_user: '1000000001',
-    from_name: '测试成员',
-    content: '[图片: 见附件]',
-    timestamp: 1793800000000,
-    images,
-  };
-}
-
-function imageBlocks(userMsg: any): any[] {
-  const content = userMsg?.content;
-  if (!Array.isArray(content)) return [];
-  return content.filter((block) => block && block.type === 'image');
-}
-
-describe('契约测试: payload.images → 纯文本按需模式真实装配', () => {
+describe('契约测试: 入站媒体纯文本路径占位与安全边界 (Batch 2)', () => {
   let tmpHome: string;
-  let booted: BootedDsh | undefined;
+  let manager: MediaStorageManager;
+  let servers: http.Server[] = [];
 
-  async function waitFor<T>(probe: () => T | undefined, timeoutMs = 8000): Promise<T> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const value = probe();
-      if (value !== undefined) return value;
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
-    }
-    throw new Error('等待装配就绪超时');
+  async function startLoopback(body: Buffer, status = 200, queryPath = '/img.png?rkey=SECRET_KEY_1'): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const srv = http.createServer((_req, res) => {
+        res.writeHead(status, { 'Content-Type': 'image/png' });
+        res.end(body);
+      });
+      srv.on('error', reject);
+      servers.push(srv);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address() as any;
+        resolve(`http://127.0.0.1:${addr.port}${queryPath}`);
+      });
+    });
   }
 
   beforeEach(async () => {
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-attachment-image-'));
-    booted = await bootDshNapcatBridge({
-      dshHome: tmpHome,
-      mountPlugin: true,
-      config: {
-        bot_qq: BOT_QQ,
-        ws_port: 29874,
-        ws_token: 'test-mock-token',
-      },
-    });
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-image-input-'));
+    manager = new MediaStorageManager({ dshHome: tmpHome, downloadDir: 'downloads' });
+    servers = [];
   });
 
   afterEach(async () => {
-    if (booted) {
-      await booted.dispose().catch(() => {});
-      booted = undefined;
+    for (const s of servers) {
+      await new Promise<void>((r) => s.close(() => r())).catch(() => {});
     }
-    if (tmpHome) {
-      await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
-    }
+    await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('契约 1: 本地 PNG 图片入站 → user message 为纯文本，绝不注入 image block', async () => {
-    const sessionManager: any = await waitFor(() => {
-      const c: any = booted!.ctx;
-      return (c.get?.('napcat-session') || c['napcat-session']) as any;
-    });
+  it('契约 1: 单张 PNG 入站裸 GET 落盘 → 正文纯文本路径占位且绝不含凭证 URL', async () => {
+    const url = await startLoopback(PNG_1X1);
+    const event: QQC2CMessageCreateEvent = {
+      id: 'ROBOT1.0_img_input_001',
+      content: '帮我看看这张图',
+      timestamp: '2026-11-11T18:30:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
+      attachments: [
+        {
+          content_type: 'image/png',
+          filename: '95C5A03B7A.png',
+          size: PNG_1X1.length,
+          url,
+        },
+      ],
+    };
 
-    const imgPath = path.join(tmpHome, 'inbound-1.png');
-    await fsp.writeFile(imgPath, PNG_1X1);
+    const descriptors = await resolveInboundAttachments(event, 'user_mock_01', manager);
+    const decision = await shouldWakeup(event, { descriptors });
 
-    const userMsg = await sessionManager.dispatchWakeup(wakeupPayload([imgPath]));
+    expect(decision.wakeup).toBe(true);
+    expect(decision.trigger).toBe('direct');
+    expect(decision.payload?.images).toHaveLength(1);
+    const localPath = decision.payload!.images![0]!;
+    expect(fs.existsSync(localPath)).toBe(true);
+    expect(localPath.endsWith('.png')).toBe(true);
 
-    const blocks = imageBlocks(userMsg);
-    expect(blocks).toHaveLength(0);
-
-    // 纯文本形式呈现，包含消息文本内容
-    expect(userMsg.content).toHaveLength(1);
-    expect(userMsg.content[0].type).toBe('text');
-    expect(userMsg.content[0].text).toContain('[图片: 见附件]');
+    expect(decision.payload?.content).toContain(`帮我看看这张图 [图片:${localPath}]`);
+    expect(decision.payload?.content).not.toContain('SECRET_KEY_1');
+    expect(decision.payload?.content).not.toContain('http://');
   });
 
-  it('契约 2: 多张图片入站 → 依然保持纯文本模式，不向 context 注入任何 image block', async () => {
-    const sessionManager: any = await waitFor(() => {
-      const c: any = booted!.ctx;
-      return (c.get?.('napcat-session') || c['napcat-session']) as any;
-    });
+  it('契约 2: 多图 + content_type=file 的 .png 文件入站 → 均保留确定性本地路径供按需读图', async () => {
+    const url1 = await startLoopback(PNG_1X1, 200, '/a.png?rkey=RKEY_A');
+    const url2 = await startLoopback(PNG_1X1, 200, '/b.png?rkey=RKEY_B');
+    const filePngUrl = await startLoopback(PNG_1X1, 200, '/doc.png?rkey=RKEY_FILE');
 
-    const first = path.join(tmpHome, 'first.png');
-    const second = path.join(tmpHome, 'second.png');
-    await fsp.writeFile(first, PNG_1X1);
-    await fsp.writeFile(second, PNG_1X1);
+    const event: QQC2CMessageCreateEvent = {
+      id: 'ROBOT1.0_img_input_002',
+      content: '',
+      timestamp: '2026-11-11T18:31:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
+      attachments: [
+        { content_type: 'image/png', filename: 'first.png', url: url1 },
+        { content_type: 'image/png', filename: 'second.png', url: url2 },
+        { content_type: 'file', filename: 'screenshot.png', url: filePngUrl },
+      ],
+    };
 
-    const userMsg = await sessionManager.dispatchWakeup(wakeupPayload([first, second]));
+    const descriptors = await resolveInboundAttachments(event, 'user_mock_02', manager);
+    const normalized = parseNormalizedContent(event, descriptors);
+    const decision = await shouldWakeup(event, { descriptors });
 
-    const blocks = imageBlocks(userMsg);
-    expect(blocks).toHaveLength(0);
-    expect(userMsg.content).toHaveLength(1);
-    expect(userMsg.content[0].type).toBe('text');
+    expect(descriptors).toHaveLength(3);
+    expect(descriptors[2]!.kind).toBe('file');
+    expect(descriptors[2]!.local?.path.endsWith('screenshot.png')).toBe(true);
+    expect(descriptors[2]!.local?.format).toBe('png');
+
+    expect(normalized).toContain('[图片:');
+    expect(normalized).toContain('[文件:screenshot.png 已保存:');
+    expect(normalized).not.toContain('RKEY_');
+    expect(decision.payload?.images).toHaveLength(3);
+  });
+
+  it('契约 3: 落盘失败时渲染文本严禁回退泄露 remote.url 中的凭证', async () => {
+    const deadUrl = await startLoopback(Buffer.from('forbidden'), 403, '/secret.png?rkey=DO_NOT_LEAK');
+    const event: QQC2CMessageCreateEvent = {
+      id: 'ROBOT1.0_img_input_003',
+      content: '图裂了吗',
+      timestamp: '2026-11-11T18:32:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
+      attachments: [
+        { content_type: 'image/png', filename: 'broken.png', url: deadUrl },
+      ],
+    };
+
+    const descriptors = await resolveInboundAttachments(event, 'user_mock_03', manager);
+    const decision = await shouldWakeup(event, { descriptors });
+
+    expect(descriptors[0]!.local).toBeUndefined();
+    expect(descriptors[0]!.unavailable).toBeTruthy();
+    expect(descriptors[0]!.unavailable).not.toContain('DO_NOT_LEAK');
+    expect(decision.payload?.content).toBe('图裂了吗 [图片:broken.png (入站落盘失败)]');
+    expect(decision.payload?.content).not.toContain('DO_NOT_LEAK');
   });
 });

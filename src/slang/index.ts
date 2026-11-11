@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 黑话学习套件核心模块
+ * kujira: 黑话知识库 (Slang & Memes) 学习套件核心模块
  * 组合 SlangStorage, SlangTools 与 SystemPrompt 动态段注入。
  */
 
@@ -10,12 +10,10 @@ import { createSlangToolDefinitions } from '../tools/slang/index.js';
 import {
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
-  DEFAULT_SLANG_STORAGE_PATH,
   DEFAULT_DATABASE_PATH,
 } from '../constants/index.js';
 import { resolveDshPath } from '../utils/path.js';
 import type { MessageDatabase } from '../storage/database.js';
-import { migrateSlangStorage } from '../storage/slang-migration.js';
 import { SnapshotManager, formatSlangContext } from '../prompt/snapshot.js';
 
 export * from './storage.js';
@@ -37,9 +35,8 @@ export interface SlangServiceOptions {
   registerPromptContext?: boolean;
 }
 
-
 /**
- * 装配并启动 Slang 服务
+ * 装配并启动黑话知识库 (Slang & Memes) 服务
  */
 export function setupSlangService(
   ctx: Context,
@@ -65,7 +62,7 @@ export function setupSlangService(
     (typeof options.enabled === 'function' ? options.enabled() : options.enabled) ??
     true;
 
-  // 1. 初始化 Storage
+  // 1. 初始化 Storage（基于 SQLite 全局共享）
   const storage = new SlangStorage(
     options.db || options.storagePath || DEFAULT_DATABASE_PATH,
     getMaxEntries,
@@ -73,19 +70,10 @@ export function setupSlangService(
     effectiveDshHome
   );
 
-  // 2. 存量旧版 Markdown 平滑迁移（若有且不删物理文件）
-  try {
-    migrateSlangStorage({
-      db: storage.getDatabase(),
-      dshHome: effectiveDshHome,
-      storagePath: options.storagePath || DEFAULT_SLANG_STORAGE_PATH,
-    });
-  } catch {}
-
   const toolDefs = createSlangToolDefinitions(storage);
   const unregisters: Array<() => void> = [];
 
-  // 3. 注册 Slang 工具到 DSH ctx.tools
+  // 2. 注册 Slang 工具到 DSH ctx.tools
   const doRegisterTools = (toolsService: any) => {
     if (!toolsService || typeof toolsService.register !== 'function') return;
     for (const def of toolDefs) {
@@ -113,11 +101,12 @@ export function setupSlangService(
     (ctx as any).on?.('ready', checkReadyTools);
   }
 
-  // 4. 注册 systemPrompt.context 动态黑话段，统一通过 SnapshotManager 享受严格 Fail-Closed 白名单防护
+  // 3. 注册动态黑话知识库通道，统一通过 SnapshotManager 享受严格 Fail-Closed 白名单防护
   if (options.registerPromptContext !== false) {
     const snapshotManager = new SnapshotManager(ctx);
+    unregisters.push(() => snapshotManager.dispose());
     const promptDisposer = snapshotManager.registerProvider({
-      name: 'napcat:slang',
+      name: 'kujira:slang',
       order: 45,
       provide: () => {
         if (!getEnabled()) {

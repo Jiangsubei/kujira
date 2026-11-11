@@ -1,12 +1,10 @@
 /**
- * dsh-napcat-bridge: Memory 插件核心模块
+ * kujira: Memory 插件核心模块
  * 组合 MemoryStorage 与 MemoryTools。
- * 动态提示词快照统一接入 SnapshotManager，全面贯彻 Fail-Closed 白名单防御。
+ * 动态提示词快照统一接入 SnapshotManager，全面贯彻 Fail-Closed 白名单防御与单聊强隔离。
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import type { MessageDatabase } from '../storage/database.js';
-import type { SessionManager } from '../gateway/session.js';
 import { MemoryStorage } from './storage.js';
 import { MemoryTools, createMemoryToolDefinitions } from '../tools/memory/index.js';
 import {
@@ -17,18 +15,12 @@ import {
 import {
   DEFAULT_USER_PROFILE_BUDGET_CHARS,
   DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
-  DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
 } from '../constants/index.js';
 import { resolveDshPath } from '../utils/path.js';
 
 export * from './types.js';
 export * from './storage.js';
 export * from '../tools/memory/index.js';
-
-export interface MemoryBudgetOptions {
-  /** 群聊注入时所有活跃用户画像合计的总预算 */
-  getGroupUserProfilesBudget?: () => number;
-}
 
 export interface MemoryServiceOptions {
   storageDir?: string;
@@ -37,14 +29,8 @@ export interface MemoryServiceOptions {
   userProfileBudgetChars?: number;
   /** 单个 Session 规则文件的写入上限 */
   sessionMemoryBudgetChars?: number;
-  /** 群聊注入时所有活跃用户画像合计的总预算 */
-  groupMemoryTotalBudgetChars?: number;
   getUserProfileBudgetChars?: () => number;
   getSessionMemoryBudgetChars?: () => number;
-  getGroupMemoryTotalBudgetChars?: () => number;
-  getCurrentSpeaker?: (peer: string) => string | undefined;
-  db?: MessageDatabase;
-  sessionManager?: SessionManager;
   /** 是否向 root ctx.tools 注册全局 Memory 工具（默认 true；在配合预设架构时传入 false 隔离 Web 会话） */
   registerGlobalTools?: boolean;
   /** 是否向 root ctx 注册动态提示词段（默认 true；在配合统一 SnapshotHub 装配时传入 false） */
@@ -71,11 +57,6 @@ export function setupMemoryService(
     options.getSessionMemoryBudgetChars?.() ??
     options.sessionMemoryBudgetChars ??
     DEFAULT_SESSION_MEMORY_BUDGET_CHARS;
-
-  const getGroupUserProfilesBudget = () =>
-    options.getGroupMemoryTotalBudgetChars?.() ??
-    options.groupMemoryTotalBudgetChars ??
-    DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS;
 
   const tools = new MemoryTools(storage, ctx, {
     getUserProfileLimit: getUserProfileBudget,
@@ -113,15 +94,13 @@ export function setupMemoryService(
     (ctx as any).on?.('ready', checkReadyTools);
   }
 
-  // 2. 统一通过 SnapshotManager 挂载会话规则与用户画像独立动态通道 (Fail-Closed 安全白名单防护)
+  // 2. 统一通过 SnapshotManager 挂载单聊会话规则与用户画像独立动态通道 (Fail-Closed 安全白名单防护)
   if (options.registerPromptContext !== false) {
-    const snapshotManager = new SnapshotManager(ctx, {
-      getCurrentSpeaker: options.getCurrentSpeaker,
-    });
+    const snapshotManager = new SnapshotManager(ctx);
     unregisters.push(() => snapshotManager.dispose());
 
     const rulesDisposer = snapshotManager.registerProvider({
-      name: 'napcat:session_rules',
+      name: 'kujira:session_rules',
       order: 40,
       provide: (session) => {
         const raw = storage.getSessionRulesSnapshotSync(session.peer);
@@ -131,37 +110,10 @@ export function setupMemoryService(
     unregisters.push(rulesDisposer);
 
     const profilesDisposer = snapshotManager.registerProvider({
-      name: 'napcat:user_profiles',
+      name: 'kujira:user_profiles',
       order: 42,
       provide: (session) => {
-        const peer = session.peer;
-        const currentQQ = session.qq !== 'default' ? session.qq : undefined;
-
-        let raw = '';
-        if (session.isPrivate) {
-          raw = storage.getUserProfilesSnapshotSync(
-            peer,
-            [{ qq: session.qq, name: session.qq }],
-            DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
-            currentQQ
-          );
-        } else {
-          let activeUsers: Array<{ qq: string; name: string }> = [];
-          if (options.db) {
-            try {
-              const rows = options.db.getActiveUsers(peer, 7, 15);
-              activeUsers = rows.map((r) => ({ qq: r.user_id, name: r.sender_name }));
-            } catch {}
-          }
-
-          raw = storage.getUserProfilesSnapshotSync(
-            peer,
-            activeUsers,
-            getGroupUserProfilesBudget(),
-            currentQQ
-          );
-        }
-
+        const raw = storage.getUserProfilesSnapshotSync(session.peer);
         return raw ? formatUserProfilesContext(raw) : '';
       },
     });

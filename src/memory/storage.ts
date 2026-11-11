@@ -1,26 +1,25 @@
 /**
- * dsh-napcat-bridge: Memory 存储管理器
- * 管理 .dsh/napcat/napcat_memory/ 下的 Session 记忆与 User Profile 纯 Markdown 文件读写。
+ * kujira: Memory 存储管理器
+ * 管理 .dsh/kujira/memory/ 下的单聊 Session 记忆与 User Profile 纯 Markdown 文件读写。
+ * 两层记忆均以当前单聊 `peer` 为物理主键，严禁跨会话复用或 default.md 兜底。
  */
 
 import * as fsSync from 'node:fs';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { atomicWriteFile, atomicWriteFileSync } from '../utils/atomic-write.js';
-import {
-  DEFAULT_MEMORY_DIR,
-  DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
-  TRUNCATED_USER_PROFILE_NOTICE,
-} from '../constants/index.js';
-import { resolveDshPath } from '../utils/path.js';
-import type { ActiveUserInfo } from './types.js';
+import { DEFAULT_MEMORY_DIR } from '../constants/index.js';
+import { encodeSegment, resolveDshPath } from '../utils/path.js';
+
+const KUJIRA_SESSION_ID_PREFIX_REGEX =
+  /^kujira-user-([0-9a-zA-Z_]+?)(?:-r\d+)?(?:-\d+)?(?:-[0-9a-fA-F]{4,16})?$/;
 
 export class MemoryStorage {
   private baseDir: string;
   private dshHome?: string;
   private sessionCache: Map<string, string> = new Map();
   private userCache: Map<string, string> = new Map();
-  private updateLocks: Map<string, Promise<any>> = new Map();
+  private updateLocks: Map<string, Promise<void>> = new Map();
 
   constructor(storageDir?: string, dshHome?: string) {
     this.dshHome = dshHome;
@@ -41,6 +40,11 @@ export class MemoryStorage {
 
   public invalidateCache(key?: string): void {
     if (key) {
+      const normalized = this.normalizePeerKey(key);
+      if (normalized) {
+        this.sessionCache.delete(normalized);
+        this.userCache.delete(normalized);
+      }
       this.sessionCache.delete(key);
       this.userCache.delete(key);
     } else {
@@ -49,25 +53,48 @@ export class MemoryStorage {
     }
   }
 
-  private sanitizeName(name: string): string {
-    return name.replace(/[^a-zA-Z0-9_-]/g, '_');
+  /**
+   * 归一化记忆主键：
+   * - `kujira-user-<hash>[-r<round>-<version>[-<hash>]]` 归一化为 `user_<hash>`
+   * - 其余非空键保留原始大小写与字符语义，交由 `encodeSegment` 安全编码
+   */
+  private normalizePeerKey(raw?: string): string {
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    if (!trimmed) {
+      return '';
+    }
+    const sessionMatch = KUJIRA_SESSION_ID_PREFIX_REGEX.exec(trimmed);
+    if (sessionMatch) {
+      return `user_${sessionMatch[1]!}`;
+    }
+    return trimmed;
+  }
+
+  private requireNormalizedKey(raw?: string): string {
+    const key = this.normalizePeerKey(raw);
+    if (!key) {
+      throw new Error('Memory peer key cannot be empty');
+    }
+    return key;
   }
 
   public getSessionMemoryPath(peer: string): string {
-    const sanitized = this.sanitizeName(peer);
-    return path.join(this.baseDir, 'session', `${sanitized}.md`);
+    const key = this.requireNormalizedKey(peer);
+    return path.join(this.baseDir, 'session', `${encodeSegment(key)}.md`);
   }
 
-  public getUserProfilePath(qq = 'default'): string {
-    const target = qq && qq.trim() ? qq.trim() : 'default';
-    const sanitized = this.sanitizeName(target);
-    return path.join(this.baseDir, 'user', `${sanitized}.md`);
+  public getUserProfilePath(peer: string): string {
+    const key = this.requireNormalizedKey(peer);
+    return path.join(this.baseDir, 'user', `${encodeSegment(key)}.md`);
   }
 
   // ==================== 异步读写方法 ====================
 
   public async readSessionMemory(peer: string): Promise<string> {
-    const key = peer || 'default';
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return '';
+    }
     if (this.sessionCache.has(key)) {
       return this.sessionCache.get(key)!;
     }
@@ -77,32 +104,35 @@ export class MemoryStorage {
       this.sessionCache.set(key, content);
       return content;
     } catch {
-      this.sessionCache.set(key, '');
       return '';
     }
   }
 
   public async writeSessionMemory(peer: string, content: string): Promise<void> {
-    const key = peer || 'default';
+    const key = this.requireNormalizedKey(peer);
     const filePath = this.getSessionMemoryPath(key);
     await atomicWriteFile(filePath, content);
     this.sessionCache.set(key, content);
   }
 
   /**
-   * 线程安全 CAS / 原子更新 Session 记忆 (B10)
+   * 线程安全 CAS / 原子更新 Session 记忆
    */
   public async updateSessionMemory(
     peer: string,
     updater: (current: string) => Promise<string> | string
   ): Promise<{ success: boolean; content: string; error?: string }> {
-    const key = peer || 'default';
-    const prevLock = this.updateLocks.get(key) || Promise.resolve();
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return { success: false, content: '', error: 'Memory peer key cannot be empty' };
+    }
+    const lockKey = `session:${key}`;
+    const prevLock = this.updateLocks.get(lockKey) || Promise.resolve();
     let releaseLock!: () => void;
     const newLock = new Promise<void>((resolve) => {
       releaseLock = resolve;
     });
-    this.updateLocks.set(key, newLock);
+    this.updateLocks.set(lockKey, newLock);
 
     try {
       await prevLock;
@@ -114,8 +144,8 @@ export class MemoryStorage {
       return { success: false, content: '', error: err?.message || String(err) };
     } finally {
       releaseLock();
-      if (this.updateLocks.get(key) === newLock) {
-        this.updateLocks.delete(key);
+      if (this.updateLocks.get(lockKey) === newLock) {
+        this.updateLocks.delete(lockKey);
       }
     }
   }
@@ -125,7 +155,10 @@ export class MemoryStorage {
   }
 
   public async existsSessionMemory(peer: string): Promise<boolean> {
-    const key = peer || 'default';
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return false;
+    }
     const filePath = this.getSessionMemoryPath(key);
     try {
       const content = await fs.readFile(filePath, 'utf-8');
@@ -135,23 +168,15 @@ export class MemoryStorage {
     }
   }
 
-  public async readUserProfileRaw(qq = 'default'): Promise<string> {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
-    if (this.userCache.has(key)) {
-      return this.userCache.get(key)!;
-    }
-    const filePath = this.getUserProfilePath(key);
-    try {
-      const content = await fs.readFile(filePath, 'utf-8');
-      this.userCache.set(key, content);
-      return content;
-    } catch {
-      return '';
-    }
+  public async readUserProfileRaw(peer: string): Promise<string> {
+    return this.readUserProfile(peer);
   }
 
-  public async existsUserProfile(qq = 'default'): Promise<boolean> {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
+  public async existsUserProfile(peer: string): Promise<boolean> {
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return false;
+    }
     const filePath = this.getUserProfilePath(key);
     try {
       const content = await fs.readFile(filePath, 'utf-8');
@@ -161,8 +186,11 @@ export class MemoryStorage {
     }
   }
 
-  public async readUserProfile(qq = 'default'): Promise<string> {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
+  public async readUserProfile(peer: string): Promise<string> {
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return '';
+    }
     if (this.userCache.has(key)) {
       return this.userCache.get(key)!;
     }
@@ -173,45 +201,37 @@ export class MemoryStorage {
         this.userCache.set(key, content);
         return content;
       }
-    } catch {}
-
-    // 若专属画像不存在且非 default，回退至 default.md
-    if (key !== 'default') {
-      try {
-        const defaultContent = await fs.readFile(this.getUserProfilePath('default'), 'utf-8');
-        return defaultContent;
-      } catch {
-        return '';
-      }
+      return '';
+    } catch {
+      return '';
     }
-
-    return '';
   }
 
-  public async writeUserProfile(qq: string, content: string): Promise<void> {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
+  public async writeUserProfile(peer: string, content: string): Promise<void> {
+    const key = this.requireNormalizedKey(peer);
     const filePath = this.getUserProfilePath(key);
     await atomicWriteFile(filePath, content);
     this.userCache.set(key, content);
-    if (key === 'default') {
-      this.userCache.clear();
-    }
   }
 
   /**
-   * 线程安全 CAS / 原子更新 User Profile (B10)
+   * 线程安全 CAS / 原子更新 User Profile
    */
   public async updateUserProfile(
-    qq: string,
+    peer: string,
     updater: (current: string) => Promise<string> | string
   ): Promise<{ success: boolean; content: string; error?: string }> {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
-    const prevLock = this.updateLocks.get(key) || Promise.resolve();
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return { success: false, content: '', error: 'Memory peer key cannot be empty' };
+    }
+    const lockKey = `user:${key}`;
+    const prevLock = this.updateLocks.get(lockKey) || Promise.resolve();
     let releaseLock!: () => void;
     const newLock = new Promise<void>((resolve) => {
       releaseLock = resolve;
     });
-    this.updateLocks.set(key, newLock);
+    this.updateLocks.set(lockKey, newLock);
 
     try {
       await prevLock;
@@ -223,8 +243,8 @@ export class MemoryStorage {
       return { success: false, content: '', error: err?.message || String(err) };
     } finally {
       releaseLock();
-      if (this.updateLocks.get(key) === newLock) {
-        this.updateLocks.delete(key);
+      if (this.updateLocks.get(lockKey) === newLock) {
+        this.updateLocks.delete(lockKey);
       }
     }
   }
@@ -232,7 +252,10 @@ export class MemoryStorage {
   // ==================== 同步读写方法 (供 System Prompt 同步组装) ====================
 
   public readSessionMemorySync(peer: string): string {
-    const key = peer || 'default';
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return '';
+    }
     if (this.sessionCache.has(key)) {
       return this.sessionCache.get(key)!;
     }
@@ -247,14 +270,17 @@ export class MemoryStorage {
   }
 
   public writeSessionMemorySync(peer: string, content: string): void {
-    const key = peer || 'default';
+    const key = this.requireNormalizedKey(peer);
     const filePath = this.getSessionMemoryPath(key);
     atomicWriteFileSync(filePath, content);
     this.sessionCache.set(key, content);
   }
 
-  public readUserProfileSync(qq = 'default'): string {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
+  public readUserProfileSync(peer: string): string {
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return '';
+    }
     if (this.userCache.has(key)) {
       return this.userCache.get(key)!;
     }
@@ -265,171 +291,61 @@ export class MemoryStorage {
         this.userCache.set(key, content);
         return content;
       }
-    } catch {}
-
-    if (key !== 'default') {
-      try {
-        const defaultContent = fsSync.readFileSync(this.getUserProfilePath('default'), 'utf-8');
-        return defaultContent;
-      } catch {
-        return '';
-      }
+      return '';
+    } catch {
+      return '';
     }
-
-    return '';
   }
 
-  public writeUserProfileSync(qq: string, content: string): void {
-    const key = qq && qq.trim() ? qq.trim() : 'default';
+  public writeUserProfileSync(peer: string, content: string): void {
+    const key = this.requireNormalizedKey(peer);
     const filePath = this.getUserProfilePath(key);
     atomicWriteFileSync(filePath, content);
     this.userCache.set(key, content);
-    if (key === 'default') {
-      this.userCache.clear();
-    }
   }
 
   /**
-   * 单独提取 Session 规则与长程记忆快照
+   * 单独提取当前单聊 Session 规则与长程记忆快照（全量注入）
    */
   public getSessionRulesSnapshotSync(peer: string): string {
-    const sessionMemory = this.readSessionMemorySync(peer).trim();
-    if (!sessionMemory) return '';
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return '';
+    }
+    const sessionMemory = this.readSessionMemorySync(key).trim();
+    if (!sessionMemory) {
+      return '';
+    }
     if (sessionMemory.startsWith('#')) {
       return sessionMemory;
     }
-    return `### Session 记忆（${peer}）\n${sessionMemory}`;
+    return `### Session 记忆（${key}）\n${sessionMemory}`;
   }
 
   /**
-   * 单独提取用户画像快照（遵循预算控制与截断保护）
+   * 单独提取当前单聊用户画像快照（全量读取当前 peer，严禁跨会话兜底）
    */
-  public getUserProfilesSnapshotSync(
-    peer: string,
-    activeUsers: ActiveUserInfo[] = [],
-    groupUserProfilesBudget = DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
-    currentQQ?: string
-  ): string {
-    const isPrivate = peer.startsWith('user_') || peer.startsWith('qq-user-');
-    const userBlocks: string[] = [];
-    let profileLength = 0;
-    let truncated = false;
-
-    if (isPrivate) {
-      // 私聊单用户画像全量注入
-      const targetQQ =
-        activeUsers[0]?.qq || currentQQ || peer.replace(/^(user_|qq-user-)/, '').split('-')[0];
-      const targetName = activeUsers[0]?.name || targetQQ;
-      const profile = this.readUserProfileSync(targetQQ).trim();
-      if (profile) {
-        userBlocks.push(
-          profile.startsWith('#') ? profile : `### ${targetName} (${targetQQ})\n${profile}`
-        );
-      }
-    } else {
-      // 群聊多用户：动态阶梯排序 + 快照稳定性保护
-      let candidateUsers = [...activeUsers];
-      const normalizedCurrentQQ =
-        currentQQ && currentQQ !== 'default' ? currentQQ.trim() : null;
-
-      if (normalizedCurrentQQ) {
-        const currentProfile = this.readUserProfileSync(normalizedCurrentQQ).trim();
-        if (currentProfile) {
-          // 模拟按自然活跃顺序装填，检查 normalizedCurrentQQ 是否能被完整/原子纳入预算
-          let naturallyIncluded = false;
-          let simLength = 0;
-
-          for (const u of candidateUsers) {
-            const p = this.readUserProfileSync(u.qq).trim();
-            if (!p) continue;
-            const b = p.startsWith('#') ? p : `### ${u.name} (${u.qq})\n${p}`;
-            simLength += (simLength > 0 ? 2 : 0) + b.length;
-
-            if (u.qq === normalizedCurrentQQ) {
-              naturallyIncluded = true;
-              break;
-            }
-
-            if (simLength >= groupUserProfilesBudget) {
-              break;
-            }
-          }
-
-          if (!naturallyIncluded) {
-            // 自然顺序下会被截断挤出（或不在活跃列表中），动态将当前发言人提拔到最前面
-            const currentName =
-              candidateUsers.find((u) => u.qq === normalizedCurrentQQ)?.name ||
-              normalizedCurrentQQ;
-            candidateUsers = [
-              { qq: normalizedCurrentQQ, name: currentName },
-              ...candidateUsers.filter((u) => u.qq !== normalizedCurrentQQ),
-            ];
-          }
-        }
-      }
-
-      // 按确定的顺序装填用户画像（整块原子装填）
-      for (let i = 0; i < candidateUsers.length; i++) {
-        const user = candidateUsers[i];
-        const profile = this.readUserProfileSync(user.qq).trim();
-        if (!profile) continue;
-
-        const block = profile.startsWith('#')
-          ? profile
-          : `### ${user.name} (${user.qq})\n${profile}`;
-
-        // 已达/超过预算时，当前及后续用户均不注入（含"放完当前块后再判断"语义）
-        if (profileLength >= groupUserProfilesBudget) {
-          truncated = true;
-          break;
-        }
-
-        userBlocks.push(block);
-        profileLength += (profileLength > 0 ? 2 : 0) + block.length;
-
-        if (profileLength >= groupUserProfilesBudget) {
-          // 达到或突破预算，检查后续候选用户中是否还有未装入的有画像用户
-          for (let j = i + 1; j < candidateUsers.length; j++) {
-            if (this.readUserProfileSync(candidateUsers[j].qq).trim()) {
-              truncated = true;
-              break;
-            }
-          }
-          break;
-        }
-      }
+  public getUserProfilesSnapshotSync(peer: string): string {
+    const key = this.normalizePeerKey(peer);
+    if (!key) {
+      return '';
     }
-
-    const parts: string[] = [];
-    if (userBlocks.length > 0) {
-      parts.push(userBlocks.join('\n\n'));
+    const profile = this.readUserProfileSync(key).trim();
+    if (!profile) {
+      return '';
     }
-    if (truncated) {
-      parts.push(TRUNCATED_USER_PROFILE_NOTICE);
+    if (profile.startsWith('#')) {
+      return profile;
     }
-    return parts.join('\n\n').trim();
+    return `### 用户画像\n${profile}`;
   }
 
   /**
-   * 组装 System Prompt 动态记忆上下文快照
-   * - Session 规则全量注入，永不切割；
-   * - 私聊用户画像全量注入，永不切割；
-   * - 群聊用户画像按总预算整块装填：放完当前画像后达到/超过预算时，
-   *   后续用户不再注入，并追加截断提示。预算只统计用户画像，不包含 Session 规则。
+   * 组装单聊 System Prompt 动态记忆上下文快照（Session 规则 + 用户画像全量注入）
    */
-  public getPromptSnapshotSync(
-    peer: string,
-    activeUsers: ActiveUserInfo[] = [],
-    groupUserProfilesBudget = DEFAULT_GROUP_MEMORY_TOTAL_BUDGET_CHARS,
-    currentQQ?: string
-  ): string {
+  public getPromptSnapshotSync(peer: string): string {
     const rules = this.getSessionRulesSnapshotSync(peer);
-    const profiles = this.getUserProfilesSnapshotSync(
-      peer,
-      activeUsers,
-      groupUserProfilesBudget,
-      currentQQ
-    );
+    const profiles = this.getUserProfilesSnapshotSync(peer);
 
     const parts: string[] = [];
     if (rules) parts.push(rules);
@@ -437,4 +353,3 @@ export class MemoryStorage {
     return parts.join('\n\n').trim();
   }
 }
-

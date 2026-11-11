@@ -1,321 +1,252 @@
 /**
- * dsh-napcat-bridge: 唤醒门控模块
- * 实现 OneBot 11 入方向消息与通知事件的唤醒条件判定与唤醒包组装。
+ * kujira: QQ 官方 Bot 单聊唤醒门控模块
+ *
+ * 面向 `C2C_MESSAGE_CREATE` (`QQC2CMessageCreateEvent`) 事件的唤醒判定与 `WakeupPayload` 组装：
+ * - 方案 A 身份映射：`openidToPeer(author.user_openid)` 生成 `user_<hash16>`，`from_user` 保留 `openid`；
+ * - 三 ID 严格隔离：提取入站 `msg_id = event.id`、`ref_idx` (`msg_idx=REFIDX_...`) 与被引用 `ref_msg_idx`；
+ * - 入站引用精确还原：优先凭 `REFIDX_...` 查本地 SQLite；未命中或遇 `TMP_...` 时由 `msg_elements[]` 回退还原；
+ * - ISO-8601 `timestamp` 解析为毫秒时间戳；过滤空内容且无附件/引用/卡片的无效事件。
  */
 
 import type {
-  BridgePluginConfig,
-  OneBotMessageEvent,
-  OneBotNoticeEvent,
-  WakeupPayload,
-  WakeupTriggerType,
   FaceRecord,
+  QQC2CMessageCreateEvent,
+  WakeupPayload,
+  WakeupQuotedInfo,
+  WakeupTriggerType,
 } from '../types/index.js';
-import type { ProactiveManager } from './proactive.js';
-import type { FriendNoticeTracker } from './friend-tracker.js';
-import { parseNormalizedContent, resolveAtNicknames } from './segment-normalizer.js';
+import type { AttachmentDescriptor } from '../attachment/types.js';
+import { describeInboundAttachments, isImageFileExt } from '../attachment/classify.js';
+import { isValidOpenid, openidToPeer } from '../utils/peer.js';
+import {
+  extractMessageRefIdx,
+  extractMsgElementsText,
+  extractQuotedRefIdx,
+  isPermanentRefIdx,
+  parseNormalizedContent,
+} from './segment-normalizer.js';
 
-// 向后兼容 Re-export 子模块导出
+// Re-export 子模块导出
 export * from './card-parser.js';
 export * from './segment-normalizer.js';
-export * from './proactive-filter.js';
+
+export interface QuotedMessageRecord {
+  msg_id?: string;
+  ref_idx?: string | null;
+  user_id?: string;
+  sender_name?: string;
+  content: string;
+  self?: number;
+  images?: string[];
+  local_path?: string | null;
+  type?: string;
+}
 
 export interface WakeupOptions {
-  bot_qq: string;
-  bot_nickname?: string;
-  aliases?: string[];
-  isQuotingBot?: (replyMsgId: number) => Promise<boolean>;
-  getQuotedMessage?: (replyMsgId: number) => Promise<{
-    user_id: string;
-    sender_name?: string;
-    content: string;
-    self?: number;
-    images?: string[];
-  } | null | undefined>;
-  /** EN-001: 被@者昵称解析器（NapCat at 段只有 qq，昵称经 get_group_member_info 获取） */
-  resolveNickname?: (groupId: number | string, qq: string) => Promise<string | undefined>;
-  /** 主动回复插件配置 */
-  proactive?: BridgePluginConfig;
-  /** 主动回复管理器实例 */
-  proactiveManager?: ProactiveManager;
-  /** 好友申请与通知跟踪器 */
-  friendTracker?: FriendNoticeTracker;
+  /** 已落盘的入站附件描述符（由 resolveInboundAttachments 产出；缺省时由 event.attachments 推导） */
+  descriptors?: AttachmentDescriptor[];
+  /** 从 message_type=102 合并转发内嵌图片下载落盘得到的本地路径 */
+  forwardImages?: string[];
+  /** 合并转发文本 URL 脱敏替换回调 */
+  sanitizeForwardContent?: (content: string) => string;
+  /** 机器人展示名（引用自身消息时用于填充 quoted.from_name） */
+  botName?: string;
+  /** 发送者本地备注/展示名覆盖 */
+  senderRemark?: string;
+  /** 根据永久引用索引 REFIDX_... 反查本地数据库消息 */
+  getMessageByRefIdx?: (
+    refIdx: string
+  ) => Promise<QuotedMessageRecord | null | undefined> | QuotedMessageRecord | null | undefined;
   /** 入站图片匹配本地表情库查询器 */
   getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
 }
 
 export interface WakeupDecision {
   wakeup: boolean;
-  trigger?: WakeupTriggerType | 'direct';
+  trigger?: WakeupTriggerType;
   payload?: WakeupPayload;
 }
 
-export async function shouldWakeup(
-  event: OneBotMessageEvent | OneBotNoticeEvent,
-  options: WakeupOptions
-): Promise<WakeupDecision> {
-  const botQQ = String(options.bot_qq || '');
+const IMAGE_FORMATS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
 
-  // 1. 自循环防护: 过滤自身发出的消息或由 bot_qq 发出的事件
-  if (event.post_type === 'message_sent') {
-    return { wakeup: false };
+function parseIsoTimestamp(timestamp?: string): number {
+  if (typeof timestamp === 'string' && timestamp.trim()) {
+    const parsed = Date.parse(timestamp);
+    if (Number.isFinite(parsed)) return parsed;
   }
+  return Date.now();
+}
 
-  const eventUserId = 'user_id' in event && event.user_id !== undefined ? String(event.user_id) : '';
-  const senderUserId = 'sender' in event && event.sender?.user_id !== undefined ? String(event.sender.user_id) : '';
-
-  if (botQQ && (eventUserId === botQQ || senderUserId === botQQ)) {
-    return { wakeup: false };
-  }
-
-  const timestamp = event.time
-    ? event.time < 10000000000
-      ? event.time * 1000
-      : event.time
-    : Date.now();
-
-  // 2. Notice 事件判定 (如 poke 戳一戳)
-  if (event.post_type === 'notice') {
-    const notice = event as OneBotNoticeEvent;
-    if (notice.notice_type === 'notify' && notice.sub_type === 'poke') {
-      const targetId = notice.target_id !== undefined ? String(notice.target_id) : '';
-      if (botQQ && targetId === botQQ) {
-        const fromUser = String(notice.user_id ?? notice.sender_id ?? '');
-        const isGroup = Boolean(notice.group_id);
-        const peer = isGroup ? `group_${notice.group_id}` : `user_${fromUser}`;
-        let fromName = '';
-        if (isGroup && notice.group_id && typeof options.resolveNickname === 'function') {
-          try {
-            fromName = (await options.resolveNickname(notice.group_id, fromUser)) || '';
-          } catch {}
-        }
-        const payload: WakeupPayload = {
-          trigger: 'poke',
-          peer,
-          from_user: fromUser,
-          from_name: fromName,
-          content: '[戳一戳]',
-          timestamp,
-        };
-        return {
-          wakeup: true,
-          trigger: 'poke',
-          payload,
-        };
-      }
+function collectDescriptorImagePaths(descriptors: ReadonlyArray<AttachmentDescriptor>): string[] {
+  const out: string[] = [];
+  for (const d of descriptors) {
+    const localPath = d.local?.path;
+    if (!localPath) continue;
+    const isImage =
+      d.kind === 'image' ||
+      d.kind === 'sticker' ||
+      (d.kind === 'file' &&
+        (isImageFileExt(localPath) ||
+          (typeof d.local?.format === 'string' && IMAGE_FORMATS.has(d.local.format.toLowerCase()))));
+    if (isImage && !out.includes(localPath)) {
+      out.push(localPath);
     }
-    return { wakeup: false };
   }
+  return out;
+}
 
-  // 3. Message 事件判定
-  const msgEvent = event as OneBotMessageEvent;
-  const fromUser = String(msgEvent.sender?.user_id ?? msgEvent.user_id ?? '');
-  let fromName = msgEvent.sender?.card || msgEvent.sender?.nickname || '';
-  const isGroup = msgEvent.message_type === 'group';
-  const groupId = msgEvent.group_id;
-  const peer = isGroup ? `group_${msgEvent.group_id}` : `user_${fromUser}`;
-
-  // 若群聊消息中发送者昵称为空，尝试调用 resolveNickname 兜底拉取群名片/昵称
-  if (isGroup && !fromName && groupId !== undefined && typeof options.resolveNickname === 'function') {
-    try {
-      fromName = (await options.resolveNickname(groupId, fromUser)) || '';
-    } catch {}
+function resolveQuotedImages(record: QuotedMessageRecord): string[] | undefined {
+  if (Array.isArray(record.images) && record.images.length > 0) {
+    const valid = record.images.filter((p): p is string => typeof p === 'string' && p.trim() !== '');
+    if (valid.length > 0) return valid;
   }
-
-  const { content: rawContent, images, replyId, atQQs } = parseNormalizedContent(msgEvent, {
-    getFaceByMd5: options.getFaceByMd5,
-  });
-  const inboundMsgId =
-    typeof msgEvent.message_id === 'number' && Number.isSafeInteger(msgEvent.message_id) && msgEvent.message_id !== 0
-      ? msgEvent.message_id
-      : (msgEvent.message_id !== undefined && msgEvent.message_id !== null && Number.isSafeInteger(Number(msgEvent.message_id)) && Number(msgEvent.message_id) !== 0)
-        ? Number(msgEvent.message_id)
-        : undefined;
-
-  // 若消息完全无字符（长度为 0）且无图片/引用/at 等有效内容，直接过滤，不唤醒（如文件下载回执/空系统灰条）
-  if (rawContent.length === 0 && images.length === 0 && replyId === undefined && atQQs.length === 0) {
-    return { wakeup: false };
-  }
-
-  // EN-001: 群聊消息的 at 段统一归一化为 @昵称(QQ号)（唤醒包 content 与 from_name 同源格式）
-  let content = rawContent;
   if (
-    isGroup &&
-    atQQs.length > 0 &&
-    typeof options.resolveNickname === 'function' &&
-    groupId !== undefined
+    typeof record.local_path === 'string' &&
+    record.local_path.trim() !== '' &&
+    (record.type === 'image' || record.type === 'sticker' || isImageFileExt(record.local_path))
   ) {
-    content = await resolveAtNicknames(content, atQQs, groupId, options.resolveNickname);
+    return [record.local_path.trim()];
+  }
+  return undefined;
+}
+
+async function resolveQuotedInfo(
+  event: QQC2CMessageCreateEvent,
+  options: WakeupOptions
+): Promise<WakeupQuotedInfo | undefined> {
+  const refMsgIdx = extractQuotedRefIdx(event);
+  const hasElements = Array.isArray(event.msg_elements) && event.msg_elements.length > 0;
+  const isQuoteEvent = event.message_type === 103 || Boolean(refMsgIdx) || hasElements;
+
+  if (!isQuoteEvent) {
+    return undefined;
   }
 
-  // 3.0 异步统一解析被引用消息（若存在 replyId）
-  let quoted: WakeupPayload['quoted'] = undefined;
-  let isQuotingSelf = false;
-  const combinedImages = [...images];
-
-  if (replyId !== undefined) {
-    if (options.getQuotedMessage) {
-      try {
-        const quotedMsg = await options.getQuotedMessage(replyId);
-        if (quotedMsg) {
-          isQuotingSelf = Boolean(
-            quotedMsg.self === 1 ||
-              (botQQ !== '' && String(quotedMsg.user_id) === botQQ)
-          );
-          quoted = {
-            msg_id: replyId,
-            user_id: String(quotedMsg.user_id || ''),
-            from_name: quotedMsg.sender_name || (isQuotingSelf ? (options.bot_nickname || '') : ''),
-            text: quotedMsg.content || '',
-            images: quotedMsg.images && quotedMsg.images.length > 0 ? quotedMsg.images : undefined,
-          };
-          if (quotedMsg.images && Array.isArray(quotedMsg.images)) {
-            for (const img of quotedMsg.images) {
-              if (img && !combinedImages.includes(img)) {
-                combinedImages.push(img);
-              }
-            }
-          }
-        } else {
-          // 优雅降级占位保底
-          quoted = {
-            msg_id: replyId,
-            user_id: '',
-            from_name: '',
-            text: '〔历史引用消息：内容已过期或无法获取〕',
-          };
-        }
-      } catch {
-        quoted = {
-          msg_id: replyId,
-          user_id: '',
-          from_name: '',
-          text: '〔历史引用消息：内容已过期或无法获取〕',
+  // 1. 若 ref_msg_idx 为永久索引 REFIDX_...，优先查询本地 SQLite
+  if (isPermanentRefIdx(refMsgIdx) && options.getMessageByRefIdx) {
+    try {
+      const hit = await options.getMessageByRefIdx(refMsgIdx);
+      if (hit) {
+        const quotedImages = resolveQuotedImages(hit);
+        const fromName =
+          hit.sender_name?.trim() || (hit.self === 1 ? options.botName?.trim() || 'Bot' : '');
+        return {
+          ...(hit.msg_id ? { msg_id: hit.msg_id } : {}),
+          ref_idx: hit.ref_idx || refMsgIdx,
+          ...(hit.user_id ? { user_id: hit.user_id } : {}),
+          ...(fromName ? { from_name: fromName } : {}),
+          text: hit.content || '',
+          ...(quotedImages ? { images: quotedImages } : {}),
         };
       }
-    } else if (options.isQuotingBot) {
-      try {
-        const isQuoting = await options.isQuotingBot(replyId);
-        if (isQuoting) {
-          isQuotingSelf = true;
-          quoted = {
-            msg_id: replyId,
-            user_id: botQQ,
-            from_name: options.bot_nickname || '',
-            text: '',
-          };
-        }
-      } catch {}
+    } catch {
+      // 查询失败自动回退 msg_elements 兜底
     }
   }
 
-  // 3.1 私聊消息: 默认直接唤醒
-  if (!isGroup) {
-    // 过滤系统号 (如 10000 系统通知) 或系统通知子类型
-    if (fromUser === '10000' || msgEvent.sub_type === 'notice' || msgEvent.sub_type === 'system') {
-      return { wakeup: false };
+  // 2. TMP_... 临时索引、无 ref_msg_idx 或本地库未命中：从 msg_elements[] 提取被引用原文
+  const fallbackText = extractMsgElementsText(event);
+  if (fallbackText) {
+    return {
+      ...(refMsgIdx ? { ref_idx: refMsgIdx } : {}),
+      text: fallbackText,
+    };
+  }
+
+  // 3. 二者皆不可得时优雅降级占位
+  return {
+    ...(refMsgIdx ? { ref_idx: refMsgIdx } : {}),
+    text: '〔历史引用消息：内容已过期或无法获取〕',
+  };
+}
+
+/**
+ * 面向 QQ 官方 Bot `C2C_MESSAGE_CREATE` 事件的唤醒门控与唤醒包组装。
+ */
+export async function shouldWakeup(
+  event: QQC2CMessageCreateEvent,
+  options: WakeupOptions = {}
+): Promise<WakeupDecision> {
+  if (!event || typeof event !== 'object') {
+    return { wakeup: false };
+  }
+
+  // 1. 自循环防护与发送者 openid 校验
+  if (event.author?.bot === true) {
+    return { wakeup: false };
+  }
+  const openid = typeof event.author?.user_openid === 'string' ? event.author.user_openid.trim() : '';
+  if (!isValidOpenid(openid)) {
+    return { wakeup: false };
+  }
+
+  const peer = openidToPeer(openid);
+  const fromName =
+    options.senderRemark?.trim() ||
+    (typeof event.author?.username === 'string' ? event.author.username.trim() : '');
+  const timestamp = parseIsoTimestamp(event.timestamp);
+  const msgId = typeof event.id === 'string' && event.id.trim() ? event.id.trim() : undefined;
+  const refIdx = extractMessageRefIdx(event);
+
+  // 2. 附件描述符与正文归一化
+  const descriptors = options.descriptors
+    ? options.descriptors
+    : describeInboundAttachments(event).attachments;
+
+  const content = parseNormalizedContent(event, descriptors, {
+    getFaceByMd5: options.getFaceByMd5,
+    sanitizeForwardContent: options.sanitizeForwardContent,
+  });
+
+  // 3. 入站引用解析（REFIDX_ 查库 -> msg_elements 兜底）
+  const quoted = await resolveQuotedInfo(event, options);
+
+  // 4. 收集图片本地路径（入站附件 + 合并转发落盘图片 + 引用消息图片）
+  const combinedImages = collectDescriptorImagePaths(descriptors);
+  if (Array.isArray(options.forwardImages)) {
+    for (const img of options.forwardImages) {
+      if (typeof img === 'string' && img.trim() && !combinedImages.includes(img.trim())) {
+        combinedImages.push(img.trim());
+      }
     }
-
-    // 若匹配为好友申请附言自动注入或伴生消息，直接阻断唤醒（零误杀）
-    if (options.friendTracker?.checkAndConsumeFriendNotice(fromUser, content, timestamp)) {
-      return { wakeup: false };
-    }
-
-    const payload: WakeupPayload = {
-      msg_id: inboundMsgId,
-      trigger: 'at', // default trigger type for private or handled by agent
-      peer,
-      from_user: fromUser,
-      from_name: fromName,
-      content,
-      quoted,
-      images: combinedImages.length > 0 ? combinedImages : undefined,
-      timestamp,
-    };
-    return {
-      wakeup: true,
-      trigger: 'direct',
-      payload,
-    };
   }
-
-  // 3.2 群聊唤醒判定
-  // (1) @ 机器人
-  if (botQQ && atQQs.includes(botQQ)) {
-    const payload: WakeupPayload = {
-      msg_id: inboundMsgId,
-      trigger: 'at',
-      peer,
-      from_user: fromUser,
-      from_name: fromName,
-      content,
-      quoted,
-      images: combinedImages.length > 0 ? combinedImages : undefined,
-      timestamp,
-    };
-    return {
-      wakeup: true,
-      trigger: 'at',
-      payload,
-    };
-  }
-
-  // (2) 引用回复机器人
-  if (isQuotingSelf && quoted) {
-    const payload: WakeupPayload = {
-      msg_id: inboundMsgId,
-      trigger: 'quote',
-      peer,
-      from_user: fromUser,
-      from_name: fromName,
-      content,
-      quoted,
-      images: combinedImages.length > 0 ? combinedImages : undefined,
-      timestamp,
-    };
-    return {
-      wakeup: true,
-      trigger: 'quote',
-      payload,
-    };
-  }
-
-  // (3) 点名机器人昵称或别名
-  const mentionTargets: string[] = [];
-  if (options.bot_nickname && options.bot_nickname.trim() !== '') {
-    mentionTargets.push(options.bot_nickname.trim());
-  }
-  if (Array.isArray(options.aliases)) {
-    for (const alias of options.aliases) {
-      if (alias && alias.trim() !== '') {
-        mentionTargets.push(alias.trim());
+  if (quoted?.images) {
+    for (const img of quoted.images) {
+      if (typeof img === 'string' && img.trim() && !combinedImages.includes(img.trim())) {
+        combinedImages.push(img.trim());
       }
     }
   }
 
-  const rawOrContent = `${msgEvent.raw_message || ''} ${content}`;
-  for (const target of mentionTargets) {
-    if (rawOrContent.includes(target)) {
-      const payload: WakeupPayload = {
-        msg_id: inboundMsgId,
-        trigger: 'mention',
-        peer,
-        from_user: fromUser,
-        from_name: fromName,
-        content,
-        quoted,
-        images: combinedImages.length > 0 ? combinedImages : undefined,
-        timestamp,
-      };
-      return {
-        wakeup: true,
-        trigger: 'mention',
-        payload,
-      };
-    }
+  // 5. 过滤完全空内容且无附件/无引用/无卡片的无效事件
+  const hasCard = event.message_type === 3 || Boolean(event.ark_data);
+  if (
+    content.length === 0 &&
+    descriptors.length === 0 &&
+    !quoted &&
+    !hasCard &&
+    combinedImages.length === 0
+  ) {
+    return { wakeup: false };
   }
 
-  // 3.3 普通群消息不再即时唤醒，由 ProactiveManager 统一收集缓冲并在轮询窗口期集中研判
+  const trigger: WakeupTriggerType = quoted ? 'quote' : 'direct';
+  const payload: WakeupPayload = {
+    ...(msgId ? { msg_id: msgId } : {}),
+    ...(refIdx ? { ref_idx: refIdx } : {}),
+    trigger,
+    peer,
+    from_user: openid,
+    from_name: fromName,
+    content,
+    ...(quoted ? { quoted } : {}),
+    ...(combinedImages.length > 0 ? { images: combinedImages } : {}),
+    timestamp,
+  };
 
-  return { wakeup: false };
+  return {
+    wakeup: true,
+    trigger,
+    payload,
+  };
 }

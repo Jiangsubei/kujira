@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 表情包资产库持久化仓库 (faces)
+ * kujira: 表情包资产库持久化仓库 (faces)
  */
 
 import type {

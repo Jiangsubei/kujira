@@ -1,19 +1,35 @@
 /**
  * tests/contract/video-attachment.test.ts
  *
- * 契约测试: 视频消息双端适配与按需拉取契约 (TDD)
+ * 契约测试: QQ 官方 Bot 单聊视频附件分类、裸 GET 落盘与语义化渲染契约
  *
- * 核心契约保证：
- * 1. 渲染层：renderAttachment 对 video 支持 local.path、remote.fileId、fileName、unavailable 等语义化渲染；
- * 2. 唤醒层：parseNormalizedContent 正确将入站 video 段渲染为语义化占位符（群聊拼 ID、私聊带物理路径）；
- * 3. 工具层：fetch_chat_resource 在群聊上下文中放行无 busid 视频，优先直链下载 -> 回退 get_file -> SnowLuma 错误垫片。
+ * 核心契约（仅依赖 Batch 1 与 Batch 2 模块）：
+ * 1. `renderAttachment` 对 `video` 支持 `local.path`、`remote.fileUuid`、`fileName`、`unavailable` 语义化渲染，且不暴露凭证 URL；
+ * 2. `describeInboundAttachments` 对 `content_type: 'video/mp4'` 判定 `kind: 'video'` 与主导类型 `'video'`；
+ * 3. `resolveInboundAttachments` 对视频执行裸 GET 落盘至 `downloads/video/<peer>/`；
+ * 4. `parseNormalizedContent` 与 `shouldWakeup` 在落盘成功/失败时输出准确、无凭证泄漏的占位文案。
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as http from 'node:http';
+import { MediaStorageManager } from '../../src/storage/media.js';
+import { describeInboundAttachments } from '../../src/attachment/classify.js';
 import { renderAttachment } from '../../src/attachment/render.js';
-import { parseNormalizedContent } from '../../src/gateway/wakeup.js';
-import { fetchChatResource } from '../../src/tools/index.js';
 import type { AttachmentDescriptor } from '../../src/attachment/types.js';
+import { resolveInboundAttachments } from '../../src/gateway/inbound-media.js';
+import { parseNormalizedContent, shouldWakeup } from '../../src/gateway/wakeup.js';
+import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
+import { openidToPeer } from '../../src/utils/peer.js';
+
+const MOCK_OPENID = 'A1B2C3D4E5F60123456789ABCDEF0005';
+const MP4_BYTES = Buffer.concat([
+  Buffer.from([0x00, 0x00, 0x00, 0x18]),
+  Buffer.from('ftypisom'),
+  Buffer.alloc(32, 0xaa),
+]);
 
 describe('契约 1: 视频附件描述符语义化渲染 (renderAttachment)', () => {
   it('无任何元数据时保持兜底 [视频]', () => {
@@ -24,256 +40,161 @@ describe('契约 1: 视频附件描述符语义化渲染 (renderAttachment)', ()
     expect(renderAttachment(desc)).toBe('[视频]');
   });
 
-  it('群聊未落盘时呈现 [视频 (ID:<file_id>)]', () => {
-    const desc: AttachmentDescriptor = {
-      kind: 'video',
-      origin: 'inbound',
-      remote: {
-        fileId: 'BV1o1HN6YExH-1.mp4',
-        url: 'https://multimedia.nt.qq.com.cn/download?appid=1415&spec=0',
-      },
-    };
-    expect(renderAttachment(desc)).toBe('[视频 (ID:BV1o1HN6YExH-1.mp4)]');
-  });
-
-  it('群聊若带独立文件名则呈现 [视频:<fileName> (ID:<file_id>)]', () => {
+  it('未落盘但有 fileUuid 与独立文件名时呈现 [视频:<fileName> (ID:<fileUuid>)]，绝不输出 remote.url', () => {
     const desc: AttachmentDescriptor = {
       kind: 'video',
       origin: 'inbound',
       fileName: '精彩集锦.mp4',
       remote: {
-        fileId: 'adad90e6bacb93d30a9f8e575542befc.mp4',
+        fileUuid: 'video-uuid-001',
+        url: 'https://multimedia.nt.qq.com.cn/download?rkey=SECRET_VIDEO_RKEY',
       },
     };
-    expect(renderAttachment(desc)).toBe('[视频:精彩集锦.mp4 (ID:adad90e6bacb93d30a9f8e575542befc.mp4)]');
+    const rendered = renderAttachment(desc);
+    expect(rendered).toBe('[视频:精彩集锦.mp4 (ID:video-uuid-001)]');
+    expect(rendered).not.toContain('SECRET_VIDEO_RKEY');
   });
 
-  it('若文件名与 file_id 完全一致则不产生冗余冒号前缀', () => {
+  it('若文件名与 fileUuid 一致则不产生冗余冒号前缀', () => {
     const desc: AttachmentDescriptor = {
       kind: 'video',
       origin: 'inbound',
-      fileName: 'BV1o1HN6YExH-1.mp4',
-      remote: {
-        fileId: 'BV1o1HN6YExH-1.mp4',
-      },
+      fileName: 'clip.mp4',
+      remote: { fileUuid: 'clip.mp4' },
     };
-    expect(renderAttachment(desc)).toBe('[视频 (ID:BV1o1HN6YExH-1.mp4)]');
+    expect(renderAttachment(desc)).toBe('[视频 (ID:clip.mp4)]');
   });
 
-  it('私聊或已落盘时呈现 [视频 已保存: <local_path>]', () => {
-    const desc: AttachmentDescriptor = {
+  it('已落盘时呈现 [视频 已保存: <local_path>] 或带文件名格式', () => {
+    const bare: AttachmentDescriptor = {
       kind: 'video',
       origin: 'inbound',
-      local: {
-        path: 'C:\\data\\downloads\\files\\user_1000000001\\BV1o1HN6YExH-1.mp4',
-      },
+      local: { path: 'C:\\data\\downloads\\video\\user_1\\clip.mp4', format: 'mp4' },
     };
-    expect(renderAttachment(desc)).toBe(
-      '[视频 已保存: C:\\data\\downloads\\files\\user_1000000001\\BV1o1HN6YExH-1.mp4]'
+    expect(renderAttachment(bare)).toBe(
+      '[视频 已保存: C:\\data\\downloads\\video\\user_1\\clip.mp4]'
     );
-  });
 
-  it('已落盘且带独立文件名呈现 [视频:<fileName> 已保存: <local_path>]', () => {
-    const desc: AttachmentDescriptor = {
+    const named: AttachmentDescriptor = {
       kind: 'video',
       origin: 'inbound',
       fileName: '实况录屏.mp4',
-      local: {
-        path: 'C:\\data\\downloads\\files\\user_1000000001\\live.mp4',
-      },
+      local: { path: 'C:\\data\\downloads\\video\\user_1\\live.mp4', format: 'mp4' },
     };
-    expect(renderAttachment(desc)).toBe(
-      '[视频:实况录屏.mp4 已保存: C:\\data\\downloads\\files\\user_1000000001\\live.mp4]'
+    expect(renderAttachment(named)).toBe(
+      '[视频:实况录屏.mp4 已保存: C:\\data\\downloads\\video\\user_1\\live.mp4]'
     );
   });
 
-  it('落盘失败时如实标记 [视频 (入站落盘失败)]', () => {
+  it('落盘失败时如实标记 [视频... (入站落盘失败)]', () => {
     const desc: AttachmentDescriptor = {
       kind: 'video',
       origin: 'inbound',
-      remote: {
-        fileId: 'bad_video.mp4',
-      },
-      unavailable: 'inbound_failed',
+      fileName: 'bad_video.mp4',
+      remote: { fileUuid: 'bad_uuid' },
+      unavailable: 'download_failed',
     };
-    expect(renderAttachment(desc)).toBe('[视频 (ID:bad_video.mp4) (入站落盘失败)]');
+    expect(renderAttachment(desc)).toBe('[视频:bad_video.mp4 (ID:bad_uuid) (入站落盘失败)]');
   });
 });
 
-describe('契约 2: 入站唤醒文本解析 (parseNormalizedContent)', () => {
-  it('群聊收到视频段未下载时拼入 [视频 (ID:<file_id>)]', () => {
-    const event = {
-      post_type: 'message',
-      message_type: 'group',
-      group_id: 3000000001,
-      user_id: 1000000002,
-      message_id: 12345,
-      time: 1700000000,
-      message: [
-        { type: 'text', data: { text: '看看这个：' } },
+describe('契约 2: 官方视频入站分类、裸 GET 落盘与唤醒归一化', () => {
+  let tmpDir: string;
+  let manager: MediaStorageManager;
+  let servers: http.Server[] = [];
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-video-att-'));
+    manager = new MediaStorageManager({ dshHome: tmpDir, downloadDir: 'downloads' });
+    servers = [];
+  });
+
+  afterEach(async () => {
+    for (const srv of servers) {
+      await new Promise<void>((r) => srv.close(() => r())).catch(() => {});
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function startVideoServer(status = 200): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const srv = http.createServer((_req, res) => {
+        res.writeHead(status, { 'Content-Type': 'video/mp4' });
+        res.end(status === 200 ? MP4_BYTES : Buffer.from('error'));
+      });
+      srv.on('error', reject);
+      servers.push(srv);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address() as any;
+        resolve(`http://127.0.0.1:${addr.port}/demo.mp4?rkey=VIDEO_RKEY_SECRET`);
+      });
+    });
+  }
+
+  it('入站 video/mp4 附件裸 GET 落盘至 downloads/video/<peer>/ 并生成标准唤醒正文', async () => {
+    const url = await startVideoServer(200);
+    const peer = openidToPeer(MOCK_OPENID);
+    const event: QQC2CMessageCreateEvent = {
+      id: 'ROBOT1.0_video_001',
+      content: '看看这个视频',
+      timestamp: '2026-11-11T18:35:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
+      attachments: [
         {
-          type: 'video',
-          data: {
-            file: 'BV1o1HN6YExH-1.mp4',
-            url: 'https://multimedia.nt.qq.com.cn/download?appid=1415',
-          },
+          content_type: 'video/mp4',
+          filename: 'demo_clip.mp4',
+          size: MP4_BYTES.length,
+          url,
         },
       ],
     };
 
-    const res = parseNormalizedContent(event);
-    expect(res.content).toBe('看看这个：[视频 (ID:BV1o1HN6YExH-1.mp4)]');
+    const rawDesc = describeInboundAttachments(event);
+    expect(rawDesc.type).toBe('video');
+    expect(rawDesc.attachments[0]!.kind).toBe('video');
+
+    const resolved = await resolveInboundAttachments(event, peer, manager);
+    expect(resolved[0]!.local?.path).toBeTruthy();
+    expect(resolved[0]!.local!.path.startsWith(path.join(tmpDir, 'downloads', 'video', peer))).toBe(true);
+    expect(resolved[0]!.local!.path.endsWith('demo_clip.mp4')).toBe(true);
+    expect(Buffer.compare(fs.readFileSync(resolved[0]!.local!.path), MP4_BYTES)).toBe(0);
+
+    const normalized = parseNormalizedContent(event, resolved);
+    expect(normalized).toBe(`看看这个视频 [视频:demo_clip.mp4 已保存: ${resolved[0]!.local!.path}]`);
+
+    const decision = await shouldWakeup(event, { descriptors: resolved });
+    expect(decision.wakeup).toBe(true);
+    expect(decision.payload?.content).toBe(normalized);
+    expect(decision.payload?.content).not.toContain('VIDEO_RKEY_SECRET');
   });
 
-  it('私聊收到已落盘视频段时拼入 [视频 已保存: <local_path>]', () => {
-    const event = {
-      post_type: 'message',
-      message_type: 'private',
-      user_id: 1000000001,
-      message_id: 12346,
-      time: 1700000000,
-      message: [
+  it('视频下载失败时标记落盘失败且绝不暴露带凭证 URL', async () => {
+    const deadUrl = await startVideoServer(404);
+    const peer = openidToPeer(MOCK_OPENID);
+    const event: QQC2CMessageCreateEvent = {
+      id: 'ROBOT1.0_video_002',
+      content: '',
+      timestamp: '2026-11-11T18:36:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
+      attachments: [
         {
-          type: 'video',
-          data: {
-            file: 'BV1o1HN6YExH-1.mp4',
-            local_path: 'C:\\data\\downloads\\files\\user_1000000001\\BV1o1HN6YExH-1.mp4',
-          },
+          content_type: 'video/mp4',
+          filename: 'missing.mp4',
+          url: deadUrl,
         },
       ],
     };
 
-    const res = parseNormalizedContent(event);
-    expect(res.content).toBe(
-      '[视频 已保存: C:\\data\\downloads\\files\\user_1000000001\\BV1o1HN6YExH-1.mp4]'
-    );
-  });
-});
+    const resolved = await resolveInboundAttachments(event, peer, manager);
+    expect(resolved[0]!.local).toBeUndefined();
+    expect(resolved[0]!.unavailable).toBeTruthy();
+    expect(resolved[0]!.unavailable).not.toContain('VIDEO_RKEY_SECRET');
 
-describe('契约 3: 群聊无 busid 视频按需拉取与双端兼容 (fetch_chat_resource)', () => {
-  it('首选直链通道：库中有 remote.url 时优先直接使用直链下载落盘', async () => {
-    const fakeDb = {
-      getByFileId: vi.fn().mockReturnValue({
-        file_id: 'BV1o1HN6YExH-1.mp4',
-        type: 'video',
-        local_path: null,
-        attachments: JSON.stringify([
-          {
-            kind: 'video',
-            origin: 'inbound',
-            remote: {
-              fileId: 'BV1o1HN6YExH-1.mp4',
-              url: 'https://multimedia.nt.qq.com.cn/download?test=1',
-            },
-          },
-        ]),
-      }),
-      saveMessage: vi.fn(),
-      saveMessageIfNotExists: vi.fn(),
-    };
-
-    const fakeMediaManager = {
-      downloadAndSave: vi.fn().mockResolvedValue({
-        localPath: 'C:\\data\\files\\group_3000000001\\BV1o1HN6YExH-1.mp4',
-      }),
-    };
-
-    const fakeGateway = {
-      getFile: vi.fn(),
-    };
-
-    const res = await fetchChatResource(
-      { file_id: 'BV1o1HN6YExH-1.mp4' },
-      {
-        db: fakeDb as any,
-        mediaManager: fakeMediaManager as any,
-        gateway: fakeGateway as any,
-        groupId: '3000000001',
-        peer: 'group_3000000001',
-      }
-    );
-
-    expect(res.success).toBe(true);
-    expect(res.local_path).toBe('C:\\data\\files\\group_3000000001\\BV1o1HN6YExH-1.mp4');
-    expect(fakeMediaManager.downloadAndSave).toHaveBeenCalledWith(
-      'https://multimedia.nt.qq.com.cn/download?test=1',
-      expect.objectContaining({
-        fileId: 'BV1o1HN6YExH-1.mp4',
-      })
-    );
-    // 直链可用时不需要调用 gateway.getFile
-    expect(fakeGateway.getFile).not.toHaveBeenCalled();
-  });
-
-  it('直链失效时回退 NapCat get_file 动态刷新并落盘', async () => {
-    const fakeDb = {
-      getByFileId: vi.fn().mockReturnValue(null), // 库中未查到直链
-      saveMessage: vi.fn(),
-    };
-
-    const fakeMediaManager = {
-      downloadAndSave: vi.fn().mockResolvedValue({
-        localPath: 'C:\\data\\files\\group_3000000001\\refreshed.mp4',
-      }),
-    };
-
-    const fakeGateway = {
-      getFile: vi.fn().mockResolvedValue({
-        status: 'ok',
-        retcode: 0,
-        data: {
-          url: 'https://multimedia.nt.qq.com.cn/download?refreshed=1',
-          file_name: 'refreshed.mp4',
-        },
-      }),
-    };
-
-    const res = await fetchChatResource(
-      { file_id: 'refreshed.mp4' },
-      {
-        db: fakeDb as any,
-        mediaManager: fakeMediaManager as any,
-        gateway: fakeGateway as any,
-        groupId: '3000000001',
-        peer: 'group_3000000001',
-      }
-    );
-
-    expect(res.success).toBe(true);
-    expect(res.local_path).toBe('C:\\data\\files\\group_3000000001\\refreshed.mp4');
-    expect(fakeGateway.getFile).toHaveBeenCalledWith('refreshed.mp4');
-  });
-
-  it('SnowLuma 垫片：若 get_file 报错 image/voice cache 限制，返回友好诊断提示', async () => {
-    const fakeDb = {
-      getByFileId: vi.fn().mockReturnValue(null),
-    };
-
-    const fakeMediaManager = {
-      downloadAndSave: vi.fn(),
-    };
-
-    const fakeGateway = {
-      getFile: vi.fn().mockResolvedValue({
-        status: 'failed',
-        retcode: 100,
-        wording: 'file_id not found in the image/voice cache. get_file only resolves cached image/voice ids...',
-      }),
-    };
-
-    const res = await fetchChatResource(
-      { file_id: 'snowluma_expired.mp4' },
-      {
-        db: fakeDb as any,
-        mediaManager: fakeMediaManager as any,
-        gateway: fakeGateway as any,
-        groupId: '3000000001',
-        peer: 'group_3000000001',
-      }
-    );
-
-    expect(res.success).toBe(false);
-    expect(res.error).toContain('SnowLuma');
-    expect(res.error).toContain('image/voice cache');
+    const decision = await shouldWakeup(event, { descriptors: resolved });
+    expect(decision.wakeup).toBe(true);
+    expect(decision.payload?.content).toBe('[视频:missing.mp4 (入站落盘失败)]');
+    expect(decision.payload?.content).not.toContain('VIDEO_RKEY_SECRET');
   });
 });

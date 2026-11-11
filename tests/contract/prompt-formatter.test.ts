@@ -5,6 +5,8 @@ import {
   formatPersonaContext,
   formatBehaviorContext,
   formatSlangContext,
+  formatSessionRulesContext,
+  formatUserProfilesContext,
   formatMemoryContext,
 } from '../../src/prompt/formatter.js';
 import type { FaceRecord } from '../../src/types/index.js';
@@ -24,10 +26,10 @@ describe('契约测试: 统一提示词与上下文格式化模块 (PromptFormat
         title: '人格设定',
         subtitle: 'Persona',
         description: '请严格遵守以下人设要求：',
-        content: '你是一个热心的群友。',
+        content: '你是一个贴心的单聊助手。',
       });
       expect(res).toBe(
-        '## 人格设定 (Persona)\n\n请严格遵守以下人设要求：\n\n你是一个热心的群友。'
+        '## 人格设定 (Persona)\n\n请严格遵守以下人设要求：\n\n你是一个贴心的单聊助手。'
       );
     });
 
@@ -102,17 +104,14 @@ describe('契约测试: 统一提示词与上下文格式化模块 (PromptFormat
 
       const res = formatFaceLibraryContext(mockFaces, 4);
 
-      // 验证顶层大标题与指引
       expect(res).toContain('## 本地表情包库存 (Sticker & Meme Library)');
       expect(res).toContain('共 4 张可用表情包');
       expect(res).toContain('send_face(face_id="..."');
 
-      // 验证情绪分组标题
       expect(res).toContain('### 开心 (2)');
       expect(res).toContain('### 调侃 (1)');
       expect(res).toContain('### 通用/其他 (1)');
 
-      // 验证组内表情项排版（ID 与详细标签）
       expect(res).toContain('- face_001: 标签: 猫咪, 摇尾巴, 可爱');
       expect(res).toContain('- face_002: 标签: 欢呼, 撒花');
       expect(res).toContain('- face_003: 标签: 熊猫头, 就这');
@@ -148,21 +147,31 @@ describe('契约测试: 统一提示词与上下文格式化模块 (PromptFormat
     });
 
     it('3.2 formatBehaviorContext 产生统一的 ## 行为准则 (Behavior Guidelines) 格式', () => {
-      const res = formatBehaviorContext('严格使用纯文本。');
-      expect(res).toBe('## 行为准则 (Behavior Guidelines)\n\n严格使用纯文本。');
+      const res = formatBehaviorContext('单聊原生支持 Markdown 富文本排版。');
+      expect(res).toBe('## 行为准则 (Behavior Guidelines)\n\n单聊原生支持 Markdown 富文本排版。');
     });
 
-    it('3.3 formatSlangContext 产生统一的 ## 社群黑话知识库 (Slang & Memes) 格式', () => {
-      const res = formatSlangContext('- **草率了**：指决定过快');
-      expect(res).toContain('## 社群黑话知识库 (Slang & Memes)');
+    it('3.3 formatSlangContext 产生统一的 ## 黑话与梗知识库 (Slang & Memes) 格式（无社群残留）', () => {
+      const res = formatSlangContext('- **草率了**：决定过快');
+      expect(res).toContain('## 黑话与梗知识库 (Slang & Memes)');
+      expect(res).not.toContain('社群');
       expect(res).toContain('query_slang');
-      expect(res).toContain('- **草率了**：指决定过快');
+      expect(res).toContain('- **草率了**：决定过快');
     });
 
-    it('3.4 formatMemoryContext 产生统一的 ## 会话规则与用户画像 (Memory & Profiles) 格式', () => {
+    it('3.4 formatSessionRulesContext 与 formatMemoryContext 产生统一规范格式', () => {
+      const rules = formatSessionRulesContext('### Session 记忆\n- 规则一');
+      expect(rules).toBe('## 会话规则与约定 (Session Rules & Conventions)\n\n### Session 记忆\n- 规则一');
+
       const res = formatMemoryContext('### Session 记忆\n- 规则一');
       expect(res).toContain('## 会话规则与用户画像 (Memory & Profiles)');
       expect(res).toContain('### Session 记忆\n- 规则一');
+    });
+
+    it('3.5 formatUserProfilesContext 产生统一的 ## 用户画像与偏好 (User Profile) 格式（无群成员残留）', () => {
+      const res = formatUserProfilesContext('### 用户画像\n- 喜欢 TypeScript');
+      expect(res).toBe('## 用户画像与偏好 (User Profile)\n\n### 用户画像\n- 喜欢 TypeScript');
+      expect(res).not.toContain('群成员');
     });
   });
 });

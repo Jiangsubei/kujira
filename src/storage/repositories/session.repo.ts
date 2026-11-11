@@ -1,17 +1,11 @@
 /**
- * dsh-napcat-bridge: 会话状态与模型路由偏好持久化仓库 (session_states)
+ * kujira: 会话状态、模型路由偏好及 peer<->openid 身份映射持久化仓库
+ * (session_states, peer_openid_map)
  */
 
-export interface SessionStateRecord {
-  peer: string;
-  current_session_id: string;
-  cleared_round: number;
-  cleared_version: number;
-  updated_at: number;
-  model_provider?: string;
-  model_name?: string;
-  model_reasoning_effort?: string;
-}
+import type { SessionStateRecord } from '../../types/index.js';
+
+export type { SessionStateRecord };
 
 export class SessionRepository {
   constructor(private getDb: () => any) {}
@@ -67,5 +61,62 @@ export class SessionRepository {
       model_name: row.model_name || undefined,
       model_reasoning_effort: row.model_reasoning_effort || undefined,
     }));
+  }
+
+  /**
+   * 写入或刷新方案 A 身份映射：内部 peer (`user_<hash16>`) <-> 真实 `openid`
+   */
+  upsertPeerOpenid(peer: string, openid: string, remark?: string): void {
+    const cleanPeer = String(peer || '').trim();
+    const cleanOpenid = String(openid || '').trim();
+    if (!cleanPeer || !cleanOpenid) {
+      throw new Error('[SessionRepository] upsertPeerOpenid requires non-empty peer and openid');
+    }
+
+    const db = this.getDb();
+    const hasRemark = remark !== undefined ? 1 : 0;
+    const remarkVal = remark !== undefined ? String(remark) : '';
+    const updatedAt = Date.now();
+
+    db.prepare(`
+      INSERT INTO peer_openid_map (peer, openid, remark, updated_at)
+      VALUES (@peer, @openid, @remark, @updated_at)
+      ON CONFLICT(peer) DO UPDATE SET
+        openid = excluded.openid,
+        remark = CASE WHEN @has_remark = 1 THEN excluded.remark ELSE peer_openid_map.remark END,
+        updated_at = excluded.updated_at
+    `).run({
+      peer: cleanPeer,
+      openid: cleanOpenid,
+      remark: remarkVal,
+      has_remark: hasRemark,
+      updated_at: updatedAt,
+    });
+  }
+
+  /**
+   * 根据内部 `peer` 反查真实 `openid`（出站接口调用前必需）
+   */
+  getOpenidByPeer(peer: string): string | null {
+    const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
+    if (!cleanPeer) return null;
+    const db = this.getDb();
+    const row = db
+      .prepare('SELECT openid FROM peer_openid_map WHERE peer = ? LIMIT 1')
+      .get(cleanPeer) as { openid?: string } | undefined;
+    return row?.openid ? String(row.openid) : null;
+  }
+
+  /**
+   * 根据真实 `openid` 查询已登记的内部 `peer`
+   */
+  getPeerByOpenid(openid: string): string | null {
+    const cleanOpenid = typeof openid === 'string' ? openid.trim() : '';
+    if (!cleanOpenid) return null;
+    const db = this.getDb();
+    const row = db
+      .prepare('SELECT peer FROM peer_openid_map WHERE openid = ? LIMIT 1')
+      .get(cleanOpenid) as { peer?: string } | undefined;
+    return row?.peer ? String(row.peer) : null;
   }
 }

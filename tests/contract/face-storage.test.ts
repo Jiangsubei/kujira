@@ -8,7 +8,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { MessageDatabase } from '../../src/storage/database.js';
-import type { FaceRecord, FaceQueryOptions } from '../../src/types/index.js';
 
 describe('契约测试: 本地表情库 SQLite 存储与资产管理 (Face Storage Contract)', () => {
   let tmpDir: string;
@@ -16,7 +15,7 @@ describe('契约测试: 本地表情库 SQLite 存储与资产管理 (Face Stora
   let db: MessageDatabase;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-face-db-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kujira-face-db-'));
     dbPath = path.join(tmpDir, 'messages.sqlite');
     db = new MessageDatabase(dbPath);
   });
@@ -288,7 +287,7 @@ describe('契约测试: 本地表情库 SQLite 存储与资产管理 (Face Stora
       id: 'face_untagged_1',
       file_path: '/untagged_1.png',
       md5: 'md5_untagged_1',
-      source: 'user_upload',
+      source: 'manual',
       tags: [],
       enabled: true,
       size: 50,
@@ -300,7 +299,7 @@ describe('契约测试: 本地表情库 SQLite 存储与资产管理 (Face Stora
       id: 'face_tagged_1',
       file_path: '/tagged_1.png',
       md5: 'md5_tagged_1',
-      source: 'user_upload',
+      source: 'manual',
       tags: ['已有标签'],
       mood: '开心',
       enabled: true,

@@ -1,820 +1,1349 @@
 /**
- * dsh-napcat-bridge: NapCat WebSocket 网关服务端
- * 作为 OneBot 11 反向 WebSocket 服务端，处理 NapCat 客户端连接、Token 鉴权、事件分发与 API Action 调用。
+ * kujira: QQ 官方 Bot API v2 正向网关与 REST 客户端
+ *
+ * 核心能力：
+ * 1. 鉴权与 Token 管理：Singleflight 获取 access_token、提前 60s 自动刷新、401 退避重取；
+ * 2. 正向 WSS Gateway 连接：GET /gateway -> HELLO 心跳 + 死链看门狗 (HELLO 超时 & HEARTBEAT_ACK 失联检测)、
+ *    IDENTIFY (intents = 1 << 25)、RESUME、RECONNECT (op=7)、INVALID_SESSION (op=9)、指数退避重连；
+ * 3. 安全事件分发：onC2CMessage、onDispatch（安全脱敏记录 FRIEND_ADD 等非消息事件）、onReady、onMessageSent；
+ * 4. 完整 REST 客户端（不抛未包装异常，统一返回 QQApiResult，日志脱敏不输出 secret/token/query）：
+ *    - sendC2CMessage (`POST /v2/users/{openid}/messages`)
+ *    - sendC2CStreamMessage (`POST /v2/users/{openid}/stream_messages`)
+ *    - sendInputNotify (`msg_type=6, input_type=1, input_second=60`)
+ *    - deleteC2CMessage (`DELETE /v2/users/{openid}/messages/{message_id}`)
+ *    - uploadC2CMedia（严格 1-based parts[].index 升序 + 累积 offset + 单片 block_size + 裸 PUT + upload_part_finish + /files，
+ *      结合 (openid, md5, fileType) 本地 24h media_upload_cache 缓存复用，绝不假设服务端 MD5 秒传）；
+ * 5. 只读网关状态查询 `getStatus()`（供 `/状态` 命令展示）。
  */
 
-import { WebSocketServer, WebSocket } from 'ws';
-import type { IncomingMessage } from 'node:http';
-import type {
-  OneBotActionResponse,
-  OneBotMessageEvent,
-  OneBotMetaEvent,
-  OneBotNoticeEvent,
-  OneBotRequestEvent,
-} from '../types/index.js';
+import { createHash } from 'node:crypto';
 import type { AttachmentDescriptor } from '../attachment/types.js';
+import {
+  QQ_API_BASE,
+  QQ_BOT_TOKEN_URL,
+  QQ_FILE_TYPE_AUDIO,
+  QQ_FILE_TYPE_FILE,
+  QQ_FILE_TYPE_IMAGE,
+  QQ_FILE_TYPE_VIDEO,
+  QQ_INPUT_NOTIFY_MAX_SECONDS,
+  QQ_INTENT_GROUP_AND_C2C_EVENT,
+  QQ_MEDIA_HARD_LIMIT,
+  QQ_MEDIA_SOFT_LIMIT_AUDIO,
+  QQ_MEDIA_SOFT_LIMIT_IMAGE,
+  QQ_MEDIA_SOFT_LIMIT_VIDEO,
+  QQ_MSG_TYPE_INPUT_NOTIFY,
+  QQ_MSG_TYPE_MARKDOWN,
+  QQ_REQUEST_TIMEOUT_MS,
+  QQ_TOKEN_REFRESH_MARGIN_MS,
+  QQ_UPLOAD_MD5_10M_BYTES,
+  QQ_UPLOAD_PUT_TIMEOUT_MS,
+  QQ_WS_BACKOFF_MS,
+} from '../constants/index.js';
+import type {
+  MediaUploadCacheRecord,
+  QQApiResult,
+  QQC2CMessageCreateEvent,
+  QQFilesMergeResponse,
+  QQGatewayPayload,
+  QQMediaFileType,
+  QQReadyEvent,
+  QQSendMessagePayload,
+  QQSendMessageResponse,
+  QQStreamMessagePayload,
+  QQStreamMessageResponse,
+  QQUploadPrepareResponse,
+  QqCredential,
+} from '../types/index.js';
+import { isValidOpenid, openidToPeer } from '../utils/peer.js';
 
-/** 出站消息成功发送后的事件（供插件自记录落库，不依赖 reportSelfMessage） */
+export * from './wait-registry.js';
+
+export interface GatewayLogger {
+  info?: (...args: any[]) => void;
+  warn?: (...args: any[]) => void;
+  error?: (...args: any[]) => void;
+  debug?: (...args: any[]) => void;
+}
+
+/** 网关 WebSocket 最小抽象（Node 内置全局 WebSocket 为其超集，便于测试注入假实现） */
+export interface QqWebSocketLike {
+  readonly readyState: number;
+  send(data: string): void;
+  close(): void;
+  addEventListener(type: string, listener: (ev: QqWsEvent) => void): void;
+}
+
+export interface QqWsEvent {
+  data?: unknown;
+  code?: number;
+  reason?: string;
+}
+
+/** Gateway READY 事件提取后的结构化信息 */
+export interface GatewayReadyInfo {
+  sessionId: string;
+  botId: string;
+  botName: string;
+}
+
+/** 只读网关运行状态（供 `/状态` 命令与运行态面板展示） */
+export interface GatewayStatus {
+  connected: boolean;
+  ready: boolean;
+  botId?: string;
+  botName?: string;
+  reconnectAttempts: number;
+}
+
+/** 出站消息成功发送后的事件（供自记录立即落库） */
 export interface OutboundSentEvent {
-  action: 'send_group_msg' | 'send_private_msg' | 'send_msg';
-  /** 目标会话 peer (group_xxx / user_xxx) */
+  /** 内部单聊会话 peer (`user_<hash16>`) */
   peer: string;
-  /** NapCat 返回的消息 ID（群聊可能为负数） */
-  msgId: number;
-  /** 发送时的 OneBot 消息段或纯文本 */
-  message: unknown;
+  /** 目标用户 openid */
+  openid: string;
+  /** QQ 返回的出站消息 ID (`ROBOT1.0_...`)，仅用于 120s 内 DELETE 撤回，绝不作入站被动锚点 */
+  msgId: string;
+  /** QQ 返回的出站引用索引 (`ext_info.ref_idx`, `REFIDX_...`) */
+  refIdx?: string;
+  /** 引用目标消息 ID / ref_idx */
+  replyTo?: string | null;
+  /** QQ 消息类型: 0=纯文本, 2=Markdown, 7=富媒体 */
+  msgType: 0 | 2 | 7;
+  /** 纯净文本正文（或富媒体展示文案） */
+  text?: string;
+  /** 发送载荷快照 */
+  payload?: unknown;
   /** 发送完成时间（毫秒时间戳） */
   time: number;
-  /**
-   * 发送方旁路携带的附件描述符（不进入发给 NapCat 的消息段）。
-   * 适合携带仅本地可知的事实：face_id / 情绪 / 本地真实格式等。
-   */
+  /** 发送方旁路携带的统一附件描述符 */
   attachments?: AttachmentDescriptor[];
 }
 
-export interface GatewayServerOptions {
-  host?: string;
-  port: number;
-  token?: string;
-  logger?: {
-    info?: (...args: any[]) => void;
-    warn?: (...args: any[]) => void;
-    error?: (...args: any[]) => void;
-    debug?: (...args: any[]) => void;
+/** `sendC2CMessage` 附带的记录元信息（不进入发给 QQ 的请求体） */
+export interface OutboundSendMeta {
+  peer?: string;
+  replyTo?: string | null;
+  text?: string;
+  attachments?: AttachmentDescriptor[];
+  /** 为 true 时跳过自动触发 onMessageSent（由调度层自行统一汇报） */
+  skipAutoRecord?: boolean;
+}
+
+/** 本地富媒体上传缓存接口（与 MessageDatabase.getCachedMediaUpload / saveCachedMediaUpload 对齐） */
+export interface MediaUploadCacheStore {
+  getCachedMediaUpload?(openid: string, md5: string, fileType: number): MediaUploadCacheRecord | null | undefined;
+  saveCachedMediaUpload?(record: MediaUploadCacheRecord): void;
+}
+
+export interface UploadC2CMediaOptions {
+  fileType: QQMediaFileType;
+  fileName: string;
+  db?: MediaUploadCacheStore;
+  bypassCache?: boolean;
+}
+
+export interface KujiraGatewayClientOptions {
+  credentials?: QqCredential;
+  appId?: string;
+  appSecret?: string;
+  logger?: GatewayLogger;
+  fetchFn?: typeof fetch;
+  createWebSocket?: (url: string) => QqWebSocketLike;
+  heartbeatIntervalRatio?: number;
+  helloTimeoutMs?: number;
+  maxMissedHeartbeatAcks?: number;
+  requestTimeoutMs?: number;
+  uploadPutTimeoutMs?: number;
+  authRetryDelayMs?: number;
+  backoffDelaysMs?: readonly number[];
+  intents?: number;
+  tokenUrl?: string;
+  apiBase?: string;
+  onC2CMessage?: (event: QQC2CMessageCreateEvent) => void | Promise<void>;
+  onDispatch?: (eventName: string, data: unknown, fullPayload: QQGatewayPayload) => void | Promise<void>;
+  onReady?: (info: GatewayReadyInfo) => void | Promise<void>;
+  onMessageSent?: (event: OutboundSentEvent) => void | Promise<void>;
+}
+
+const DEFAULT_HELLO_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_MISSED_HEARTBEAT_ACKS = 2;
+const DEFAULT_AUTH_RETRY_DELAY_MS = 200;
+const DEFAULT_MEDIA_CACHE_TTL_SEC = 86_400;
+const TOKEN_401_RETRY_CODE = 401;
+const ERR_INVALID_MARKDOWN = 40034011;
+const ERR_STREAM_MISSING_MSG_ID = 50015001;
+
+const OP_DISPATCH = 0;
+const OP_HEARTBEAT = 1;
+const OP_IDENTIFY = 2;
+const OP_RESUME = 6;
+const OP_RECONNECT = 7;
+const OP_INVALID_SESSION = 9;
+const OP_HELLO = 10;
+const OP_HEARTBEAT_ACK = 11;
+
+interface RawHttpResponse {
+  ok: boolean;
+  status: number;
+  text: string;
+  contentType: string | null;
+  bytes: Uint8Array;
+}
+
+function defaultCreateWebSocket(url: string): QqWebSocketLike {
+  return new WebSocket(url) as unknown as QqWebSocketLike;
+}
+
+const md5Hex = (data: Uint8Array): string => createHash('md5').update(data).digest('hex');
+const sha1Hex = (data: Uint8Array): string => createHash('sha1').update(data).digest('hex');
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** 去除 URL 中的 query 参数，避免预签名/带凭证下载 URL 明文落入日志 */
+function stripUrlQuery(rawUrl: string): string {
+  const qIndex = rawUrl.indexOf('?');
+  return qIndex === -1 ? rawUrl : `${rawUrl.slice(0, qIndex)}?<redacted>`;
+}
+
+/** 日志脱敏：隐藏 URL query、secret 与 token */
+function sanitizeLogText(text: string, secrets: Array<string | null | undefined>): string {
+  let out = text.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => stripUrlQuery(match));
+  out = out.replace(/(Bearer|QQBot)\s+[A-Za-z0-9._-]+/gi, '$1 <redacted>');
+  for (const secret of secrets) {
+    if (secret && secret.length >= 4) {
+      out = out.split(secret).join('<redacted>');
+    }
+  }
+  return out;
+}
+
+function resolveEffectiveMediaFileType(requestedType: QQMediaFileType, sizeBytes: number): QQMediaFileType {
+  const softLimit =
+    requestedType === QQ_FILE_TYPE_IMAGE
+      ? QQ_MEDIA_SOFT_LIMIT_IMAGE
+      : requestedType === QQ_FILE_TYPE_VIDEO
+        ? QQ_MEDIA_SOFT_LIMIT_VIDEO
+        : requestedType === QQ_FILE_TYPE_AUDIO
+          ? QQ_MEDIA_SOFT_LIMIT_AUDIO
+          : Number.POSITIVE_INFINITY;
+  return sizeBytes > softLimit ? QQ_FILE_TYPE_FILE : requestedType;
+}
+
+function toApiResult<T = any>(res: RawHttpResponse): QQApiResult<T> {
+  let body: any = null;
+  if (res.text) {
+    try {
+      body = JSON.parse(res.text);
+    } catch {
+      body = res.text;
+    }
+  }
+  const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : undefined;
+  const code = record?.code ?? record?.errcode;
+  const message = record?.message ?? record?.msg ?? record?.errmsg;
+  const ok = res.ok && (code === undefined || String(code) === '0');
+  return {
+    ok,
+    status: res.status,
+    ...(code === undefined ? {} : { code: code as string | number }),
+    ...(message === undefined ? {} : { message: String(message) }),
+    body: body as T,
   };
-  /**
-   * 出站消息发送成功且拿到有效 message_id 后的回调。
-   * 用于插件自身落库，避免完全依赖 NapCat 的 message_sent 上报。
-   */
-  onMessageSent?: (event: OutboundSentEvent) => void;
 }
 
-const OUTBOUND_SEND_ACTIONS = new Set(['send_group_msg', 'send_private_msg', 'send_msg']);
+export class KujiraGatewayClient {
+  private appId: string;
+  private appSecret: string;
+  private readonly log: GatewayLogger;
+  private readonly fetchFn: typeof fetch;
+  private readonly createWebSocket: (url: string) => QqWebSocketLike;
+  private readonly heartbeatIntervalRatio: number;
+  private readonly helloTimeoutMs: number;
+  private readonly maxMissedHeartbeatAcks: number;
+  private readonly requestTimeoutMs: number;
+  private readonly uploadPutTimeoutMs: number;
+  private readonly authRetryDelayMs: number;
+  private readonly backoffDelays: readonly number[];
+  private readonly intents: number;
+  private readonly tokenUrl: string;
+  private readonly apiBase: string;
 
-export type MessageHandler = (event: OneBotMessageEvent) => void | Promise<void>;
-export type NoticeHandler = (event: OneBotNoticeEvent) => void | Promise<void>;
-export type RequestHandler = (event: OneBotRequestEvent) => void | Promise<void>;
-export type MetaHandler = (event: OneBotMetaEvent) => void | Promise<void>;
+  // ── 鉴权状态 ──
+  private accessToken: string | null = null;
+  private tokenExpiresAt = 0;
+  private tokenPromise: Promise<string> | null = null;
 
-interface PendingAction {
-  resolve: (res: OneBotActionResponse) => void;
-  reject: (err: Error) => void;
-  timer: NodeJS.Timeout;
-}
+  // ── WS 网关状态 ──
+  private ws: QqWebSocketLike | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private helloWatchdog: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private sessionId: string | null = null;
+  private lastSeq = 0;
+  private reconnectAttempts = 0;
+  private missedHeartbeatAcks = 0;
+  private awaitingHeartbeatAck = false;
+  private isClosing = false;
+  private ready = false;
+  private botId: string | undefined;
+  private botName: string | undefined;
 
-export class NapCatGatewayServer {
-  private wss: WebSocketServer | null = null;
-  private activeSocket: WebSocket | null = null;
-  private echoCounter = 0;
-  private pendingActions = new Map<string, PendingAction>();
+  // ── 内存回退上传缓存（未传入 db 时兜底） ──
+  private readonly memoryMediaCache = new Map<string, MediaUploadCacheRecord>();
 
-  private messageHandlers: MessageHandler[] = [];
-  private noticeHandlers: NoticeHandler[] = [];
-  private requestHandlers: RequestHandler[] = [];
-  private metaHandlers: MetaHandler[] = [];
-  private connectHandlers: Array<() => void | Promise<void>> = [];
+  // ── 回调集合 ──
+  private c2cMessageHandlers: Array<(event: QQC2CMessageCreateEvent) => void | Promise<void>> = [];
+  private dispatchHandlers: Array<(eventName: string, data: unknown, fullPayload: QQGatewayPayload) => void | Promise<void>> = [];
+  private readyHandlers: Array<(info: GatewayReadyInfo) => void | Promise<void>> = [];
+  private messageSentHandlers: Array<(event: OutboundSentEvent) => void | Promise<void>> = [];
 
-  constructor(public readonly options: GatewayServerOptions) {}
+  constructor(public readonly options: KujiraGatewayClientOptions = {}) {
+    this.appId = (options.credentials?.appId ?? options.appId ?? '').trim();
+    this.appSecret = (options.credentials?.appSecret ?? options.appSecret ?? '').trim();
+    this.log = options.logger ?? {};
+    this.fetchFn = options.fetchFn ?? fetch;
+    this.createWebSocket = options.createWebSocket ?? defaultCreateWebSocket;
+    this.heartbeatIntervalRatio = options.heartbeatIntervalRatio ?? 0.8;
+    this.helloTimeoutMs = options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
+    this.maxMissedHeartbeatAcks = Math.max(1, options.maxMissedHeartbeatAcks ?? DEFAULT_MAX_MISSED_HEARTBEAT_ACKS);
+    this.requestTimeoutMs = options.requestTimeoutMs ?? QQ_REQUEST_TIMEOUT_MS;
+    this.uploadPutTimeoutMs = options.uploadPutTimeoutMs ?? QQ_UPLOAD_PUT_TIMEOUT_MS;
+    this.authRetryDelayMs = Math.max(0, options.authRetryDelayMs ?? DEFAULT_AUTH_RETRY_DELAY_MS);
+    this.backoffDelays = options.backoffDelaysMs ?? QQ_WS_BACKOFF_MS;
+    this.intents = options.intents ?? QQ_INTENT_GROUP_AND_C2C_EVENT;
+    this.tokenUrl = options.tokenUrl ?? QQ_BOT_TOKEN_URL;
+    this.apiBase = options.apiBase ?? QQ_API_BASE;
+
+    if (options.onC2CMessage) this.c2cMessageHandlers.push(options.onC2CMessage);
+    if (options.onDispatch) this.dispatchHandlers.push(options.onDispatch);
+    if (options.onReady) this.readyHandlers.push(options.onReady);
+    if (options.onMessageSent) this.messageSentHandlers.push(options.onMessageSent);
+  }
 
   get isConnected(): boolean {
-    return Boolean(this.activeSocket && this.activeSocket.readyState === WebSocket.OPEN);
+    return Boolean(this.ws && this.ws.readyState === 1);
   }
 
-  onConnect(handler: () => void | Promise<void>): () => void {
-    this.connectHandlers.push(handler);
-    return () => {
-      this.connectHandlers = this.connectHandlers.filter((h) => h !== handler);
+  getStatus(): GatewayStatus {
+    return {
+      connected: this.isConnected,
+      ready: this.ready,
+      ...(this.botId ? { botId: this.botId } : {}),
+      ...(this.botName ? { botName: this.botName } : {}),
+      reconnectAttempts: this.reconnectAttempts,
     };
   }
 
-  onMessage(handler: MessageHandler): () => void {
-    this.messageHandlers.push(handler);
+  updateCredentials(credentials: QqCredential): void {
+    this.appId = (credentials.appId ?? '').trim();
+    this.appSecret = (credentials.appSecret ?? '').trim();
+    this.invalidateToken();
+  }
+
+  onC2CMessage(handler: (event: QQC2CMessageCreateEvent) => void | Promise<void>): () => void {
+    this.c2cMessageHandlers.push(handler);
     return () => {
-      this.messageHandlers = this.messageHandlers.filter((h) => h !== handler);
+      this.c2cMessageHandlers = this.c2cMessageHandlers.filter((h) => h !== handler);
     };
   }
 
-  onNotice(handler: NoticeHandler): () => void {
-    this.noticeHandlers.push(handler);
+  onDispatch(
+    handler: (eventName: string, data: unknown, fullPayload: QQGatewayPayload) => void | Promise<void>
+  ): () => void {
+    this.dispatchHandlers.push(handler);
     return () => {
-      this.noticeHandlers = this.noticeHandlers.filter((h) => h !== handler);
+      this.dispatchHandlers = this.dispatchHandlers.filter((h) => h !== handler);
     };
   }
 
-  onRequest(handler: RequestHandler): () => void {
-    this.requestHandlers.push(handler);
+  onReady(handler: (info: GatewayReadyInfo) => void | Promise<void>): () => void {
+    this.readyHandlers.push(handler);
     return () => {
-      this.requestHandlers = this.requestHandlers.filter((h) => h !== handler);
+      this.readyHandlers = this.readyHandlers.filter((h) => h !== handler);
     };
   }
 
-  onMeta(handler: MetaHandler): () => void {
-    this.metaHandlers.push(handler);
+  onMessageSent(handler: (event: OutboundSentEvent) => void | Promise<void>): () => void {
+    this.messageSentHandlers.push(handler);
     return () => {
-      this.metaHandlers = this.metaHandlers.filter((h) => h !== handler);
+      this.messageSentHandlers = this.messageSentHandlers.filter((h) => h !== handler);
     };
   }
 
-  private authenticate(req: IncomingMessage): boolean {
-    const expectedToken = (this.options.token || '').trim();
-    if (!expectedToken) return false; // 鉴权 Token 必填：未配置直接拒绝连接
-
-    let token = '';
-    const authHeader = req.headers['authorization'];
-    if (typeof authHeader === 'string') {
-      if (authHeader.startsWith('Bearer ')) {
-        token = authHeader.slice(7).trim();
-      } else if (authHeader.startsWith('Token ')) {
-        token = authHeader.slice(6).trim();
-      } else {
-        token = authHeader.trim();
-      }
-    } else if (typeof req.headers['access_token'] === 'string') {
-      token = req.headers['access_token'].trim();
-    }
-
-    if (!token) {
+  /** 允许外部调度层在流式结束等场景显式发射 OutboundSentEvent */
+  emitMessageSent(event: OutboundSentEvent): void {
+    for (const h of this.messageSentHandlers) {
       try {
-        const url = new URL(req.url || '/', 'http://localhost');
-        token = url.searchParams.get('access_token') || '';
-      } catch {}
+        const res = h(event);
+        if (res && typeof (res as Promise<unknown>).catch === 'function') {
+          void (res as Promise<unknown>).catch((err) => {
+            this.log.warn?.(`[KujiraGateway] onMessageSent 异步回调异常: ${this.sanitize(errorMessage(err))}`);
+          });
+        }
+      } catch (err) {
+        this.log.warn?.(`[KujiraGateway] onMessageSent 回调异常: ${this.sanitize(errorMessage(err))}`);
+      }
+    }
+  }
+
+  // ─────────────────────────────── 鉴权 (Singleflight + 提前 60s 刷新) ───────────────────────────────
+
+  async getAccessToken(forceRefresh = false): Promise<string> {
+    if (forceRefresh) {
+      this.invalidateToken();
+    }
+    const now = Date.now();
+    if (this.accessToken && this.tokenExpiresAt - now > QQ_TOKEN_REFRESH_MARGIN_MS) {
+      return this.accessToken;
+    }
+    if (this.tokenPromise) {
+      return this.tokenPromise;
     }
 
-    return token === expectedToken;
+    this.tokenPromise = (async () => {
+      try {
+        if (!this.appId || !this.appSecret) {
+          throw new Error('缺少 QQ Bot 凭据（QQ_BOT_APP_ID / QQ_BOT_SECRET）');
+        }
+        const res = await this.rawRequest(
+          this.tokenUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ appId: this.appId, clientSecret: this.appSecret }),
+          },
+          this.requestTimeoutMs
+        );
+        if (!res.ok) {
+          throw new Error(`获取 access_token 失败 [HTTP ${res.status}]: ${this.sanitize(res.text)}`);
+        }
+        let data: { access_token?: string; expires_in?: number; code?: number; message?: string };
+        try {
+          data = JSON.parse(res.text);
+        } catch {
+          throw new Error('获取 access_token 响应非合法 JSON');
+        }
+        if (!data?.access_token) {
+          throw new Error(
+            `获取 access_token 响应异常 (code=${String(data?.code ?? 'n/a')} message=${this.sanitize(String(data?.message ?? ''))})`
+          );
+        }
+        const expiresInSec = Number(data.expires_in ?? 7200);
+        this.accessToken = data.access_token;
+        this.tokenExpiresAt = Date.now() + (Number.isFinite(expiresInSec) && expiresInSec > 0 ? expiresInSec : 7200) * 1000;
+        this.log.debug?.(`[KujiraGateway] access_token 已刷新（有效期 ${expiresInSec}s）`);
+        return this.accessToken;
+      } finally {
+        this.tokenPromise = null;
+      }
+    })();
+
+    return this.tokenPromise;
   }
+
+  private invalidateToken(): void {
+    this.accessToken = null;
+    this.tokenExpiresAt = 0;
+  }
+
+  private async refreshTokenAfter401(): Promise<void> {
+    this.invalidateToken();
+    if (this.authRetryDelayMs > 0) {
+      await sleep(this.authRetryDelayMs);
+    }
+  }
+
+  private sanitize(text: string): string {
+    return sanitizeLogText(text, [this.appSecret, this.accessToken]);
+  }
+
+  // ─────────────────────────────── WSS Gateway ───────────────────────────────
 
   async start(): Promise<void> {
-    if (this.wss) return;
+    this.isClosing = false;
+    await this.connect();
+  }
 
-    return new Promise<void>((resolve, reject) => {
+  stop(): void {
+    this.isClosing = true;
+    this.ready = false;
+    this.clearHeartbeat();
+    this.clearHelloWatchdog();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const socket = this.ws;
+    this.ws = null;
+    if (socket) {
       try {
-        const host = this.options.host || '127.0.0.1';
-        this.wss = new WebSocketServer({
-          host,
-          port: this.options.port,
-          verifyClient: (info, callback) => {
-            const authenticated = this.authenticate(info.req);
-            if (!authenticated) {
-              this.options.logger?.warn?.(`[GatewayServer] 鉴权失败: 来源 ${info.req.socket.remoteAddress}`);
-              callback(false, 401, 'Unauthorized');
-            } else {
-              callback(true);
-            }
-          },
-        });
-
-        this.wss.on('listening', () => {
-          this.options.logger?.info?.(`[GatewayServer] OneBot 11 反向 WS 服务端已监听 ${host}:${this.options.port}`);
-          resolve();
-        });
-
-        this.wss.on('error', (err) => {
-          this.options.logger?.error?.('[GatewayServer] WebSocket 服务端错误:', err);
-          reject(err);
-        });
-
-        this.wss.on('connection', (ws, req) => {
-          this.options.logger?.info?.(`[GatewayServer] NapCat 客户端已连接 (${req.socket.remoteAddress})`);
-          this.activeSocket = ws;
-
-          for (const h of this.connectHandlers) {
-            try {
-              const res = h();
-              if (res && typeof (res as Promise<any>).catch === 'function') {
-                (res as Promise<any>).catch((e) => {
-                  this.options.logger?.error?.('[GatewayServer] 异步连接处理器异常:', e);
-                });
-              }
-            } catch (e) {
-              this.options.logger?.error?.('[GatewayServer] 连接处理器异常:', e);
-            }
-          }
-
-          ws.on('message', (data) => {
-            this.handleIncomingRaw(data.toString());
-          });
-
-          ws.on('close', (code, reason) => {
-            this.options.logger?.warn?.(`[GatewayServer] NapCat 连接断开 (code: ${code}, reason: ${reason.toString()})`);
-            if (this.activeSocket === ws) {
-              this.activeSocket = null;
-            }
-          });
-
-          ws.on('error', (err) => {
-            this.options.logger?.error?.('[GatewayServer] 客户端 Socket 异常:', err);
-          });
-        });
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
-
-  private handleIncomingRaw(rawText: string): void {
-    let parsed: any;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (err) {
-      this.options.logger?.warn?.('[GatewayServer] 无法解析 JSON 载荷:', rawText);
-      return;
-    }
-
-    // 1. 如果带有 echo，则是 Action 调用的响应
-    if (parsed.echo && this.pendingActions.has(parsed.echo)) {
-      const pending = this.pendingActions.get(parsed.echo)!;
-      this.pendingActions.delete(parsed.echo);
-      clearTimeout(pending.timer);
-      pending.resolve(parsed as OneBotActionResponse);
-      return;
-    }
-
-    // 2. 根据 post_type 分发事件
-    const postType = parsed.post_type;
-    if (postType === 'message' || postType === 'message_sent') {
-      const msgEvent = parsed as OneBotMessageEvent;
-      for (const h of this.messageHandlers) {
-        try {
-          const res = h(msgEvent);
-          if (res && typeof (res as Promise<any>).catch === 'function') {
-            (res as Promise<any>).catch((e) => {
-              this.options.logger?.error?.('[GatewayServer] 异步消息处理器异常:', e);
-            });
-          }
-        } catch (e) {
-          this.options.logger?.error?.('[GatewayServer] 消息处理器异常:', e);
-        }
-      }
-    } else if (postType === 'notice') {
-      const noticeEvent = parsed as OneBotNoticeEvent;
-      for (const h of this.noticeHandlers) {
-        try {
-          const res = h(noticeEvent);
-          if (res && typeof (res as Promise<any>).catch === 'function') {
-            (res as Promise<any>).catch((e) => {
-              this.options.logger?.error?.('[GatewayServer] 异步通知处理器异常:', e);
-            });
-          }
-        } catch (e) {
-          this.options.logger?.error?.('[GatewayServer] 通知处理器异常:', e);
-        }
-      }
-    } else if (postType === 'request') {
-      const reqEvent = parsed as OneBotRequestEvent;
-      for (const h of this.requestHandlers) {
-        try {
-          const res = h(reqEvent);
-          if (res && typeof (res as Promise<any>).catch === 'function') {
-            (res as Promise<any>).catch((e) => {
-              this.options.logger?.error?.('[GatewayServer] 异步请求处理器异常:', e);
-            });
-          }
-        } catch (e) {
-          this.options.logger?.error?.('[GatewayServer] 请求处理器异常:', e);
-        }
-      }
-    } else if (postType === 'meta_event') {
-      const metaEvent = parsed as OneBotMetaEvent;
-      for (const h of this.metaHandlers) {
-        try {
-          const res = h(metaEvent);
-          if (res && typeof (res as Promise<any>).catch === 'function') {
-            (res as Promise<any>).catch((e) => {
-              this.options.logger?.error?.('[GatewayServer] 异步元事件处理器异常:', e);
-            });
-          }
-        } catch (e) {
-          this.options.logger?.error?.('[GatewayServer] 元事件处理器异常:', e);
-        }
+        socket.close();
+      } catch {
+        // 忽略关闭异常
       }
     }
   }
 
-  async sendAction<T = any>(
-    action: string,
-    params: Record<string, any> = {},
-    timeoutMs = 15000,
-    attachments?: AttachmentDescriptor[]
-  ): Promise<OneBotActionResponse<T>> {
-    if (!this.activeSocket || this.activeSocket.readyState !== WebSocket.OPEN) {
-      throw new Error(`NapCat WebSocket 客户端未连接或连接已断开 (action: ${action})`);
-    }
-
-    const echo = `echo_${Date.now()}_${++this.echoCounter}`;
-    const payload = JSON.stringify({
-      action,
-      params,
-      echo,
-    });
-
-    const response = await new Promise<OneBotActionResponse<T>>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.pendingActions.has(echo)) {
-          this.pendingActions.delete(echo);
-          reject(new Error(`NapCat Action 调用超时 (${timeoutMs}ms, action: ${action})`));
-        }
-      }, timeoutMs);
-
-      this.pendingActions.set(echo, {
-        resolve: resolve as any,
-        reject,
-        timer,
-      });
-
-      this.activeSocket!.send(payload, (err) => {
-        if (err) {
-          this.pendingActions.delete(echo);
-          clearTimeout(timer);
-          reject(err);
-        }
-      });
-    });
-
-    // 出站消息成功发送后立即回调，供插件主动落库（不依赖 OneBot 自身消息上报）
-    this.notifyOutboundSent(action, params, response as OneBotActionResponse, attachments);
-    return response;
-  }
-
-  /**
-   * 出站发送成功（status ok / retcode 0 且有有效 message_id）时触发 onMessageSent。
-   * 失败或无 message_id 的应答一律不触发，避免写入无法寻址的记录。
-   */
-  private notifyOutboundSent(
-    action: string,
-    params: Record<string, any>,
-    response: OneBotActionResponse,
-    attachments?: AttachmentDescriptor[]
-  ): void {
-    if (!OUTBOUND_SEND_ACTIONS.has(action)) return;
-
-    const isSuccess =
-      (response as any).status === 'ok' || (response as any).retcode === 0;
-    if (!isSuccess) return;
-
-    const msgId = Number((response as any).data?.message_id);
-    if (!Number.isSafeInteger(msgId) || msgId === 0) return;
-
-    let peer = '';
-    if (action === 'send_group_msg') {
-      if (params.group_id === undefined || params.group_id === null) return;
-      peer = `group_${params.group_id}`;
-    } else if (action === 'send_private_msg') {
-      if (params.user_id === undefined || params.user_id === null) return;
-      peer = `user_${params.user_id}`;
-    } else {
-      if (params.group_id !== undefined && params.group_id !== null) {
-        peer = `group_${params.group_id}`;
-      } else if (params.user_id !== undefined && params.user_id !== null) {
-        peer = `user_${params.user_id}`;
-      } else {
-        return;
-      }
-    }
-
-    try {
-      this.options.onMessageSent?.({
-        action: action as OutboundSentEvent['action'],
-        peer,
-        msgId,
-        message: params.message,
-        time: Date.now(),
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-      });
-    } catch (err) {
-      this.options.logger?.warn?.('[GatewayServer] onMessageSent 回调异常:', err);
-    }
-  }
-
-  async sendGroupMsg(
-    groupId: number | string,
-    message: any,
-    attachments?: AttachmentDescriptor[]
-  ): Promise<OneBotActionResponse> {
-    return this.sendAction(
-      'send_group_msg',
-      {
-        group_id: Number(groupId),
-        message,
-      },
-      15000,
-      attachments
-    );
-  }
-
-  async sendPrivateMsg(
-    userId: number | string,
-    message: any,
-    attachments?: AttachmentDescriptor[]
-  ): Promise<OneBotActionResponse> {
-    return this.sendAction(
-      'send_private_msg',
-      {
-        user_id: Number(userId),
-        message,
-      },
-      15000,
-      attachments
-    );
-  }
-
-  async sendMsg(
-    peer: string,
-    message: any,
-    attachments?: AttachmentDescriptor[]
-  ): Promise<OneBotActionResponse> {
-    if (peer.startsWith('group_')) {
-      const groupId = peer.slice(6).split('-')[0];
-      return this.sendGroupMsg(groupId, message, attachments);
-    }
-    if (peer.startsWith('user_')) {
-      const userId = peer.slice(5).split('-')[0];
-      return this.sendPrivateMsg(userId, message, attachments);
-    }
-    if (peer.startsWith('qq-group-')) {
-      const groupId = peer.slice(9).split('-')[0];
-      return this.sendGroupMsg(groupId, message, attachments);
-    }
-    if (peer.startsWith('qq-user-')) {
-      const userId = peer.slice(8).split('-')[0];
-      return this.sendPrivateMsg(userId, message, attachments);
-    }
-    throw new Error(`未知的 peer 格式: ${peer}`);
-  }
-
-  /**
-   * OneBot 11 get_msg: 根据 message_id 获取单条消息详情
-   */
-  async getMsg(messageId: number | string, timeoutMs = 15000): Promise<OneBotActionResponse> {
-    return this.sendAction('get_msg', {
-      message_id: Number(messageId),
-    }, timeoutMs);
-  }
-
-  /**
-   * OneBot 11 delete_msg: 撤回单条消息
-   */
-  async deleteMsg(messageId: number | string): Promise<OneBotActionResponse> {
-    return this.sendAction('delete_msg', {
-      message_id: Number(messageId),
-    });
-  }
-
-  /**
-   * OneBot 11 get_image: 取图片在 NapCat 侧的本机路径。
-   * NapCat 源码实证 (GetImage.ts): GetImagePayloadSchema {file}，返回 data.{file, url, file_size, file_name}，
-   * data.file 为 NapCat 本机原图路径 —— 入站图片四段式取图的首选段（QQ 直链对第三方进程不可用）。
-   */
-  async getImage(file: string, timeoutMs = 5000): Promise<OneBotActionResponse> {
-    return this.sendAction('get_image', {
-      file,
-    }, timeoutMs);
-  }
-
-  async getForwardMsg(forwardId: string): Promise<OneBotActionResponse> {
-    return this.sendAction('get_forward_msg', {
-      id: forwardId,
-      message_id: forwardId,
-    });
-  }
-
-  async getGroupFileUrl(groupId: number | string, fileId: string, busid?: number): Promise<OneBotActionResponse> {
-    const params: Record<string, any> = {
-      group_id: Number(groupId),
-      file_id: fileId,
-    };
-    // NapCat 不消费 busid；SnowLuma 缺省时会自行回退 102，但显式传 0 会报「参数错误」。
-    // 因此只有正数 busid 才透传，缺失 / null / 0 一律省略（见 devlog SnowLuma 兼容实测）。
-    const numericBusid = busid === undefined || busid === null ? NaN : Number(busid);
-    if (Number.isFinite(numericBusid) && numericBusid > 0) {
-      params.busid = numericBusid;
-    }
-    return this.sendAction('get_group_file_url', params);
-  }
-
-  /**
-   * OneBot 11 / NapCat / SnowLuma: 获取群根目录文件与文件夹列表。
-   * 用于 SnowLuma 兼容垫片：notice 事件只带 32 位 hex file_id，需换回消息段的 /uuid。
-   */
-  async getGroupRootFiles(
-    groupId: number | string,
-    timeoutMs = 20000
-  ): Promise<OneBotActionResponse<{ files?: any[]; folders?: any[] }>> {
-    return this.sendAction('get_group_root_files', {
-      group_id: Number(groupId),
-    }, timeoutMs);
-  }
-
-  /**
-   * OneBot 11 / NapCat / SnowLuma: 获取群子目录文件列表（垫片递归匹配用）。
-   */
-  async getGroupFilesByFolder(
-    groupId: number | string,
-    folderId: string,
-    timeoutMs = 20000
-  ): Promise<OneBotActionResponse<{ files?: any[]; folders?: any[] }>> {
-    return this.sendAction('get_group_files_by_folder', {
-      group_id: Number(groupId),
-      folder_id: folderId,
-    }, timeoutMs);
-  }
-
-  /**
-   * PF-001: OneBot 11 get_private_file_url —— 获取私聊文件下载直链。
-   * NapCat 源码实证 (GetPrivateFileUrl.ts): PayloadSchema 仅 {file_id}，返回 data.url (HTTP 直链)；
-   * 依赖 packet 后端 (GetPacketStatusDepends)，QQ 9.9.30-48762 起 packet 不可用会失败 ——
-   * 作为私聊文件入站落盘「首选」，失败由 downloadPrivateFile 回退 get_file（任务包 §3.1 用户拍板）。
-   */
-  async getPrivateFileUrl(fileId: string): Promise<OneBotActionResponse> {
-    return this.sendAction('get_private_file_url', {
-      file_id: fileId,
-    });
-  }
-
-  /**
-   * PF-001: OneBot 11 get_file —— 获取文件的 NapCat 侧本地路径（不依赖 packet 后端）。
-   * NapCat 源码实证 (GetFile.ts): GetFilePayloadSchema {file?, file_id?}（私聊消息标记以 file_id 传入），
-   * 返回 data.{file, url, file_size, file_name}，data.file 为 NapCat 本机本地路径 ——
-   * 作为私聊文件入站落盘「回退」路径（packet 不可用时仍可靠，任务包 §3.1）。
-   */
-  async getFile(fileId: string, timeoutMs = 5000): Promise<OneBotActionResponse> {
-    return this.sendAction('get_file', {
-      file_id: fileId,
-    }, timeoutMs);
-  }
-
-  /**
-   * OneBot 11 get_group_member_info (EN-001)：获取群成员信息（含 nickname/card），
-   * 用于 at 段被@者昵称归一化（NapCat at 段只有 qq）。
-   */
-  async getGroupMemberInfo(
-    groupId: number | string,
-    userId: number | string
-  ): Promise<OneBotActionResponse> {
-    return this.sendAction('get_group_member_info', {
-      group_id: Number(groupId),
-      user_id: Number(userId),
-    });
-  }
-
-  /**
-   * OneBot 11 get_group_member_list: 获取群全量成员列表
-   * @param groupId 群号
-   * @param noCache 是否强制穿透 NapCat 缓存 (默认 false)
-   */
-  async getGroupMemberList(
-    groupId: number | string,
-    noCache = false
-  ): Promise<OneBotActionResponse<any[]>> {
-    return this.sendAction('get_group_member_list', {
-      group_id: Number(groupId),
-      no_cache: Boolean(noCache),
-    });
-  }
-
-  /**
-   * OneBot 11 get_group_info: 获取群基础信息（群名称等）
-   */
-  async getGroupInfo(groupId: number | string): Promise<OneBotActionResponse> {
-    return this.sendAction('get_group_info', {
-      group_id: Number(groupId),
-    });
-  }
-
-  /**
-   * OneBot 11 / NapCat 扩展 get_group_detail_info: 获取群详细信息（建群时间、群介绍等）
-   */
-  async getGroupDetailInfo(groupId: number | string): Promise<OneBotActionResponse> {
-    return this.sendAction('get_group_detail_info', {
-      group_id: String(groupId),
-    });
-  }
-
-  /**
-   * OneBot 11 get_stranger_info: 获取陌生人/好友信息（昵称等）
-   */
-  async getStrangerInfo(userId: number | string): Promise<OneBotActionResponse> {
-    return this.sendAction('get_stranger_info', {
-      user_id: Number(userId),
-    });
-  }
-
-  /**
-   * OneBot 11 get_friend_list: 获取好友列表
-   */
-  async getFriendList(): Promise<OneBotActionResponse<any[]>> {
-    return this.sendAction('get_friend_list', {});
-  }
-
-  /**
-   * OneBot 11 get_group_list: 获取群列表
-   */
-  async getGroupList(noCache = false): Promise<OneBotActionResponse<any[]>> {
-    return this.sendAction('get_group_list', {
-      no_cache: Boolean(noCache),
-    });
-  }
-
-  /**
-   * OneBot 11 / NapCat _get_group_notice: 获取群公告列表
-   */
-  async getGroupNotice(groupId: number | string): Promise<OneBotActionResponse<any[]>> {
-    return this.sendAction('_get_group_notice', {
-      group_id: Number(groupId),
-    });
-  }
-
-  /**
-   * OneBot 11 / NapCat: 获取群历史消息记录 (get_group_msg_history)
-   */
-  async getGroupMsgHistory(
-    groupId: number | string,
-    count = 20,
-    messageSeq?: number | string
-  ): Promise<OneBotActionResponse<{ messages?: any[] }>> {
-    const params: Record<string, any> = {
-      group_id: Number(groupId),
-      count: Number(count),
-    };
-    if (messageSeq !== undefined && messageSeq !== null && messageSeq !== '') {
-      params.message_seq = Number(messageSeq);
-    }
-    return this.sendAction('get_group_msg_history', params);
-  }
-
-  /**
-   * OneBot 11 / NapCat: 获取好友历史消息记录 (get_friend_msg_history)
-   */
-  async getFriendMsgHistory(
-    userId: number | string,
-    count = 20,
-    messageSeq?: number | string
-  ): Promise<OneBotActionResponse<{ messages?: any[] }>> {
-    const params: Record<string, any> = {
-      user_id: Number(userId),
-      count: Number(count),
-    };
-    if (messageSeq !== undefined && messageSeq !== null && messageSeq !== '') {
-      params.message_seq = Number(messageSeq);
-    }
-    return this.sendAction('get_friend_msg_history', params);
-  }
-
-  /**
-   * NapCat 扩展 API: 获取最近活跃会话列表 (get_recent_contact)
-   */
-  async getRecentContact(count = 20): Promise<OneBotActionResponse<any[]>> {
-    return this.sendAction('get_recent_contact', {
-      count: Number(count),
-    });
-  }
-
-  /**
-   * IS-S3 (v2 预留)：上传文件到群文件系统 (upload_group_file)。
-   * v1 决策走消息附件（send_group_msg 带 file 段，Spec §6.2），本方法为 v2「上传到群文件
-   * 系统」预留接入点（NapCat 支持该 action），文档标注 v2 预留，当前未被 send_file 调用。
-   */
-  async uploadGroupFile(
-    groupId: number | string,
-    file: string,
-    name?: string,
-    folder?: string
-  ): Promise<OneBotActionResponse> {
-    const params: Record<string, any> = {
-      group_id: Number(groupId),
-      file,
-    };
-    if (name !== undefined) params.name = name;
-    if (folder !== undefined) params.folder = folder;
-    return this.sendAction('upload_group_file', params);
-  }
-
-  /**
-   * IS-S3 (v2 预留)：上传文件到私聊会话 (upload_private_file)。
-   * v1 走消息附件；本方法为 v2 预留接入点，当前未被 send_file 调用。
-   */
-  async uploadPrivateFile(
-    userId: number | string,
-    file: string,
-    name?: string
-  ): Promise<OneBotActionResponse> {
-    const params: Record<string, any> = {
-      user_id: Number(userId),
-      file,
-    };
-    if (name !== undefined) params.name = name;
-    return this.sendAction('upload_private_file', params);
-  }
-
-  async sendPoke(userId: string | number, groupId?: string | number): Promise<OneBotActionResponse> {
-    const numUserId = Number(userId);
-    const numGroupId = groupId ? Number(groupId) : undefined;
-
-    // 优先调用 NapCat 推荐的统一通用接口 send_poke
-    try {
-      const params: Record<string, any> = { user_id: numUserId };
-      if (numGroupId) {
-        params.group_id = numGroupId;
-      }
-      const res = await this.sendAction('send_poke', params);
-      if (res && res.status === 'ok' && res.retcode === 0) {
-        return res;
-      }
-
-      // 如果 send_poke 失败或未识别，尝试回退特定场景接口
-      if (numGroupId) {
-        const fallbackRes = await this.sendAction('group_poke', {
-          group_id: numGroupId,
-          user_id: numUserId,
-        });
-        if (fallbackRes && (fallbackRes.status === 'ok' || fallbackRes.retcode === 0)) {
-          return fallbackRes;
-        }
-      } else {
-        const fallbackRes = await this.sendAction('friend_poke', {
-          user_id: numUserId,
-        });
-        if (fallbackRes && (fallbackRes.status === 'ok' || fallbackRes.retcode === 0)) {
-          return fallbackRes;
-        }
-      }
-
-      return res;
-    } catch (err) {
-      if (numGroupId) {
-        return this.sendAction('group_poke', {
-          group_id: numGroupId,
-          user_id: numUserId,
-        });
-      }
-      return this.sendAction('friend_poke', {
-        user_id: numUserId,
-      });
-    }
-  }
-
-  /**
-   * OneBot 11 扩展 set_msg_emoji_like: 为消息贴表情回应
-   */
-  async setMsgEmojiLike(
-    messageId: number | string,
-    emojiId: string | number,
-    set = true
-  ): Promise<OneBotActionResponse> {
-    return this.sendAction('set_msg_emoji_like', {
-      message_id: Number(messageId),
-      emoji_id: String(emojiId),
-      set,
-    });
-  }
-
-  async restart(options?: Partial<GatewayServerOptions>): Promise<void> {
-    await this.stop();
-    if (options) {
-      if (options.host !== undefined) {
-        this.options.host = options.host;
-      }
-      if (options.port !== undefined) {
-        this.options.port = options.port;
-      }
-      if (options.token !== undefined) {
-        this.options.token = options.token;
-      }
+  async restart(credentials?: QqCredential): Promise<void> {
+    this.stop();
+    this.sessionId = null;
+    this.lastSeq = 0;
+    this.reconnectAttempts = 0;
+    if (credentials) {
+      this.updateCredentials(credentials);
     }
     await this.start();
   }
 
-  async stop(): Promise<void> {
-    for (const pending of this.pendingActions.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error('GatewayServer is closing'));
+  private async fetchGatewayUrl(allowAuthRetry = true): Promise<string> {
+    const token = await this.getAccessToken();
+    const res = await this.rawRequest(
+      `${this.apiBase}/gateway`,
+      { method: 'GET', headers: { Authorization: `QQBot ${token}` } },
+      this.requestTimeoutMs
+    );
+    if (res.status === TOKEN_401_RETRY_CODE && allowAuthRetry) {
+      this.log.warn?.('[KujiraGateway] GET /gateway 返回 401，退避刷新 token 重试');
+      await this.refreshTokenAfter401();
+      return this.fetchGatewayUrl(false);
     }
-    this.pendingActions.clear();
+    if (!res.ok) {
+      throw new Error(`获取 Gateway 地址失败 [HTTP ${res.status}]: ${this.sanitize(res.text)}`);
+    }
+    const parsed = JSON.parse(res.text) as { url?: string };
+    if (!parsed?.url) {
+      throw new Error('GET /gateway 响应缺少 url 字段');
+    }
+    return parsed.url;
+  }
 
-    if (this.activeSocket) {
-      try {
-        this.activeSocket.terminate();
-      } catch {}
-      this.activeSocket = null;
+  private async connect(): Promise<void> {
+    if (this.isClosing) return;
+
+    let url: string;
+    try {
+      url = await this.fetchGatewayUrl();
+    } catch (err) {
+      this.log.error?.(`[KujiraGateway] 获取 Gateway 失败: ${this.sanitize(errorMessage(err))}`);
+      this.scheduleReconnect();
+      return;
     }
 
-    if (this.wss) {
+    if (this.isClosing) return;
+
+    this.log.debug?.(`[KujiraGateway] 连接 Gateway: ${stripUrlQuery(url)}`);
+    let ws: QqWebSocketLike;
+    try {
+      ws = this.createWebSocket(url);
+    } catch (err) {
+      this.log.error?.(`[KujiraGateway] 创建 WebSocket 失败: ${this.sanitize(errorMessage(err))}`);
+      this.scheduleReconnect();
+      return;
+    }
+
+    this.ws = ws;
+
+    ws.addEventListener('open', () => {
+      if (this.ws !== ws) return;
+      this.log.debug?.('[KujiraGateway] WebSocket 已连接，等待 HELLO');
+      this.armHelloWatchdog(ws);
+    });
+
+    ws.addEventListener('message', (ev) => {
+      if (this.ws !== ws) return;
       try {
-        for (const client of this.wss.clients) {
-          try {
-            client.terminate();
-          } catch {}
+        const raw = typeof ev.data === 'string' ? ev.data : String(ev.data ?? '');
+        const parsed = JSON.parse(raw) as QQGatewayPayload;
+        this.handlePayload(parsed, ws);
+      } catch (err) {
+        this.log.warn?.(`[KujiraGateway] 解析 WS 帧失败: ${this.sanitize(errorMessage(err))}`);
+      }
+    });
+
+    ws.addEventListener('close', (ev) => {
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.ready = false;
+      this.clearHeartbeat();
+      this.clearHelloWatchdog();
+      this.log.warn?.(`[KujiraGateway] WebSocket 关闭 [${ev?.code ?? '?'}]: ${this.sanitize(String(ev?.reason ?? ''))}`);
+      if (!this.isClosing) {
+        this.scheduleReconnect();
+      }
+    });
+
+    ws.addEventListener('error', () => {
+      if (this.ws !== ws) return;
+      this.log.warn?.('[KujiraGateway] WebSocket 连接出错');
+    });
+  }
+
+  private handlePayload(payload: QQGatewayPayload, ws: QqWebSocketLike): void {
+    if (typeof payload.s === 'number') {
+      this.lastSeq = payload.s;
+    }
+
+    switch (payload.op) {
+      case OP_HELLO: {
+        this.clearHelloWatchdog();
+        const hello = payload.d as { heartbeat_interval?: number } | undefined;
+        const interval = hello?.heartbeat_interval ?? 45_000;
+        this.missedHeartbeatAcks = 0;
+        this.awaitingHeartbeatAck = false;
+        this.startHeartbeat(Math.floor(interval * this.heartbeatIntervalRatio), ws);
+        if (this.sessionId) {
+          this.fireAndLog(this.sendResume(ws), '发送 RESUME');
+        } else {
+          this.fireAndLog(this.sendIdentify(ws), '发送 IDENTIFY');
         }
-      } catch {}
+        break;
+      }
 
-      await new Promise<void>((resolve) => {
-        this.wss!.close(() => resolve());
-      });
-      this.wss = null;
+      case OP_DISPATCH: {
+        this.missedHeartbeatAcks = 0;
+        this.awaitingHeartbeatAck = false;
+        const eventName = String(payload.t ?? '');
+        this.invokeDispatchHandlers(eventName, payload.d, payload);
+
+        if (eventName === 'READY') {
+          const ready = (payload.d ?? {}) as Partial<QQReadyEvent>;
+          this.sessionId = ready.session_id ?? null;
+          this.botId = ready.user?.id !== undefined ? String(ready.user.id) : undefined;
+          this.botName = ready.user?.username !== undefined ? String(ready.user.username) : undefined;
+          this.ready = true;
+          this.reconnectAttempts = 0;
+
+          const info: GatewayReadyInfo = {
+            sessionId: String(this.sessionId ?? ''),
+            botId: this.botId ?? '',
+            botName: this.botName ?? '',
+          };
+          this.log.info?.(`[KujiraGateway] READY: ${info.botName || 'Bot'} (${info.botId || '?'})`);
+          this.invokeReadyHandlers(info);
+        } else if (eventName === 'RESUMED') {
+          this.ready = true;
+          this.reconnectAttempts = 0;
+          this.log.info?.('[KujiraGateway] RESUMED');
+        } else if (eventName === 'C2C_MESSAGE_CREATE') {
+          this.invokeC2CMessageHandlers(payload.d as QQC2CMessageCreateEvent);
+        } else {
+          this.logNonMessageDispatch(eventName, payload.d);
+        }
+        break;
+      }
+
+      case OP_HEARTBEAT_ACK: {
+        this.missedHeartbeatAcks = 0;
+        this.awaitingHeartbeatAck = false;
+        break;
+      }
+
+      case OP_RECONNECT: {
+        this.log.warn?.('[KujiraGateway] 服务端下发 RECONNECT，关闭当前链接准备恢复重连');
+        this.ready = false;
+        try {
+          ws.close();
+        } catch {
+          // 忽略关闭异常
+        }
+        break;
+      }
+
+      case OP_INVALID_SESSION: {
+        const resumable = payload.d === true;
+        this.ready = false;
+        if (resumable && this.sessionId) {
+          this.log.warn?.('[KujiraGateway] INVALID_SESSION (resumable=true)，尝试 RESUME');
+          this.fireAndLog(this.sendResume(ws), '发送 RESUME');
+        } else {
+          this.log.warn?.('[KujiraGateway] INVALID_SESSION：重置会话并重新 IDENTIFY');
+          this.sessionId = null;
+          this.lastSeq = 0;
+          this.fireAndLog(this.sendIdentify(ws), '重新 IDENTIFY');
+        }
+        break;
+      }
+
+      default:
+        break;
     }
   }
+
+  private logNonMessageDispatch(eventName: string, data: unknown): void {
+    try {
+      const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : undefined;
+      const rawOpenid =
+        typeof record?.openid === 'string'
+          ? record.openid
+          : typeof record?.user_openid === 'string'
+            ? record.user_openid
+            : undefined;
+      const peerTag = rawOpenid && isValidOpenid(rawOpenid) ? ` peer=${openidToPeer(rawOpenid)}` : '';
+      this.log.info?.(`[KujiraGateway] 收到非消息网关事件: ${eventName || 'UNKNOWN'}${peerTag}`);
+    } catch {
+      // 安全日志记录绝不抛出
+    }
+  }
+
+  private invokeDispatchHandlers(eventName: string, data: unknown, fullPayload: QQGatewayPayload): void {
+    for (const h of this.dispatchHandlers) {
+      try {
+        const res = h(eventName, data, fullPayload);
+        if (res && typeof (res as Promise<unknown>).catch === 'function') {
+          void (res as Promise<unknown>).catch((err) => {
+            this.log.error?.(`[KujiraGateway] onDispatch(${eventName}) 异步异常: ${this.sanitize(errorMessage(err))}`);
+          });
+        }
+      } catch (err) {
+        this.log.error?.(`[KujiraGateway] onDispatch(${eventName}) 异常: ${this.sanitize(errorMessage(err))}`);
+      }
+    }
+  }
+
+  private invokeReadyHandlers(info: GatewayReadyInfo): void {
+    for (const h of this.readyHandlers) {
+      try {
+        const res = h(info);
+        if (res && typeof (res as Promise<unknown>).catch === 'function') {
+          void (res as Promise<unknown>).catch((err) => {
+            this.log.error?.(`[KujiraGateway] onReady 异步异常: ${this.sanitize(errorMessage(err))}`);
+          });
+        }
+      } catch (err) {
+        this.log.error?.(`[KujiraGateway] onReady 异常: ${this.sanitize(errorMessage(err))}`);
+      }
+    }
+  }
+
+  private invokeC2CMessageHandlers(event: QQC2CMessageCreateEvent): void {
+    for (const h of this.c2cMessageHandlers) {
+      try {
+        const res = h(event);
+        if (res && typeof (res as Promise<unknown>).catch === 'function') {
+          void (res as Promise<unknown>).catch((err) => {
+            this.log.error?.(`[KujiraGateway] onC2CMessage 异步异常: ${this.sanitize(errorMessage(err))}`);
+          });
+        }
+      } catch (err) {
+        this.log.error?.(`[KujiraGateway] onC2CMessage 异常: ${this.sanitize(errorMessage(err))}`);
+      }
+    }
+  }
+
+  private async sendIdentify(ws: QqWebSocketLike): Promise<void> {
+    if (this.ws !== ws || this.isClosing) return;
+    const token = await this.getAccessToken();
+    if (this.ws !== ws || this.isClosing) return;
+    this.sendWS(
+      {
+        op: OP_IDENTIFY,
+        d: {
+          token: `QQBot ${token}`,
+          intents: this.intents,
+          properties: { os: process.platform, browser: 'kujira', device: 'kujira' },
+        },
+      },
+      ws
+    );
+  }
+
+  private async sendResume(ws: QqWebSocketLike): Promise<void> {
+    if (this.ws !== ws || this.isClosing) return;
+    const token = await this.getAccessToken();
+    if (this.ws !== ws || this.isClosing) return;
+    this.sendWS(
+      {
+        op: OP_RESUME,
+        d: {
+          token: `QQBot ${token}`,
+          session_id: this.sessionId,
+          seq: this.lastSeq,
+        },
+      },
+      ws
+    );
+  }
+
+  private startHeartbeat(intervalMs: number, ws: QqWebSocketLike): void {
+    this.clearHeartbeat();
+    if (intervalMs <= 0) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws !== ws || this.isClosing) return;
+      if (this.awaitingHeartbeatAck) {
+        this.missedHeartbeatAcks += 1;
+        if (this.missedHeartbeatAcks >= this.maxMissedHeartbeatAcks) {
+          this.log.warn?.(
+            `[KujiraGateway] 连续 ${this.missedHeartbeatAcks} 次心跳未收到 HEARTBEAT_ACK，判定死链并重连`
+          );
+          this.handleDeadSocket(ws);
+          return;
+        }
+      }
+      this.awaitingHeartbeatAck = true;
+      this.sendWS({ op: OP_HEARTBEAT, d: this.lastSeq || null }, ws);
+    }, intervalMs);
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private armHelloWatchdog(ws: QqWebSocketLike): void {
+    this.clearHelloWatchdog();
+    this.helloWatchdog = setTimeout(() => {
+      this.helloWatchdog = null;
+      if (this.isClosing || this.ws !== ws) return;
+      this.log.warn?.(`[KujiraGateway] 连接后 ${this.helloTimeoutMs}ms 未收到 HELLO，判定假死并重连`);
+      this.handleDeadSocket(ws);
+    }, this.helloTimeoutMs);
+  }
+
+  private clearHelloWatchdog(): void {
+    if (this.helloWatchdog) {
+      clearTimeout(this.helloWatchdog);
+      this.helloWatchdog = null;
+    }
+  }
+
+  private handleDeadSocket(ws: QqWebSocketLike): void {
+    this.clearHeartbeat();
+    this.clearHelloWatchdog();
+    this.ready = false;
+    if (this.ws === ws) {
+      this.ws = null;
+    }
+    try {
+      ws.close();
+    } catch {
+      // 忽略关闭异常
+    }
+    if (!this.isClosing) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private sendWS(payload: unknown, ws: QqWebSocketLike | null = this.ws): void {
+    try {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify(payload));
+      }
+    } catch (err) {
+      this.log.warn?.(`[KujiraGateway] 发送 WS 帧失败: ${this.sanitize(errorMessage(err))}`);
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.isClosing || this.reconnectTimer) return;
+    const delay = this.backoffDelays[Math.min(this.reconnectAttempts, this.backoffDelays.length - 1)] ?? 5000;
+    this.reconnectAttempts += 1;
+    this.log.info?.(`[KujiraGateway] ${delay}ms 后发起第 ${this.reconnectAttempts} 次重连`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.isClosing) {
+        void this.connect();
+      }
+    }, delay);
+  }
+
+  private fireAndLog(promise: Promise<void>, label: string): void {
+    void promise.catch((err) => {
+      this.log.error?.(`[KujiraGateway] ${label} 失败: ${this.sanitize(errorMessage(err))}`);
+    });
+  }
+
+  // ─────────────────────────────── 底层 HTTP ───────────────────────────────
+
+  private async rawRequest(
+    url: string,
+    init: { method: string; headers?: Record<string, string>; body?: string | Uint8Array },
+    timeoutMs: number
+  ): Promise<RawHttpResponse> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`请求超时 (${timeoutMs}ms)`)), timeoutMs);
+    const requestInit: RequestInit = {
+      method: init.method,
+      headers: init.headers,
+      signal: controller.signal,
+    };
+    if (typeof init.body === 'string') {
+      requestInit.body = init.body;
+    } else if (init.body !== undefined) {
+      requestInit.body = init.body as unknown as BodyInit;
+    }
+    try {
+      const res = await this.fetchFn(url, requestInit);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const text = new TextDecoder().decode(bytes);
+      return {
+        ok: res.ok,
+        status: res.status,
+        text,
+        contentType: res.headers.get('content-type'),
+        bytes,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 0,
+        text: this.sanitize(errorMessage(err)),
+        contentType: null,
+        bytes: new Uint8Array(),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async authedJsonRequest<T = any>(
+    method: 'POST' | 'DELETE',
+    url: string,
+    payload?: unknown,
+    allowAuthRetry = true
+  ): Promise<QQApiResult<T>> {
+    try {
+      const token = await this.getAccessToken();
+      const headers: Record<string, string> = {
+        Authorization: `QQBot ${token}`,
+        'Content-Type': 'application/json',
+      };
+      const res = await this.rawRequest(
+        url,
+        {
+          method,
+          headers,
+          ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
+        },
+        this.requestTimeoutMs
+      );
+      if (res.status === TOKEN_401_RETRY_CODE && allowAuthRetry) {
+        this.log.warn?.('[KujiraGateway] REST 401，退避刷新 access_token 后重试一次');
+        await this.refreshTokenAfter401();
+        return this.authedJsonRequest<T>(method, url, payload, false);
+      }
+      if (res.status === 0) {
+        return {
+          ok: false,
+          status: 0,
+          message: this.sanitize(res.text || '网络请求失败'),
+          body: null as T,
+        };
+      }
+      return toApiResult<T>(res);
+    } catch (err) {
+      return {
+        ok: false,
+        status: 0,
+        message: this.sanitize(errorMessage(err)),
+        body: null as T,
+      };
+    }
+  }
+
+  // ─────────────────────────────── REST 原始方法 ───────────────────────────────
+
+  /**
+   * 发送单聊普通/Markdown/输入状态/富媒体消息 (`POST /v2/users/{openid}/messages`)。
+   * 永不抛未包装异常，统一返回 `QQApiResult`。
+   */
+  async sendC2CMessage(
+    openid: string,
+    payload: QQSendMessagePayload,
+    meta?: OutboundSendMeta
+  ): Promise<QQApiResult<QQSendMessageResponse>> {
+    if (!openid || typeof openid !== 'string' || !isValidOpenid(openid)) {
+      return { ok: false, status: 400, message: '无效的目标 openid', body: null as any };
+    }
+
+    let finalPayload: QQSendMessagePayload = { ...payload };
+    if (finalPayload.msg_type === QQ_MSG_TYPE_MARKDOWN) {
+      const mdContent = finalPayload.markdown?.content;
+      if (typeof mdContent !== 'string' || mdContent.trim() === '') {
+        return {
+          ok: false,
+          status: 400,
+          code: ERR_INVALID_MARKDOWN,
+          message: 'msg_type=2 必须携带非空 markdown.content（否则触发 40034011）',
+          body: null as any,
+        };
+      }
+      // 实测规范：msg_type=2 时仅下发 markdown.content，不冗余携带 content
+      const { content: _omitted, ...rest } = finalPayload;
+      finalPayload = { ...rest, markdown: { content: mdContent } };
+    }
+
+    const url = `${this.apiBase}/v2/users/${encodeURIComponent(openid)}/messages`;
+    const res = await this.authedJsonRequest<QQSendMessageResponse>('POST', url, finalPayload);
+
+    if (
+      res.ok &&
+      finalPayload.msg_type !== QQ_MSG_TYPE_INPUT_NOTIFY &&
+      !meta?.skipAutoRecord &&
+      res.body &&
+      typeof res.body.id === 'string' &&
+      res.body.id.trim() !== ''
+    ) {
+      const refIdx =
+        typeof res.body.ext_info?.ref_idx === 'string' && res.body.ext_info.ref_idx.trim() !== ''
+          ? res.body.ext_info.ref_idx.trim()
+          : undefined;
+      const peer = meta?.peer ?? openidToPeer(openid);
+      const replyTo =
+        meta?.replyTo !== undefined
+          ? meta.replyTo
+          : (finalPayload.message_reference?.message_id ?? null);
+      const fallbackText =
+        finalPayload.msg_type === QQ_MSG_TYPE_MARKDOWN
+          ? finalPayload.markdown?.content
+          : finalPayload.content;
+      const text = meta?.text !== undefined ? meta.text : fallbackText;
+
+      this.emitMessageSent({
+        peer,
+        openid,
+        msgId: res.body.id,
+        ...(refIdx ? { refIdx } : {}),
+        replyTo: replyTo ?? null,
+        msgType: finalPayload.msg_type as 0 | 2 | 7,
+        ...(text !== undefined ? { text } : {}),
+        payload: finalPayload,
+        time: Date.now(),
+        ...(meta?.attachments && meta.attachments.length > 0 ? { attachments: meta.attachments } : {}),
+      });
+    }
+
+    return res;
+  }
+
+  /**
+   * 发送单聊流式消息 (`POST /v2/users/{openid}/stream_messages`)。
+   * 护栏：必须携带有效入站 `msg_id`（无 `msg_id` 必报 `50015001`）。
+   */
+  async sendC2CStreamMessage(
+    openid: string,
+    payload: QQStreamMessagePayload
+  ): Promise<QQApiResult<QQStreamMessageResponse>> {
+    if (!openid || typeof openid !== 'string' || !isValidOpenid(openid)) {
+      return { ok: false, status: 400, message: '无效的目标 openid', body: null as any };
+    }
+    if (!payload?.msg_id || typeof payload.msg_id !== 'string' || payload.msg_id.trim() === '') {
+      return {
+        ok: false,
+        status: 400,
+        code: ERR_STREAM_MISSING_MSG_ID,
+        message: '流式消息必须携带有效入站 msg_id（无 msg_id 必报 50015001）',
+        body: null as any,
+      };
+    }
+
+    const url = `${this.apiBase}/v2/users/${encodeURIComponent(openid)}/stream_messages`;
+    return this.authedJsonRequest<QQStreamMessageResponse>('POST', url, payload);
+  }
+
+  /**
+   * 发送单聊「正在输入」状态 (`msg_type=6`, `input_type=1`, `input_second=60`)。
+   */
+  async sendInputNotify(
+    openid: string,
+    msgId: string,
+    msgSeq: number,
+    inputSecond = QQ_INPUT_NOTIFY_MAX_SECONDS
+  ): Promise<QQApiResult<QQSendMessageResponse>> {
+    if (!msgId || typeof msgId !== 'string' || msgId.trim() === '') {
+      return { ok: false, status: 400, message: 'sendInputNotify 必须提供有效入站 msgId', body: null as any };
+    }
+    const clampedSeconds = Math.min(QQ_INPUT_NOTIFY_MAX_SECONDS, Math.max(1, Math.floor(inputSecond)));
+    return this.sendC2CMessage(
+      openid,
+      {
+        msg_type: QQ_MSG_TYPE_INPUT_NOTIFY,
+        input_notify: {
+          input_type: 1,
+          input_second: clampedSeconds,
+        },
+        msg_id: msgId,
+        msg_seq: msgSeq,
+      },
+      { skipAutoRecord: true }
+    );
+  }
+
+  /**
+   * 撤回单聊出站消息 (`DELETE /v2/users/{openid}/messages/{message_id}`)。
+   * 实测严格 120s 时限（超时 `40064004`，入站 ID `40061002`，幂等返回 `200 {}`）。
+   */
+  async deleteC2CMessage(
+    openid: string,
+    messageId: string,
+    hidetip?: boolean
+  ): Promise<QQApiResult<Record<string, unknown>>> {
+    if (!openid || typeof openid !== 'string' || !isValidOpenid(openid)) {
+      return { ok: false, status: 400, message: '无效的目标 openid', body: null as any };
+    }
+    if (!messageId || typeof messageId !== 'string' || messageId.trim() === '') {
+      return { ok: false, status: 400, message: '无效的撤回 message_id', body: null as any };
+    }
+    const suffix = hidetip ? '?hidetip=true' : '';
+    const url = `${this.apiBase}/v2/users/${encodeURIComponent(openid)}/messages/${encodeURIComponent(messageId)}${suffix}`;
+    return this.authedJsonRequest<Record<string, unknown>>('DELETE', url);
+  }
+
+  /**
+   * 单聊富媒体四步分片上传 (`upload_prepare` -> 裸 `PUT` -> `upload_part_finish` -> `/files`)。
+   * 严格对齐实测报告 #4：
+   * - `parts[].index` 1-based 升序排序；
+   * - 累积 `offset` 切片；
+   * - 每片使用自身 `block_size` 并向 `upload_part_finish` 上报该片真实 `block_size`；
+   * - 裸 `PUT` 预签名 URL（不附鉴权头）；
+   * - 结合 `(openid, md5, fileType)` 读写本地 `media_upload_cache` 24h 缓存，绝不假设服务端 MD5 秒传。
+   */
+  async uploadC2CMedia(
+    openid: string,
+    buffer: Buffer | Uint8Array,
+    options: UploadC2CMediaOptions
+  ): Promise<QQApiResult<QQFilesMergeResponse>> {
+    try {
+      if (!openid || typeof openid !== 'string' || !isValidOpenid(openid)) {
+        return { ok: false, status: 400, message: '无效的目标 openid', body: null as any };
+      }
+
+      const bytes = buffer instanceof Uint8Array
+        ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+        : new Uint8Array(buffer);
+
+      if (bytes.length === 0) {
+        return { ok: false, status: 400, message: '媒体文件为空，无法上传', body: null as any };
+      }
+      if (bytes.length > QQ_MEDIA_HARD_LIMIT) {
+        return {
+          ok: false,
+          status: 400,
+          message: `媒体文件大小 (${(bytes.length / 1024 / 1024).toFixed(2)}MB) 超过 200MB 硬上限`,
+          body: null as any,
+        };
+      }
+
+      const effectiveFileType = resolveEffectiveMediaFileType(options.fileType, bytes.length);
+      const md5 = md5Hex(bytes);
+      const sha1 = sha1Hex(bytes);
+      const md510m = md5Hex(bytes.subarray(0, QQ_UPLOAD_MD5_10M_BYTES));
+
+      // 1. 本地缓存检查（仅复用此前由服务端完整上传合并得到的 file_info，绝不假设服务端秒传）
+      if (!options.bypassCache) {
+        const cached = this.readMediaCache(openid, md5, effectiveFileType, options.db);
+        if (cached) {
+          this.log.debug?.(`[KujiraGateway] 命中本地 media_upload_cache (fileType=${effectiveFileType})`);
+          return {
+            ok: true,
+            status: 200,
+            body: {
+              ...(cached.file_uuid ? { file_uuid: cached.file_uuid } : {}),
+              file_info: cached.file_info,
+              ttl: Math.max(1, Math.floor((cached.expires_at - Date.now()) / 1000)),
+            },
+          };
+        }
+      }
+
+      const base = `${this.apiBase}/v2/users/${encodeURIComponent(openid)}`;
+
+      // 2. Step 1: upload_prepare
+      const prepareRes = await this.authedJsonRequest<QQUploadPrepareResponse>('POST', `${base}/upload_prepare`, {
+        file_type: effectiveFileType,
+        file_size: String(bytes.length),
+        file_name: options.fileName,
+        md5,
+        sha1,
+        md5_10m: md510m,
+      });
+      if (!prepareRes.ok) {
+        return {
+          ok: false,
+          status: prepareRes.status,
+          ...(prepareRes.code !== undefined ? { code: prepareRes.code } : {}),
+          message: `upload_prepare 失败: ${this.sanitize(prepareRes.message ?? '')}`,
+          body: prepareRes.body as any,
+        };
+      }
+
+      const uploadId = prepareRes.body?.upload_id;
+      const rawParts = Array.isArray(prepareRes.body?.parts) ? prepareRes.body.parts : [];
+      if (typeof uploadId !== 'string' || uploadId === '' || rawParts.length === 0) {
+        return {
+          ok: false,
+          status: 500,
+          message: 'upload_prepare 响应缺少 upload_id 或 parts',
+          body: prepareRes.body as any,
+        };
+      }
+
+      const globalBlockSize = Number(prepareRes.body?.block_size ?? 0);
+      // 实测硬规则：parts[].index 为 1-based，按 index 升序排序并累积 offset 切片
+      const sortedParts = [...rawParts].sort((a, b) => Number(a.index) - Number(b.index));
+
+      let offset = 0;
+      for (const part of sortedParts) {
+        if (offset >= bytes.length) break;
+        const remaining = bytes.length - offset;
+        const declaredSize = Number(part.block_size ?? globalBlockSize) || remaining;
+        const take = Math.min(declaredSize, remaining);
+        const chunk = bytes.subarray(offset, offset + take);
+        offset += chunk.length;
+
+        // 3. Step 2: 裸 PUT 分片二进制数据（不带 Authorization 或自定义头）
+        const putRes = await this.rawRequest(
+          part.presigned_url,
+          { method: 'PUT', body: chunk },
+          this.uploadPutTimeoutMs
+        );
+        if (!putRes.ok) {
+          return {
+            ok: false,
+            status: putRes.status,
+            message: `分片 #${part.index} PUT 上传失败 (status=${putRes.status})`,
+            body: null as any,
+          };
+        }
+
+        // 4. Step 3: upload_part_finish（必须上报该分片自身的实际 block_size）
+        const finishRes = await this.authedJsonRequest('POST', `${base}/upload_part_finish`, {
+          upload_id: uploadId,
+          part_index: part.index,
+          block_size: String(chunk.length),
+          md5: md5Hex(chunk),
+        });
+        if (!finishRes.ok) {
+          return {
+            ok: false,
+            status: finishRes.status,
+            ...(finishRes.code !== undefined ? { code: finishRes.code } : {}),
+            message: `upload_part_finish 分片 #${part.index} 失败: ${this.sanitize(finishRes.message ?? '')}`,
+            body: finishRes.body as any,
+          };
+        }
+      }
+
+      if (offset !== bytes.length) {
+        return {
+          ok: false,
+          status: 500,
+          message: `分片上传覆盖不完整：已上传 ${offset}/${bytes.length} 字节`,
+          body: null as any,
+        };
+      }
+
+      // 5. Step 4: POST /files 合并获取 file_info
+      const mergeRes = await this.authedJsonRequest<QQFilesMergeResponse>('POST', `${base}/files`, {
+        upload_id: uploadId,
+      });
+      if (!mergeRes.ok) {
+        return {
+          ok: false,
+          status: mergeRes.status,
+          ...(mergeRes.code !== undefined ? { code: mergeRes.code } : {}),
+          message: `文件合并失败: ${this.sanitize(mergeRes.message ?? '')}`,
+          body: mergeRes.body as any,
+        };
+      }
+
+      const fileInfo = mergeRes.body?.file_info;
+      if (typeof fileInfo !== 'string' || fileInfo === '') {
+        return {
+          ok: false,
+          status: 500,
+          message: '文件合并响应缺少 file_info',
+          body: mergeRes.body as any,
+        };
+      }
+
+      const rawTtl = mergeRes.body?.ttl;
+      if (rawTtl === undefined || (typeof rawTtl === 'number' && rawTtl > 0)) {
+        const ttlSec = typeof rawTtl === 'number' && rawTtl > 0 ? rawTtl : DEFAULT_MEDIA_CACHE_TTL_SEC;
+        const safetyMs = ttlSec > 120 ? QQ_TOKEN_REFRESH_MARGIN_MS : 0;
+        const expiresAt = Date.now() + ttlSec * 1000 - safetyMs;
+        this.writeMediaCache(
+          {
+            openid,
+            md5,
+            file_type: effectiveFileType,
+            file_info: fileInfo,
+            ...(mergeRes.body?.file_uuid ? { file_uuid: mergeRes.body.file_uuid } : {}),
+            expires_at: expiresAt,
+          },
+          options.db
+        );
+      }
+
+      return mergeRes;
+    } catch (err) {
+      return {
+        ok: false,
+        status: 0,
+        message: this.sanitize(errorMessage(err)),
+        body: null as any,
+      };
+    }
+  }
+
+  /** 下载入站附件（实测裸 GET 即可，无需鉴权头，错误与日志均脱敏去 query） */
+  async fetchAttachment(
+    url: string
+  ): Promise<{ ok: boolean; status: number; bytes: Uint8Array; contentType: string | null; message?: string }> {
+    const res = await this.rawRequest(url, { method: 'GET' }, this.requestTimeoutMs);
+    return {
+      ok: res.ok,
+      status: res.status,
+      bytes: res.bytes,
+      contentType: res.contentType,
+      ...(!res.ok ? { message: this.sanitize(res.text || `HTTP ${res.status}`) } : {}),
+    };
+  }
+
+  private readMediaCache(
+    openid: string,
+    md5: string,
+    fileType: number,
+    db?: MediaUploadCacheStore
+  ): MediaUploadCacheRecord | null {
+    const now = Date.now();
+    if (db?.getCachedMediaUpload) {
+      try {
+        const hit = db.getCachedMediaUpload(openid, md5, fileType);
+        if (hit && hit.file_info && hit.expires_at > now) {
+          return hit;
+        }
+      } catch (err) {
+        this.log.warn?.(`[KujiraGateway] 读取 media_upload_cache 失败: ${this.sanitize(errorMessage(err))}`);
+      }
+      return null;
+    }
+    const key = `${openid}:${md5}:${fileType}`;
+    const mem = this.memoryMediaCache.get(key);
+    if (mem && mem.expires_at > now) {
+      return mem;
+    }
+    if (mem) {
+      this.memoryMediaCache.delete(key);
+    }
+    return null;
+  }
+
+  private writeMediaCache(record: MediaUploadCacheRecord, db?: MediaUploadCacheStore): void {
+    if (db?.saveCachedMediaUpload) {
+      try {
+        db.saveCachedMediaUpload(record);
+      } catch (err) {
+        this.log.warn?.(`[KujiraGateway] 写入 media_upload_cache 失败: ${this.sanitize(errorMessage(err))}`);
+      }
+      return;
+    }
+    const key = `${record.openid}:${record.md5}:${record.file_type}`;
+    this.memoryMediaCache.set(key, record);
+  }
 }
-
-export * from './wait-registry.js';
-
-
-export { NapCatGatewayServer as GatewayServer };

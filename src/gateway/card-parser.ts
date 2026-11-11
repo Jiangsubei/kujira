@@ -1,7 +1,9 @@
 /**
- * dsh-napcat-bridge: 富媒体卡片解析模块
- * 专职 XML/JSON 富媒体卡片解析、字段提取与 URL/协议规范化。
+ * kujira: 富媒体卡片解析模块
+ * 专职 QQ 官方 `ark_data`（`message_type=3`）与 XML/JSON 富媒体卡片解析、字段提取与 URL 规范化。
  */
+
+import type { QQArkData } from '../types/index.js';
 
 export interface ExtractedCardInfo {
   text: string;
@@ -281,4 +283,70 @@ export function extractCardContent(
   }
 
   return cardInfo;
+}
+
+function cleanCardField(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * 解析 QQ 官方 `message_type=3` 卡片 / 小程序结构化载荷 `d.ark_data` 与兜底 `d.content`。
+ */
+export function extractArkDataContent(
+  arkData?: QQArkData | null,
+  fallbackContent?: string | null
+): string {
+  const fallback = cleanCardField(fallbackContent);
+  if (!arkData || typeof arkData !== 'object') {
+    return fallback || '[卡片消息]';
+  }
+
+  const arkName = cleanCardField(arkData.ark_name);
+  const prompt = cleanCardField(arkData.prompt);
+  const fields = arkData.fields && typeof arkData.fields === 'object' ? arkData.fields : {};
+
+  const rawTitle = cleanCardField(fields.title) || cleanCardField(fields.desc) || cleanCardField(fields.summary);
+  const source = cleanCardField(fields.source);
+  const link = normalizeUrl(
+    cleanCardField(fields.qqdocurl) ||
+      cleanCardField(fields.jumpUrl) ||
+      cleanCardField(fields.url) ||
+      cleanCardField(fields.link)
+  );
+  const preview = normalizeUrl(
+    cleanCardField(fields.preview) ||
+      cleanCardField(fields.cover) ||
+      cleanCardField(fields.image) ||
+      cleanCardField(fields.icon)
+  );
+
+  const hasRichFields = Boolean(rawTitle || prompt || source || link || preview);
+  if (!hasRichFields) {
+    if (fallback) return fallback;
+    return arkName ? `[卡片消息:${arkName}]` : '[卡片消息]';
+  }
+
+  // 若 fields.title 仅重复应用名 source 而 prompt 携带了具体标题，优先采用 prompt 作主标题
+  const mainTitle =
+    rawTitle && source && rawTitle === source && prompt
+      ? prompt
+      : rawTitle || prompt || arkName || '卡片消息';
+
+  const baseText = link ? `[卡片消息:${mainTitle}](${link})` : `[卡片消息:${mainTitle}]`;
+  const extras: string[] = [];
+
+  if (arkName && arkName !== mainTitle && !mainTitle.includes(arkName)) {
+    extras.push(`[类型:${arkName}]`);
+  }
+  if (source && source !== mainTitle && !mainTitle.includes(source)) {
+    extras.push(`[来源:${source}]`);
+  }
+  if (prompt && prompt !== mainTitle && !mainTitle.includes(prompt)) {
+    extras.push(`[摘要:${prompt}]`);
+  }
+  if (preview) {
+    extras.push(`[封面:${preview}]`);
+  }
+
+  return [baseText, ...extras].join(' ');
 }

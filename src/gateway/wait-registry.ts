@@ -1,21 +1,23 @@
 /**
- * dsh-napcat-bridge: 会话级消息并发等待收集器
- * 专供 Agent 工具 wait_for_user_messages 挂起等待并收集入站消息。
+ * kujira: 会话级消息并发等待收集器
+ * 专供 Agent 工具 wait_for_user_messages 在 QQ 单聊中挂起等待并收集入站消息。
  */
 
 /**
- * EN-005: 等待收集的一条入站消息（字段与唤醒包同源：from 昵称 / user_id QQ /
- * content 归一化文本 / time 毫秒时间戳）
+ * 等待收集的一条单聊入站消息（字段与唤醒包同源：from 展示名 / user_id 内部标识 /
+ * content 归一化文本 / time 毫秒时间戳 / msg_id 字符串与 ref_idx 引用索引）
  */
 export interface WaitCollectedMessage {
-  msg_id?: number;
+  msg_id?: string;
+  ref_idx?: string;
   from: string;
   user_id: string;
   content: string;
   time: number;
-  reply_to?: number | null;
+  reply_to?: string | null;
   quoted?: {
-    msg_id?: number;
+    msg_id?: string;
+    ref_idx?: string;
     user_id?: string;
     from_name?: string;
     text?: string;
@@ -24,9 +26,9 @@ export interface WaitCollectedMessage {
 }
 
 /**
- * EN-005: 等待结算结果。
- * - ok:true     → 窗口结束返回已收集消息（纯超时窗口，用户拍板）
- * - timeout     → 状态层报错（0 条消息，不给建议，Agent 自己推理下一步）
+ * 等待结算结果。
+ * - ok:true     → 窗口结束返回已收集消息（纯超时窗口）
+ * - timeout     → 状态层报错（0 条消息）
  * - cancelled   → Agent 回合取消 / 插件 dispose
  * - wait-active → 同 peer 已有活动等待（防御性拒绝）
  */
@@ -43,8 +45,8 @@ export interface ActiveWait {
 }
 
 /**
- * EN-005: 入站消息等待收集器（一次性消息收集器桥接）。
- * peer 键控（group_* 与 user_*，与 normalizePeer / index.ts 流水线同一键空间）；
+ * 入站消息等待收集器（一次性消息收集器桥接）。
+ * 以单聊 peer (`user_<hash16>`) 键控，与消息入站流水线共享同一键空间；
  * 纯超时窗口语义：注册起算 timeoutMs 毫秒，到点返回已收集消息，0 条则状态层超时
  * 报错。可通过 AbortSignal 取消（Agent 回合中断）。单线程事件循环内注册/投递/结算
  * 同步串行，无撕裂窗口。
@@ -54,7 +56,7 @@ export class MessageWaitRegistry {
 
   /**
    * 注册一次性消息收集器并挂起等待。
-   * 同 peer 已有活动等待 → wait-active 拒绝（防御：同会话工具串行调用下理论不可达）；
+   * 同 peer 已有活动等待 → wait-active 拒绝；
    * 传入已中止的 signal → 立即 cancelled。
    */
   wait(peer: string, opts: { userId?: string; timeoutMs: number; signal?: AbortSignal }): Promise<MessageWaitResult> {
@@ -120,12 +122,12 @@ export class MessageWaitRegistry {
     });
   }
 
-  /** 判活（index.ts 等待门控用，同步、O(1)） */
+  /** 判活（入站等待门控用，同步、O(1)） */
   isWaiting(peer: string): boolean {
     return this.waits.has(peer);
   }
 
-  /** 尝试投递入站消息；命中（peer + user_id 过滤）并收集 → true，否则 false（不改状态） */
+  /** 尝试投递入站消息；命中并收集 → true，否则 false（不改状态） */
   tryDeliver(peer: string, msg: WaitCollectedMessage): boolean {
     const entry = this.waits.get(peer);
     if (!entry) return false;

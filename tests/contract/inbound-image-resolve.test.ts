@@ -1,3 +1,17 @@
+/**
+ * tests/contract/inbound-image-resolve.test.ts
+ *
+ * 契约测试: QQ 官方 Bot 入站附件裸 GET 下载、语音 WAV 优先、文件安全净化与凭证脱敏
+ *
+ * 覆盖实测契约：
+ * 1. 所有入站 `attachments[]` 均直接裸 GET（不附带 Authorization 头）；
+ * 2. 图片下载后按字节魔数纠正扩展名落盘至 `downloads/image/<peer>/`；
+ * 3. `content_type === 'voice'` 忽略响应头错报 `audio/mp3`，优先拉取 `voice_wav_url`（`ext: 'wav'`），
+ *    无 WAV 地址或失败时回退 `url`，且始终保留 `asr_refer_text`；
+ * 4. `content_type === 'file'` 对 `.png` 保留真实扩展名与魔数格式，并对外部 `filename` 做 `path.basename` + 危险字符净化防路径穿越；
+ * 5. 下载报错与日志彻底剥离 URL query 凭证（不含 `rkey`）。
+ */
+
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -5,470 +19,230 @@ import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import * as http from 'node:http';
 import { MediaStorageManager } from '../../src/storage/media.js';
-import { MessageDatabase } from '../../src/storage/database.js';
-import { resolveInboundImage, setLearnedNtqqDir, getLearnedNtqqDir, findNtqqCachedImage } from '../../src/gateway/inbound-media.js';
+import {
+  resolveInboundAttachments,
+  sanitizeErrorMessage,
+  sanitizeInboundFilename,
+  sanitizeUrlForLog,
+} from '../../src/gateway/inbound-media.js';
+import { openidToPeer } from '../../src/utils/peer.js';
+import type { QQC2CMessageCreateEvent } from '../../src/types/index.js';
 
-/**
- * 契约测试: 入站图片四段式解析 (Inbound Image Resolve)
- *
- * 背景（devlog/修复方案-媒体直链失效与回退落盘_261030.md §1）：
- *   QQ 下发的 gchat.qpic.cn/download?rkey=… 直链对第三方进程 100% 返回
- *   {"retcode":-5503007,"retmsg":"download url has expired"}（收到后 100ms 即失败，改 header/参数无效），
- *   而 NapCat get_image / get_file 19/19 能拿到本地原图。
- *   因此主路改为「NapCat 本地优先 → 直链 → get_msg 刷新直链」四段式，且拿到字节后必须
- *   复制进我们自己的 downloads/<type>/<peer>/ 落盘（不能只引用 NapCat 缓存路径）。
- *
- * 本文件只 mock NapCat 应答与网络（外部依赖隔离），MediaStorageManager / MessageDatabase 均为真实实现。
- *
- * DC-1 直链不可用 → get_image 本地路径 → 复制进 downloads（魔数纠正后缀）
- * DC-2 get_image 失败 → get_file 兜住
- * DC-3 前两段失败 → 直链成功（multimedia / gchatpic_new 这类仍可用的 host 不回归）
- * DC-4 前三段失败 → get_msg 刷新直链后成功
- * DC-5 四段全失败 → ok=false + 四段 attempts 齐全 + 不落盘
- * DC-6 同 file_id 二次入站 → 一级去重直接命中，不再调用 NapCat
- * DC-7 本地文件小于段内声明尺寸 → 仍落盘，但标记 sizeMismatch
- */
+const MOCK_OPENID = 'A1B2C3D4E5F60123456789ABCDEF0003';
+const PEER = openidToPeer(MOCK_OPENID);
 
-const PEER = 'group_3000000001';
-const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(48, 7)]);
+const PNG_BYTES = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(48, 7),
+]);
 const GIF_BYTES = Buffer.concat([Buffer.from('GIF89a'), Buffer.alloc(24, 1)]);
+const WAV_BYTES = Buffer.concat([
+  Buffer.from('RIFF'),
+  Buffer.from([0x24, 0x00, 0x00, 0x00]),
+  Buffer.from('WAVEfmt '),
+  Buffer.alloc(32, 0),
+]);
+const AMR_BYTES = Buffer.concat([Buffer.from('#!AMR\n'), Buffer.alloc(16, 2)]);
 
-describe('契约测试: 入站图片四段式解析 (Inbound Image Resolve)', () => {
+function makeEvent(attachments: QQC2CMessageCreateEvent['attachments']): QQC2CMessageCreateEvent {
+  return {
+    id: 'ROBOT1.0_media_001',
+    content: '',
+    timestamp: '2026-11-11T18:28:47+08:00',
+    author: { user_openid: MOCK_OPENID, username: '' },
+    message_type: 0,
+    attachments,
+  };
+}
+
+describe('契约测试: 入站媒体裸 GET 下载与安全脱敏 (Inbound Media Resolve)', () => {
   let tmpHome: string;
-  let db: MessageDatabase;
   let manager: MediaStorageManager;
   let servers: http.Server[] = [];
 
-  const ok = (data: any) => ({ status: 'ok' as const, retcode: 0, data });
-
-  async function startLoopback(body: Buffer, status = 200): Promise<string> {
+  async function startServer(
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+  ): Promise<string> {
     return new Promise((resolve, reject) => {
-      const srv = http.createServer((_req, res) => {
-        res.writeHead(status, { 'Content-Type': 'image/gif' });
-        res.end(body);
-      });
+      const srv = http.createServer(handler);
       srv.on('error', reject);
       servers.push(srv);
       srv.listen(0, '127.0.0.1', () => {
         const addr = srv.address() as any;
-        resolve(`http://127.0.0.1:${addr.port}/image.gif`);
+        resolve(`http://127.0.0.1:${addr.port}`);
       });
     });
   }
 
-  async function makeLocalImage(name = 'origin.png'): Promise<string> {
-    const p = path.join(tmpHome, 'napcat-cache', name);
-    await fsp.mkdir(path.dirname(p), { recursive: true });
-    await fsp.writeFile(p, PNG_BYTES);
-    return p;
-  }
-
   beforeEach(async () => {
-    setLearnedNtqqDir(null);
-    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-napcat-inbound-image-'));
-    db = new MessageDatabase(path.join(tmpHome, 'messages.sqlite'));
-    manager = new MediaStorageManager({ dshHome: tmpHome, downloadDir: 'downloads', db });
+    tmpHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'kujira-inbound-media-'));
+    manager = new MediaStorageManager({ dshHome: tmpHome, downloadDir: 'downloads' });
     servers = [];
   });
 
   afterEach(async () => {
-    setLearnedNtqqDir(null);
-    for (const s of servers) await new Promise<void>((r) => s.close(() => r())).catch(() => {});
-    db.close();
+    for (const s of servers) {
+      await new Promise<void>((r) => s.close(() => r())).catch(() => {});
+    }
     await fsp.rm(tmpHome, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('DC-1: 直链不可用 → get_image 本地路径 → 复制进 downloads 并按魔数纠正后缀', async () => {
-    const origin = await makeLocalImage();
-    const getImage = async () => ok({ file: origin, file_size: String(PNG_BYTES.length), file_name: 'origin.png' });
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'DEADBEEF.png',
-      fileId: 'DEADBEEF.png',
-      url: 'http://127.0.0.1:1/never-used.png',
-      declaredSize: PNG_BYTES.length,
-      msgId: 9001,
-      gateway: { getImage },
-      mediaManager: manager,
+  it('契约 1: image/* 裸 GET（绝不带 Authorization 头）并按魔数纠偏扩展名落盘', async () => {
+    let seenAuthHeader: string | undefined;
+    const base = await startServer((req, res) => {
+      seenAuthHeader = req.headers.authorization;
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(GIF_BYTES);
     });
 
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('get_image');
-    expect(res.localPath).toBeTruthy();
-    expect(res.localPath!).not.toBe(origin); // 必须是复制件，不是引用 NapCat 缓存
-    expect(res.localPath!.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
-    expect(res.localPath!.endsWith('.png')).toBe(true);
-    expect(Buffer.compare(fs.readFileSync(res.localPath!), PNG_BYTES)).toBe(0);
-    expect(res.fingerprint).toBeTruthy();
+    const event = makeEvent([
+      {
+        content_type: 'image/jpeg',
+        filename: 'FAKE_HASH.jpg',
+        size: GIF_BYTES.length,
+        url: `${base}/download?appid=1406&rkey=SECRET_IMG_KEY`,
+      },
+    ]);
+
+    const result = await resolveInboundAttachments(event, PEER, manager);
+    expect(seenAuthHeader).toBeUndefined();
+    expect(result).toHaveLength(1);
+    expect(result[0]!.kind).toBe('image');
+    expect(result[0]!.local?.format).toBe('gif');
+    expect(result[0]!.local?.path.endsWith('.gif')).toBe(true);
+    expect(result[0]!.local?.path.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
+    expect(Buffer.compare(fs.readFileSync(result[0]!.local!.path), GIF_BYTES)).toBe(0);
   });
 
-  it('DC-2: get_image 失败 → get_file 本地路径兜住', async () => {
-    const origin = await makeLocalImage();
-    const getImage = async () => ({ status: 'failed' as const, retcode: 1404, data: null as any, wording: 'unknown action' });
-    const getFile = async () => ok({ file: origin, file_size: String(PNG_BYTES.length) });
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: true,
-      file: 'CAFEBABE.jpg',
-      fileId: 'CAFEBABE',
-      url: 'http://127.0.0.1:1/never-used.png',
-      gateway: { getImage: getImage as any, getFile: getFile as any },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('get_file');
-    expect(fs.existsSync(res.localPath!)).toBe(true);
-  });
-
-  it('DC-3: 前两段失败 → 直链下载成功（multimedia/gchatpic_new 不回归）', async () => {
-    const url = await startLoopback(GIF_BYTES);
-    const getImage = async () => ({ status: 'failed' as const, retcode: 1404, data: null as any });
-    const getFile = async () => ({ status: 'failed' as const, retcode: 1404, data: null as any });
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: true,
-      file: 'FEEDFACE.jpg',
-      fileId: 'FEEDFACE',
-      url,
-      gateway: { getImage: getImage as any, getFile: getFile as any },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('url');
-    expect(res.localPath!.endsWith('.gif')).toBe(true);
-  });
-
-  it('DC-4: 前三段失败 → get_msg 刷新直链后成功', async () => {
-    const url = await startLoopback(GIF_BYTES);
-    const getImage = async () => ({ status: 'failed' as const, retcode: 1404, data: null as any });
-    const getFile = async () => ({ status: 'failed' as const, retcode: 1404, data: null as any });
-    const getMsg = async () =>
-      ok({ message: [{ type: 'image', data: { url, file: 'CAFEBABE.jpg' } }] });
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'CAFEBABE.jpg',
-      fileId: 'CAFEBABE',
-      url: await startLoopback(Buffer.from('{}'), 400),
-      msgId: 9002,
-      gateway: { getImage: getImage as any, getFile: getFile as any, getMsg: getMsg as any },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('get_msg_url');
-    expect(res.attempts.map((a) => a.via)).toEqual(['get_image', 'get_file', 'url', 'get_msg_url']);
-  });
-
-  it('DC-5: 四段全失败 → ok=false、attempts 齐全、目录无落盘', async () => {
-    const deadUrl = await startLoopback(Buffer.from('{"retcode":-5503007,"retmsg":"download url has expired"}'), 400);
-    const fail = async () => ({ status: 'failed' as const, retcode: 1404, data: null as any });
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: '0123456789ABCDEF.png',
-      fileId: '0123456789ABCDEF.png',
-      url: deadUrl,
-      msgId: 9003,
-      gateway: { getImage: fail as any, getFile: fail as any, getMsg: fail as any },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(false);
-    expect(res.localPath).toBeUndefined();
-    expect(res.attempts).toHaveLength(4);
-    expect(res.attempts.every((a) => a.ok === false)).toBe(true);
-    expect(res.error).toBeTruthy();
-    const targetDir = path.join(tmpHome, 'downloads', 'image', PEER);
-    expect(fs.existsSync(targetDir) ? fs.readdirSync(targetDir).length : 0).toBe(0);
-  });
-
-  it('DC-6: 同 file_id 二次入站 → 一级去重直接命中，不再调用 NapCat', async () => {
-    const origin = await makeLocalImage();
-    let getImageCalls = 0;
-    const getImage = async () => {
-      getImageCalls++;
-      return ok({ file: origin, file_size: String(PNG_BYTES.length) });
-    };
-
-    const base = {
-      peer: PEER,
-      isSticker: false,
-      file: 'SAMESAME.png',
-      fileId: 'SAMESAME.png',
-      url: 'http://127.0.0.1:1/never-used.png',
-      gateway: { getImage },
-      mediaManager: manager,
-    };
-    const first = await resolveInboundImage(base);
-    // 模拟调用方（index.ts）在处理完首条消息后落库：resolver 自身不写 messages 表，
-    // 一级去重依赖消息行上的 file_id/local_path。
-    db.saveMessage({
-      msg_id: 9101,
-      peer: PEER,
-      user_id: '2000000001',
-      sender_name: '测试成员',
-      time: Date.now(),
-      type: 'image',
-      content: '[图片:SAMESAME.png]',
-      raw: '{}',
-      file_id: 'SAMESAME.png',
-      busid: null,
-      local_path: first.localPath!,
-      fingerprint: first.fingerprint ?? null,
-      recalled: 0,
-      self: 0,
-      reply_to: null,
-    });
-    const second = await resolveInboundImage(base);
-
-    expect(first.ok).toBe(true);
-    expect(second.ok).toBe(true);
-    expect(second.via).toBe('cache');
-    expect(second.localPath).toBe(first.localPath);
-    expect(getImageCalls).toBe(1);
-  });
-
-  it('DC-8: 段内已带 local_path → 直接复制，不再调用 NapCat', async () => {
-    const origin = await makeLocalImage('prefetched.png');
-    let calls = 0;
-    const getImage = async () => {
-      calls++;
-      return ok({ file: origin, file_size: String(PNG_BYTES.length) });
-    };
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'PREFETCH.png',
-      fileId: 'PREFETCH.png',
-      localPath: origin,
-      gateway: { getImage },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('segment_local_path');
-    expect(calls).toBe(0);
-    expect(res.localPath!.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
-    expect(Buffer.compare(fs.readFileSync(res.localPath!), PNG_BYTES)).toBe(0);
-  });
-
-  it('DC-9: 段内 local_path 不可读 → 快速失败，不调用 NapCat（消息链路不被卡住）', async () => {
-    let calls = 0;
-    const getImage = async () => {
-      calls++;
-      return ok({ file: path.join(tmpHome, 'napcat-cache', 'origin.png') });
-    };
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'GONE.png',
-      fileId: 'GONE.png',
-      localPath: path.join(tmpHome, 'napcat-cache', 'gone.png'),
-      msgId: 9005,
-      gateway: { getImage, getFile: getImage as any, getMsg: getImage as any },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(false);
-    expect(calls).toBe(0);
-    expect(res.attempts.map((a) => a.via)).toEqual(['segment_local_path']);
-  });
-
-  it('DC-7: 本地字节小于段内声明尺寸 → 仍落盘但标记 sizeMismatch', async () => {
-    const origin = await makeLocalImage('thumb.png');
-    const getImage = async () => ok({ file: origin, file_size: String(PNG_BYTES.length) });
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'THUMBTHUMB.png',
-      fileId: 'THUMBTHUMB.png',
-      declaredSize: PNG_BYTES.length * 10,
-      msgId: 9004,
-      gateway: { getImage },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(true);
-    expect(res.sizeMismatch).toBe(true);
-  });
-
-  it('DC-8: 同机 NTQQ 缓存直读命中 → 直接落盘且绝不调用 NapCat WebSocket 取图', async () => {
-    const ntqqRoot = path.join(tmpHome, 'mock-ntqq-data');
-    const oriDir = path.join(ntqqRoot, '1000000001', 'nt_qq', 'nt_data', 'Pic', '2026-10', 'Ori');
-    await fsp.mkdir(oriDir, { recursive: true });
-    const cachedFile = path.join(oriDir, 'CAFEBABE01020304CAFEBABE01020304.jpg');
-    await fsp.writeFile(cachedFile, PNG_BYTES);
-
-    let getImageCalled = 0;
-    let getFileCalled = 0;
-    const getImage = async () => {
-      getImageCalled++;
-      return ok({ file: 'never-called' });
-    };
-    const getFile = async () => {
-      getFileCalled++;
-      return ok({ file: 'never-called' });
-    };
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'CAFEBABE01020304CAFEBABE01020304.image',
-      fileId: 'CAFEBABE01020304CAFEBABE01020304',
-      dataDir: ntqqRoot,
-      botQQ: '1000000001',
-      gateway: { getImage, getFile },
-      mediaManager: manager,
-    });
-
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('nt_cache');
-    expect(getImageCalled).toBe(0);
-    expect(getFileCalled).toBe(0);
-    expect(res.localPath).toBeTruthy();
-    expect(res.localPath!).not.toBe(cachedFile);
-    expect(res.localPath!.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
-    expect(fs.existsSync(res.localPath!)).toBe(true);
-  });
-
-  it('DC-9: 动态学习 NTQQ 路径契约：首次 getImage 解析后自动记住 NTQQ 根路径，后续图片直读缓存', async () => {
-    const ntqqRoot = path.join(tmpHome, 'dynamic-ntqq-files');
-    const oriDir = path.join(ntqqRoot, '1000000001', 'nt_qq', 'nt_data', 'Pic', '2026-10', 'Ori');
-    await fsp.mkdir(oriDir, { recursive: true });
-
-    const firstImageFile = path.join(oriDir, 'FIRST00000000000FIRST00000000000.png');
-    const secondImageFile = path.join(oriDir, 'SECOND0000000000SECOND0000000000.png');
-    await fsp.writeFile(firstImageFile, PNG_BYTES);
-    await fsp.writeFile(secondImageFile, PNG_BYTES);
-
-    let getImageCalls = 0;
-    const getImage = async (f: string) => {
-      getImageCalls++;
-      if (f.includes('FIRST')) {
-        return ok({ file: firstImageFile, file_size: String(PNG_BYTES.length) });
+  it('契约 2: 语音忽略响应头错报 audio/mp3，优先拉取 voice_wav_url (.wav) 并保留 asr_refer_text', async () => {
+    let amrCalled = 0;
+    let wavCalled = 0;
+    const base = await startServer((req, res) => {
+      if (req.url?.startsWith('/wav')) {
+        wavCalled++;
+        // 故意错报 audio/mp3 以验证不信任响应头
+        res.writeHead(200, { 'Content-Type': 'audio/mp3' });
+        res.end(WAV_BYTES);
+        return;
       }
-      return ok({ file: secondImageFile, file_size: String(PNG_BYTES.length) });
-    };
-
-    expect(getLearnedNtqqDir()).toBeNull();
-    const res1 = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'FIRST00000000000FIRST00000000000.png',
-      gateway: { getImage },
-      mediaManager: manager,
+      amrCalled++;
+      res.writeHead(200, { 'Content-Type': 'audio/mp3' });
+      res.end(AMR_BYTES);
     });
 
-    expect(res1.ok).toBe(true);
-    expect(res1.via).toBe('get_image');
-    expect(getImageCalls).toBe(1);
-    expect(getLearnedNtqqDir()).toBe(ntqqRoot);
+    const event = makeEvent([
+      {
+        content_type: 'voice',
+        filename: 'A1B2C3D4.amr',
+        url: `${base}/amr?rkey=AMR_SECRET`,
+        voice_wav_url: `${base}/wav?sig=WAV_SECRET`,
+        asr_refer_text: '你好，这是一条语音消息',
+      },
+    ]);
 
-    const res2 = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'SECOND0000000000SECOND0000000000.image',
-      gateway: { getImage },
-      mediaManager: manager,
-    });
-
-    expect(res2.ok).toBe(true);
-    expect(res2.via).toBe('nt_cache');
-    expect(getImageCalls).toBe(1);
+    const result = await resolveInboundAttachments(event, PEER, manager);
+    expect(wavCalled).toBe(1);
+    expect(amrCalled).toBe(0);
+    expect(result[0]!.kind).toBe('record');
+    expect(result[0]!.local?.path.endsWith('.wav')).toBe(true);
+    expect(result[0]!.local?.format).toBe('wav');
+    expect(result[0]!.local?.path.startsWith(path.join(tmpHome, 'downloads', 'voice', PEER))).toBe(true);
+    expect(result[0]!.remote?.asrReferText).toBe('你好，这是一条语音消息');
+    expect(Buffer.compare(fs.readFileSync(result[0]!.local!.path), WAV_BYTES)).toBe(0);
   });
 
-  it('DC-10: 找不到本地缓存时正常回退到 NapCat 并在超时/失败时完整记录 attempts', async () => {
-    let getImageCalls = 0;
-    const getImage = async () => {
-      getImageCalls++;
-      throw new Error('Action timeout after 10000ms');
-    };
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: false,
-      file: 'NOT_FOUND_ANYWHERE.png',
-      gateway: { getImage },
-      mediaManager: manager,
+  it('契约 3: voice_wav_url 缺失或失败时回退拉取原始 url，仍保留 asr_refer_text', async () => {
+    const base = await startServer((req, res) => {
+      if (req.url?.startsWith('/wav')) {
+        res.writeHead(502);
+        res.end('bad gateway');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'audio/mp3' });
+      res.end(AMR_BYTES);
     });
 
-    expect(res.ok).toBe(false);
-    expect(getImageCalls).toBe(1);
-    expect(res.attempts.some((a) => a.via === 'get_image' && !a.ok && a.error?.includes('timeout'))).toBe(true);
+    const event = makeEvent([
+      {
+        content_type: 'voice',
+        filename: 'fallback.amr',
+        url: `${base}/amr?rkey=AMR_SECRET`,
+        voice_wav_url: `${base}/wav?sig=WAV_FAIL_SECRET`,
+        asr_refer_text: '回退测试',
+      },
+    ]);
+
+    const warnLogs: string[] = [];
+    const result = await resolveInboundAttachments(event, PEER, manager, {
+      warn: (...args: any[]) => warnLogs.push(args.map(String).join(' ')),
+    });
+
+    expect(result[0]!.local?.path.endsWith('.amr')).toBe(true);
+    expect(result[0]!.remote?.asrReferText).toBe('回退测试');
+    expect(Buffer.compare(fs.readFileSync(result[0]!.local!.path), AMR_BYTES)).toBe(0);
+    // 日志严禁包含 query 凭证
+    expect(warnLogs.join('\n')).not.toContain('WAV_FAIL_SECRET');
   });
 
-  it('DC-11: 商城官方表情 (Emoji/marketface) 本地缓存存在时瞬时直读落盘', async () => {
-    const ntqqRoot = path.join(tmpHome, 'marketface-ntqq-data');
-    const marketDir = path.join(ntqqRoot, '1000000001', 'nt_qq', 'nt_data', 'Emoji', 'marketface', '235605');
-    await fsp.mkdir(marketDir, { recursive: true });
-    const cachedFile = path.join(marketDir, 'b06b0b05e2c8c0e01733ceddbd3542cd');
-    await fsp.writeFile(cachedFile, GIF_BYTES);
-
-    let getImageCalled = 0;
-    const getImage = async () => {
-      getImageCalled++;
-      return ok({ file: 'never-called' });
-    };
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: true,
-      file: 'b0-b06b0b05e2c8c0e01733ceddbd3542cd.gif',
-      emojiPackageId: 235605,
-      emojiId: 'b06b0b05e2c8c0e01733ceddbd3542cd',
-      dataDir: ntqqRoot,
-      botQQ: '1000000001',
-      gateway: { getImage },
-      mediaManager: manager,
+  it('契约 4: content_type=file 的 .png 文件保留扩展名与魔数，并对 filename 做路径穿越净化', async () => {
+    const base = await startServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(PNG_BYTES);
     });
 
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('nt_cache');
-    expect(getImageCalled).toBe(0);
-    expect(fs.existsSync(res.localPath!)).toBe(true);
+    const event = makeEvent([
+      {
+        content_type: 'file',
+        filename: '../../../../../etc/..\\..\\real_image.png',
+        size: PNG_BYTES.length,
+        url: `${base}/file?rkey=FILE_SECRET`,
+      },
+    ]);
+
+    const result = await resolveInboundAttachments(event, PEER, manager);
+    const targetDir = path.join(tmpHome, 'downloads', 'files', PEER);
+
+    expect(result[0]!.kind).toBe('file');
+    expect(result[0]!.fileName).toBe('real_image.png');
+    expect(result[0]!.local?.format).toBe('png');
+    expect(result[0]!.local?.path.startsWith(targetDir)).toBe(true);
+    expect(result[0]!.local?.path.endsWith('real_image.png')).toBe(true);
+    expect(sanitizeInboundFilename('..')).toBeUndefined();
+    expect(sanitizeInboundFilename('../../a:b*c?.pdf')).toBe('a_b_c_.pdf');
   });
 
-  it('DC-12: 商城官方表情未命中本地缓存时，直接走 HTTP 直链且坚决不调用 NapCat 避免超时挂起', async () => {
-    const url = await startLoopback(GIF_BYTES);
-    let getImageCalled = 0;
-    let getFileCalled = 0;
-    const getImage = async () => {
-      getImageCalled++;
-      throw new Error('Should not be called for market emoji');
-    };
-    const getFile = async () => {
-      getFileCalled++;
-      throw new Error('Should not be called for market emoji');
-    };
-
-    const res = await resolveInboundImage({
-      peer: PEER,
-      isSticker: true,
-      file: 'b0-b06b0b05e2c8c0e01733ceddbd3542cd.gif',
-      emojiPackageId: 235605,
-      emojiId: 'b06b0b05e2c8c0e01733ceddbd3542cd',
-      url,
-      gateway: { getImage, getFile },
-      mediaManager: manager,
+  it('契约 5: 下载失败时的错误信息与 logger 必须彻底剥离 URL query 凭证', async () => {
+    const base = await startServer((_req, res) => {
+      res.writeHead(403);
+      res.end('expired');
     });
 
-    expect(res.ok).toBe(true);
-    expect(res.via).toBe('url');
-    expect(getImageCalled).toBe(0);
-    expect(getFileCalled).toBe(0);
-    expect(res.attempts.map((a) => a.via)).toEqual(['url']);
-    expect(fs.existsSync(res.localPath!)).toBe(true);
+    const secretUrl = `${base}/download?appid=1406&rkey=SUPER_SECRET_RKEY_XYZ&spec=0`;
+    const warnLogs: string[] = [];
+    const result = await resolveInboundAttachments(
+      makeEvent([
+        {
+          content_type: 'image/png',
+          filename: 'expired.png',
+          url: secretUrl,
+        },
+      ]),
+      PEER,
+      manager,
+      {
+        warn: (...args: any[]) => warnLogs.push(args.map(String).join(' ')),
+      }
+    );
+
+    expect(result[0]!.local).toBeUndefined();
+    expect(result[0]!.unavailable).toBeTruthy();
+    expect(result[0]!.unavailable).not.toContain('SUPER_SECRET_RKEY_XYZ');
+    expect(result[0]!.unavailable).not.toContain('appid=1406');
+    expect(warnLogs.join('\n')).not.toContain('SUPER_SECRET_RKEY_XYZ');
+
+    expect(sanitizeUrlForLog(secretUrl)).toBe(`${base}/download`);
+    expect(
+      sanitizeErrorMessage(new Error(`HTTP 403 at ${secretUrl}`))
+    ).not.toContain('SUPER_SECRET_RKEY_XYZ');
   });
 });

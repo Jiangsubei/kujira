@@ -1,349 +1,147 @@
 /**
  * tests/contract/negative-msg-id.test.ts
- * 契约测试: 32位有符号整数回绕产生的负数 message_id 全链路支持契约
- * 
- * 覆盖场景：
- * 1. formatWakeupPrompt 私聊消息透传负数 [消息ID: <id>]
- * 2. formatWakeupPrompt 群聊单条消息透传负数 [消息ID: <id>]
- * 3. formatWakeupPrompt 群聊形态1 (前序缓冲+当前消息) 均精准透传负数消息ID
- * 4. formatWakeupPrompt 主动回复形态透传负数消息ID
- * 5. shouldWakeup 唤醒门控正确解析并保留负数 inboundMsgId
- * 6. send_qq_message 工具支持负数 reply_to (包括数字与数字字符串)
- * 7. collect_face 工具支持负数 message_id (包括传参和隐式入站绑定)
+ *
+ * 契约测试: 入站/出站字符串 ID 隔离与三 ID 模型契约（替代旧版 32 位整数负数 message_id 契约）
+ *
+ * QQ 官方 Bot API v2 三 ID 严格隔离模型：
+ * 1. 入站被动回复锚点 `msg_id`: 来自 `C2C_MESSAGE_CREATE` 的 `d.id`（`ROBOT1.0_...` 字符串，不得被 Number() 强转）；
+ * 2. 出站消息撤回 ID `id`: 来自发送响应 `body.id`（仅用于 120s 内 DELETE 撤回，绝不混用为被动锚点）；
+ * 3. 引用索引 `ref_idx`: 来自 `message_scene.ext` (`msg_idx=REFIDX_...` / `ref_msg_idx=REFIDX_...`) 或出站 `ext_info.ref_idx`。
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
-import { formatWakeupPrompt } from '../../src/gateway/session/id-resolver.js';
-import { shouldWakeup } from '../../src/gateway/wakeup.js';
-import { sendQqMessage, collectFace, registerAgentTools } from '../../src/tools/index.js';
-import { MessageDatabase } from '../../src/storage/database.js';
-import { Context } from '@deepseek-ai/cordis';
+import { describe, it, expect } from 'vitest';
+import {
+  extractMessageRefIdx,
+  extractQuotedRefIdx,
+  isPermanentRefIdx,
+  shouldWakeup,
+} from '../../src/gateway/wakeup.js';
+import { buildOutboundMediaAttachment } from '../../src/attachment/outbound.js';
+import { deserializeAttachments, serializeAttachments } from '../../src/attachment/store.js';
+import type {
+  InboundReplyContext,
+  QQC2CMessageCreateEvent,
+  QQSendMessagePayload,
+  QQSendMessageResponse,
+} from '../../src/types/index.js';
 
-describe('契约测试: 负数 message_id 全链路支持与透传', () => {
-  const NEGATIVE_MSG_ID = -837578626;
-  const NEGATIVE_BUFFER_MSG_ID = -1510201145;
+const MOCK_OPENID = 'A1B2C3D4E5F60123456789ABCDEF0007';
 
-  let tmpDir: string;
-  let dbPath: string;
-  let db: MessageDatabase;
-  let faceDir: string;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-negative-msgid-'));
-    dbPath = path.join(tmpDir, 'messages.sqlite');
-    db = new MessageDatabase(dbPath);
-    faceDir = path.join(tmpDir, 'faces');
-    fs.mkdirSync(faceDir, { recursive: true });
-  });
-
-  afterEach(() => {
-    db.close();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it('契约 1: formatWakeupPrompt 私聊消息必须透传负数 [消息ID: <id>]', () => {
-    const prompt = formatWakeupPrompt({
-      trigger: 'passive',
-      peer: 'user_1000000012',
-      from_user: '1000000012',
-      from_name: '测试用户B',
-      msg_id: NEGATIVE_MSG_ID,
-      timestamp: 1793716513000,
-      content: '[图片:test.png] 哈哈哈，硬梨',
-    });
-
-    expect(prompt).toContain(`[消息ID: ${NEGATIVE_MSG_ID}]`);
-    expect(prompt).toContain('[QQ私聊]');
-    expect(prompt).toContain('[测试用户B (QQ: 1000000012)]: [图片:test.png] 哈哈哈，硬梨');
-  });
-
-  it('契约 2: formatWakeupPrompt 群聊单条消息必须透传负数 [消息ID: <id>]', () => {
-    const prompt = formatWakeupPrompt({
-      trigger: 'passive',
-      peer: 'group_1000000001',
-      from_user: '2000000001',
-      from_name: '群友A',
-      msg_id: NEGATIVE_MSG_ID,
-      timestamp: 1793716513000,
-      content: '收到请回复',
-    });
-
-    expect(prompt).toContain(`[消息ID: ${NEGATIVE_MSG_ID}]`);
-    expect(prompt).toContain('[QQ群聊: 1000000001]');
-  });
-
-  it('契约 3: formatWakeupPrompt 群聊形态1 (前序缓冲+当前消息) 均必须透传负数 [消息ID: <id>]', () => {
-    const prompt = formatWakeupPrompt({
-      trigger: 'passive',
-      peer: 'group_1000000001',
-      from_user: '2000000001',
-      from_name: '当前发言人',
-      msg_id: NEGATIVE_MSG_ID,
-      timestamp: 1793716513000,
-      content: '大家看这个',
-      buffered_messages: [
-        {
-          from_user: '2000000002',
-          from_name: '前序发言人',
-          content: '前一条沙雕图',
-          timestamp: 1793716500000,
-          msg_id: NEGATIVE_BUFFER_MSG_ID,
-        },
-      ],
-    });
-
-    expect(prompt).toContain(`[消息ID: ${NEGATIVE_BUFFER_MSG_ID}]`);
-    expect(prompt).toContain(`[消息ID: ${NEGATIVE_MSG_ID}]`);
-    expect(prompt).toContain('历史消息：');
-    expect(prompt).toContain('当前消息：');
-  });
-
-  it('契约 4: formatWakeupPrompt 主动回复 (proactive) 未回复消息列表中必须透传负数 [消息ID: <id>]', () => {
-    const prompt = formatWakeupPrompt({
-      trigger: 'proactive',
-      peer: 'group_1000000001',
-      buffered_messages: [
-        {
-          from_user: '2000000002',
-          from_name: '提问者',
-          content: '有人在吗？',
-          timestamp: 1793716500000,
-          msg_id: NEGATIVE_BUFFER_MSG_ID,
-        },
-      ],
-    });
-
-    expect(prompt).toContain(`[消息ID: ${NEGATIVE_BUFFER_MSG_ID}]`);
-    expect(prompt).toContain('【主动关注】');
-  });
-
-  it('契约 5: shouldWakeup 唤醒门控对负数 message_id 必须精准解析并保留在 payload.msg_id 中', async () => {
-    const event: any = {
-      post_type: 'message',
-      message_type: 'private',
-      sub_type: 'friend',
-      message_id: NEGATIVE_MSG_ID,
-      user_id: 1000000012,
-      time: 1793716513,
-      raw_message: '测试负数消息ID唤醒',
-      message: [{ type: 'text', data: { text: '测试负数消息ID唤醒' } }],
+describe('契约测试: 官方字符串 ID 保真与三 ID 严格隔离', () => {
+  it('契约 1: 入站 ROBOT1.0_... 字符串 msg_id 在 shouldWakeup 中原样保真（严禁数值化为 NaN）', async () => {
+    const inboundId = 'ROBOT1.0_aBcDeF0123456789_xyz-99887766554433221100';
+    const event: QQC2CMessageCreateEvent = {
+      id: inboundId,
+      content: '测试入站字符串消息 ID 保真',
+      timestamp: '2026-11-11T18:28:47+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 0,
     };
 
+    const decision = await shouldWakeup(event);
+    expect(decision.wakeup).toBe(true);
+    expect(typeof decision.payload?.msg_id).toBe('string');
+    expect(decision.payload?.msg_id).toBe(inboundId);
+  });
+
+  it('契约 2: 负数样式/纯数字字符串 ID 同样保持精确字符串形态，不被 Number() 截断精度', async () => {
+    const bigDigitId = '9007199254740993123456';
+    const negativeStyleId = '-837578626';
+
+    for (const id of [bigDigitId, negativeStyleId]) {
+      const event: QQC2CMessageCreateEvent = {
+        id,
+        content: '字符串 ID 精度保真',
+        timestamp: '2026-11-11T18:28:47+08:00',
+        author: { user_openid: MOCK_OPENID, username: '' },
+        message_type: 0,
+      };
+      const decision = await shouldWakeup(event);
+      expect(decision.payload?.msg_id).toBe(id);
+      expect(typeof decision.payload?.msg_id).toBe('string');
+    }
+  });
+
+  it('契约 3: 三 ID 隔离 — 入站 msg_id、自身 ref_idx、被引用 ref_msg_idx 互不串用', async () => {
+    const inboundId = 'ROBOT1.0_inbound_anchor_001';
+    const selfRefIdx = 'REFIDX_inbound_self_991';
+    const quotedRefIdx = 'REFIDX_quoted_outbound_881';
+    const outboundRecallId = 'ROBOT1.0_outbound_recall_only_771';
+
+    const event: QQC2CMessageCreateEvent = {
+      id: inboundId,
+      content: '引用这条消息',
+      timestamp: '2026-11-11T18:29:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '' },
+      message_type: 103,
+      message_scene: {
+        ext: [`msg_idx=${selfRefIdx}`, `ref_msg_idx=${quotedRefIdx}`],
+      },
+    };
+
+    expect(extractMessageRefIdx(event)).toBe(selfRefIdx);
+    expect(extractQuotedRefIdx(event)).toBe(quotedRefIdx);
+    expect(isPermanentRefIdx(selfRefIdx)).toBe(true);
+    expect(isPermanentRefIdx(inboundId)).toBe(false);
+
     const decision = await shouldWakeup(event, {
-      bot_qq: '1000000000',
+      getMessageByRefIdx: async (refIdx) => {
+        expect(refIdx).toBe(quotedRefIdx);
+        return {
+          msg_id: outboundRecallId,
+          ref_idx: quotedRefIdx,
+          user_id: 'bot',
+          sender_name: 'Kujira',
+          self: 1,
+          content: '机器人历史回复',
+        };
+      },
     });
 
     expect(decision.wakeup).toBe(true);
-    expect(decision.payload?.msg_id).toBe(NEGATIVE_MSG_ID);
-  });
+    expect(decision.trigger).toBe('quote');
+    // 入站被动锚点仍为 event.id，绝不被出站撤回 ID 覆盖
+    expect(decision.payload?.msg_id).toBe(inboundId);
+    expect(decision.payload?.ref_idx).toBe(selfRefIdx);
+    expect(decision.payload?.quoted?.msg_id).toBe(outboundRecallId);
+    expect(decision.payload?.quoted?.ref_idx).toBe(quotedRefIdx);
 
-  it('契约 6: send_qq_message 工具支持负数 reply_to (包括数字和数字字符串)', async () => {
-    let capturedPayload: any;
-    const mockGateway: any = {
-      sendMsg: async (_peer: string, payload: any) => {
-        capturedPayload = payload;
-        return { status: 'ok', retcode: 0, data: { message_id: 12345 } };
-      },
+    // 校验运行态上下文与发信载荷结构中的三 ID 语义边界
+    const replyCtx: InboundReplyContext = {
+      msg_id: decision.payload!.msg_id,
+      ref_idx: decision.payload!.ref_idx,
+      from_user: decision.payload!.from_user,
+    };
+    const sendPayload: QQSendMessagePayload = {
+      msg_type: 0,
+      content: '收到',
+      msg_id: replyCtx.msg_id,
+      msg_seq: 1,
+      message_reference: { message_id: replyCtx.ref_idx! },
+    };
+    const mockSendRes: QQSendMessageResponse = {
+      id: outboundRecallId,
+      ext_info: { ref_idx: quotedRefIdx },
     };
 
-    // 6.1 数字格式传入负数 reply_to
-    const res1 = await sendQqMessage(
-      { text: '回复消息', reply_to: NEGATIVE_MSG_ID },
-      { peer: 'user_1000000012', gateway: mockGateway }
-    );
-    expect(res1.success).toBe(true);
-    expect(capturedPayload).toEqual([
-      { type: 'reply', data: { id: NEGATIVE_MSG_ID } },
-      { type: 'text', data: { text: '回复消息' } },
-    ]);
-
-    // 6.2 字符串格式传入负数 reply_to
-    const res2 = await sendQqMessage(
-      { text: '回复消息2', reply_to: String(NEGATIVE_MSG_ID) as any },
-      { peer: 'user_1000000012', gateway: mockGateway }
-    );
-    expect(res2.success).toBe(true);
-    expect(capturedPayload).toEqual([
-      { type: 'reply', data: { id: NEGATIVE_MSG_ID } },
-      { type: 'text', data: { text: '回复消息2' } },
-    ]);
+    expect(sendPayload.msg_id).toBe(inboundId);
+    expect(sendPayload.message_reference?.message_id).toBe(selfRefIdx);
+    expect(mockSendRes.id).not.toBe(sendPayload.msg_id);
   });
 
-  it('契约 7: collect_face 工具在传入负数 message_id 或隐式入站绑定时均能成功定位并收录', async () => {
-    // 构造测试图片文件
-    const sampleImgPath = path.join(tmpDir, 'sample_hard_pear.png');
-    fs.writeFileSync(sampleImgPath, Buffer.from('mock-pear-image-binary-data'));
-
-    // 保存一条负数 ID 的图文消息入库
-    db.saveMessage({
-      msg_id: NEGATIVE_MSG_ID,
-      peer: 'user_1000000012',
-      user_id: '1000000012',
-      sender_name: '测试用户',
-      time: 1793716513000,
-      type: 'image',
-      content: `[图片:${sampleImgPath}] 哈哈哈，硬梨`,
-      raw: JSON.stringify([{ type: 'image', data: { file: sampleImgPath } }]),
-      file_id: null,
-      busid: null,
-      local_path: sampleImgPath,
-      fingerprint: null,
-      recalled: 0,
-      self: 0,
-      reply_to: null,
+  it('契约 4: 附件描述符中的字符串 fileUuid / fileInfo 经序列化/反序列化往返保持原样', () => {
+    const desc = buildOutboundMediaAttachment({
+      kind: 'image',
+      localPath: '/tmp/out.png',
+      fileUuid: '00001234-abcd-5678-ef90',
+      fileInfo: 'CgYK...base64_file_info...',
     });
 
-    // 7.1 显式传入负数 message_id 收录
-    const resExplicit = await collectFace(
-      {
-        message_id: NEGATIVE_MSG_ID,
-        tags: ['硬梨', '搞怪'],
-        mood: '搞笑',
-      },
-      {
-        peer: 'user_1000000012',
-        db,
-        faceDir,
-        dshHome: tmpDir,
-      }
-    );
-    expect(resExplicit.success).toBe(true);
-    expect(resExplicit.face_id).toMatch(/^face_/);
+    const serialized = serializeAttachments([desc]);
+    const restored = deserializeAttachments(serialized);
 
-    // 7.2 不传 message_id，依赖 inboundMsgIdGetter 返回的负数 ID 自动绑定收录
-    const sampleImgPath2 = path.join(tmpDir, 'sample_hard_pear_2.png');
-    fs.writeFileSync(sampleImgPath2, Buffer.from('mock-pear-image-binary-data-2'));
-    const ANOTHER_NEGATIVE_ID = -1618069279;
-    db.saveMessage({
-      msg_id: ANOTHER_NEGATIVE_ID,
-      peer: 'user_1000000012',
-      user_id: '1000000012',
-      sender_name: '测试用户',
-      time: 1793716630000,
-      type: 'image',
-      content: `[图片:${sampleImgPath2}] 第二张图`,
-      raw: JSON.stringify([{ type: 'image', data: { file: sampleImgPath2 } }]),
-      file_id: null,
-      busid: null,
-      local_path: sampleImgPath2,
-      fingerprint: null,
-      recalled: 0,
-      self: 0,
-      reply_to: null,
-    });
-
-    const resImplicit = await collectFace(
-      {
-        tags: ['第二张', '硬梨'],
-        mood: '得瑟',
-      },
-      {
-        peer: 'user_1000000012',
-        db,
-        faceDir,
-        dshHome: tmpDir,
-        inboundMsgIdGetter: (_peer: string) => ANOTHER_NEGATIVE_ID,
-      }
-    );
-    expect(resImplicit.success).toBe(true);
-    expect(resImplicit.face_id).toMatch(/^face_/);
-  });
-
-  it('契约 8: DSH 装配注册工具在 execute 接收字符串格式负数 ID 时必须通过 Schema 校验并正常执行', async () => {
-    const mockCtx = new Context();
-    const registeredTools: any[] = [];
-    mockCtx.provide('tools', {
-      register: (tool: any) => {
-        registeredTools.push(tool);
-        return () => {};
-      },
-    });
-
-    let sentPayload: any;
-    const mockGateway: any = {
-      sendMsg: vi.fn(async (_peer: string, payload: any) => {
-        sentPayload = payload;
-        return { status: 'ok', retcode: 0, data: { message_id: 9999 } };
-      }),
-    };
-
-    registerAgentTools(mockCtx, {
-      gateway: mockGateway,
-      db,
-      dshHome: tmpDir,
-      config: { face_enabled: true },
-    });
-
-    const sendTool = registeredTools.find((t) => t.name === 'send_qq_message');
-    const collectTool = registeredTools.find((t) => t.name === 'collect_face');
-    const historyTool = registeredTools.find((t) => t.name === 'read_chat_history');
-
-    expect(sendTool).toBeDefined();
-    expect(collectTool).toBeDefined();
-    expect(historyTool).toBeDefined();
-
-    // 8.1 send_qq_message 传入字符串形式负数 reply_to 不被 DSH 拦截报错
-    const sendRes = await sendTool.execute(
-      { text: '测试回复', reply_to: String(NEGATIVE_MSG_ID) },
-      { agent: { session: { id: 'qq-group-1000000001' } } }
-    );
-    expect(sendRes.success).toBe(true);
-    expect(sentPayload).toEqual([
-      { type: 'reply', data: { id: NEGATIVE_MSG_ID } },
-      { type: 'text', data: { text: '测试回复' } },
-    ]);
-
-    // 8.2 read_chat_history 传入字符串形式负数 reply_to 不被 DSH 拦截报错
-    const historyRes = await historyTool.execute(
-      { reply_to: String(NEGATIVE_MSG_ID) },
-      { agent: { session: { id: 'qq-group-1000000001' } } }
-    );
-    expect(historyRes).toBeDefined();
-
-    // 8.4 collect_face 传入字符串形式负数 message_id 不被 DSH 拦截报错
-    const sampleImg = path.join(tmpDir, 'schema_test.png');
-    fs.writeFileSync(sampleImg, Buffer.from('schema-test-img'));
-    db.saveMessage({
-      msg_id: -99998888,
-      peer: 'group_1000000001',
-      user_id: '2000000001',
-      sender_name: '测试者',
-      time: 1793716513000,
-      type: 'image',
-      content: `[图片:${sampleImg}] 表情测试`,
-      raw: JSON.stringify([{ type: 'image', data: { file: sampleImg } }]),
-      file_id: null,
-      busid: null,
-      local_path: sampleImg,
-      fingerprint: null,
-      recalled: 0,
-      self: 0,
-      reply_to: null,
-    });
-    const collectRes = await collectTool.execute(
-      { tags: ['契约8'], mood: '搞笑', message_id: '-99998888' },
-      { agent: { session: { id: 'qq-group-1000000001' } } }
-    );
-    expect(collectRes.success).toBe(true);
-
-    // 8.5 send_qq_message 传入标准数字格式（正数与负数）均正常执行
-    const sendResNum = await sendTool.execute(
-      { text: '测试回复数字', reply_to: NEGATIVE_MSG_ID },
-      { agent: { session: { id: 'qq-group-1000000001' } } }
-    );
-    expect(sendResNum.success).toBe(true);
-
-    const sendResPosStr = await sendTool.execute(
-      { text: '测试回复正数字符串', reply_to: '12345678' },
-      { agent: { session: { id: 'qq-group-1000000001' } } }
-    );
-    expect(sendResPosStr.success).toBe(true);
-    expect(sentPayload).toEqual([
-      { type: 'reply', data: { id: 12345678 } },
-      { type: 'text', data: { text: '测试回复正数字符串' } },
-    ]);
+    expect(restored).toHaveLength(1);
+    expect(restored[0]!.remote?.fileUuid).toBe('00001234-abcd-5678-ef90');
+    expect(restored[0]!.remote?.fileInfo).toBe('CgYK...base64_file_info...');
   });
 });

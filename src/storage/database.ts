@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: SQLite 消息存储模块 (Facade 门面)
+ * kujira: SQLite 消息存储模块 (Facade 门面)
  * 管理数据库生命周期并将具体的领域操作委托给专职 Repository
  */
 
@@ -10,6 +10,8 @@ import { DEFAULT_FACE_STORE_MAX } from '../constants/index.js';
 import type {
   SlangEntry,
   MessageRecord,
+  InboundReplySlot,
+  MediaUploadCacheRecord,
   ReadChatHistoryParams,
   ReadChatHistoryResult,
   FaceRecord,
@@ -54,7 +56,7 @@ export class MessageDatabase {
     this.taskRepo = new TaskRepository(getDb);
     this.slangRepo = new SlangRepository(getDb);
     this.faceRepo = new FaceRepository(getDb);
-    this.messageRepo = new MessageRepository(getDb, (id, opts) => this.faceRepo.getFaceById(id, opts));
+    this.messageRepo = new MessageRepository(getDb);
   }
 
   init(): void {
@@ -66,7 +68,7 @@ export class MessageDatabase {
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
 
-    initDatabaseSchema(this.db, this.kvRepo);
+    initDatabaseSchema(this.db);
   }
 
   private ensureDb(): DatabaseType {
@@ -82,7 +84,7 @@ export class MessageDatabase {
     this.messageRepo.saveMessage(record);
   }
 
-  hasMessage(msgId: number): boolean {
+  hasMessage(msgId: string): boolean {
     return this.messageRepo.hasMessage(msgId);
   }
 
@@ -98,33 +100,16 @@ export class MessageDatabase {
     return this.messageRepo.readHistory(peer, params);
   }
 
-  findGroupFileSibling(
-    peer: string,
-    fileName: string,
-    time: number,
-    size?: number
-  ): MessageRecord | null {
-    return this.messageRepo.findGroupFileSibling(peer, fileName, time, size);
-  }
-
-  getActiveUsers(peer: string, days = 7, limit = 20): Array<{ user_id: string; sender_name: string; last_active: number }> {
-    return this.messageRepo.getActiveUsers(peer, days, limit);
-  }
-
-  hasNewImageMessages(peer: string, sinceMsgId: number = 0): { hasNew: boolean; latestMsgId: number } {
-    return this.messageRepo.hasNewImageMessages(peer, sinceMsgId);
-  }
-
-  getLatestMsgId(peer: string): number {
-    return this.messageRepo.getLatestMsgId(peer);
-  }
-
-  markRecalled(msgId: number): void {
+  markRecalled(msgId: string): void {
     this.messageRepo.markRecalled(msgId);
   }
 
-  getMessage(msgId: number): MessageRecord | null {
+  getMessage(msgId: string): MessageRecord | null {
     return this.messageRepo.getMessage(msgId);
+  }
+
+  getMessageByRefIdx(refIdx: string): MessageRecord | null {
+    return this.messageRepo.getMessageByRefIdx(refIdx);
   }
 
   getByFileId(fileId: string): MessageRecord | null {
@@ -135,18 +120,18 @@ export class MessageDatabase {
     return this.messageRepo.getByFingerprint(fingerprint);
   }
 
-  updateLocalPath(msgId: number, localPath: string, fingerprint?: string | null): void {
+  updateLocalPath(msgId: string, localPath: string, fingerprint?: string | null): void {
     this.messageRepo.updateLocalPath(msgId, localPath, fingerprint);
   }
 
   updateMessageMedia(
-    msgId: number,
+    msgId: string,
     patch: {
       file_id?: string | null;
-      busid?: number | null;
       local_path?: string | null;
       raw?: string;
       attachments?: string | null;
+      ref_idx?: string | null;
     }
   ): void {
     this.messageRepo.updateMessageMedia(msgId, patch);
@@ -160,7 +145,42 @@ export class MessageDatabase {
     this.messageRepo.clearLocalPath(localPath);
   }
 
-  // ==================== 会话状态管理 ====================
+  // ==================== 入站被动回复槽位与富媒体上传缓存 ====================
+
+  recordInboundReplySlot(msgId: string, peer: string, openid: string, receivedAt?: number): void {
+    this.messageRepo.recordInboundReplySlot(msgId, peer, openid, receivedAt);
+  }
+
+  allocateNextMsgSeq(msgId: string, seed?: { peer: string; openid: string }): number {
+    return this.messageRepo.allocateNextMsgSeq(msgId, seed);
+  }
+
+  advanceMsgSeq(msgId: string, minNextSeq: number): number {
+    return this.messageRepo.advanceMsgSeq(msgId, minNextSeq);
+  }
+
+  markInboundSlotInvalidated(msgId: string): void {
+    this.messageRepo.markInboundSlotInvalidated(msgId);
+  }
+
+  getLatestValidInboundSlot(peer: string): InboundReplySlot | null {
+    return this.messageRepo.getLatestValidInboundSlot(peer);
+  }
+
+  getCachedMediaUpload(
+    openid: string,
+    md5: string,
+    fileType: number,
+    now?: number
+  ): MediaUploadCacheRecord | null {
+    return this.messageRepo.getCachedMediaUpload(openid, md5, fileType, now);
+  }
+
+  saveCachedMediaUpload(record: MediaUploadCacheRecord): void {
+    this.messageRepo.saveCachedMediaUpload(record);
+  }
+
+  // ==================== 会话状态与 peer<->openid 映射 ====================
 
   saveSessionState(state: SessionStateRecord): void {
     this.sessionRepo.saveSessionState(state);
@@ -172,6 +192,18 @@ export class MessageDatabase {
 
   getAllSessionStates(): SessionStateRecord[] {
     return this.sessionRepo.getAllSessionStates();
+  }
+
+  upsertPeerOpenid(peer: string, openid: string, remark?: string): void {
+    this.sessionRepo.upsertPeerOpenid(peer, openid, remark);
+  }
+
+  getOpenidByPeer(peer: string): string | null {
+    return this.sessionRepo.getOpenidByPeer(peer);
+  }
+
+  getPeerByOpenid(openid: string): string | null {
+    return this.sessionRepo.getPeerByOpenid(openid);
   }
 
   // ==================== 插件键值配置 ====================
@@ -280,7 +312,7 @@ export class MessageDatabase {
     return this.taskRepo.getPendingScheduledTasks(thresholdTime);
   }
 
-  // ==================== 社群黑话词典 ====================
+  // ==================== 黑话词典 ====================
 
   getSlangEntry(term: string, incrementQueryCount = false): SlangEntry | null {
     return this.slangRepo.getSlangEntry(term, incrementQueryCount);
