@@ -359,7 +359,9 @@ describe('契约测试: 入站图片识别本地表情库并替换语义 (Inboun
       expect(decision.payload?.peer).toBe(peer);
       expect(decision.payload?.content).toContain('[表情包: face_happy_cat (情绪: 喜悦) 路径:');
       expect(decision.payload?.content).not.toContain('FACE_RKEY');
-      expect(decision.payload?.images).toEqual([descriptors[0]!.local!.path]);
+      // 图片不进视觉载荷，只通过 content 内本地路径按需 read_image
+      expect(decision.payload?.content).toContain(descriptors[0]!.local!.path);
+      expect('images' in decision.payload!).toBe(false);
     });
 
     it('契约 3.2: 入站 <faceType=6,...> 未收藏自定义表情包经裸 GET + shouldWakeup 归一化为 [表情包:<path>]', async () => {

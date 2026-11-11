@@ -8,10 +8,10 @@
  *              `entries[0].sanitizedUrl` 保留脱敏 URL，`logger.warn` 不打印 query 凭证；
  * - FC-1 契约 2: 多模态全量落盘（视频 `moov -> mvhd` 时长 + 分辨率/大小、语音、文件、去重）
  *              + `<faceType=6>` 表情识别与 `getFaceByMd5` 收藏命中 + `<faceType=4,ext=...>` 商城表情 `ext.text`
- *              + `localImagePaths` 严格只含图片与表情包路径（不含 `.mp4` / `.wav` / `.pdf`）；
+ *              + 全量落盘路径 `localPaths` 按出现顺序去重（图片/表情/视频/语音/文件均含）；
  * - FC-1 契约 3: 默认取消 10 个数量与大小上限（12 个全量落盘）；显式传 `{ limit: 2 }` 时超出部分保留选项 A `直链: ...`；
  * - FC-1 契约 4: 单附件 HTTP 403/404 失败不阻断其余附件下载，正文保留 `(下载失败: ...)` 与真实 `直链: <rawUrl>`，日志保持脱敏；
- * - FC-1 契约 5: 与 `shouldWakeup` 真实联动，转发含视频 + 图片时 `payload.images` 仅收 `localImagePaths`，`payload.content` 为清晰对话流。
+ * - FC-1 契约 5: 与 `shouldWakeup` 真实联动，转发含视频 + 图片时 `payload.content` 为清晰对话流，`payload` 不含任何视觉载荷。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -141,7 +141,6 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(seenAuthHeaders[0]).toBeUndefined();
 
     expect(res.localPaths).toHaveLength(1);
-    expect(res.localImagePaths).toEqual(res.localPaths);
     const localPath = res.localPaths[0]!;
     expect(fs.existsSync(localPath)).toBe(true);
     expect(localPath.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
@@ -163,7 +162,7 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(warnLogs.join('\n')).not.toContain('SECRET_RKEY_001');
   });
 
-  it('FC-1 契约 2: 多模态全量落盘（视频元信息/语音/文件/URL去重）、表情识别与 localImagePaths 严格隔离', async () => {
+  it('FC-1 契约 2: 多模态全量落盘（视频元信息/语音/文件/URL去重）与表情识别', async () => {
     const mp4Bytes = makeMp4WithDuration(1000, 8776);
     const favMd5 = computeBufferMd5(FAV_PNG_BYTES);
     const requestedUrls: string[] = [];
@@ -270,16 +269,15 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(favEntry.localPath!.startsWith(path.join(tmpHome, 'downloads', 'sticker', PEER))).toBe(true);
     expect(photoEntry.localPath!.startsWith(path.join(tmpHome, 'downloads', 'image', PEER))).toBe(true);
 
-    // localImagePaths 严格仅含图片与表情包路径，不含视频/语音/文件
-    expect(res.localImagePaths).toEqual([
+    // 全量落盘路径按出现顺序去重，包含视频/语音/文件
+    expect(res.localPaths).toEqual([
+      videoEntry.localPath!,
+      voiceEntry.localPath!,
+      fileEntry.localPath!,
       stickerEntry.localPath!,
       favEntry.localPath!,
       photoEntry.localPath!,
     ]);
-    expect(res.localImagePaths).not.toContain(videoEntry.localPath);
-    expect(res.localImagePaths).not.toContain(voiceEntry.localPath);
-    expect(res.localImagePaths).not.toContain(fileEntry.localPath);
-    expect(res.localImagePaths.some((p) => /\.(mp4|wav|pdf)$/i.test(p))).toBe(false);
 
     expect(res.formattedContent).toBe(
       [
@@ -317,7 +315,6 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     expect(res.entries).toHaveLength(12);
     expect(res.entries.filter((e) => e.downloaded)).toHaveLength(12);
     expect(res.localPaths).toHaveLength(12);
-    expect(res.localImagePaths).toHaveLength(12);
     expect(res.formattedContent).not.toContain('LIMIT_RKEY_');
     expect(res.formattedContent).not.toContain('链接已脱敏');
 
@@ -372,7 +369,6 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
     });
 
     expect(res.localPaths).toHaveLength(1);
-    expect(res.localImagePaths).toHaveLength(1);
     expect(res.entries[0]!.downloaded).toBe(false);
     expect(res.entries[0]!.error).toBeTruthy();
     expect(res.entries[0]!.error).toContain('403');
@@ -425,16 +421,14 @@ describe('契约测试: message_type=102 合并转发全量媒体裸 GET 落盘�
 
     const embedded = await resolveEmbeddedForwardMedia(event.content, PEER, manager);
     const decision = await shouldWakeup(event, {
-      forwardImages: embedded.localImagePaths,
       formatForwardContent: () => embedded.formattedContent,
     });
 
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('direct');
     expect(embedded.localPaths).toHaveLength(2);
-    expect(embedded.localImagePaths).toHaveLength(1);
-    expect(decision.payload?.images).toEqual(embedded.localImagePaths);
-    expect(decision.payload?.images?.some((p) => p.endsWith('.mp4'))).toBe(false);
+    expect('images' in decision.payload!).toBe(false);
+    expect(embedded.localPaths.every((p) => fs.existsSync(p))).toBe(true);
 
     const videoEntry = embedded.entries.find((e) => e.mediaType === 'video')!;
     const imageEntry = embedded.entries.find((e) => e.mediaType === 'image')!;

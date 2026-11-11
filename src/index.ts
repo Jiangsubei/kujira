@@ -55,7 +55,7 @@ import {
   describeInboundAttachments,
   toMessageMediaFields,
 } from './attachment/classify.js';
-import { deserializeAttachments, serializeAttachments } from './attachment/store.js';
+import { serializeAttachments } from './attachment/store.js';
 import { OutboundStreamBridge } from './outbound/stream.js';
 import { recordOutboundSelfMessage } from './outbound/self-record.js';
 import {
@@ -145,14 +145,6 @@ function parseIsoTimeMs(raw?: string): number {
 
 function toQuotedRecord(row: MessageRecord | null | undefined): QuotedMessageRecord | null {
   if (!row) return null;
-  const images: string[] = [];
-  if (row.local_path) images.push(row.local_path);
-  for (const desc of deserializeAttachments(row.attachments)) {
-    const p = desc.local?.path;
-    if (p && (desc.kind === 'image' || desc.kind === 'sticker') && !images.includes(p)) {
-      images.push(p);
-    }
-  }
   return {
     msg_id: row.msg_id,
     short_id: row.short_id ?? null,
@@ -164,7 +156,6 @@ function toQuotedRecord(row: MessageRecord | null | undefined): QuotedMessageRec
     self: row.self,
     local_path: row.local_path,
     type: row.type,
-    ...(images.length > 0 ? { images } : {}),
   };
 }
 
@@ -602,7 +593,6 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
 
     // message_type=102 合并转发全量内嵌媒体裸 GET 落盘 + 结构化排版 + 本地表情库匹配
-    let forwardImages: string[] | undefined;
     let formatForwardContent: ((raw: string) => string) | undefined;
     if (event.message_type === QQ_INBOUND_MSG_TYPE_FORWARD && typeof event.content === 'string') {
       const resolvedFwd = await resolveEmbeddedForwardMedia(
@@ -614,15 +604,11 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
           getFaceByMd5: (md5) => db.getFaceByMd5(md5),
         }
       );
-      if (resolvedFwd.localImagePaths.length > 0) {
-        forwardImages = resolvedFwd.localImagePaths;
-      }
       formatForwardContent = () => resolvedFwd.formattedContent;
     }
 
     const decision = await shouldWakeup(event, {
       descriptors,
-      ...(forwardImages ? { forwardImages } : {}),
       ...(formatForwardContent ? { formatForwardContent } : {}),
       botName: gateway.getStatus().botName,
       getMessageByRefIdx: (idx) => toQuotedRecord(db.getMessageByRefIdx(idx)),

@@ -86,8 +86,6 @@ export interface ResolveEmbeddedForwardMediaResult {
   replacements: Map<string, string>;
   /** 所有成功落盘附件的本地路径列表（去重，保持出现顺序） */
   localPaths: string[];
-  /** 仅包含 `image` 与 `sticker` 成功落盘路径的列表（绝不含视频/语音/文件，避免污染视觉模块） */
-  localImagePaths: string[];
   /** 每个内嵌附件的处理明细 */
   entries: EmbeddedForwardAttachmentEntry[];
 }
@@ -888,7 +886,6 @@ export async function resolveEmbeddedForwardMedia(
 ): Promise<ResolveEmbeddedForwardMediaResult> {
   const replacements = new Map<string, string>();
   const localPaths: string[] = [];
-  const localImagePaths: string[] = [];
   const entries: EmbeddedForwardAttachmentEntry[] = [];
 
   if (!content || typeof content !== 'string') {
@@ -897,7 +894,6 @@ export async function resolveEmbeddedForwardMedia(
       sanitizedContent: '',
       replacements,
       localPaths,
-      localImagePaths,
       entries,
     };
   }
@@ -1001,12 +997,6 @@ export async function resolveEmbeddedForwardMedia(
       if (!localPaths.includes(saved.localPath)) {
         localPaths.push(saved.localPath);
       }
-      if (
-        (parsed.mediaType === 'image' || parsed.mediaType === 'sticker') &&
-        !localImagePaths.includes(saved.localPath)
-      ) {
-        localImagePaths.push(saved.localPath);
-      }
 
       const okEntry: EmbeddedForwardAttachmentEntry = {
         rawUrl,
@@ -1065,7 +1055,6 @@ export async function resolveEmbeddedForwardMedia(
     sanitizedContent: formattedContent,
     replacements,
     localPaths,
-    localImagePaths,
     entries,
   };
 }

@@ -167,13 +167,14 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
       short_id: 'msg_self_5',
       time: 1788045798000,
       text: '[图片:/dsh/kujira/downloads/image/user_1/cat.png]',
-      images: ['/dsh/kujira/downloads/image/user_1/cat.png'],
     });
     expect('msg_id' in decision.payload!.quoted!).toBe(false);
     expect('ref_idx' in decision.payload!.quoted!).toBe(false);
     expect('user_id' in decision.payload!.quoted!).toBe(false);
     expect('from_name' in decision.payload!.quoted!).toBe(false);
-    expect(decision.payload?.images).toEqual(['/dsh/kujira/downloads/image/user_1/cat.png']);
+    // 图片一律不注入视觉载荷：模型只能通过 content 内的本地路径按需 read_image
+    expect('images' in decision.payload!.quoted!).toBe(false);
+    expect('images' in decision.payload!).toBe(false);
   });
 
   it('契约 5: ref_msg_idx 为 TMP_... 或查库未命中时，直接从 msg_elements[] 提取原文兜底', async () => {
@@ -447,5 +448,34 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
         },
       ])
     ).toBe('[表情包:/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg]');
+  });
+
+  it('契约 11: 图片一律不写入视觉载荷，只以 content 内本地路径供模型按需 read_image', async () => {
+    const event = makeEvent({ id: 'ROBOT1.0_img_path_011', content: '这张图你怎么看' });
+    const descriptors: AttachmentDescriptor[] = [
+      {
+        kind: 'image',
+        origin: 'inbound',
+        fileName: 'shot.png',
+        local: { path: '/dsh/kujira/downloads/image/user_mock/shot.png', format: 'png' },
+      },
+      {
+        kind: 'file',
+        origin: 'inbound',
+        fileName: 'doc.png',
+        local: { path: '/dsh/kujira/downloads/files/user_mock/doc.png', format: 'png' },
+      },
+    ];
+
+    const decision = await shouldWakeup(event, { descriptors });
+    expect(decision.wakeup).toBe(true);
+    expect(decision.payload?.content).toContain(
+      '[图片:/dsh/kujira/downloads/image/user_mock/shot.png]'
+    );
+    expect(decision.payload?.content).toContain(
+      '[文件:doc.png 已保存: /dsh/kujira/downloads/files/user_mock/doc.png]'
+    );
+    // 纯图片消息仍必须唤醒（由 descriptors 兜住，不再依赖 images 收集）
+    expect('images' in decision.payload!).toBe(false);
   });
 });

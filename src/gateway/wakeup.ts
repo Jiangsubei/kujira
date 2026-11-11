@@ -16,7 +16,7 @@ import type {
   WakeupTriggerType,
 } from '../types/index.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
-import { describeInboundAttachments, isImageFileExt } from '../attachment/classify.js';
+import { describeInboundAttachments } from '../attachment/classify.js';
 import { isValidOpenid, openidToPeer } from '../utils/peer.js';
 import {
   extractMessageRefIdx,
@@ -39,7 +39,6 @@ export interface QuotedMessageRecord {
   time?: number;
   content: string;
   self?: number;
-  images?: string[];
   local_path?: string | null;
   type?: string;
 }
@@ -49,8 +48,6 @@ export interface WakeupOptions {
   descriptors?: AttachmentDescriptor[];
   /** 当前入站消息分配到的单聊短消息 ID（如 `msg_<n>`），可选注入到 WakeupPayload */
   shortId?: string;
-  /** 从 message_type=102 合并转发内嵌媒体落盘得到的本地图片/表情包路径（仅含图片与表情包，不含视频/语音/文件） */
-  forwardImages?: string[];
   /** 合并转发文本结构化排版与占位替换回调 */
   formatForwardContent?: (content: string) => string;
   /** 机器人展示名（引用自身消息时用于填充 quoted.from_name） */
@@ -71,47 +68,12 @@ export interface WakeupDecision {
   payload?: WakeupPayload;
 }
 
-const IMAGE_FORMATS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
-
 function parseIsoTimestamp(timestamp?: string): number {
   if (typeof timestamp === 'string' && timestamp.trim()) {
     const parsed = Date.parse(timestamp);
     if (Number.isFinite(parsed)) return parsed;
   }
   return Date.now();
-}
-
-function collectDescriptorImagePaths(descriptors: ReadonlyArray<AttachmentDescriptor>): string[] {
-  const out: string[] = [];
-  for (const d of descriptors) {
-    const localPath = d.local?.path;
-    if (!localPath) continue;
-    const isImage =
-      d.kind === 'image' ||
-      d.kind === 'sticker' ||
-      (d.kind === 'file' &&
-        (isImageFileExt(localPath) ||
-          (typeof d.local?.format === 'string' && IMAGE_FORMATS.has(d.local.format.toLowerCase()))));
-    if (isImage && !out.includes(localPath)) {
-      out.push(localPath);
-    }
-  }
-  return out;
-}
-
-function resolveQuotedImages(record: QuotedMessageRecord): string[] | undefined {
-  if (Array.isArray(record.images) && record.images.length > 0) {
-    const valid = record.images.filter((p): p is string => typeof p === 'string' && p.trim() !== '');
-    if (valid.length > 0) return valid;
-  }
-  if (
-    typeof record.local_path === 'string' &&
-    record.local_path.trim() !== '' &&
-    (record.type === 'image' || record.type === 'sticker' || isImageFileExt(record.local_path))
-  ) {
-    return [record.local_path.trim()];
-  }
-  return undefined;
 }
 
 async function resolveQuotedInfo(
@@ -131,7 +93,6 @@ async function resolveQuotedInfo(
     try {
       const hit = await options.getMessageByRefIdx(refMsgIdx);
       if (hit) {
-        const quotedImages = resolveQuotedImages(hit);
         const shortId =
           typeof hit.short_id === 'string' && hit.short_id.trim() !== ''
             ? hit.short_id.trim()
@@ -140,7 +101,6 @@ async function resolveQuotedInfo(
           ...(shortId ? { short_id: shortId } : {}),
           ...(typeof hit.time === 'number' && Number.isFinite(hit.time) ? { time: hit.time } : {}),
           text: hit.content || '',
-          ...(quotedImages ? { images: quotedImages } : {}),
         };
       }
     } catch {
@@ -205,32 +165,10 @@ export async function shouldWakeup(
   // 3. 入站引用解析（REFIDX_ 查库 -> msg_elements 兜底）
   const quoted = await resolveQuotedInfo(event, options);
 
-  // 4. 收集图片本地路径（入站附件 + 合并转发落盘图片 + 引用消息图片）
-  const combinedImages = collectDescriptorImagePaths(descriptors);
-  if (Array.isArray(options.forwardImages)) {
-    for (const img of options.forwardImages) {
-      if (typeof img === 'string' && img.trim() && !combinedImages.includes(img.trim())) {
-        combinedImages.push(img.trim());
-      }
-    }
-  }
-  if (quoted?.images) {
-    for (const img of quoted.images) {
-      if (typeof img === 'string' && img.trim() && !combinedImages.includes(img.trim())) {
-        combinedImages.push(img.trim());
-      }
-    }
-  }
-
-  // 5. 过滤完全空内容且无附件/无引用/无卡片的无效事件
+  // 4. 过滤完全空内容且无附件/无引用/无卡片的无效事件
+  //    纯图片消息由 descriptors 兜住，合并转发由 content 兜住；图片不再收集进任何视觉载荷。
   const hasCard = event.message_type === 3 || Boolean(event.ark_data);
-  if (
-    content.length === 0 &&
-    descriptors.length === 0 &&
-    !quoted &&
-    !hasCard &&
-    combinedImages.length === 0
-  ) {
+  if (content.length === 0 && descriptors.length === 0 && !quoted && !hasCard) {
     return { wakeup: false };
   }
 
@@ -245,7 +183,6 @@ export async function shouldWakeup(
     from_name: fromName,
     content,
     ...(quoted ? { quoted } : {}),
-    ...(combinedImages.length > 0 ? { images: combinedImages } : {}),
     timestamp,
   };
 

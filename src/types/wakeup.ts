@@ -11,7 +11,6 @@ export interface WakeupQuotedInfo {
   short_id?: string;
   time?: number;
   text: string;
-  images?: string[];
 }
 
 export interface WakeupPayload {
@@ -33,7 +32,6 @@ export interface WakeupPayload {
   from_name: string;
   content: string;
   quoted?: WakeupQuotedInfo;
-  images?: string[];
   /** 是否为系统内部生成的事件（定时任务，非真实用户消息） */
   is_system?: boolean;
   /** 对应的强类型系统事件实体（由 SystemEventHub 统一注入） */

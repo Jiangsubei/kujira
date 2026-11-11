@@ -84,8 +84,8 @@ describe('契约测试: 入站媒体纯文本路径占位与安全边界 (Batch 
 
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('direct');
-    expect(decision.payload?.images).toHaveLength(1);
-    const localPath = decision.payload!.images![0]!;
+    expect('images' in decision.payload!).toBe(false);
+    const localPath = descriptors[0]!.local!.path;
     expect(fs.existsSync(localPath)).toBe(true);
     expect(localPath.endsWith('.png')).toBe(true);
 
@@ -124,7 +124,7 @@ describe('契约测试: 入站媒体纯文本路径占位与安全边界 (Batch 
     expect(normalized).toContain('[图片:');
     expect(normalized).toContain('[文件:screenshot.png 已保存:');
     expect(normalized).not.toContain('RKEY_');
-    expect(decision.payload?.images).toHaveLength(3);
+    expect('images' in decision.payload!).toBe(false);
   });
 
   it('契约 3: 落盘失败且存在 remote.url 时遵循选项 A 输出下载失败原因与真实直链', async () => {
