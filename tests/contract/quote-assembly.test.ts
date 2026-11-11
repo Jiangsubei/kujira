@@ -16,7 +16,8 @@ import { formatDateTime } from '../../src/storage/time-parser.js';
  * (a) 出站 reply_to 仅接收短 ID（msg_<n> / msg_self_<n>），经 getMessageByShortId 换取 REFIDX_... 后在首片发送 message_reference，拒绝非短 ID；
  * (b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原精简短 ID 引用头（含入站图与出站自身消息）；
  * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（保留可用直链 URL），不泄露索引/发送者标识；
- * (d) 双未命中时优雅降级占位，不中断唤醒。
+ * (d) 双未命中时优雅降级占位，不中断唤醒；
+ * (e) 引用未命中本地库时下载 `msg_elements[]` 内合并转发内嵌附件并本地化为 OS 路径；命中本地库时不触发下载。
  */
 
 function expectLosslessJson(value: unknown, trail = 'root'): void {
@@ -482,6 +483,89 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     expect(promptMiss).not.toContain(MOCK_OPENID);
     expect(promptMiss).not.toContain('提问者');
     expect(promptMiss).not.toContain('[QQ私聊]');
+  });
+
+  it('(e) 引用未命中本地库时下载合并转发内嵌附件并本地化；命中本地库时不触发下载', async () => {
+    const requests: string[] = [];
+    const srv = http.createServer((req, res) => {
+      requests.push(req.url || '');
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(PNG_BYTES);
+    });
+    servers.push(srv);
+    await new Promise<void>((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => resolve());
+    });
+    const base = `http://127.0.0.1:${(srv.address() as any).port}`;
+
+    await preparePeerAgent();
+    const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
+
+    // 1. 先产生一条可被命中的入站原文
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_HIT_BASE',
+      content: '被引用的原文',
+      timestamp: '2026-11-11T12:04:00+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 0,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_HIT_BASE'] },
+    });
+    await waitForDbRow('ROBOT1.0_Q_HIT_BASE');
+
+    // 引用命中本地库：直接使用库内原文，即使 msg_elements 带 URL 也不下载
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_HIT_REPLY',
+      content: '引用一下',
+      timestamp: '2026-11-11T12:04:10+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_HIT_REPLY', 'ref_msg_idx=REFIDX_Q_HIT_BASE'] },
+      msg_elements: [
+        { content: `[附件1] 类型:图片 文件名:hit.png URL:${base}/hit.png?rkey=HIT_SECRET` },
+      ],
+    });
+    await waitUntil(() => capturedFollowups.length >= 2, 3000, 'hit quote followup');
+    const promptHit = capturedFollowups[1]!.content;
+    expect(promptHit).toContain('[引用回复: "[msg_1]');
+    expect(promptHit).toContain('被引用的原文"]');
+    expect(promptHit).not.toContain('HIT_SECRET');
+    expect(requests).toHaveLength(0);
+
+    // 2. REFIDX_ 未命中本地库：下载 msg_elements 内嵌附件并本地化为 OS 路径
+    ws.emitDispatch('C2C_MESSAGE_CREATE', {
+      id: 'ROBOT1.0_Q_MISS_MEDIA',
+      content: '这张图是什么意思',
+      timestamp: '2026-11-11T12:04:20+08:00',
+      author: { user_openid: MOCK_OPENID, username: '提问者' },
+      message_type: 103,
+      message_scene: { ext: ['msg_idx=REFIDX_Q_MISS_MEDIA', 'ref_msg_idx=REFIDX_Q_NOT_IN_DB_MEDIA'] },
+      msg_elements: [
+        {
+          content: [
+            '=== 消息 1 ===',
+            '[发送者] 群友A',
+            `[附件1] 类型:图片 文件名:cat.png URL:${base}/quoted/cat.png?rkey=QUOTE_SECRET`,
+          ].join('\n'),
+          message_type: 102,
+        },
+      ],
+    });
+    await waitUntil(() => capturedFollowups.length >= 3, 3000, 'miss quote media followup');
+    const promptMiss = capturedFollowups[2]!.content;
+
+    expect(requests).toEqual(['/quoted/cat.png?rkey=QUOTE_SECRET']);
+    expect(promptMiss).toContain('[引用回复: "1. 群友A: [图片:');
+    expect(promptMiss).not.toContain('QUOTE_SECRET');
+    expect(promptMiss).not.toContain('rkey');
+    const localMatch = /\[图片:([^\]]+)\]/.exec(promptMiss);
+    expect(localMatch).toBeTruthy();
+    const localPath = localMatch![1]!;
+    expect(
+      path.resolve(localPath).startsWith(
+        path.resolve(tmpHome, 'kujira', 'downloads', 'image', MOCK_PEER)
+      )
+    ).toBe(true);
   });
 
   it('(d) 本地库与 msg_elements[] 均未命中时优雅降级占位，唤醒不中断', async () => {

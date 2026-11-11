@@ -94,21 +94,18 @@ export function isPermanentRefIdx(refIdx?: string | null): refIdx is string {
 }
 
 /**
- * 从 `event.msg_elements[]`（及必要时 `parallel_message.msg_nodes[]`）提取被引用原文；
- * 含嵌套合并转发头（`=== 消息 `）时自动结构化清洗排版；其余文本（含直链 URL）原样保留。
+ * 从 `event.msg_elements[]`（或必要时 `parallel_message.msg_nodes[]`）收集被引用原文片段。
+ * 保持原始文本（含 URL），供上层按需做内嵌媒体落盘与替换。
  */
-export function extractMsgElementsText(
+export function msgElementsRawContents(
   event: QQC2CMessageCreateEvent | null | undefined
-): string | undefined {
+): string[] {
   const parts: string[] = [];
 
   if (Array.isArray(event?.msg_elements)) {
     for (const el of event.msg_elements) {
       if (typeof el?.content === 'string' && el.content.trim()) {
-        const trimmed = el.content.trim();
-        parts.push(
-          trimmed.includes('=== 消息 ') ? formatForwardMessageContent(trimmed) : trimmed
-        );
+        parts.push(el.content.trim());
       }
     }
   }
@@ -116,13 +113,58 @@ export function extractMsgElementsText(
   if (parts.length === 0 && Array.isArray(event?.parallel_message?.msg_nodes)) {
     for (const node of event.parallel_message.msg_nodes) {
       if (typeof node?.content === 'string' && node.content.trim()) {
-        const trimmed = node.content.trim();
-        parts.push(
-          trimmed.includes('=== 消息 ') ? formatForwardMessageContent(trimmed) : trimmed
-        );
+        parts.push(node.content.trim());
       }
     }
   }
+
+  return parts;
+}
+
+const FORWARD_LIKE_CONTENT_RE = /(?:^|\n)\s*===\s*消息\s*\d+\s*===|\[附件\d+\]/;
+
+/** 是否为合并转发式引用内容（含 `=== 消息 N ===` 头或行首 `[附件k]` 行）。 */
+export function isForwardLikeContent(raw: string): boolean {
+  return FORWARD_LIKE_CONTENT_RE.test(raw);
+}
+
+function applyUrlReplacements(raw: string, replacements: ReadonlyMap<string, string>): string {
+  let out = raw;
+  for (const [url, placeholder] of replacements) {
+    if (url && out.includes(url)) {
+      out = out.split(url).join(placeholder);
+    }
+  }
+  return out;
+}
+
+export interface ExtractMsgElementsOptions {
+  /** 合并转发内嵌附件原始 URL → 已落盘占位文案（仅对合并转发式引用片段生效，普通引用原文保持不变） */
+  replacements?: ReadonlyMap<string, string>;
+}
+
+/**
+ * 从 `event.msg_elements[]`（及必要时 `parallel_message.msg_nodes[]`）提取被引用原文；
+ * 含嵌套合并转发头（`=== 消息 `）时自动结构化清洗排版；合并转发式片段可按替换表将内嵌附件 URL 本地化；
+ * 其余普通引用文本原样保留。
+ */
+export function extractMsgElementsText(
+  event: QQC2CMessageCreateEvent | null | undefined,
+  options?: ExtractMsgElementsOptions
+): string | undefined {
+  const rawParts = msgElementsRawContents(event);
+  if (rawParts.length === 0) return undefined;
+
+  const replacements = options?.replacements;
+  const hasReplacements = Boolean(replacements && replacements.size > 0);
+
+  const parts = rawParts.map((raw) => {
+    if (!isForwardLikeContent(raw)) return raw;
+    if (raw.includes('=== 消息 ')) {
+      return formatForwardMessageContent(raw, hasReplacements ? { replacements } : undefined);
+    }
+    return hasReplacements ? applyUrlReplacements(raw, replacements!) : raw;
+  });
 
   const joined = parts.join('\n').trim();
   return joined || undefined;

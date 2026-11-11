@@ -478,4 +478,110 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
     // 纯图片消息仍必须唤醒（由 descriptors 兜住，不再依赖 images 收集）
     expect('images' in decision.payload!).toBe(false);
   });
+
+  it('契约 12: 引用 msg_elements 内嵌附件按替换表本地化，普通引用原文不受影响', () => {
+    const forwardEvent = makeEvent({
+      id: 'ROBOT1.0_quote_fwd_012',
+      content: '这张图哪来的',
+      message_type: 103,
+      message_scene: { ext: ['ref_msg_idx=REFIDX_qf_012'] },
+      msg_elements: [
+        {
+          content: [
+            '=== 消息 1 ===',
+            '[发送者] 群友A',
+            '[附件1] 类型:图片 文件名:cat.png URL:https://cdn.example.com/cat.png?rkey=QUOTE_SECRET',
+          ].join('\n'),
+          message_type: 102,
+        },
+      ],
+    });
+
+    const replacements = new Map([
+      ['https://cdn.example.com/cat.png?rkey=QUOTE_SECRET', '[图片:/dsh/kujira/downloads/image/user_mock/cat.png]'],
+    ]);
+
+    const localized = extractMsgElementsText(forwardEvent, { replacements });
+    expect(localized).toContain('[图片:/dsh/kujira/downloads/image/user_mock/cat.png]');
+    expect(localized).not.toContain('rkey=QUOTE_SECRET');
+    expect(localized).not.toContain('cdn.example.com');
+
+    // 散装附件行同样可用替换表本地化
+    const scatteredEvent = makeEvent({
+      message_type: 103,
+      msg_elements: [
+        {
+          content: '看这个 [附件1] 类型:图片 文件名:a.png URL:https://cdn.example.com/a.png?rkey=A_SECRET',
+        },
+      ],
+    });
+    const scattered = extractMsgElementsText(scatteredEvent, {
+      replacements: new Map([
+        ['https://cdn.example.com/a.png?rkey=A_SECRET', '[图片:/dsh/local/a.png]'],
+      ]),
+    });
+    expect(scattered).toContain('[图片:/dsh/local/a.png]');
+    expect(scattered).not.toContain('A_SECRET');
+
+    // 普通引用原文（非合并转发）不做任何替换
+    const plainEvent = makeEvent({
+      message_type: 103,
+      msg_elements: [{ content: 'URL:https://example.com/pic.png?rkey=PLAIN_SECRET' }],
+    });
+    expect(
+      extractMsgElementsText(plainEvent, {
+        replacements: new Map([['https://example.com/pic.png?rkey=PLAIN_SECRET', '[图片:/x.png]']]),
+      })
+    ).toBe('URL:https://example.com/pic.png?rkey=PLAIN_SECRET');
+  });
+
+  it('契约 13: quotedContentReplacements 生效，prefetchedQuoted 避免重复查库', async () => {
+    const event = makeEvent({
+      id: 'ROBOT1.0_quote_prefetch_013',
+      content: '解释一下',
+      message_type: 103,
+      message_scene: { ext: ['ref_msg_idx=REFIDX_qp_013'] },
+      msg_elements: [
+        {
+          content: [
+            '=== 消息 1 ===',
+            '[发送者] 群友A',
+            '[附件1] 类型:图片 文件名:p.png URL:https://cdn.example.com/p.png?rkey=P_SECRET',
+          ].join('\n'),
+        },
+      ],
+    });
+    const replacements = new Map([
+      ['https://cdn.example.com/p.png?rkey=P_SECRET', '[图片:/dsh/kujira/downloads/image/user_mock/p.png]'],
+    ]);
+
+    const decision = await shouldWakeup(event, {
+      prefetchedQuoted: null,
+      quotedContentReplacements: replacements,
+      getMessageByRefIdx: () => {
+        throw new Error('prefetchedQuoted 已给出，不应再查询本地库');
+      },
+    });
+    expect(decision.trigger).toBe('quote');
+    expect(decision.payload?.quoted?.text).toContain('[图片:/dsh/kujira/downloads/image/user_mock/p.png]');
+    expect(decision.payload?.quoted?.text).not.toContain('P_SECRET');
+
+    // prefetchedQuoted 命中时直接复用，且优先于 msg_elements 兜底
+    const hitDecision = await shouldWakeup(event, {
+      prefetchedQuoted: {
+        short_id: 'msg_7',
+        time: 1788045798000,
+        content: '本地库命中原文',
+      },
+      quotedContentReplacements: replacements,
+      getMessageByRefIdx: () => {
+        throw new Error('prefetchedQuoted 已给出，不应再查询本地库');
+      },
+    });
+    expect(hitDecision.payload?.quoted).toEqual({
+      short_id: 'msg_7',
+      time: 1788045798000,
+      text: '本地库命中原文',
+    });
+  });
 });

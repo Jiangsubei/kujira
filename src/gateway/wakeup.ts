@@ -58,6 +58,15 @@ export interface WakeupOptions {
   getMessageByRefIdx?: (
     refIdx: string
   ) => Promise<QuotedMessageRecord | null | undefined> | QuotedMessageRecord | null | undefined;
+  /**
+   * 预取到的被引用消息记录（由调用方先行查库）：
+   * - 记录对象：直接复用，避免重复查库；
+   * - `null`：已查库未命中，回退 `msg_elements[]` 兜底；
+   * - `undefined`（缺省）：按 `getMessageByRefIdx` 现场查询。
+   */
+  prefetchedQuoted?: QuotedMessageRecord | null;
+  /** 合并转发式引用内嵌附件的原始 URL → 已落盘占位文案替换表 */
+  quotedContentReplacements?: ReadonlyMap<string, string>;
   /** 入站图片匹配本地表情库查询器 */
   getFaceByMd5?: (md5: string) => FaceRecord | null | undefined;
 }
@@ -88,28 +97,35 @@ async function resolveQuotedInfo(
     return undefined;
   }
 
-  // 1. 若 ref_msg_idx 为永久索引 REFIDX_...，优先查询本地 SQLite
-  if (isPermanentRefIdx(refMsgIdx) && options.getMessageByRefIdx) {
-    try {
-      const hit = await options.getMessageByRefIdx(refMsgIdx);
-      if (hit) {
-        const shortId =
-          typeof hit.short_id === 'string' && hit.short_id.trim() !== ''
-            ? hit.short_id.trim()
-            : undefined;
-        return {
-          ...(shortId ? { short_id: shortId } : {}),
-          ...(typeof hit.time === 'number' && Number.isFinite(hit.time) ? { time: hit.time } : {}),
-          text: hit.content || '',
-        };
+  // 1. 若 ref_msg_idx 为永久索引 REFIDX_...，优先查询本地 SQLite（或复用调用方预取结果）
+  if (isPermanentRefIdx(refMsgIdx)) {
+    let hit: QuotedMessageRecord | null | undefined;
+    if (options.prefetchedQuoted !== undefined) {
+      hit = options.prefetchedQuoted;
+    } else if (options.getMessageByRefIdx) {
+      try {
+        hit = await options.getMessageByRefIdx(refMsgIdx);
+      } catch {
+        // 查询失败自动回退 msg_elements 兜底
       }
-    } catch {
-      // 查询失败自动回退 msg_elements 兜底
+    }
+    if (hit) {
+      const shortId =
+        typeof hit.short_id === 'string' && hit.short_id.trim() !== ''
+          ? hit.short_id.trim()
+          : undefined;
+      return {
+        ...(shortId ? { short_id: shortId } : {}),
+        ...(typeof hit.time === 'number' && Number.isFinite(hit.time) ? { time: hit.time } : {}),
+        text: hit.content || '',
+      };
     }
   }
 
   // 2. TMP_... 临时索引、无 ref_msg_idx 或本地库未命中：从 msg_elements[] 提取被引用原文
-  const fallbackText = extractMsgElementsText(event);
+  const fallbackText = extractMsgElementsText(event, {
+    replacements: options.quotedContentReplacements,
+  });
   if (fallbackText) {
     return {
       text: fallbackText,

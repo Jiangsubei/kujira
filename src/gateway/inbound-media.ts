@@ -38,6 +38,7 @@ import {
   type MediaStorageManager,
   type SaveResourceOptions,
 } from '../storage/media.js';
+import { mapWithConcurrency } from '../utils/concurrency.js';
 
 export { sanitizeUrlForLog };
 
@@ -411,10 +412,8 @@ export async function resolveInboundAttachments(
   }
   const forceSticker = isPureStickerMessage(event?.content, imageAttachmentCount);
 
-  return Promise.all(
-    validAttachments.map((att) =>
-      resolveSingleInboundAttachment(att, peer, mediaManager, logger, forceSticker)
-    )
+  return mapWithConcurrency(validAttachments, 4, (att) =>
+    resolveSingleInboundAttachment(att, peer, mediaManager, logger, forceSticker)
   );
 }
 
@@ -1006,62 +1005,51 @@ export async function resolveEmbeddedForwardMedia(
     }
   }
 
-  for (const { parsed, hadFaceTag } of workItems) {
-    const rawUrl = parsed.rawUrl!;
-    const sanitizedUrl = sanitizeUrlForLog(rawUrl);
+  function baseEntry(
+    parsed: ParsedForwardAttachment,
+    rawUrl: string
+  ): Omit<EmbeddedForwardAttachmentEntry, 'downloaded'> {
+    return {
+      rawUrl,
+      sanitizedUrl: sanitizeUrlForLog(rawUrl),
+      mediaType: parsed.mediaType,
+      ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
+      ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+      ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
+      ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+    };
+  }
 
-    if (cachedByUrl.has(rawUrl)) {
-      const cached = cachedByUrl.get(rawUrl)!;
-      const cloned: EmbeddedForwardAttachmentEntry = {
-        ...cached,
-        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
-        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
-        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
-        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
-      };
-      entries.push(cloned);
-      if (!replacements.has(rawUrl)) {
-        replacements.set(
-          rawUrl,
-          renderForwardAttachment(parsed, cloned, { hadFaceTag, getFaceByMd5 })
-        );
-      }
-      continue;
-    }
+  function cloneEntry(
+    source: EmbeddedForwardAttachmentEntry,
+    parsed: ParsedForwardAttachment
+  ): EmbeddedForwardAttachmentEntry {
+    return {
+      ...source,
+      ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
+      ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
+      ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
+      ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+    };
+  }
 
-    if (!mediaManager || downloadedCount >= maxDownloads) {
-      const unresolvedEntry: EmbeddedForwardAttachmentEntry = {
-        rawUrl,
-        sanitizedUrl,
-        mediaType: parsed.mediaType,
-        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
-        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
-        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
-        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
-        downloaded: false,
-      };
-      cachedByUrl.set(rawUrl, unresolvedEntry);
-      entries.push(unresolvedEntry);
-      replacements.set(
-        rawUrl,
-        renderForwardAttachment(parsed, unresolvedEntry, { hadFaceTag, getFaceByMd5 })
-      );
-      continue;
-    }
-
+  async function downloadEntry(
+    parsed: ParsedForwardAttachment,
+    rawUrl: string
+  ): Promise<EmbeddedForwardAttachmentEntry> {
+    const base = baseEntry(parsed, rawUrl);
     const fallbackExt =
       inferExtFromFilename(parsed.fileName) ||
       inferExtFromUrl(rawUrl) ||
       (parsed.mediaType === 'video' ? 'mp4' : undefined);
 
     try {
-      const saved = await mediaManager.downloadAndSave(rawUrl, {
+      const saved = await mediaManager!.downloadAndSave(rawUrl, {
         type: parsed.mediaType,
         sessionId: peer,
         ...(parsed.fileName ? { filename: parsed.fileName } : {}),
         ...(fallbackExt ? { ext: fallbackExt } : {}),
       });
-      downloadedCount++;
 
       const localSize = readLocalSize(saved.localPath);
       const durationSec = normalizePositiveDuration(saved.durationSec);
@@ -1074,18 +1062,8 @@ export async function resolveEmbeddedForwardMedia(
           ? toActiveFaceMeta(getFaceByMd5(md5))
           : undefined;
 
-      if (!localPaths.includes(saved.localPath)) {
-        localPaths.push(saved.localPath);
-      }
-
-      const okEntry: EmbeddedForwardAttachmentEntry = {
-        rawUrl,
-        sanitizedUrl,
-        mediaType: parsed.mediaType,
-        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
-        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
-        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
-        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+      return {
+        ...base,
         localPath: saved.localPath,
         ...(localSize !== undefined ? { localSize } : {}),
         ...(durationSec !== undefined ? { durationSec } : {}),
@@ -1094,34 +1072,131 @@ export async function resolveEmbeddedForwardMedia(
         ...(face ? { face } : {}),
         downloaded: true,
       };
-      cachedByUrl.set(rawUrl, okEntry);
-      entries.push(okEntry);
-      replacements.set(
-        rawUrl,
-        renderForwardAttachment(parsed, okEntry, { hadFaceTag, getFaceByMd5 })
-      );
     } catch (err) {
       const safeError = sanitizeErrorMessage(err);
       logger?.warn?.(
-        `[InboundMedia] 合并转发内嵌媒体下载失败 (peer: ${peer}, type: ${parsed.mediaType}, url: ${sanitizedUrl}): ${safeError}`
+        `[InboundMedia] 合并转发内嵌媒体下载失败 (peer: ${peer}, type: ${parsed.mediaType}, url: ${base.sanitizedUrl}): ${safeError}`
       );
-      const failedEntry: EmbeddedForwardAttachmentEntry = {
-        rawUrl,
-        sanitizedUrl,
-        mediaType: parsed.mediaType,
-        ...(parsed.attachmentType ? { attachmentType: parsed.attachmentType } : {}),
-        ...(parsed.fileName ? { fileName: parsed.fileName } : {}),
-        ...(parsed.dimensions ? { dimensions: parsed.dimensions } : {}),
-        ...(parsed.sizeText ? { sizeText: parsed.sizeText } : {}),
+      return {
+        ...base,
         downloaded: false,
         error: safeError,
       };
-      cachedByUrl.set(rawUrl, failedEntry);
-      entries.push(failedEntry);
+    }
+  }
+
+  if (Number.isFinite(maxDownloads)) {
+    // 显式 limit：逐条按出现顺序处理，确保“前 N 个成功下载”的既有语义完全不变
+    for (const { parsed, hadFaceTag } of workItems) {
+      const rawUrl = parsed.rawUrl!;
+
+      if (cachedByUrl.has(rawUrl)) {
+        const cloned = cloneEntry(cachedByUrl.get(rawUrl)!, parsed);
+        entries.push(cloned);
+        if (!replacements.has(rawUrl)) {
+          replacements.set(
+            rawUrl,
+            renderForwardAttachment(parsed, cloned, { hadFaceTag, getFaceByMd5 })
+          );
+        }
+        continue;
+      }
+
+      if (!mediaManager || downloadedCount >= maxDownloads) {
+        const unresolvedEntry: EmbeddedForwardAttachmentEntry = {
+          ...baseEntry(parsed, rawUrl),
+          downloaded: false,
+        };
+        cachedByUrl.set(rawUrl, unresolvedEntry);
+        entries.push(unresolvedEntry);
+        replacements.set(
+          rawUrl,
+          renderForwardAttachment(parsed, unresolvedEntry, { hadFaceTag, getFaceByMd5 })
+        );
+        continue;
+      }
+
+      const entry = await downloadEntry(parsed, rawUrl);
+      if (entry.downloaded) downloadedCount++;
+      if (entry.localPath && !localPaths.includes(entry.localPath)) {
+        localPaths.push(entry.localPath);
+      }
+      cachedByUrl.set(rawUrl, entry);
+      entries.push(entry);
       replacements.set(
         rawUrl,
-        renderForwardAttachment(parsed, failedEntry, { hadFaceTag, getFaceByMd5 })
+        renderForwardAttachment(parsed, entry, { hadFaceTag, getFaceByMd5 })
       );
+    }
+  } else {
+    // 默认无 limit：有限并发 4 下载，最终按出现顺序组装 entries / replacements / localPaths
+    type ForwardPlan =
+      | { kind: 'download' | 'unresolved'; parsed: ParsedForwardAttachment; hadFaceTag: boolean; rawUrl: string }
+      | {
+          kind: 'duplicate';
+          parsed: ParsedForwardAttachment;
+          hadFaceTag: boolean;
+          rawUrl: string;
+          sourceIndex: number;
+        };
+
+    const plans: ForwardPlan[] = [];
+    const sourceIndexByUrl = new Map<string, number>();
+    for (const { parsed, hadFaceTag } of workItems) {
+      const rawUrl = parsed.rawUrl!;
+      const sourceIndex = sourceIndexByUrl.get(rawUrl);
+      if (sourceIndex !== undefined) {
+        plans.push({ kind: 'duplicate', parsed, hadFaceTag, rawUrl, sourceIndex });
+        continue;
+      }
+      sourceIndexByUrl.set(rawUrl, plans.length);
+      plans.push({ kind: mediaManager ? 'download' : 'unresolved', parsed, hadFaceTag, rawUrl });
+    }
+
+    const resolved = new Array<EmbeddedForwardAttachmentEntry | undefined>(plans.length);
+    const downloadTargets: number[] = [];
+    plans.forEach((plan, index) => {
+      if (plan.kind === 'download') downloadTargets.push(index);
+    });
+
+    await mapWithConcurrency(downloadTargets, 4, async (index) => {
+      const plan = plans[index]!;
+      if (plan.kind !== 'download') return;
+      resolved[index] = await downloadEntry(plan.parsed, plan.rawUrl);
+    });
+
+    for (let index = 0; index < plans.length; index++) {
+      const plan = plans[index]!;
+      let entry: EmbeddedForwardAttachmentEntry;
+
+      if (plan.kind === 'duplicate') {
+        const sourcePlan = plans[plan.sourceIndex]!;
+        const sourceEntry =
+          sourcePlan.kind === 'download' ? resolved[plan.sourceIndex] : undefined;
+        entry = sourceEntry
+          ? cloneEntry(sourceEntry, plan.parsed)
+          : { ...baseEntry(plan.parsed, plan.rawUrl), downloaded: false };
+      } else if (plan.kind === 'unresolved') {
+        entry = { ...baseEntry(plan.parsed, plan.rawUrl), downloaded: false };
+        cachedByUrl.set(plan.rawUrl, entry);
+      } else {
+        entry = resolved[index]!;
+        cachedByUrl.set(plan.rawUrl, entry);
+      }
+
+      if (entry.localPath && !localPaths.includes(entry.localPath)) {
+        localPaths.push(entry.localPath);
+      }
+      entries.push(entry);
+      if (!replacements.has(plan.rawUrl)) {
+        replacements.set(
+          plan.rawUrl,
+          renderForwardAttachment(plan.parsed, entry, {
+            hadFaceTag: plan.hadFaceTag,
+            getFaceByMd5,
+          })
+        );
+      }
     }
   }
 

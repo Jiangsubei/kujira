@@ -49,6 +49,9 @@ import {
   shouldWakeup,
   extractMessageRefIdx,
   extractQuotedRefIdx,
+  isForwardLikeContent,
+  isPermanentRefIdx,
+  msgElementsRawContents,
   type QuotedMessageRecord,
 } from './gateway/wakeup.js';
 import { SessionManager } from './gateway/session.js';
@@ -58,6 +61,7 @@ import {
   toMessageMediaFields,
 } from './attachment/classify.js';
 import { serializeAttachments } from './attachment/store.js';
+import { mapWithConcurrency } from './utils/concurrency.js';
 import { OutboundStreamBridge } from './outbound/stream.js';
 import { recordOutboundSelfMessage } from './outbound/self-record.js';
 import {
@@ -611,8 +615,37 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       forwardDescriptors = descriptorsFromForwardEntries(resolvedFwd.entries);
     }
 
+    // 引用消息：先查本地库；仅在未命中时下载合并转发式 msg_elements 内嵌附件并生成替换表
+    const quotedRefIdx = extractQuotedRefIdx(event);
+    const prefetchedQuoted = isPermanentRefIdx(quotedRefIdx)
+      ? toQuotedRecord(db.getMessageByRefIdx(quotedRefIdx))
+      : null;
+    let quotedContentReplacements: Map<string, string> | undefined;
+    if (!prefetchedQuoted) {
+      const quotedParts = msgElementsRawContents(event).filter((raw) => isForwardLikeContent(raw));
+      if (quotedParts.length > 0) {
+        const resolvedParts = await mapWithConcurrency(quotedParts, 4, (part) =>
+          resolveEmbeddedForwardMedia(part, peer, mediaManager, {
+            logger,
+            getFaceByMd5: (md5) => db.getFaceByMd5(md5),
+          })
+        );
+        const merged = new Map<string, string>();
+        for (const resolved of resolvedParts) {
+          for (const [url, placeholder] of resolved.replacements) {
+            merged.set(url, placeholder);
+          }
+        }
+        if (merged.size > 0) {
+          quotedContentReplacements = merged;
+        }
+      }
+    }
+
     const decision = await shouldWakeup(event, {
       descriptors,
+      prefetchedQuoted,
+      ...(quotedContentReplacements ? { quotedContentReplacements } : {}),
       ...(formatForwardContent ? { formatForwardContent } : {}),
       botName: gateway.getStatus().botName,
       getMessageByRefIdx: (idx) => toQuotedRecord(db.getMessageByRefIdx(idx)),
