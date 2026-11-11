@@ -18,7 +18,7 @@ import { openidToPeer } from '../../src/utils/peer.js';
  *
  * - ASM-1: attachments[] 带 ?rkey=mock_secret 裸 GET 下载落入 dshHome/kujira/downloads/image/<peer>/，
  *          SQLite 写入 local_path 与 attachments JSON；
- * - ASM-2: 死链 / HTTP 403 失败时 local_path 为 null，描述符 unavailable 与正文绝不泄漏 rkey query；
+ * - ASM-2: 死链 / HTTP 403 失败时 local_path 为 null，描述符 unavailable 不泄漏 rkey query，正文与唤醒遵循选项 A 保留真实直链；
  * - ASM-3: 魔数纠偏（响应头错报 image/jpeg、文件名 .jpg 但字节为 PNG → 实际落盘 .png 且 format='png'）；
  * - ASM-4: 多图 attachments[] 并发裸 GET 下载并全部落盘记录至 attachments JSON 与正文。
  */
@@ -318,12 +318,13 @@ describe('契约测试: 入站图片落盘真实装配闭环 (Inbound Image Asse
     expect(capturedFollowups[0]!.text).not.toContain('mock_secret');
   });
 
-  it('ASM-2: 死链或 HTTP 403 失败时 local_path = null，描述符 unavailable 与正文绝不泄漏 rkey query', async () => {
+  it('ASM-2: 死链或 HTTP 403 失败时 local_path = null，unavailable 脱敏且正文与唤醒遵循选项 A 保留真实直链', async () => {
     const srv = await startHttpServer((_req, res) => {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ message: 'rkey expired' }));
     });
 
+    const rawUrl = `${srv.baseUrl}/expired/expired.png?rkey=mock_secret`;
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_IN_IMG_DEAD',
@@ -337,7 +338,7 @@ describe('契约测试: 入站图片落盘真实装配闭环 (Inbound Image Asse
           content_type: 'image/png',
           filename: 'expired.png',
           size: 128,
-          url: `${srv.baseUrl}/expired/expired.png?rkey=mock_secret`,
+          url: rawUrl,
         },
       ],
     });
@@ -346,11 +347,13 @@ describe('契约测试: 入站图片落盘真实装配闭环 (Inbound Image Asse
     await waitUntil(() => capturedFollowups.length === 1, 3000, 'followup captured for dead link');
 
     expect(row.local_path).toBeNull();
-    expect(row.content).toContain('(入站落盘失败)');
-    expect(row.content).not.toContain('rkey');
-    expect(row.content).not.toContain('mock_secret');
-    expect(capturedFollowups[0]!.text).not.toContain('rkey');
-    expect(capturedFollowups[0]!.text).not.toContain('mock_secret');
+    expect(row.content).toContain('看看这张失效图');
+    expect(row.content).toContain('(下载失败:');
+    expect(row.content).toContain(`直链: ${rawUrl}`);
+    expect(row.content).not.toContain('链接已脱敏');
+    expect(capturedFollowups[0]!.text).toContain('(下载失败:');
+    expect(capturedFollowups[0]!.text).toContain(`直链: ${rawUrl}`);
+    expect(capturedFollowups[0]!.text).not.toContain('链接已脱敏');
 
     const parsedAtts = JSON.parse(row.attachments);
     expect(parsedAtts).toHaveLength(1);

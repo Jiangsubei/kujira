@@ -15,7 +15,7 @@ import { formatDateTime } from '../../src/storage/time-parser.js';
  *
  * (a) 出站 reply_to 仅接收短 ID（msg_<n> / msg_self_<n>），经 getMessageByShortId 换取 REFIDX_... 后在首片发送 message_reference，拒绝非短 ID；
  * (b) 入站 message_type=103 ref_msg_idx="REFIDX_..." 命中 SQLite getMessageByRefIdx 还原精简短 ID 引用头（含入站图与出站自身消息）；
- * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（含 URL 凭证脱敏），不泄露索引/发送者标识；
+ * (c) TMP_... 临时索引或未命中 DB 时回退解析 msg_elements[]（保留可用直链 URL），不泄露索引/发送者标识；
  * (d) 双未命中时优雅降级占位，不中断唤醒。
  */
 
@@ -427,11 +427,11 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     expect(prompt2).not.toContain('REFIDX_');
   });
 
-  it('(c) TMP_... 临时索引或未命中本地 SQLite 时回退解析 msg_elements[] 并脱敏 URL', async () => {
+  it('(c) TMP_... 临时索引或未命中本地 SQLite 时回退解析 msg_elements[] 并保留可用直链 URL', async () => {
     await preparePeerAgent();
     const ws = FakeWs.instances[FakeWs.instances.length - 1]!;
 
-    // 1. TMP_... 临时索引不查 DB，直接解析 msg_elements[] 且剥离含 rkey URL
+    // 1. TMP_... 临时索引不查 DB，直接解析 msg_elements[] 并原样保留可用 URL
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_Q_TMP_1',
       content: '针对这段复合引用回复一下',
@@ -449,16 +449,16 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     await waitUntil(() => capturedFollowups.length >= 1, 3000, 'tmp quote followup');
     const promptTmp = capturedFollowups[0]!.content;
     expect(promptTmp).toBe(
-      `[msg_1] [${formatDateTime(tmpRow.time)}] [引用回复: "复合引用第一段\n[图片(链接已脱敏)]"] 针对这段复合引用回复一下`
+      `[msg_1] [${formatDateTime(tmpRow.time)}] [引用回复: "复合引用第一段\nURL:https://example.com/pic.png?rkey=mock_secret"] 针对这段复合引用回复一下`
     );
+    expect(promptTmp).toContain('URL:https://example.com/pic.png?rkey=mock_secret');
+    expect(promptTmp).not.toContain('[图片(链接已脱敏)]');
     expect(promptTmp).not.toContain('TMP_COMPOSITE_1');
     expect(promptTmp).not.toContain('ROBOT1.0_');
     expect(promptTmp).not.toContain('REFIDX_');
     expect(promptTmp).not.toContain(MOCK_OPENID);
     expect(promptTmp).not.toContain('提问者');
     expect(promptTmp).not.toContain('[QQ私聊]');
-    expect(promptTmp).not.toContain('rkey');
-    expect(promptTmp).not.toContain('mock_secret');
 
     // 2. REFIDX_... 未命中本地库，回退 msg_elements[]
     ws.emitDispatch('C2C_MESSAGE_CREATE', {

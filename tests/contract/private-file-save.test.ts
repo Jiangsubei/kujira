@@ -19,7 +19,7 @@ import { openidToPeer } from '../../src/utils/peer.js';
  * - PF-2: 实测特征 — .png 走 content_type="file" 时保持 'file' 分类落盘并保留 .png 扩展名；
  * - PF-3: 安全文件名净化防 ../ 与 ..\ 路径穿越；
  * - PF-4: content_type="voice" 优先拉取 voice_wav_url（忽略 audio/mp3 错报头），落盘 .wav 并保留 asr_refer_text；
- * - PF-5: voice_wav_url 失败回退 url；双失败时 local_path = null、保留 asr_refer_text、绝不泄漏 rkey；
+ * - PF-5: voice_wav_url 失败回退 url；双失败时 local_path = null、保留 asr_refer_text、unavailable 脱敏且正文遵循选项 A 保留真实直链；
  * - PF-6: 空消息不落库不唤醒，纯空格消息正常入库并唤醒。
  */
 
@@ -487,7 +487,7 @@ describe('契约测试: 单聊文件与语音入站即时落盘装配闭环 (PF-
     expect(parsedAtts[0].remote?.asrReferText).toBe('今晚记得早点休息');
   });
 
-  it('PF-5: voice_wav_url 失败回退 url；双失败时 local_path = null、保留 asr_refer_text 并标注落盘失败且不泄漏 rkey', async () => {
+  it('PF-5: voice_wav_url 失败回退 url；双失败时 local_path = null、保留 asr_refer_text 并遵循选项 A 保留真实直链', async () => {
     const srv = await startHttpServer((req, res) => {
       if (req.url?.includes('wav-fail')) {
         res.writeHead(404);
@@ -530,7 +530,8 @@ describe('契约测试: 单聊文件与语音入站即时落盘装配闭环 (PF-
     expect(Buffer.compare(fs.readFileSync(rowFb.local_path), AMR_BYTES)).toBe(0);
     expect(rowFb.content).toContain('(语音转文字: "语音回退识别")');
 
-    // 2. 双失败 -> local_path=null、保留转写文本、不泄漏 rkey
+    // 2. 双失败 -> local_path=null、保留转写文本、unavailable 保持脱敏、正文遵循选项 A 优先保留 voice_wav_url 直链
+    const wavFailUrl = `${srv.baseUrl}/wav-fail.wav?rkey=mock_secret`;
     ws.emitDispatch('C2C_MESSAGE_CREATE', {
       id: 'ROBOT1.0_PF_VOICE_DEAD',
       content: '',
@@ -542,7 +543,7 @@ describe('契约测试: 单聊文件与语音入站即时落盘装配闭环 (PF-
           content_type: 'voice',
           filename: 'dead.amr',
           url: `${srv.baseUrl}/both-dead.amr?rkey=mock_secret`,
-          voice_wav_url: `${srv.baseUrl}/wav-fail.wav?rkey=mock_secret`,
+          voice_wav_url: wavFailUrl,
           asr_refer_text: '双失败保留转写',
         },
       ],
@@ -551,11 +552,14 @@ describe('契约测试: 单聊文件与语音入站即时落盘装配闭环 (PF-
     const rowDead = await waitForDbRow('ROBOT1.0_PF_VOICE_DEAD');
     expect(rowDead.type).toBe('record');
     expect(rowDead.local_path).toBeNull();
-    expect(rowDead.content).toBe('[语音 (语音转文字: "双失败保留转写") (入站落盘失败)]');
-    expect(rowDead.content).not.toContain('rkey');
-    expect(rowDead.content).not.toContain('mock_secret');
+    expect(rowDead.content).toContain('(语音转文字: "双失败保留转写")');
+    expect(rowDead.content).toContain('(下载失败:');
+    expect(rowDead.content).toContain(`直链: ${wavFailUrl}`);
+    expect(rowDead.content).not.toContain('链接已脱敏');
 
     const parsedAtts = JSON.parse(rowDead.attachments);
+    expect(parsedAtts[0].unavailable).toBeTruthy();
+    expect(String(parsedAtts[0].unavailable)).toContain('403');
     expect(String(parsedAtts[0].unavailable)).not.toContain('rkey');
     expect(String(parsedAtts[0].unavailable)).not.toContain('mock_secret');
   });

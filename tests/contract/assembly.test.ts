@@ -178,10 +178,9 @@ describe('契约测试: DSH 真实服务装配与 Kujira 插件挂载 (Assembly 
   it('B3-契约 6: system-prompt/assemble 呈现侧预设隔离 — Web 装配不含 Kujira 工具，Kujira 装配含全量', async () => {
     const KUJIRA_TOOLS = new Set([
       'read_chat_history',
-      'fetch_chat_resource',
-      'expand_forward_message',
       'send_file',
     ]);
+    const REMOVED_TOOLS = ['fetch_chat_resource', 'expand_forward_message'];
 
     await fsp.mkdir(path.join(tmpHome, 'web-ws-2'), { recursive: true });
     await fsp.mkdir(path.join(tmpHome, 'kujira-ws-2'), { recursive: true });
@@ -208,6 +207,11 @@ describe('契约测试: DSH 真实服务装配与 Kujira 插件挂载 (Assembly 
     const asmQq = await booted.ctx.systemPrompt.assemble({ scope: qqAgent, agent: qqAgent } as any);
     const qqKujira = (asmQq.tools as any[]).filter((t) => KUJIRA_TOOLS.has(t.name));
     expect(qqKujira.map((t) => t.name).sort()).toEqual([...KUJIRA_TOOLS].sort());
+
+    const qqToolNames = new Set((asmQq.tools as any[]).map((t) => t.name));
+    for (const removed of REMOVED_TOOLS) {
+      expect(qqToolNames.has(removed)).toBe(false);
+    }
   });
 
   it('断言 7: 审批本轮唤醒者追踪器真实装配，并经 session/event 严格绑定与清理', async () => {

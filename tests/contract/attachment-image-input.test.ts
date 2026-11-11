@@ -1,13 +1,14 @@
 /**
  * tests/contract/attachment-image-input.test.ts
  *
- * 契约测试: 入站媒体回归纯文本本地路径占位模式（绝不暴露含凭证 URL，支持模型按需读图）
+ * 契约测试: 入站媒体纯文本路径占位与选项 A 失败直链兜底契约
  *
  * 覆盖规范（仅依赖 Batch 1 与 Batch 2 模块）：
  * 1. 入站 PNG 图片经 `resolveInboundAttachments` 裸 GET 落盘后，`parseNormalizedContent` 与 `shouldWakeup`
  *    输出纯文本本地路径占位 `[图片:<localPath>]`，且 `payload.images` 收集物理路径；
  * 2. 多张图片及以 `content_type === 'file'` 下发的 `.png` 文件均保存真实扩展名与确定性本地路径；
- * 3. 下载失败或无本地路径时，渲染文本绝不回退泄露带 `rkey` query 凭证的 `remote.url`。
+ * 3. 下载失败且存在 `remote.url` 时，遵循选项 A 向 Agent 暴露真实直链 URL（绝不含 `(链接已脱敏)`），
+ *    同时 `unavailable` 短错误字段本身保持 URL query 脱敏。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -126,7 +127,7 @@ describe('契约测试: 入站媒体纯文本路径占位与安全边界 (Batch 
     expect(decision.payload?.images).toHaveLength(3);
   });
 
-  it('契约 3: 落盘失败时渲染文本严禁回退泄露 remote.url 中的凭证', async () => {
+  it('契约 3: 落盘失败且存在 remote.url 时遵循选项 A 输出下载失败原因与真实直链', async () => {
     const deadUrl = await startLoopback(Buffer.from('forbidden'), 403, '/secret.png?rkey=DO_NOT_LEAK');
     const event: QQC2CMessageCreateEvent = {
       id: 'ROBOT1.0_img_input_003',
@@ -144,8 +145,12 @@ describe('契约测试: 入站媒体纯文本路径占位与安全边界 (Batch 
 
     expect(descriptors[0]!.local).toBeUndefined();
     expect(descriptors[0]!.unavailable).toBeTruthy();
+    expect(descriptors[0]!.unavailable).toContain('HTTP 下载失败 (status: 403):');
     expect(descriptors[0]!.unavailable).not.toContain('DO_NOT_LEAK');
-    expect(decision.payload?.content).toBe('图裂了吗 [图片:broken.png (入站落盘失败)]');
-    expect(decision.payload?.content).not.toContain('DO_NOT_LEAK');
+    expect(decision.payload?.content).toBe(
+      `图裂了吗 [图片:broken.png (下载失败: ${descriptors[0]!.unavailable}) 直链: ${deadUrl}]`
+    );
+    expect(decision.payload?.content).toContain(`直链: ${deadUrl}`);
+    expect(decision.payload?.content).not.toContain('(链接已脱敏)');
   });
 });

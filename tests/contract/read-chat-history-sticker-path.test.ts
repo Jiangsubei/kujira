@@ -7,7 +7,7 @@
  * 1. 命中表情库记录：通过 attachment/render (`renderAttachments`) 与 `serializeAttachments` 标准入库，
  *    `db.readHistory` 完整保留 `local_path` 与结构化 `attachments` JSON，渲染文本为 `[表情包: face_id (情绪: mood) 路径: <local_path>]`；
  * 2. 普通表情记录：`renderAttachment` / `renderAttachments` 输出精简本地路径格式 `[表情包:<path>]`；
- * 3. 无本地路径兜底：`renderAttachments` 仅输出脱敏占位 `[表情包]` 且绝不泄漏 URL query 凭证，同时 `attachments` 保留远端元数据；
+ * 3. 无本地路径直链兜底：有 `remote.url` 时按选项 A 渲染为 `[表情包 直链: https://...]`，同时验证数据库落库、`read_chat_history` 与 `attachments` JSON 完整保留；
  * 4. 真实工具装配闭环：通过 `read_chat_history` `defineTool` `execute`（`kujira-user-<hash>` 会话绑定）与 `output.render` 验证短 ID 渲染 + Lossless JSON 无 `undefined`。
  */
 
@@ -195,20 +195,20 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     expect(rendered).not.toContain('已保存:');
   });
 
-  it('契约 3: 无 local.path 的表情描述符仅渲染脱敏占位且不泄漏 URL 凭证，同时保留 attachments', () => {
+  it('契约 3: 有 remote.url 而无 local.path 的表情描述符按选项 A 保留真实直链并完整落库与通过 read_chat_history 召回', async () => {
+    const remoteUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=SECRET_CREDENTIAL_XYZ';
     const descriptor: AttachmentDescriptor = {
       kind: 'sticker',
       origin: 'inbound',
       summary: '[动画表情]',
       remote: {
         fileUuid: 'uuid_sticker_remote_01',
-        url: 'https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=SECRET_CREDENTIAL_XYZ',
+        url: remoteUrl,
       },
     };
-    const [safeContent] = renderAttachments([descriptor]);
-    expect(safeContent).toBe('[表情包]');
-    expect(safeContent).not.toContain('rkey=');
-    expect(safeContent).not.toContain('SECRET_CREDENTIAL_XYZ');
+    const [renderedContent] = renderAttachments([descriptor]);
+    expect(renderedContent).toBe(`[表情包 直链: ${remoteUrl}]`);
+    expect(renderedContent).not.toContain('(链接已脱敏)');
 
     db.saveMessage({
       msg_id: 'ROBOT1.0_STK_103',
@@ -217,7 +217,7 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
       sender_name: '好友C',
       time: 1793716520000,
       type: 'sticker',
-      content: safeContent!,
+      content: renderedContent!,
       raw: '{}',
       file_id: 'uuid_sticker_remote_01',
       local_path: null,
@@ -232,10 +232,27 @@ describe('契约测试: read_chat_history 新式表情记录存储与渲染契�
     const res = db.readHistory(PEER);
     expect(res.messages).toHaveLength(1);
     expect(res.messages[0]!.local_path).toBeNull();
-    expect(res.messages[0]!.content).toBe('[表情包]');
+    expect(res.messages[0]!.content).toBe(`[表情包 直链: ${remoteUrl}]`);
     const descriptors = deserializeAttachments(res.messages[0]!.attachments);
     expect(descriptors).toHaveLength(1);
     expect(descriptors[0]!.remote?.fileUuid).toBe('uuid_sticker_remote_01');
+    expect(descriptors[0]!.remote?.url).toBe(remoteUrl);
+
+    const toolResult: ReadChatHistoryResult = await historyTool.execute(
+      {},
+      { agent: { session: { id: SESSION_ID } } }
+    );
+    expect(toolResult.messages).toHaveLength(1);
+    expect(toolResult.messages[0]!.local_path).toBeNull();
+    expect(toolResult.messages[0]!.content).toBe(`[表情包 直链: ${remoteUrl}]`);
+    const toolDescriptors = deserializeAttachments(toolResult.messages[0]!.attachments);
+    expect(toolDescriptors).toHaveLength(1);
+    expect(toolDescriptors[0]!.remote?.fileUuid).toBe('uuid_sticker_remote_01');
+    expect(toolDescriptors[0]!.remote?.url).toBe(remoteUrl);
+    assertNoUndefinedFields(toolResult);
+
+    const renderedToolOutput = historyTool.output.render({}, toolResult);
+    expect(renderedToolOutput[0].text).toContain(`[表情包 直链: ${remoteUrl}]`);
   });
 
   it('契约 4: 真实 read_chat_history 工具调用装配闭环与 Lossless JSON 合规性', async () => {

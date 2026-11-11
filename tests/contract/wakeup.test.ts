@@ -200,12 +200,12 @@ describe('契约测试: 入站引用消息还原 (message_type=103)', () => {
       },
     });
 
-    // TMP_ 临时索引不查本地 SQLite，直接走 msg_elements 兜底（仅输出 { text }）
+    // TMP_ 临时索引不查本地 SQLite，直接走 msg_elements 兜底（含嵌套 === 消息 N === 结构化清洗）
     expect(dbQueried).toBe(false);
     expect(decision.wakeup).toBe(true);
     expect(decision.trigger).toBe('quote');
     expect(decision.payload?.quoted).toEqual({
-      text: '=== 消息 1 ===\n[消息内容] 复合引用前文内容\n[消息类型] 引用消息',
+      text: '1. 复合引用前文内容\n   [消息类型] 引用消息',
     });
 
     // REFIDX_ 存在但查库未命中时，同样回退 msg_elements
@@ -334,7 +334,9 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
     );
   });
 
-  it('契约 9: message_type=102 合并转发经 parseNormalizedContent 自动脱敏 URL 凭证', () => {
+  it('契约 9: message_type=102 未预下载合并转发经 parseNormalizedContent 重排对话流并保留选项 A 真实直链', () => {
+    const rawUrl =
+      'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=TOP_SECRET_FORWARD_RKEY&spec=0';
     const forwardEvent = makeEvent({
       id: 'ROBOT1.0_fwd_001',
       message_type: 102,
@@ -342,15 +344,18 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
         '[群聊的聊天记录]',
         '=== 消息 1 ===',
         '[消息内容] 看看这张截图',
-        '[附件1] 类型:图片 文件名:shot.png 尺寸:800x600 大小:120KB URL:https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=TOP_SECRET_FORWARD_RKEY&spec=0',
+        `[附件1] 类型:图片 文件名:shot.png 尺寸:800x600 大小:120KB URL:${rawUrl}`,
       ].join('\n'),
     });
 
-    const sanitized = parseNormalizedContent(forwardEvent, []);
-    expect(sanitized).toContain('[消息内容] 看看这张截图');
-    expect(sanitized).toContain('[图片(链接已脱敏)]');
-    expect(sanitized).not.toContain('TOP_SECRET_FORWARD_RKEY');
-    expect(sanitized).not.toContain('https://multimedia.nt.qq.com.cn');
+    const formatted = parseNormalizedContent(forwardEvent, []);
+    expect(formatted).toBe(
+      `[群聊的聊天记录]\n1. 看看这张截图 [图片:shot.png (800x600, 120KB) 直链: ${rawUrl}]`
+    );
+    expect(formatted).not.toContain('[图片(链接已脱敏)]');
+    expect(formatted).not.toContain('链接已脱敏');
+    expect(formatted).not.toContain('=== 消息');
+    expect(formatted).not.toContain('[消息内容]');
   });
 
   it('契约 10: QQ 商城/官方表情 ext.text 兜底展示与自定义表情包附件优先级', async () => {

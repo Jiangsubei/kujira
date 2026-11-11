@@ -135,8 +135,6 @@ describe('契约测试: Kujira 单聊会话专属预设装配与工具隔离 (QQ
     expect(toolNames.has('send_qq_message')).toBe(true);
     expect(toolNames.has('recall_message')).toBe(true);
     expect(toolNames.has('read_chat_history')).toBe(true);
-    expect(toolNames.has('fetch_chat_resource')).toBe(true);
-    expect(toolNames.has('expand_forward_message')).toBe(true);
     expect(toolNames.has('send_file')).toBe(true);
     expect(toolNames.has('wait_for_user_messages')).toBe(true);
     expect(toolNames.has('send_face')).toBe(true);
@@ -152,8 +150,10 @@ describe('契约测试: Kujira 单聊会话专属预设装配与工具隔离 (QQ
     expect(toolNames.has('schedule_task')).toBe(true);
     expect(toolNames.has('manage_scheduled_tasks')).toBe(true);
 
-    // 6. 已移除的旧群聊/空间/多代理工具绝不能在预设中注册
+    // 6. 已移除的旧群聊/空间/多代理/资源拉取与转发展开工具绝不能在预设中注册
     for (const removed of [
+      'fetch_chat_resource',
+      'expand_forward_message',
       'read_qzone_feeds',
       'publish_qzone_feed',
       'comment_qzone_feed',

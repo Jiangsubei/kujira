@@ -8,7 +8,7 @@
  * 2. `.png` 文件以 `content_type === 'file'` 下发时保留 `'file'` 分类与安全文件名；
  * 3. `voice` 附件提取 `voice_wav_url` 与 `asr_refer_text`；
  * 4. `buildOutboundMediaAttachment` 与 `buildOutboundFaceAttachment(face, localPath)` 无 `subType`，Lossless JSON；
- * 5. `renderAttachment` 唯一渲染入口：严禁暴露带 query 凭证的 `remote.url`，支持语音转写与 `.png` 文件路径展示；
+ * 5. `renderAttachment` 唯一渲染入口：遵循选项 A（已落盘仅展示本地路径，未落盘/失败保留真实直链），支持语音转写、视频元信息与 `.png` 文件路径展示；
  * 6. `serializeAttachments` / `deserializeAttachments` / `descriptorsFromRaw` 无损往返与官方事件解析。
  */
 
@@ -199,26 +199,61 @@ describe('契约测试: 唯一安全渲染入口 (renderAttachment)', () => {
     expect(outbound).toBe(inbound);
   });
 
-  it('契约 8: renderImage 严禁暴露带 query 凭证的 remote.url；仅展示安全占位', () => {
+  it('契约 8: renderImage 遵循选项 A（已落盘只展示本地路径；未落盘/失败保留真实直链；无 URL 失败呈入站落盘失败）', () => {
     const secretUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=TOP_SECRET_KEY';
-    const renderedNoLocal = render({
+
+    // 1. 已落盘：仅展示本地路径，不拼接 remote.url
+    const renderedWithLocal = render({
+      kind: 'image',
+      origin: 'inbound',
+      fileName: '95C5A03B7A.png',
+      remote: { url: secretUrl },
+      local: { path: '/dsh/kujira/downloads/image/user_1/95C5A03B7A.png', format: 'png' },
+    });
+    expect(renderedWithLocal).toBe('[图片:/dsh/kujira/downloads/image/user_1/95C5A03B7A.png]');
+    expect(renderedWithLocal).not.toContain('TOP_SECRET_KEY');
+    expect(renderedWithLocal).not.toContain('直链:');
+
+    // 2. 无 local.path 且有 unavailable 与 remote.url：输出下载失败原因与真实直链
+    const renderedFailedWithUrl = render({
       kind: 'image',
       origin: 'inbound',
       fileName: '95C5A03B7A.png',
       remote: { url: secretUrl },
       unavailable: 'download_failed',
     });
-    expect(renderedNoLocal).toBe('[图片:95C5A03B7A.png (入站落盘失败)]');
-    expect(renderedNoLocal).not.toContain('TOP_SECRET_KEY');
-    expect(renderedNoLocal).not.toContain('multimedia.nt.qq.com.cn');
+    expect(renderedFailedWithUrl).toBe(
+      `[图片:95C5A03B7A.png (下载失败: download_failed) 直链: ${secretUrl}]`
+    );
+
+    // 3. 无 local.path 但有 remote.url（无 unavailable）：输出真实直链
+    const renderedNamedWithUrl = render({
+      kind: 'image',
+      origin: 'inbound',
+      fileName: '95C5A03B7A.png',
+      remote: { url: secretUrl },
+    });
+    expect(renderedNamedWithUrl).toBe(`[图片:95C5A03B7A.png 直链: ${secretUrl}]`);
 
     const renderedBare = render({
       kind: 'image',
       origin: 'inbound',
       remote: { url: secretUrl },
     });
-    expect(renderedBare).toBe('[图片]');
-    expect(renderedBare).not.toContain('TOP_SECRET_KEY');
+    expect(renderedBare).toBe(`[图片 直链: ${secretUrl}]`);
+
+    // 4. 无 remote.url 落盘失败才输出入站落盘失败占位
+    const renderedFailedNoUrl = render({
+      kind: 'image',
+      origin: 'inbound',
+      fileName: '95C5A03B7A.png',
+      unavailable: 'download_failed',
+    });
+    expect(renderedFailedNoUrl).toBe('[图片:95C5A03B7A.png (入站落盘失败)]');
+    expect(renderedFailedNoUrl).not.toContain('TOP_SECRET_KEY');
+
+    // 5. 纯空图片占位
+    expect(render({ kind: 'image', origin: 'inbound' })).toBe('[图片]');
   });
 
   it('契约 9: content_type=file 的 .png 文件明确展示路径；语音结合 local.path 与 asrReferText 渲染', () => {
@@ -260,7 +295,7 @@ describe('契约测试: 唯一安全渲染入口 (renderAttachment)', () => {
     expect(render({ kind: 'record', origin: 'inbound' })).toBe('[语音]');
   });
 
-  it('契约 10: 合并转发与视频渲染适配官方结构，未知 group_file 返回 null', () => {
+  it('契约 10: 合并转发与视频元信息渲染适配官方结构，空 content_type 按扩展名分类，未知 group_file 返回 null', () => {
     expect(render({ kind: 'forward', origin: 'inbound' })).toBe('[合并转发]');
     expect(render({ kind: 'forward', origin: 'inbound', summary: '群聊的聊天记录' })).toBe(
       '[合并转发: 群聊的聊天记录]'
@@ -273,6 +308,46 @@ describe('契约测试: 唯一安全渲染入口 (renderAttachment)', () => {
         local: { path: '/dsh/kujira/downloads/video/user_1/clip.mp4' },
       })
     ).toBe('[视频:clip.mp4 已保存: /dsh/kujira/downloads/video/user_1/clip.mp4]');
+
+    expect(
+      render({
+        kind: 'video',
+        origin: 'inbound',
+        fileName: 'clip.mp4',
+        local: {
+          path: '/dsh/kujira/downloads/video/user_1/clip.mp4',
+          dimensions: '720x1280',
+          size: 849510,
+          durationSec: 8.776,
+        },
+      })
+    ).toBe(
+      '[视频:clip.mp4 (720x1280, 829.6KB, 8.8s) 已保存: /dsh/kujira/downloads/video/user_1/clip.mp4]'
+    );
+
+    expect(
+      render({
+        kind: 'video',
+        origin: 'inbound',
+        local: {
+          path: '/dsh/kujira/downloads/video/user_1/long.mp4',
+          dimensions: '1080x1920',
+          size: 2 * 1024 * 1024,
+          durationSec: 65,
+        },
+      })
+    ).toBe('[视频 (1080x1920, 2.0MB, 1m5s) 已保存: /dsh/kujira/downloads/video/user_1/long.mp4]');
+
+    // content_type 为空或 application/octet-stream 时按扩展名分类
+    expect(classifyAttachment({ content_type: '', filename: 'clip.mp4' })).toBe('video');
+    expect(classifyAttachment({ filename: 'clip.mp4' })).toBe('video');
+    expect(classifyAttachment({ content_type: 'application/octet-stream', filename: 'clip.mp4' })).toBe('video');
+    expect(classifyAttachment({ content_type: '', filename: 'voice.wav' })).toBe('record');
+    expect(classifyAttachment({ content_type: 'application/octet-stream', filename: 'voice.wav' })).toBe('record');
+    expect(classifyAttachment({ content_type: '', filename: 'photo.png' })).toBe('image');
+    expect(classifyAttachment({ content_type: 'application/octet-stream', filename: 'photo.png' })).toBe('image');
+    // content_type='file' 的 .png 严格保持 'file'
+    expect(classifyAttachment({ content_type: 'file', filename: 'photo.png' })).toBe('file');
 
     expect(renderAttachment({ kind: 'group_file' as any, origin: 'inbound' })).toBeNull();
   });
