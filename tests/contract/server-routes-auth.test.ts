@@ -255,12 +255,12 @@ describe('契约测试: Kujira 路由宿主身份认证门控 (Host Connection A
     expect(mockConnection.requestRejection).toHaveBeenCalled();
   });
 
-  describe('15 项 Schema 与可选凭据保存放行契约', () => {
-    it('Schema 兼容性: 空配置安全应用全部 15 项单聊默认值，绝不抛出解析异常且已剔除 markdown_enabled/input_notify_enabled/ws_token/admins', () => {
+  describe('19 项 Schema 与可选凭据保存放行契约', () => {
+    it('Schema 兼容性: 空配置安全应用全部 19 项单聊默认值，绝不抛出解析异常且已剔除 markdown_enabled/input_notify_enabled/ws_token/admins', () => {
       const parsed = BridgeConfigSchema({});
       const dict = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
       const unwrap = (val: any) => (typeof val?.get === 'function' ? val.get() : val);
-      expect(Object.keys(dict)).toHaveLength(15);
+      expect(Object.keys(dict)).toHaveLength(19);
       expect(dict.markdown_enabled).toBeUndefined();
       expect(dict.input_notify_enabled).toBeUndefined();
       expect(dict.ws_token).toBeUndefined();

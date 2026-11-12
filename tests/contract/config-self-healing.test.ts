@@ -29,7 +29,17 @@ const EXPECTED_15_KEYS = [
   'slang_storage_path',
 ] as const;
 
-describe('契约测试: Kujira 15 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+/** 新增的单聊主动能力配置键（消息聚合回复 + 冷场主动搭话），共 4 项 */
+const PROACTIVE_KEYS = [
+  'aggregation_enabled',
+  'aggregation_interval_mins',
+  'idle_reply_enabled',
+  'idle_reply_timeout_mins',
+] as const;
+
+const EXPECTED_19_KEYS = [...EXPECTED_15_KEYS, ...PROACTIVE_KEYS] as const;
+
+describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -40,23 +50,23 @@ describe('契约测试: Kujira 15 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 15 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 15 项合法键', () => {
+  describe('1. 单一真相源与 19 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 19 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(15);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_15_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_15_KEYS].sort());
+      expect(validKeys.size).toBe(19);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_19_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_19_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_15_KEYS) {
+      for (const field of EXPECTED_19_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_15_KEYS) {
+      for (const field of EXPECTED_19_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'
@@ -121,7 +131,7 @@ describe('契约测试: Kujira 15 项配置 Schema 与物理自愈引擎 (Config
   });
 
   describe('2. 纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
-    it('分离 15 项合法字段与 markdown_enabled / input_notify_enabled / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
+    it('分离 19 项合法字段与 markdown_enabled / input_notify_enabled / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
       const dirtyInput = {
         image_ttl_days: 14,
         new_message_behavior: 'queue',

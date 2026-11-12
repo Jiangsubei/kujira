@@ -22,6 +22,10 @@ import {
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
   DEFAULT_SLANG_STORAGE_PATH,
+  DEFAULT_AGGREGATION_ENABLED,
+  DEFAULT_AGGREGATION_INTERVAL_MINS,
+  DEFAULT_IDLE_REPLY_ENABLED,
+  DEFAULT_IDLE_REPLY_TIMEOUT_MINS,
 } from '../constants/index.js';
 import type { BridgePluginConfig } from '../types/index.js';
 
@@ -101,6 +105,26 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_SLANG_STORAGE_PATH)
     .volatile()
     .description('黑话 Markdown 文档保存路径 (默认 .dsh/kujira/slang/slang.md)'),
+  aggregation_enabled: z
+    .boolean()
+    .default(DEFAULT_AGGREGATION_ENABLED)
+    .volatile()
+    .description('消息聚合回复总开关：开启后连续消息按周期窗口合并为一次回复'),
+  aggregation_interval_mins: z
+    .number()
+    .default(DEFAULT_AGGREGATION_INTERVAL_MINS)
+    .volatile()
+    .description('消息聚合周期窗口 (单位: 分钟，默认 2 分钟)'),
+  idle_reply_enabled: z
+    .boolean()
+    .default(DEFAULT_IDLE_REPLY_ENABLED)
+    .volatile()
+    .description('冷场主动搭话总开关：长时间无新消息时主动发起话题'),
+  idle_reply_timeout_mins: z
+    .number()
+    .default(DEFAULT_IDLE_REPLY_TIMEOUT_MINS)
+    .volatile()
+    .description('冷场判定阈值 (单位: 分钟，默认 60 分钟)'),
 });
 
 export type { BridgePluginConfig };

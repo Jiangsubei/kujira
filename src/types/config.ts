@@ -25,7 +25,7 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（15 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（19 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
@@ -57,4 +57,12 @@ export interface BridgePluginConfig {
   slang_evict_policy?: 'reject' | 'evict_lru';
   /** 黑话 Markdown 文档参考导出路径 (默认 .dsh/kujira/slang/slang.md) */
   slang_storage_path?: string;
+  /** 消息聚合回复总开关：开启后用户连续发送的消息按周期窗口聚合，一次性交给模型回复 */
+  aggregation_enabled?: boolean;
+  /** 消息聚合周期窗口 (单位: 分钟，默认 2 分钟)：每隔该时长抓取一次未回复消息池 */
+  aggregation_interval_mins?: number;
+  /** 冷场主动搭话总开关：长时间无新消息时主动发起话题 */
+  idle_reply_enabled?: boolean;
+  /** 冷场判定阈值 (单位: 分钟，默认 60 分钟)：沉默达到该时长后触发主动搭话 */
+  idle_reply_timeout_mins?: number;
 }

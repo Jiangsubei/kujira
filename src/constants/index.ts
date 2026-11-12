@@ -108,6 +108,25 @@ export const DEFAULT_SLANG_MAX_ENTRIES = 300;
 export const DEFAULT_SLANG_EVICT_POLICY = 'reject' as const;
 
 // ---------------------------------------------------------------------------
+// 单聊消息聚合回复与冷场主动搭话默认值
+// ---------------------------------------------------------------------------
+
+/** 消息聚合回复总开关 (默认关闭，需用户显式开启) */
+export const DEFAULT_AGGREGATION_ENABLED = false;
+
+/** 消息聚合周期窗口 (单位: 分钟，默认 2 分钟) */
+export const DEFAULT_AGGREGATION_INTERVAL_MINS = 2;
+
+/** 冷场主动搭话总开关 (默认关闭，需用户显式开启) */
+export const DEFAULT_IDLE_REPLY_ENABLED = false;
+
+/** 冷场判定阈值 (单位: 分钟，默认 60 分钟) */
+export const DEFAULT_IDLE_REPLY_TIMEOUT_MINS = 60;
+
+/** 主动能力集中巡检周期 (固定 60 秒，与 TaskScheduler 兜底扫描同频) */
+export const PROACTIVE_CHECK_INTERVAL_MS = 60 * 1000;
+
+// ---------------------------------------------------------------------------
 // 人格、记忆与单聊交互规范文案
 // ---------------------------------------------------------------------------
 
@@ -140,7 +159,7 @@ export function resolveEffectiveBehavior(configured?: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// 核心配置默认值单一真相源 (与 BridgePluginConfig 15 项核心配置对齐)
+// 核心配置默认值单一真相源 (与 BridgePluginConfig 19 项核心配置对齐)
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_BASE_CONFIG = {
@@ -159,4 +178,8 @@ export const DEFAULT_BASE_CONFIG = {
   slang_max_entries: DEFAULT_SLANG_MAX_ENTRIES,
   slang_evict_policy: DEFAULT_SLANG_EVICT_POLICY,
   slang_storage_path: DEFAULT_SLANG_STORAGE_PATH,
+  aggregation_enabled: DEFAULT_AGGREGATION_ENABLED,
+  aggregation_interval_mins: DEFAULT_AGGREGATION_INTERVAL_MINS,
+  idle_reply_enabled: DEFAULT_IDLE_REPLY_ENABLED,
+  idle_reply_timeout_mins: DEFAULT_IDLE_REPLY_TIMEOUT_MINS,
 };

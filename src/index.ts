@@ -18,6 +18,7 @@ import {
   DEFAULT_SLANG_STORAGE_PATH,
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
+  PROACTIVE_CHECK_INTERVAL_MS,
 } from './constants/index.js';
 
 const QQ_INBOUND_MSG_TYPE_FORWARD = 102;
@@ -56,6 +57,8 @@ import {
 } from './gateway/wakeup.js';
 import { SessionManager } from './gateway/session.js';
 import { SystemEventHub } from './gateway/system-event-hub.js';
+import { ProactiveManager } from './gateway/proactive.js';
+import type { SystemWakeupEvent } from './types/system-event.js';
 import {
   describeInboundAttachments,
   toMessageMediaFields,
@@ -271,6 +274,35 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   const systemEventHub = new SystemEventHub({ sessionManager, logger });
   sessionManager.setSystemEventHub(systemEventHub);
 
+  // 4.1 单聊主动能力：消息聚合回复与冷场主动搭话（巡检固定 60s，两个开关各自独立门控）
+  const proactiveManager = new ProactiveManager();
+  const dispatchProactiveEvent = async (event: SystemWakeupEvent): Promise<void> => {
+    // 冷场搭话必须拿得到有效被动锚点才能发信；无锚点时直接跳过，绝不降级为纯主动消息
+    if (event.kind === 'idle_reply') {
+      const anchor = outboundBridge.resolvePassiveMsgId(event.peer);
+      if (!anchor) {
+        logger.debug?.(`[Plugin] 冷场搭话跳过：无可用被动锚点 (peer: ${event.peer})`);
+        return;
+      }
+    }
+    await systemEventHub.dispatchSystemEvent(event);
+  };
+  proactiveManager.startChecker(
+    () => ({
+      config: currentConfig(),
+      dispatch: dispatchProactiveEvent,
+      isSessionBusy: (peer: string) => sessionManager.isBusy(peer),
+      knownPeers: () => {
+        try {
+          return db.getAllSessionStates().map((s) => s.peer);
+        } catch {
+          return [];
+        }
+      },
+    }),
+    PROACTIVE_CHECK_INTERVAL_MS
+  );
+
   const taskScheduler = new TaskScheduler({
     systemEventHub,
     db,
@@ -388,6 +420,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   provideService(ctx, 'kujira-bridge-config', currentConfig);
   provideService(ctx, 'kujira-gateway', gateway);
   provideService(ctx, 'kujira-outbound-bridge', outboundBridge);
+  provideService(ctx, 'kujira-proactive', proactiveManager);
 
   (ctx as any).inject?.(['agentPresets'], (presetCtx: Context) => {
     const agentPresetsSvc = (presetCtx as any).agentPresets;
@@ -824,7 +857,26 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       return;
     }
 
-    // 拦截 5：正常唤醒 Agent（先更新入站上下文与输入中状态，再入队唤醒）
+    // 拦截 5：消息聚合回复门控
+    // 聚合开启时，普通消息不再即时唤醒，而是落入该 peer 的消息池，由周期巡检统一投递。
+    // 聚合入池期间绝不发送 `msg_type=6` 输入中提示（否则「正在输入」会挂满整个窗口）。
+    const activeConfig = currentConfig();
+    if (activeConfig.aggregation_enabled) {
+      outboundBridge.trackInboundContext(peer, inboundContext);
+      proactiveManager.recordMessage(
+        peer,
+        {
+          ...(savedShortId ? { short_id: savedShortId } : {}),
+          content,
+          time: receivedAt,
+        },
+        activeConfig
+      );
+      logger.debug?.(`[Plugin] 消息已入聚合池 (peer: ${peer}, 窗口: ${activeConfig.aggregation_interval_mins ?? 2} 分钟)`);
+      return;
+    }
+
+    // 拦截 6：正常唤醒 Agent（先更新入站上下文与输入中状态，再入队唤醒）
     outboundBridge.trackInboundContext(peer, inboundContext);
     if (msgId) {
       void outboundBridge.sendInputNotifyIfEnabled(peer, { openid, msgId }).catch(() => {});
@@ -914,6 +966,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     memoryService.dispose();
     slangService.dispose();
     taskScheduler.dispose();
+    proactiveManager.dispose();
     safeCall(stopOutboundBridge);
     try {
       outboundBridge.dispose();

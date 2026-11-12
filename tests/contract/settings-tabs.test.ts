@@ -155,6 +155,45 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).not.toContain('admins');
       expect(connectionHtml).not.toContain('aliases');
     });
+
+    it('Tab 1 追加 4 项主动能力配置：聚合开关/聚合窗口/搭话开关/搭话阈值，且窗口与阈值随各自开关联动禁用', () => {
+      const html = renderCard({ initialTab: 'connection' });
+      const connectionPanelMatch = html.match(
+        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
+      );
+      expect(connectionPanelMatch).not.toBeNull();
+      const connectionHtml = connectionPanelMatch![0];
+
+      // 1. 四个控件齐全
+      expect(connectionHtml).toContain('id="kujira-aggregation-enabled"');
+      expect(connectionHtml).toContain('id="kujira-aggregation-interval-mins"');
+      expect(connectionHtml).toContain('id="kujira-idle-reply-enabled"');
+      expect(connectionHtml).toContain('id="kujira-idle-reply-timeout-mins"');
+
+      // 2. 默认全关时，两个数值项均被禁用（避免无意义配置）
+      expect(connectionHtml).toMatch(/id="kujira-aggregation-interval-mins"[^>]*disabled/);
+      expect(connectionHtml).toMatch(/id="kujira-idle-reply-timeout-mins"[^>]*disabled/);
+
+      // 3. 默认值渲染（聚合窗口 2 分钟 / 搭话阈值 60 分钟）
+      expect(connectionHtml).toMatch(/id="kujira-aggregation-interval-mins"[^>]*value="2"/);
+      expect(connectionHtml).toMatch(/id="kujira-idle-reply-timeout-mins"[^>]*value="60"/);
+
+      // 4. 开启后对应数值项解禁
+      const enabledHtml = renderCard({
+        initialTab: 'connection',
+        initialConfig: { aggregation_enabled: true, idle_reply_enabled: true },
+      });
+      const enabledPanel = enabledHtml.match(
+        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
+      )![0];
+      expect(enabledPanel).not.toMatch(/id="kujira-aggregation-interval-mins"[^>]*disabled/);
+      expect(enabledPanel).not.toMatch(/id="kujira-idle-reply-timeout-mins"[^>]*disabled/);
+
+      // 5. 绝不复用已废弃的群聊 proactive_* 键名
+      expect(connectionHtml).not.toContain('proactive_reply_enabled');
+      expect(connectionHtml).not.toContain('proactive_idle_timeout_mins');
+      expect(connectionHtml).not.toContain('proactive_buffer_size');
+    });
   });
 
   describe('3. 各 Tab 控件完整性契约', () => {

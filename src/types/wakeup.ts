@@ -4,13 +4,25 @@
 
 import type { SystemWakeupEvent } from './system-event.js';
 
-export type WakeupTriggerType = 'direct' | 'quote' | 'scheduled';
+export type WakeupTriggerType = 'direct' | 'quote' | 'scheduled' | 'aggregated' | 'idle_reply';
 
 /** 入站引用消息快照（优先通过 ref_idx 反查库；TMP_ 或未命中时由 msg_elements 回退填充） */
 export interface WakeupQuotedInfo {
   short_id?: string;
   time?: number;
   text: string;
+}
+
+/**
+ * 消息聚合池中的一条待回复消息（精简契约：全部使用短 ID，绝不透出长 `ROBOT1.0_` 锚点）
+ */
+export interface AggregatedMessage {
+  /** 单聊短消息 ID（如 `msg_<n>`），入池时已解析 */
+  short_id?: string;
+  /** 归一化后的消息正文（含附件占位符与引用前缀） */
+  content: string;
+  /** 消息时间戳（毫秒） */
+  time: number;
 }
 
 export interface WakeupPayload {
@@ -27,12 +39,18 @@ export interface WakeupPayload {
   task_rule?: string;
   /** 定时任务类型 (当 trigger === 'scheduled' 时提供) */
   task_type?: 'once' | 'recurring';
+  /** 本轮聚合的未回复消息快照 (当 trigger === 'aggregated' 时提供) */
+  aggregated_messages?: AggregatedMessage[];
+  /** 聚合周期窗口分钟数 (当 trigger === 'aggregated' 时提供) */
+  aggregation_interval_mins?: number;
+  /** 沉默时长分钟数 (当 trigger === 'idle_reply' 时提供) */
+  idle_minutes?: number;
   peer: string;
   from_user: string;
   from_name: string;
   content: string;
   quoted?: WakeupQuotedInfo;
-  /** 是否为系统内部生成的事件（定时任务，非真实用户消息） */
+  /** 是否为系统内部生成的事件（定时任务、聚合投递、冷场搭话） */
   is_system?: boolean;
   /** 对应的强类型系统事件实体（由 SystemEventHub 统一注入） */
   system_event?: SystemWakeupEvent;

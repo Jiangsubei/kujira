@@ -1,5 +1,5 @@
 import React from 'react';
-import { ValueField } from '../fields.js';
+import { ValueField, SwitchField } from '../fields.js';
 import { cardStyle, fieldStyle } from '../card-styles.js';
 import type {
   BridgePluginConfig,
@@ -9,6 +9,8 @@ import type {
 import {
   DEFAULT_IMAGE_TTL_DAYS,
   DEFAULT_NEW_MESSAGE_BEHAVIOR,
+  DEFAULT_AGGREGATION_INTERVAL_MINS,
+  DEFAULT_IDLE_REPLY_TIMEOUT_MINS,
 } from '../../constants/index.js';
 import type { KujiraFormModel } from '../model.js';
 
@@ -148,6 +150,72 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
         overridden={model.isOverridden('image_ttl_days')}
         onReset={() => onResetField('image_ttl_days')}
         onChange={(val) => onFieldChange('image_ttl_days', parseInt(val, 10) || DEFAULT_IMAGE_TTL_DAYS)}
+      />
+
+      <SwitchField
+        id="kujira-aggregation-enabled"
+        label="连续消息聚合回复 (aggregation_enabled)"
+        hint={
+          draft.aggregation_enabled
+            ? '用户连续发送的多条消息会按下方周期窗口合并，到点后由模型一次性综合回复'
+            : '开启后，用户连续发送的多条消息不再逐条即时回复，而是按周期窗口合并后一次性回复'
+        }
+        checked={draft.aggregation_enabled ?? false}
+        disabled={saving}
+        overridden={model.isOverridden('aggregation_enabled')}
+        onReset={() => onResetField('aggregation_enabled')}
+        onChange={(checked) => onFieldChange('aggregation_enabled', checked)}
+      />
+
+      <ValueField
+        id="kujira-aggregation-interval-mins"
+        label="聚合周期窗口 (aggregation_interval_mins)"
+        hint={`每隔多少分钟抓取一次未回复消息池 (默认 ${DEFAULT_AGGREGATION_INTERVAL_MINS} 分钟)`}
+        placeholder={String(DEFAULT_AGGREGATION_INTERVAL_MINS)}
+        numeric
+        value={String(draft.aggregation_interval_mins ?? DEFAULT_AGGREGATION_INTERVAL_MINS)}
+        disabled={saving || !draft.aggregation_enabled}
+        overridden={model.isOverridden('aggregation_interval_mins')}
+        onReset={() => onResetField('aggregation_interval_mins')}
+        onChange={(val) =>
+          onFieldChange(
+            'aggregation_interval_mins',
+            parseInt(val, 10) || DEFAULT_AGGREGATION_INTERVAL_MINS
+          )
+        }
+      />
+
+      <SwitchField
+        id="kujira-idle-reply-enabled"
+        label="冷场主动搭话 (idle_reply_enabled)"
+        hint={
+          draft.idle_reply_enabled
+            ? '长时间没有新消息时，由模型自主判断是否主动发起话题'
+            : '开启后，单聊长时间无新消息时模型会主动找话题；需存在可用的被动回复锚点才会发信'
+        }
+        checked={draft.idle_reply_enabled ?? false}
+        disabled={saving}
+        overridden={model.isOverridden('idle_reply_enabled')}
+        onReset={() => onResetField('idle_reply_enabled')}
+        onChange={(checked) => onFieldChange('idle_reply_enabled', checked)}
+      />
+
+      <ValueField
+        id="kujira-idle-reply-timeout-mins"
+        label="冷场判定阈值 (idle_reply_timeout_mins)"
+        hint={`连续多少分钟没有新消息视为冷场 (默认 ${DEFAULT_IDLE_REPLY_TIMEOUT_MINS} 分钟)`}
+        placeholder={String(DEFAULT_IDLE_REPLY_TIMEOUT_MINS)}
+        numeric
+        value={String(draft.idle_reply_timeout_mins ?? DEFAULT_IDLE_REPLY_TIMEOUT_MINS)}
+        disabled={saving || !draft.idle_reply_enabled}
+        overridden={model.isOverridden('idle_reply_timeout_mins')}
+        onReset={() => onResetField('idle_reply_timeout_mins')}
+        onChange={(val) =>
+          onFieldChange(
+            'idle_reply_timeout_mins',
+            parseInt(val, 10) || DEFAULT_IDLE_REPLY_TIMEOUT_MINS
+          )
+        }
       />
     </div>
   );
