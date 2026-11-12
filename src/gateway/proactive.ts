@@ -167,8 +167,11 @@ export class ProactiveManager {
       for (const peer of peers) {
         // 等待用户输入：跳过本轮唤醒，标志保留，等下一轮一并处理
         if (options.isAwaitingUserInput?.(peer)) continue;
-        // 无活跃会话：跳过（消息仍在库中，会话恢复后由后续 tick 处理）
-        if (options.hasActiveSession && !options.hasActiveSession(peer)) continue;
+        // 无活跃会话：尝试建立（用户真实发过消息，消息已在库中）
+        if (options.hasActiveSession && !options.hasActiveSession(peer)) {
+          const ready = await options.ensureSession?.(peer);
+          if (!ready) continue;
+        }
         // 原子消费标志：即便投递失败也不回滚，避免同一批消息被反复唤醒
         if (!this.consumePendingMessage(peer)) continue;
 

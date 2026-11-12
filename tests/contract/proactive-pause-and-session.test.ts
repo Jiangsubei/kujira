@@ -6,7 +6,7 @@
  * 覆盖规范清单:
  * 1. 等待用户输入时跳过唤醒：时钟继续走、标志保留，消息累积到下一轮；
  * 2. 恢复后由下一轮 tick 一并处理，绝不丢失消息；
- * 3. 活跃会话门控：聚合仅在有活跃会话时投递；冷场搭话对「曾互动但会话已不在」允许建会话；
+ * 3. 活跃会话门控：聚合与冷场搭话均对「无活跃会话」尝试 ensureSession 后投递；
  * 4. 审批解耦：聚合轮次登记真实发起人（可审批），冷场搭话与定时任务保持 Fail-Closed。
  */
 
@@ -132,24 +132,35 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
 });
 
 describe('契约 2: 活跃会话门控', () => {
-  it('聚合：无活跃会话时跳过，标志保留待会话恢复', async () => {
+  it('聚合：无活跃会话时尝试 ensureSession，成功则投递', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
+    const ensureSession = vi.fn(async () => true);
 
     manager.recordMessage(PEER);
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
     await manager.checkProactive(
-      makeOptions({ dispatch, now: T0 + 120_000, hasActiveSession: () => false })
+      makeOptions({ dispatch, now: T0 + 120_000, hasActiveSession: () => false, ensureSession })
     );
 
-    expect(dispatch).not.toHaveBeenCalled();
-    expect(manager.hasPendingMessage(PEER)).toBe(true);
-
-    // 会话恢复后正常投递
-    await manager.checkProactive(
-      makeOptions({ dispatch, now: T0 + 240_000, hasActiveSession: () => true })
-    );
+    expect(ensureSession).toHaveBeenCalledWith(PEER);
     expect(dispatch).toHaveBeenCalledTimes(1);
+    expect((dispatch.mock.calls[0]![0] as any).kind).toBe('aggregated_messages');
+  });
+
+  it('聚合：无活跃会话且 ensureSession 失败时跳过，标志已消费', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const ensureSession = vi.fn(async () => false);
+
+    manager.recordMessage(PEER);
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
+    await manager.checkProactive(
+      makeOptions({ dispatch, now: T0 + 120_000, hasActiveSession: () => false, ensureSession })
+    );
+
+    expect(ensureSession).toHaveBeenCalledWith(PEER);
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it('冷场搭话：有 peer 记录但无会话 → 建会话后搭话', async () => {
