@@ -119,4 +119,20 @@ export class SessionRepository {
       .get(cleanOpenid) as { peer?: string } | undefined;
     return row?.peer ? String(row.peer) : null;
   }
+
+  /**
+   * 全量列举已登记过身份映射的 peer（即「曾经真实互动过」的用户）。
+   * 冷场搭话据此判定：有 peer 记录才允许为其创建会话并唤醒，
+   * 绝不为从未出现过的 User 凭空新建 Session。
+   */
+  getAllPeers(): string[] {
+    const db = this.getDb();
+    const rows = db.prepare('SELECT peer FROM peer_openid_map').all() as Array<{ peer?: unknown }>;
+    const out: string[] = [];
+    for (const row of rows) {
+      const peer = typeof row?.peer === 'string' ? row.peer.trim() : '';
+      if (peer) out.push(peer);
+    }
+    return out;
+  }
 }

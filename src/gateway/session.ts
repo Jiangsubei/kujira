@@ -475,6 +475,23 @@ export class SessionManager {
   }
 
   /**
+   * 确保该 peer 拥有可用会话（必要时创建）。
+   * 仅用于冷场搭话：调用方须先确认该 peer 在 `peer_openid_map` 中有过真实互动记录，
+   * 杜绝为从未出现过的 User 凭空新建会话。
+   *
+   * @returns 会话是否可用
+   */
+  public async ensureSession(peer: string): Promise<boolean> {
+    if (!peer) return false;
+    try {
+      const sid = this.peerToSessionId(peer);
+      return Boolean(sid);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * 只读判定：该 peer 是否存在**当前活跃会话**（口径与 `/状态` 命令一致）。
    *
    * 严格无副作用——绝不创建、绝不持久化、绝不重新分配会话。

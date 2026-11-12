@@ -214,6 +214,11 @@ export class MessageDatabase {
     return this.sessionRepo.getPeerByOpenid(openid);
   }
 
+  /** 全量列举「曾经真实互动过」的 peer（peer_openid_map 中已登记的） */
+  getAllPeers(): string[] {
+    return this.sessionRepo.getAllPeers();
+  }
+
   // ==================== 插件键值配置 ====================
 
   getPluginConfig(key: string): string | null {

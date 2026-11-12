@@ -12,13 +12,6 @@ import type { OutboundBridgeLike } from './session/types.js';
 import type { ScheduledTaskEvent, SystemWakeupEvent, AggregatedMessagesEvent, IdleReplyEvent } from '../types/system-event.js';
 import type { WakeupPayload } from '../types/index.js';
 import { formatDateTime } from '../storage/time-parser.js';
-import { isShortMessageId } from '../utils/short-id.js';
-
-/** 格式化短消息 ID 标签（仅接受 `msg_<n>` / `msg_self_<n>`；本地内联以避免与 external-prompt 循环依赖） */
-function formatShortIdTag(shortId: unknown): string {
-  const raw = typeof shortId === 'string' ? shortId.trim() : '';
-  return raw && isShortMessageId(raw) ? `[${raw}]` : '';
-}
 
 export interface SystemEventSessionManager {
   dispatchWakeup(
@@ -63,31 +56,28 @@ export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
 
     case 'aggregated_messages': {
       const intervalTag = event.intervalMinutes
-        ? ` [聚合窗口: ${event.intervalMinutes} 分钟]`
+        ? ` [聚合周期: ${event.intervalMinutes} 分钟]`
         : '';
-      const lines: string[] = [];
-      for (const m of event.messages) {
-        const timeTag = m.time && !Number.isNaN(m.time) ? `[${formatDateTime(m.time)}]` : '';
-        const idTag = formatShortIdTag(m.short_id);
-        const parts = [idTag, timeTag, m.content].filter((p) => p !== '');
-        lines.push(parts.join(' '));
-      }
-      const listContent = lines.join('\n') || '（本轮无待回复消息）';
 
+      // 关键设计：绝不携带任何消息内容或消息列表。
+      // 数据库是唯一可信源，模型必须自行调用 read_chat_history 取回新消息。
       const guide =
-        '（说明：以上是你在最近一个聚合窗口内尚未回复的连续单聊消息，已按时间顺序列出。请综合理解整段对话的意图后，通过 send_qq_message 一次性作出完整回应，不要逐条机械复读；若前文不足可先调用 read_chat_history 补齐。表现自然，切勿向用户透露消息聚合、窗口或系统唤醒等任何后台痕迹。）';
+        '（说明：这是一次周期性的消息检查点，用户在你的上一条回复之后又发来了新消息。' +
+        '**你必须先调用 read_chat_history 工具**（建议用 relative 参数按需回溯，如 "30m"、"2h"，' +
+        '并结合 exclude_self: true 只看对方发言），确认自你上次回复以来对方说了什么，' +
+        '再判断是否需要通过 send_qq_message 回复。若读取后发现没有需要回应的内容，直接输出 [已回复] 即可。' +
+        '表现自然，切勿向用户透露消息聚合、周期检查或系统唤醒等任何后台痕迹。）';
 
       return (
         `系统事件：[消息聚合]${intervalTag}${timeStr ? ` [${timeStr}]` : ''}\n\n` +
-        `待回复消息：\n` +
-        `${listContent}\n\n` +
+        `会话状态：检测到自上次回复以来有新的用户消息待查看。\n\n` +
         guide
       );
     }
 
     case 'idle_reply': {
       const guide =
-        '（说明：当前单聊已经较长时间没有新消息。你可以自主评估是否适合主动发起一个自然的话题、关心近况或延续此前聊过的事情，并通过 send_qq_message 发送给对方；若判断当前不宜打扰，直接输出 [结束] 即可，不必强行发言。切勿向用户透露冷场判定、沉默时长或系统唤醒等任何后台痕迹。）';
+        '（说明：当前单聊已经较长时间没有新消息。你可以自主评估是否适合主动发起一个自然的话题、关心近况或延续此前聊过的事情；若需要回顾前情，可先调用 read_chat_history 查看最近的聊天记录。判断适合时通过 send_qq_message 发送给对方，若判断当前不宜打扰，直接输出 [结束] 即可，不必强行发言。切勿向用户透露冷场判定、沉默时长或系统唤醒等任何后台痕迹。）';
 
       return (
         `系统事件：[冷场陪伴]${timeStr ? ` [${timeStr}]` : ''}\n\n` +
@@ -102,6 +92,11 @@ export interface SystemEventHubOptions {
   sessionManager: SystemEventSessionManager;
   outboundBridge?: OutboundBridgeLike;
   logger?: any;
+  /**
+   * 解析 peer 对应的真实 openid（来自身份映射表）。
+   * 聚合轮次据此登记审批发起人；解析不到时该轮次审批保持 Fail-Closed。
+   */
+  resolveOpenid?: (peer: string) => string | undefined;
 }
 
 export class SystemEventHub {
@@ -164,7 +159,19 @@ export class SystemEventHub {
     // 关键区分：聚合投递来自真实用户消息（携带真实 from_user），具备审批发起人资格；
     // 定时任务与冷场搭话为系统自发，from_user 严格留空，审批保持 Fail-Closed。
     const isAggregated = event.kind === 'aggregated_messages';
-    const realFromUser = isAggregated ? (event.fromUser ?? '') : '';
+    let realFromUser = '';
+    if (isAggregated) {
+      const explicit = typeof event.fromUser === 'string' ? event.fromUser.trim() : '';
+      if (explicit) {
+        realFromUser = explicit;
+      } else if (this.options.resolveOpenid) {
+        try {
+          realFromUser = this.options.resolveOpenid(peer)?.trim() ?? '';
+        } catch {
+          realFromUser = '';
+        }
+      }
+    }
 
     const payload: WakeupPayload = {
       peer,
@@ -180,7 +187,6 @@ export class SystemEventHub {
         : {}),
       ...(isAggregated
         ? {
-            aggregated_messages: event.messages,
             ...(event.intervalMinutes !== undefined
               ? { aggregation_interval_mins: event.intervalMinutes }
               : {}),

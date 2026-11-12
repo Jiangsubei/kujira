@@ -271,7 +271,18 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   const stopOutboundBridge = outboundBridge.start();
   const serialSender = outboundBridge.getSender();
 
-  const systemEventHub = new SystemEventHub({ sessionManager, logger });
+  const systemEventHub = new SystemEventHub({
+    sessionManager,
+    logger,
+    // 聚合轮次的审批发起人：从身份映射表解析真实 openid（解析不到则 Fail-Closed）
+    resolveOpenid: (peer: string) => {
+      try {
+        return db.getOpenidByPeer(peer) ?? undefined;
+      } catch {
+        return undefined;
+      }
+    },
+  });
   sessionManager.setSystemEventHub(systemEventHub);
 
   // 4.1 单聊主动能力：消息聚合回复与冷场主动搭话（巡检固定 60s，两个开关各自独立门控）
@@ -294,13 +305,25 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     () => ({
       config: currentConfig(),
       dispatch: dispatchProactiveEvent,
-      // 等待提问答复或审批决策期间暂停全部计时，恢复后重新累计完整窗口
+      // 等待提问答复或审批决策期间跳过唤醒，新消息累积到下一轮
       isAwaitingUserInput: (peer: string) => isAwaitingUserInput(peer),
-      // 活跃会话门控：口径与 `/状态` 命令一致，无活跃会话的 peer 一律跳过
+      // 活跃会话门控：口径与 `/状态` 命令一致
       hasActiveSession: (peer: string) => sessionManager.hasActiveSession(peer),
+      // 冷场搭话时：曾有互动但会话已不在 → 允许新建会话后唤醒
+      ensureSession: (peer: string) => sessionManager.ensureSession(peer),
+      // 沉默起点以库中最新入站消息为准，重启后依然准确
+      lastHumanMessageAt: (peer: string) => {
+        try {
+          const slot = db.getLatestValidInboundSlot(peer);
+          return slot?.received_at ?? null;
+        } catch {
+          return null;
+        }
+      },
+      // 仅「曾经真实互动过」的 peer（peer_openid_map 已登记）才参与冷场搭话扫描
       knownPeers: () => {
         try {
-          return db.getAllSessionStates().map((s) => s.peer);
+          return db.getAllPeers();
         } catch {
           return [];
         }
@@ -874,23 +897,16 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
 
     // 拦截 5：消息聚合回复门控
-    // 聚合开启时，普通消息不再即时唤醒，而是落入该 peer 的消息池，由周期巡检统一投递。
-    // 聚合入池期间绝不发送 `msg_type=6` 输入中提示（否则「正在输入」会挂满整个窗口）。
+    // 聚合开启时，普通消息**不进入 session、不即时唤醒**，仅落库并置「有新消息」标志。
+    // 模型在周期检查点被唤醒后，自行调用 read_chat_history 取回内容——我们不再维护消息池。
+    // 聚合期间绝不发送 `msg_type=6` 输入中提示（否则「正在输入」会长时间挂着）。
     const activeConfig = currentConfig();
     if (activeConfig.aggregation_enabled) {
       outboundBridge.trackInboundContext(peer, inboundContext);
-      proactiveManager.recordMessage(
-        peer,
-        {
-          ...(savedShortId ? { short_id: savedShortId } : {}),
-          content,
-          time: receivedAt,
-        },
-        activeConfig,
-        // 真实发送者 openid：聚合轮次据此登记审批发起人，使轮内可正常使用审批/提问工具
-        openid
+      proactiveManager.recordMessage(peer);
+      logger.debug?.(
+        `[Plugin] 消息已落库并标记待聚合 (peer: ${peer}, 周期: ${activeConfig.aggregation_interval_mins ?? 2} 分钟)`
       );
-      logger.debug?.(`[Plugin] 消息已入聚合池 (peer: ${peer}, 窗口: ${activeConfig.aggregation_interval_mins ?? 2} 分钟)`);
       return;
     }
 

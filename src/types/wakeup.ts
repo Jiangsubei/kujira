@@ -15,6 +15,8 @@ export interface WakeupQuotedInfo {
 
 /**
  * 消息聚合池中的一条待回复消息（精简契约：全部使用短 ID，绝不透出长 `ROBOT1.0_` 锚点）
+ * @deprecated 聚合已改为「不携带消息内容、由模型自调 read_chat_history」，
+ *   该类型仅保留供历史调用方过渡，新代码请勿使用。
  */
 export interface AggregatedMessage {
   /** 单聊短消息 ID（如 `msg_<n>`），入池时已解析 */
@@ -39,9 +41,7 @@ export interface WakeupPayload {
   task_rule?: string;
   /** 定时任务类型 (当 trigger === 'scheduled' 时提供) */
   task_type?: 'once' | 'recurring';
-  /** 本轮聚合的未回复消息快照 (当 trigger === 'aggregated' 时提供) */
-  aggregated_messages?: AggregatedMessage[];
-  /** 聚合周期窗口分钟数 (当 trigger === 'aggregated' 时提供) */
+  /** 聚合周期分钟数 (当 trigger === 'aggregated' 时提供) */
   aggregation_interval_mins?: number;
   /** 沉默时长分钟数 (当 trigger === 'idle_reply' 时提供) */
   idle_minutes?: number;

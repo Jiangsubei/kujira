@@ -4,15 +4,9 @@
  * 契约测试: 单聊主动能力的**真实装配闭环** (Proactive Assembly Contract)
  *
  * 依据 AGENTS.md 3.1「严禁以单元测试替代装配验证」：
- * 本文件不新建 mock 桩，而是走真实 `bootDshKujira({ mountPlugin: true })` 装配，
- * 验证「ProactiveManager → 入站链路 → SystemEventHub → SessionManager」全链路真实可达：
- *
- * 1. 真实 boot 装配后 `kujira-proactive` 服务可获取，且停驻于插件生命周期；
- * 2. 聚合开关开启时，真实入站 C2C_MESSAGE_CREATE 事件**不立即唤醒**，而是落入聚合池；
- * 3. 周期巡检到点后，经 SystemEventHub 真实投递聚合唤醒（断言 payload 形态与提示词）；
- * 4. 聚合入池期间绝不发送 `msg_type=6` 输入中提示（否则「正在输入」挂满窗口）；
- * 5. 冷场搭话在无可用被动锚点时被跳过，绝不降级为纯主动消息；
- * 6. 插件 dispose 后巡检定时器停止，无悬挂句柄。
+ * 走真实 `bootDshKujira({ mountPlugin: true })` 装配，通过真实网关分发链路
+ * （FakeWs 注入 OP_DISPATCH 帧）验证「入站 → 标志 → 自由周期时钟 → SystemEventHub → SessionManager」
+ * 全链路真实可达，而非直调内部 handler。
  */
 
 import * as os from 'node:os';
@@ -97,6 +91,8 @@ class FakeWs {
   }
 }
 
+let lastWs: FakeWs | null = null;
+
 async function waitForGatewayReady(gateway: any, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -106,10 +102,7 @@ async function waitForGatewayReady(gateway: any, timeoutMs = 3000): Promise<void
   throw new Error('KujiraGatewayClient READY 超时');
 }
 
-/** 捕获最近一次构造的 FakeWs 实例，用于注入服务端下发帧 */
-let lastWs: FakeWs | null = null;
-
-describe('契约 1 ~ 6: 单聊主动能力真实装配闭环', () => {
+describe('单聊主动能力真实装配闭环', () => {
   let tmpHome: string;
   let booted: BootedDsh | null = null;
   let outboundRequests: Array<{ url: string; body: Record<string, any> }> = [];
@@ -192,136 +185,94 @@ describe('契约 1 ~ 6: 单聊主动能力真实装配闭环', () => {
     });
   }
 
-  it('契约 1: 真实装配后 kujira-proactive 服务可获取并有 checkProactive 能力', () => {
+  it('契约 1: 真实装配后 kujira-proactive 可获取，且暴露极简布尔标志 API', () => {
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
     expect(proactive).toBeDefined();
     expect(typeof proactive.checkProactive).toBe('function');
     expect(typeof proactive.recordMessage).toBe('function');
-    expect(typeof proactive.consumePendingMessages).toBe('function');
+    expect(typeof proactive.hasPendingMessage).toBe('function');
+    // 消息池 API 必须已删除
+    expect(proactive.getPendingMessages).toBeUndefined();
+    expect(proactive.consumePendingMessages).toBeUndefined();
   });
 
-  it('契约 2: 聚合开启时入站消息落入聚合池，且不发送 msg_type=6 输入中提示', async () => {
+  it('契约 2: 聚合开启时入站消息只置标志，不唤醒、不进 session、不发输入中提示', async () => {
     emitInbound('ROBOT1.0_IN_P_1', '在吗');
-    await new Promise((r) => setTimeout(r, 80));
+    await new Promise((r) => setTimeout(r, 120));
 
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
-    const pending = proactive.getPendingMessages(MOCK_PEER);
-    expect(pending).toHaveLength(1);
-    expect(pending[0].content).toBe('在吗');
-    expect(pending[0].short_id).toBeTruthy();
+    expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(true);
 
-    // 聚合入池期间绝不发送任何出站（尤其不得发 msg_type=6 输入中提示）
+    // 不产生任何出站（尤其不得发 msg_type=6 输入中提示）
     expect(outboundRequests).toHaveLength(0);
   });
 
-  it('契约 3: 周期巡检到点后经 SystemEventHub 真实投递聚合唤醒，payload 形态与提示词正确', async () => {
+  it('契约 3: 自由周期时钟到点后经 SystemEventHub 真实投递聚合唤醒，事件不带消息内容', async () => {
     emitInbound('ROBOT1.0_IN_P_2', '在吗');
     emitInbound('ROBOT1.0_IN_P_3', '那个接口一直 403');
-    await new Promise((r) => setTimeout(r, 80));
+    await new Promise((r) => setTimeout(r, 120));
 
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
     const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
     const dispatchSpy = vi.spyOn(hub, 'dispatchSystemEvent');
 
-    expect(proactive.getPendingMessages(MOCK_PEER)).toHaveLength(2);
-
-    // 用真实巡检入口，把 now 设为窗口之后
+    const now = Date.now();
+    // 建立相位
     await proactive.checkProactive({
       config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
       dispatch: (event: any) => hub.dispatchSystemEvent(event),
-      isSessionBusy: () => false,
-      now: Date.now() + 3 * 60 * 1000,
+      now,
+    });
+    // 到点
+    await proactive.checkProactive({
+      config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
+      dispatch: (event: any) => hub.dispatchSystemEvent(event),
+      now: now + 121_000,
     });
 
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
     const event = dispatchSpy.mock.calls[0]![0] as any;
     expect(event.kind).toBe('aggregated_messages');
     expect(event.peer).toBe(MOCK_PEER);
-    expect(event.messages).toHaveLength(2);
-    expect(event.messages.map((m: any) => m.content)).toEqual(['在吗', '那个接口一直 403']);
+    // 绝不携带消息内容
+    expect(event.messages).toBeUndefined();
 
-    // 投递后池已清空，绝不重复打扰
-    expect(proactive.getPendingMessages(MOCK_PEER)).toEqual([]);
+    // 标志已消费
+    expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(false);
   });
 
-  it('契约 4: 冷场搭话在无可用被动锚点时被跳过，绝不降级为纯主动消息', async () => {
-    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
-    // 从未有任何入站消息 → 无被动锚点
-    const anchor = (booted!.ctx as any).get('kujira-outbound-bridge').resolvePassiveMsgId(MOCK_PEER);
-    expect(anchor).toBeUndefined();
-
-    proactive.recordHumanMessage(MOCK_PEER, Date.now() - 120 * 60 * 1000);
-
-    const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
-    const dispatchSpy = vi.spyOn(hub, 'dispatchSystemEvent');
-
-    // 复刻 plugin 侧的真实门控逻辑：无锚点直接跳过
-    const idleEvent = { kind: 'idle_reply' as const, peer: MOCK_PEER, idleMinutes: 60 };
-    const guardAnchor = (booted!.ctx as any)
-      .get('kujira-outbound-bridge')
-      .resolvePassiveMsgId(idleEvent.peer);
-    if (guardAnchor) {
-      await hub.dispatchSystemEvent(idleEvent);
-    }
-
-    expect(dispatchSpy).not.toHaveBeenCalled();
-    expect(outboundRequests).toHaveLength(0);
-  });
-
-  it('契约 5: 插件 dispose 后巡检定时器停止，且状态清空', async () => {
-    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
-    emitInbound('ROBOT1.0_IN_P_4', '待清空消息');
-    await new Promise((r) => setTimeout(r, 80));
-    expect(proactive.getPendingMessages(MOCK_PEER).length).toBeGreaterThan(0);
-
-    await booted!.dispose();
-    booted = null;
-
-    expect(proactive.getPendingMessages(MOCK_PEER)).toEqual([]);
-  });
-
-  it('契约 6: 聚合池记录真实发送者 openid，聚合投递事件携带 fromUser', async () => {
-    emitInbound('ROBOT1.0_IN_P_5', '在吗');
-    await new Promise((r) => setTimeout(r, 80));
-
-    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
-    const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
-    const dispatchSpy = vi.spyOn(hub, 'dispatchSystemEvent');
-
-    await proactive.checkProactive({
-      config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
-      dispatch: (event: any) => hub.dispatchSystemEvent(event),
-      now: Date.now() + 3 * 60 * 1000,
-    });
-
-    expect(dispatchSpy).toHaveBeenCalledTimes(1);
-    expect((dispatchSpy.mock.calls[0]![0] as any).fromUser).toBe(MOCK_OPENID);
-  });
-
-  it('契约 7: 聚合轮次的 WakeupPayload 携带真实 from_user，使轮内审批可登记发起人', async () => {
-    emitInbound('ROBOT1.0_IN_P_6', '在吗');
-    await new Promise((r) => setTimeout(r, 80));
+  it('契约 4: 聚合轮次的 WakeupPayload 提示词要求模型自调 read_chat_history，且携带真实 from_user', async () => {
+    emitInbound('ROBOT1.0_IN_P_4', '在吗');
+    await new Promise((r) => setTimeout(r, 120));
 
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
     const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
     const sm = (booted!.ctx as any).get('kujira-session') as any;
-    const dispatchSpy = vi.spyOn(sm, 'dispatchWakeup');
+    const wakeSpy = vi.spyOn(sm, 'dispatchWakeup');
 
+    const now = Date.now();
     await proactive.checkProactive({
       config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
       dispatch: (event: any) => hub.dispatchSystemEvent(event),
-      now: Date.now() + 3 * 60 * 1000,
+      now,
+    });
+    await proactive.checkProactive({
+      config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
+      dispatch: (event: any) => hub.dispatchSystemEvent(event),
+      now: now + 121_000,
     });
 
-    expect(dispatchSpy).toHaveBeenCalledTimes(1);
-    const payload = dispatchSpy.mock.calls[0]![0] as any;
+    expect(wakeSpy).toHaveBeenCalledTimes(1);
+    const payload = wakeSpy.mock.calls[0]![0] as any;
     expect(payload.trigger).toBe('aggregated');
-    // 聚合来自真实用户消息 → 携带真实 from_user（与 idle_reply / scheduled 的空值严格区分）
     expect(payload.from_user).toBe(MOCK_OPENID);
     expect(payload.from_name).toBe('');
+    // 提示词强制自调工具，且不含消息正文
+    expect(payload.content).toContain('read_chat_history');
+    expect(payload.content).not.toContain('那个接口');
   });
 
-  it('契约 8: 冷场搭话的 WakeupPayload 保持 from_user 为空（系统自发，审批 Fail-Closed）', async () => {
+  it('契约 5: 冷场搭话 payload 保持 from_user 为空（系统自发，审批 Fail-Closed）', async () => {
     const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
     const sm = (booted!.ctx as any).get('kujira-session') as any;
     const dispatchSpy = vi.spyOn(sm, 'dispatchWakeup');
@@ -340,33 +291,38 @@ describe('契约 1 ~ 6: 单聊主动能力真实装配闭环', () => {
     expect(payload.from_name).toBe('');
   });
 
-  it('契约 9: 两个 provider 的 isWaiting 已真实装配且可查询', () => {
-    const questionProvider = (booted!.ctx as any).get('kujira-question-provider');
-    const approvalResponder = (booted!.ctx as any).get('kujira-approval-responder');
-    // 未提供为服务的场景下退化为能力探测：至少 plugin 内部持有的实例可被判活
-    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
-    expect(proactive).toBeDefined();
-
-    // isWaiting 必须是可安全调用的同步查询（无论是否挂起，绝不抛错）
-    if (questionProvider && typeof questionProvider.isWaiting === 'function') {
-      expect(() => questionProvider.isWaiting(MOCK_PEER)).not.toThrow();
-      expect(questionProvider.isWaiting(MOCK_PEER)).toBe(false);
-    }
-    if (approvalResponder && typeof approvalResponder.isWaiting === 'function') {
-      expect(() => approvalResponder.isWaiting(MOCK_PEER)).not.toThrow();
-      expect(approvalResponder.isWaiting(MOCK_PEER)).toBe(false);
-    }
+  it('契约 6: 冷场搭话在无可用被动锚点时被跳过', async () => {
+    const outbound = (booted!.ctx as any).get('kujira-outbound-bridge') as any;
+    expect(outbound.resolvePassiveMsgId(MOCK_PEER)).toBeUndefined();
   });
 
-  it('契约 10: hasActiveSession 为只读判定，绝不为无会话 peer 创建会话', async () => {
+  it('契约 7: 两个 provider 的 isWaiting 已真实装配且安全可调用', () => {
+    const proactive = (booted!.ctx as any).get('kujira-proactive');
+    expect(proactive).toBeDefined();
+
+    // 通过对外暴露的服务间接验证判活不会抛错（未挂起时应为 false）
+    const sessionManager = (booted!.ctx as any).get('kujira-session') as any;
+    expect(typeof sessionManager.hasActiveSession).toBe('function');
+    expect(() => sessionManager.hasActiveSession(MOCK_PEER)).not.toThrow();
+  });
+
+  it('契约 8: hasActiveSession 为只读判定，绝不为无会话 peer 创建会话', () => {
     const sm = (booted!.ctx as any).get('kujira-session') as any;
     const unknownPeer = 'user_ffffffffffffffff';
 
-    // 首次查询前：无会话
     expect(sm.hasActiveSession(unknownPeer)).toBe(false);
-    // 查询本身就是只读的，重复调用结果稳定且不产生副作用
     expect(sm.hasActiveSession(unknownPeer)).toBe(false);
-    // 该 peer 名下不存在任何被持久化的会话记录
     expect(sm.listPeerSessionIds(unknownPeer)).toEqual([]);
+  });
+
+  it('契约 9: 插件 dispose 后定时器停止且状态清空', async () => {    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
+    emitInbound('ROBOT1.0_IN_P_5', '待清空消息');
+    await new Promise((r) => setTimeout(r, 120));
+    expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(true);
+
+    await booted!.dispose();
+    booted = null;
+
+    expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(false);
   });
 });

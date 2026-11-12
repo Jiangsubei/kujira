@@ -157,8 +157,8 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
         label="连续消息聚合回复 (aggregation_enabled)"
         hint={
           draft.aggregation_enabled
-            ? '用户连续发送的多条消息会先收集起来，攒满下方时长后合并成一轮由模型一次性回复；等待用户答题或审批期间自动暂停计时'
-            : '开启后，用户连续发送的多条消息不再逐条即时回复，而是收集一段时间后合并成一轮一次性回复'
+            ? '按固定节奏周期性检查新消息，到点后由模型自行回看聊天记录并统一回复；不逐条即时应答，等待用户答题或审批期间自动跳过'
+            : '开启后，用户连续发送的多条消息不再逐条即时回复，而是按固定节奏统一查看并回复'
         }
         checked={draft.aggregation_enabled ?? false}
         disabled={saving}
@@ -169,8 +169,8 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-aggregation-interval-mins"
-        label="聚合收集时长 (aggregation_interval_mins)"
-        hint={`新消息到达后先收集多少分钟，到期再统一交给模型回复 (默认 ${DEFAULT_AGGREGATION_INTERVAL_MINS} 分钟)`}
+        label="聚合检查周期 (aggregation_interval_mins)"
+        hint={`每隔多少分钟检查一次新消息并统一回复，节奏从开启时起算 (默认 ${DEFAULT_AGGREGATION_INTERVAL_MINS} 分钟)`}
         placeholder={String(DEFAULT_AGGREGATION_INTERVAL_MINS)}
         numeric
         value={String(draft.aggregation_interval_mins ?? DEFAULT_AGGREGATION_INTERVAL_MINS)}
@@ -190,7 +190,7 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
         label="冷场主动搭话 (idle_reply_enabled)"
         hint={
           draft.idle_reply_enabled
-            ? '长时间没有新消息时，由模型自主判断是否主动发起话题；等待用户答题或审批期间同样暂停计时'
+            ? '长时间没有新消息时，由模型自主判断是否主动发起话题；等待用户答题或审批期间同样跳过'
             : '开启后，单聊长时间无新消息时模型会主动找话题；需存在可用的被动回复锚点才会发信'
         }
         checked={draft.idle_reply_enabled ?? false}
