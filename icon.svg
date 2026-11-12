@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="1007" height="1007" viewBox="0 0 1007 1007" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Blue-haired chibi maid — geometric vector reconstruction</title>
+  <desc id="description">Hand-designed cubic Bezier shapes and ellipses, layered to match the supplied square reference. Fully vector, without embedded images, tracing, scripts, fonts or external dependencies.</desc>
+  <defs>
+    <!-- 圆角遮罩：10px @ 36px 显示尺寸，等于官方 48px 图标框 r=16px 减去 6px 内边距，弧线同心 -->
+    <clipPath id="canvas"><rect width="1007" height="1007" rx="280"/></clipPath>
+    <linearGradient id="rearHair" x1="778" y1="494" x2="824" y2="1030" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1c2149"/><stop offset=".21" stop-color="#202650"/><stop offset=".43" stop-color="#303d79"/><stop offset="1" stop-color="#3b559d"/>
+    </linearGradient>
+    <linearGradient id="rearTail" x1="790" y1="666" x2="966" y2="866" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2e3b76"/><stop offset="1" stop-color="#33417f"/>
+    </linearGradient>
+    <linearGradient id="lowerHair" x1="690" y1="803" x2="723" y2="1047" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#40549f"/><stop offset="1" stop-color="#4c6bb3"/>
+    </linearGradient>
+    <linearGradient id="ruffleShadow" x1="310" y1="119" x2="708" y2="582" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c7c5dc"/><stop offset=".5" stop-color="#d2d0e2"/><stop offset="1" stop-color="#c7c6dc"/>
+    </linearGradient>
+    <linearGradient id="ruffleWhite" x1="335" y1="110" x2="670" y2="544" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f7f3f6"/><stop offset="1" stop-color="#f6f2f5"/>
+    </linearGradient>
+    <linearGradient id="tailRuffle" x1="776" y1="789" x2="931" y2="902" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b5b4d2"/><stop offset=".53" stop-color="#c2c1d8"/><stop offset="1" stop-color="#d5d2e2"/>
+    </linearGradient>
+    <linearGradient id="skin" x1="0" y1="450" x2="0" y2="1007" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff1e8"/><stop offset=".46" stop-color="#fdf0e8"/><stop offset=".8" stop-color="#f8ebe5"/><stop offset="1" stop-color="#f4e5e0"/>
+    </linearGradient>
+    <radialGradient id="skinLight" cx="310" cy="705" r="260" gradientUnits="userSpaceOnUse" gradientTransform="translate(310 705) scale(1 1.2) translate(-310 -705)">
+      <stop stop-color="#fffefe" stop-opacity=".98"/><stop offset=".3" stop-color="#fffefe" stop-opacity=".8"/><stop offset=".7" stop-color="#fffdfa" stop-opacity=".35"/><stop offset="1" stop-color="#fffaf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="skinWarmth" x1="330" y1="700" x2="650" y2="700" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff3eb" stop-opacity="0"/><stop offset="1" stop-color="#fff2e9" stop-opacity=".65"/>
+    </linearGradient>
+    <linearGradient id="skinShadow" x1="329" y1="369" x2="362" y2="565" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#edc3b5"/><stop offset="1" stop-color="#f4d7ca"/>
+    </linearGradient>
+    <linearGradient id="crown" x1="350" y1="170" x2="501" y2="810" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#384b90"/><stop offset=".46" stop-color="#40579e"/><stop offset="1" stop-color="#5d7dbd"/>
+    </linearGradient>
+    <linearGradient id="leftSweep" x1="160" y1="186" x2="115" y2="623" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3d5197"/><stop offset=".52" stop-color="#4b69b1"/><stop offset="1" stop-color="#729bd0"/>
+    </linearGradient>
+    <linearGradient id="sweepInset" x1="152" y1="293" x2="56" y2="531" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#344c91"/><stop offset="1" stop-color="#405ba4"/>
+    </linearGradient>
+    <linearGradient id="forelock" x1="304" y1="214" x2="238" y2="592" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#43599f"/><stop offset=".49" stop-color="#4964af"/><stop offset="1" stop-color="#7092cc"/>
+    </linearGradient>
+    <linearGradient id="centerBang" x1="395" y1="220" x2="363" y2="667" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#455ba0"/><stop offset=".36" stop-color="#485fa9"/><stop offset=".56" stop-color="#526eb8"/><stop offset=".82" stop-color="#6f8dce"/><stop offset="1" stop-color="#7393ce"/>
+    </linearGradient>
+    <linearGradient id="bangTipShade" x1="442" y1="553" x2="433" y2="670" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5f7dc0" stop-opacity="0"/><stop offset=".45" stop-color="#5674b9"/><stop offset="1" stop-color="#698acb"/>
+    </linearGradient>
+    <linearGradient id="templeHair" x1="560" y1="380" x2="560" y2="720" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#455ca4"/><stop offset=".35" stop-color="#455fa9"/><stop offset=".65" stop-color="#5d78bd"/><stop offset="1" stop-color="#6992c9"/>
+    </linearGradient>
+    <linearGradient id="templeShadow" x1="559" y1="419" x2="626" y2="755" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3a529a"/><stop offset="1" stop-color="#4363ab"/>
+    </linearGradient>
+    <linearGradient id="sideLock" x1="650" y1="250" x2="650" y2="1000" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3c4d94"/><stop offset=".33" stop-color="#41559e"/><stop offset=".53" stop-color="#4b62ae"/><stop offset=".67" stop-color="#576fb9"/><stop offset=".8" stop-color="#6284c4"/><stop offset="1" stop-color="#78a5d5"/>
+    </linearGradient>
+    <radialGradient id="sideLockLight" cx="648" cy="800" r="85" gradientUnits="userSpaceOnUse" gradientTransform="translate(648 800) scale(1 2.5) translate(-648 -800)">
+      <stop stop-color="#7fb4df" stop-opacity=".4"/><stop offset=".5" stop-color="#7fb4df" stop-opacity=".3"/><stop offset="1" stop-color="#7fb4df" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sideLockInset" x1="687" y1="603" x2="631" y2="885" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#415ba5"/><stop offset="1" stop-color="#4261ab"/>
+    </linearGradient>
+    <linearGradient id="ahoge" x1="274" y1="23" x2="433" y2="231" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4256a2"/><stop offset=".56" stop-color="#4359a4"/><stop offset="1" stop-color="#425ba7"/>
+    </linearGradient>
+    <linearGradient id="eyeColor" x1="293" y1="534" x2="356" y2="801" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#20253f"/><stop offset="1" stop-color="#20263f"/>
+    </linearGradient>
+    <linearGradient id="blush" x1="260" y1="690" x2="302" y2="897" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fcd9d5"/><stop offset="1" stop-color="#fbd8d4"/>
+    </linearGradient>
+    <linearGradient id="bowBlue" x1="771" y1="581" x2="881" y2="714" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6495d3"/><stop offset=".51" stop-color="#6897d9"/><stop offset="1" stop-color="#6592d6"/>
+    </linearGradient>
+    <linearGradient id="bowEdge" x1="773" y1="655" x2="875" y2="724" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4168b4"/><stop offset="1" stop-color="#426bb7"/>
+    </linearGradient>
+  </defs>
+  
+  <g id="artwork" clip-path="url(#canvas)" stroke="none">
+    <!-- 01: Rear hair is behind the headdress, face, bow and front locks. -->
+    <g id="rear-hair" aria-label="Rear hair">
+      <path fill="url(#rearHair)" d="M704 420 C778 431 830 492 855 587 C867 639 874 674 895 725 C924 799 957 841 989 870 C995 882 951 899 920 891 L872 879 C878 922 897 968 919 1007 L866 1007 L850 987 L852 1007 L579 1007 C627 958 655 875 673 777 C688 682 676 532 704 420Z"/>
+      <path fill="url(#lowerHair)" d="M717 739 C752 782 781 819 812 872 C803 924 818 965 852 1007 L580 1007 C631 963 654 879 676 799Z"/>
+      <path fill="#344b90" d="M761 811 C775 873 778 937 758 996 C789 968 801 928 810 889 C817 933 837 978 866 1007 L919 1007 C891 959 873 909 865 865Z"/>
+      <path fill="#4b68af" d="M764 883 C764 932 755 976 738 1007 L692 1007 C726 967 750 923 764 883Z"/>
+    </g>
+    <!-- 02: Individual rounded ruffles over a continuous folded band. -->
+    <g id="headdress" aria-label="White scalloped headdress">
+      <path fill="url(#ruffleShadow)" d="M-15 195 C17 173 38 165 46 181 C53 150 94 132 120 131 C140 128 151 135 155 150 C172 114 203 105 237 104 C270 102 303 110 307 131 L332 128 C343 116 359 116 370 117 L461 155 C485 141 501 140 528 152 C560 164 596 184 592 210 L600 220 C620 210 643 226 664 244 C697 271 720 299 706 317 L713 334 C734 332 758 355 775 390 C790 419 795 444 782 459 L778 467 C807 477 818 512 818 542 C819 561 813 578 801 582 L780 603 L691 479 L540 331 L327 250 L98 254 L-15 275Z"/>
+      <path fill="#cfccdf" d="M-15 196 C9 178 38 162 46 180 L76 210 L-15 243Z"/>
+      <path fill="url(#ruffleWhite)" d="M46 180 C54 151 91 133 119 131 C137 129 151 133 153 146 C149 164 141 178 135 192 L77 211 C60 202 52 192 46 180Z"/>
+      <path fill="#e1dce9" d="M155 148 L184 183 L135 195Z"/>
+      <path fill="url(#ruffleWhite)" d="M156 145 C171 116 202 103 235 103 C266 102 299 109 306 124 C310 135 299 162 291 181 L184 184 C173 169 164 157 156 145Z"/>
+      <path fill="url(#ruffleWhite)" d="M332 128 C342 117 357 116 368 116 C389 129 413 151 436 166 L403 210 L349 197 C338 172 334 151 332 128Z"/>
+      <path fill="#dedbe9" d="M436 166 L462 155 L476 228 L412 210Z"/>
+      <path fill="url(#ruffleWhite)" d="M473 150 C493 140 510 146 530 152 C561 163 597 184 592 207 C581 226 561 245 544 260 L480 239 C473 215 469 179 473 150Z"/>
+      <path fill="url(#ruffleWhite)" d="M604 219 C619 210 641 224 661 241 C689 264 720 295 708 313 C699 326 673 345 653 354 L594 294 C596 269 598 241 604 219Z"/>
+      <path fill="url(#ruffleWhite)" d="M719 334 C740 334 761 357 777 391 C790 420 797 443 782 455 C769 461 745 465 724 467 L685 414 C694 388 707 356 719 334Z"/>
+      <path fill="url(#ruffleWhite)" d="M781 469 C806 478 816 510 818 540 C819 547 818 555 816 560 C796 558 776 557 756 550 L741 521 C751 500 766 480 781 469Z"/>
+    </g>
+    <!-- 03: Lower lace and the blue outer tail overlap the rear hair. -->
+    <g id="side-tail" aria-label="Back side tail and lace">
+      <path fill="url(#tailRuffle)" d="M775 748 C806 770 831 798 863 818 C910 849 958 868 989 872 C986 885 964 900 939 900 C923 900 903 896 891 890 C883 900 852 888 838 880 C828 873 822 868 821 858 C809 877 780 834 776 812Z"/>
+      <path fill="#bab9d5" d="M776 766 C790 793 808 813 830 825 C825 839 824 851 820 860 C805 873 780 832 776 812Z"/>
+      <path fill="#cdcadf" d="M831 824 C852 844 873 858 892 866 L891 890 C872 899 840 882 827 869 C820 863 822 853 825 843Z"/>
+      <path fill="url(#rearTail)" d="M809 635 C836 635 867 654 890 689 C917 756 943 822 989 870 C991 876 982 883 966 885 C934 887 881 864 845 839 C840 834 835 830 831 824 L827 818 C807 812 787 791 780 772 L765 703Z"/>
+      <path fill="#1e2c65" d="M774 679 L819 665 L850 712 C832 704 822 695 817 682 C803 700 794 716 778 725Z"/>
+    </g>
+    <!-- 04: One continuous face; the hair masks its upper and right edges. -->
+    <g id="face" aria-label="Face">
+      <path fill="url(#skin)" d="M-25 446 C80 445 172 396 259 346 C353 312 460 363 527 456 C611 531 664 645 667 747 C668 819 656 887 636 925 C626 961 606 990 581 1007 L-25 1007Z"/>
+      <path fill="url(#skinLight)" d="M-25 446 C80 445 172 396 259 346 C353 312 460 363 527 456 C611 531 664 645 667 747 C668 819 656 887 636 925 C626 961 606 990 581 1007 L-25 1007Z"/>
+      <path fill="url(#skinWarmth)" d="M-25 446 C80 445 172 396 259 346 C353 312 460 363 527 456 C611 531 664 645 667 747 C668 819 656 887 636 925 C626 961 606 990 581 1007 L-25 1007Z"/>
+      <path fill="url(#skinShadow)" d="M169 456 C211 421 239 384 272 345 L260 414Z"/>
+      <path fill="url(#skinShadow)" d="M506 461 L524 447 C536 495 547 544 562 584 C541 550 526 528 508 505Z"/>
+      <g id="cheeks" fill="url(#blush)">
+        <ellipse cx="47" cy="712" rx="60" ry="36" transform="rotate(26 47 712)"/>
+        <ellipse cx="549" cy="864" rx="55" ry="33" transform="rotate(25 549 864)"/>
+      </g>
+      <g id="eyes" fill="url(#eyeColor)">
+        <path d="M187 528 C211 532 223 552 217 581 C214 604 203 640 193 669 C186 690 172 697 153 694 C131 691 117 678 117 656 C116 637 130 582 141 556 C151 534 170 524 187 528Z"/>
+        <path d="M518 649 C543 654 557 675 553 701 C550 726 541 762 532 786 C525 806 511 815 491 810 C471 806 457 792 457 772 C456 753 469 700 479 676 C488 654 500 645 518 649Z"/>
+      </g>
+    </g>
+    <!-- 05: Crown and left sweep sit in front of the forehead. -->
+    <g id="crown-and-left-bangs" aria-label="Crown and left hair">
+      <path fill="url(#crown)" d="M-30 241 C108 182 241 154 382 195 C523 214 626 284 680 369 L650 679 C580 568 550 474 502 384 C425 308 364 297 279 316 C218 433 119 505 20 536 C10 570 5 630 28 665 C8 662 -9 651 -30 636Z"/>
+      <path fill="url(#leftSweep)" d="M-20 330 C43 250 119 204 198 181 C261 173 328 179 382 196 L357 263 C247 316 136 425 71 517 C53 525 37 531 20 536 C6 584 6 630 28 665 C9 662 -9 651 -20 643Z"/>
+      <path fill="url(#sweepInset)" d="M142 351 C113 394 79 465 72 517 C53 525 37 531 20 536 C51 467 93 404 142 351Z"/>
+      <path fill="#344b92" d="M142 351 L278 302 L286 322 L260 373 C236 403 211 427 184 446 L72 517Z"/>
+      <path fill="url(#forelock)" d="M382 216 C290 238 214 281 142 351 C110 399 78 465 72 517 C150 484 225 420 277 321 C258 376 249 421 252 474 C253 529 271 579 305 599 C297 569 296 533 303 505 C332 441 390 334 421 257Z"/>
+    </g>
+    <!-- 06: Bow is in front of the tail, but partly hidden by the side lock. -->
+    <g id="ribbon" aria-label="Blue bow">
+      <path fill="url(#bowEdge)" d="M762 590 C779 568 793 583 807 608 C819 630 829 648 826 669 C816 688 792 700 771 697Z"/>
+      <path fill="url(#bowBlue)" d="M760 590 C773 567 787 571 802 591 C817 611 826 632 826 650 C826 665 804 684 777 685Z"/>
+      <path fill="url(#bowEdge)" d="M824 650 C847 625 881 608 891 623 C906 642 890 701 877 721 C863 744 837 709 830 690 C824 676 820 659 824 650Z"/>
+      <path fill="url(#bowBlue)" d="M825 648 C841 629 869 612 884 615 C909 617 898 662 888 691 C884 705 881 712 876 717 C862 725 840 701 834 684 C828 668 824 655 825 648Z"/>
+      <path fill="#5585c9" d="M825 638 C830 637 835 641 836 646 C836 658 831 674 825 679 C821 682 816 680 812 675 C819 665 823 650 825 638Z"/>
+      <path fill="#6597d6" d="M825 640 C829 639 833 641 834 644 C833 653 830 665 826 671 C823 674 817 674 814 672 C820 660 823 648 825 640Z"/>
+      <path fill="#507ec0" d="M822 654 C817 643 811 642 809 646 C805 654 814 659 822 658Z"/>
+      <path fill="#5483c6" d="M834 658 C841 651 846 655 849 658 C857 669 841 672 834 663Z"/>
+    </g>
+    <!-- 07: The overlapping right locks and the central fringe. -->
+    <g id="front-hair" aria-label="Front bangs and right side lock">
+      <path fill="url(#templeShadow)" d="M491 291 C565 311 602 383 625 494 C646 595 652 689 646 775 L628 802 C639 769 636 741 634 721 C624 706 615 692 609 682 C563 614 531 542 520 469 C513 435 510 390 507 352Z"/>
+      <path fill="url(#templeHair)" d="M473 249 C526 265 561 316 586 384 C611 453 616 539 615 592 C616 632 612 661 609 682 C563 614 531 542 520 469 C513 435 510 390 507 352Z"/>
+      <path fill="url(#sideLock)" d="M382 195 C560 229 680 326 740 478 C770 554 788 675 779 789 C779 883 746 974 660 989 C697 963 718 921 730 871 C703 910 637 938 581 920 C613 901 632 874 637 866 C648 830 648 798 647 773 L627 802 C634 777 636 750 634 721 C640 637 622 548 608 485 C589 405 561 342 526 291 C486 236 448 222 396 215Z"/>
+      <path fill="url(#sideLockLight)" d="M382 195 C560 229 680 326 740 478 C770 554 788 675 779 789 C779 883 746 974 660 989 C697 963 718 921 730 871 C703 910 637 938 581 920 C613 901 632 874 637 866 C648 830 648 798 647 773 L627 802 C634 777 636 750 634 721 C640 637 622 548 608 485 C589 405 561 342 526 291 C486 236 448 222 396 215Z"/>
+      <path fill="url(#sideLockInset)" d="M685 628 C691 716 669 811 637 867 C648 830 648 798 647 773 C671 735 682 682 685 628Z"/>
+      <path fill="url(#centerBang)" d="M382 216 C421 212 465 224 491 250 C522 282 530 339 525 395 C522 453 510 520 489 564 C473 598 454 621 435 637 C432 652 435 663 441 672 C388 658 348 627 322 583 C302 550 297 511 302 467 C299 484 299 510 303 531 C297 549 300 580 305 599 C274 582 256 539 253 497 C247 441 254 375 278 316 C310 263 346 232 382 216Z"/>
+      <path fill="url(#bangTipShade)" d="M445 552 C438 587 435 612 435 637 C431 651 436 665 441 672 L434 670 C431 640 432 589 445 552Z"/>
+    </g>
+    <!-- 08: A single crescent-shaped curl, with its inner space genuinely open. -->
+    <g id="top-curl" aria-label="Top curl">
+      <path fill="url(#ahoge)" d="M164 69 C190 36 237 15 285 13 C340 10 392 25 428 55 C457 80 471 113 462 146 C453 177 428 201 397 215 L379 218 C394 176 371 123 337 91 C295 48 233 34 164 69Z"/>
+    </g>
+  </g>
+</svg>
