@@ -504,7 +504,7 @@ describe('契约 7: 聚合提示词不携带消息内容，强制模型自调工
 
     expect(prompt).toContain('系统事件');
     expect(prompt).toContain('read_chat_history');
-    expect(prompt).toContain('send_qq_message');
+    expect(prompt).toContain('[结束]');
     expect(prompt).toMatch(/2026-11-13 14:05:00/);
 
     // 绝不出现消息内容、短 ID 或渠道前缀
@@ -515,13 +515,13 @@ describe('契约 7: 聚合提示词不携带消息内容，强制模型自调工
     expect(prompt).not.toContain('群聊');
   });
 
-  it('提示词明确指出这是周期检查点，且不透露后台机制', () => {
+  it('提示词说明新消息到达语义，且不透露后台机制', () => {
     const prompt = formatSystemEventPrompt({
       kind: 'aggregated_messages',
       peer: PEER,
       intervalMinutes: 2,
     });
-    expect(prompt).toMatch(/周期/);
+    expect(prompt).toMatch(/打扰用户/);
     expect(prompt).toMatch(/切勿|严禁/);
   });
 
