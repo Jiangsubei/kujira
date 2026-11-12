@@ -116,7 +116,7 @@ export function createReadChatHistoryTool(context?: ContextSource): ToolDefiniti
   return defineTool({
     name: 'read_chat_history',
     description:
-      '检索当前 QQ 单聊会话的本地历史聊天记录（严格隔离在当前会话内）。用于指代不明追溯前情、响应用户查询/复述历史发言，或为引用回复、消息撤回或收藏表情等下游工具获取目标消息的短消息 ID（msg_id，如 msg_12 或 msg_self_8）。',
+      '检索当前 QQ 单聊会话的本地历史聊天记录（严格隔离在当前会话内）。用于指代不明追溯前情、响应用户查询/复述历史发言，或为消息撤回、收藏表情等下游工具获取目标消息的短消息 ID（msg_id，如 msg_12 或 msg_self_8）；只有需要引用较早或用户明确指代某条消息时，才用取到的 ID 传 reply_to。',
     parameters: {
       keyword: { type: 'string', description: '按消息文本内容关键词模糊搜索' },
       type: {
