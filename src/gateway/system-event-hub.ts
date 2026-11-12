@@ -55,21 +55,16 @@ export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
     }
 
     case 'aggregated_messages': {
-      const intervalTag = event.intervalMinutes
-        ? ` [聚合周期: ${event.intervalMinutes} 分钟]`
-        : '';
-
       // 关键设计：绝不携带任何消息内容或消息列表。
       // 数据库是唯一可信源，模型必须自行调用 read_chat_history 取回新消息。
       const guide =
-        '（说明：这是一次周期性的消息检查点，用户在你的上一条回复之后又发来了新消息。' +
-        '**你必须先调用 read_chat_history 工具**（建议用 relative 参数按需回溯，如 "30m"、"2h"，' +
-        '并结合 exclude_self: true 只看对方发言），确认自你上次回复以来对方说了什么，' +
-        '再判断是否需要通过 send_qq_message 回复。若读取后发现没有需要回应的内容，直接输出 [已回复] 即可。' +
-        '表现自然，切勿向用户透露消息聚合、周期检查或系统唤醒等任何后台痕迹。）';
+        '（说明：用户在你的上一条回复之后又发来了新消息。' +
+        '你必须先调用 read_chat_history 工具，查看自你上次回复以来有什么新消息，再判断如何回复。' +
+        '如果此时回复会打扰用户，或者没有值得回应的内容，直接输出 [结束] 即可。' +
+        '表现自然，切勿向用户透露消息聚合、或系统唤醒等任何后台痕迹。）';
 
       return (
-        `系统事件：[消息聚合]${intervalTag}${timeStr ? ` [${timeStr}]` : ''}\n\n` +
+        `系统事件：[消息聚合]${timeStr ? ` [${timeStr}]` : ''}\n\n` +
         `会话状态：检测到自上次回复以来有新的用户消息待查看。\n\n` +
         guide
       );
