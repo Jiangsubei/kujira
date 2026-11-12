@@ -160,12 +160,17 @@ export class SystemEventHub {
       });
     }
 
-    // 构造干净的 WakeupPayload（from_name 与 from_user 严格留空，is_system 为 true）
+    // 构造干净的 WakeupPayload。
+    // 关键区分：聚合投递来自真实用户消息（携带真实 from_user），具备审批发起人资格；
+    // 定时任务与冷场搭话为系统自发，from_user 严格留空，审批保持 Fail-Closed。
+    const isAggregated = event.kind === 'aggregated_messages';
+    const realFromUser = isAggregated ? (event.fromUser ?? '') : '';
+
     const payload: WakeupPayload = {
       peer,
       trigger,
       from_name: '',
-      from_user: '',
+      from_user: realFromUser,
       content: promptText,
       timestamp: now,
       is_system: true,
@@ -173,7 +178,7 @@ export class SystemEventHub {
       ...(event.kind === 'scheduled_task'
         ? { task_id: event.taskId, task_type: event.taskType, task_rule: event.taskRule }
         : {}),
-      ...(event.kind === 'aggregated_messages'
+      ...(isAggregated
         ? {
             aggregated_messages: event.messages,
             ...(event.intervalMinutes !== undefined

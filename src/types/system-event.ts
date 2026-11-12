@@ -33,6 +33,12 @@ export interface AggregatedMessagesEvent {
   peer: string;
   /** 本轮聚合的未回复消息快照（按时间升序，已消费即从池中移除） */
   messages: AggregatedMessage[];
+  /**
+   * 触发本轮聚合的真实发送者身份（peer 内真实用户 openid）。
+   * 池内消息均来自该用户的真实入站事件，故聚合轮次具备审批发起人资格；
+   * 与 `idle_reply` / `scheduled_task` 的「无真实发起人」严格区分。
+   */
+  fromUser?: string;
   /** 聚合周期窗口（分钟），仅用于上下文说明 */
   intervalMinutes?: number;
   timestamp?: number;

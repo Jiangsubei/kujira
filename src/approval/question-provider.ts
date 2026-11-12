@@ -289,6 +289,16 @@ export class KujiraQuestionProvider {
   }
 
   /**
+   * 判活：该 peer 当前是否有挂起中的提问（等待用户作答）。
+   * 供主动能力巡检判定「是否暂停计时」使用；同步、O(1)、无副作用。
+   */
+  isWaiting(peer: string): boolean {
+    const key = typeof peer === 'string' ? peer.trim() : '';
+    if (!key) return false;
+    return this.pendingByPeer.has(key) || this.pendingByPeer.has(sessionIdToPeer(key));
+  }
+
+  /**
    * 处理 QQ 单聊端用户的回复。命中当前 pending 提问则推进/收尾串行问答并返回 true；
    * 未命中返回 false —— 调用方按普通消息继续流转。
    */

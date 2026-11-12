@@ -606,10 +606,10 @@ export class SessionAgentRunner {
       source: { kind: 'user' },
     });
 
-    // 审批「本轮唤醒者」登记：只登记真实 QQ 单聊发送者唤醒（系统触发返回 null）
-    const wakeupInitiator = payload.is_system
-      ? null
-      : resolveWakeupInitiator(payload.trigger, payload.from_user);
+    // 审批「本轮唤醒者」登记：按 trigger 判定，与提示词是否走系统事件格式解耦。
+    // - 真实用户来源（direct / quote / aggregated）：登记真实发起人，本轮可正常审批；
+    // - 系统自发（scheduled / idle_reply）：result 为 null，审批保持 Fail-Closed。
+    const wakeupInitiator = resolveWakeupInitiator(payload.trigger, payload.from_user);
     if (wakeupInitiator) {
       this.turnInitiatorTracker?.expect(userMsg?.id, sessionId, wakeupInitiator);
     }

@@ -257,6 +257,15 @@ export class KujiraApprovalResponder {
   }
 
   /**
+   * 判活：该 peer 当前是否有挂起中的审批（等待用户 y/n 决策）。
+   * 供主动能力巡检判定「是否暂停计时」使用；同步、O(1)、无副作用。
+   */
+  isWaiting(peer: string): boolean {
+    const key = typeof peer === 'string' ? peer.trim() : '';
+    return key ? this.pendingByPeer.has(key) : false;
+  }
+
+  /**
    * 处理 QQ 单聊端用户的审批决策 (y/n)
    */
   handleInboundReply(peer: string, text: string): boolean {

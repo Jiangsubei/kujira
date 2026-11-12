@@ -276,6 +276,9 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
 
   // 4.1 单聊主动能力：消息聚合回复与冷场主动搭话（巡检固定 60s，两个开关各自独立门控）
   const proactiveManager = new ProactiveManager();
+  // 等待用户输入的判活回调：由下方 questionProvider / approvalResponder 装配后回填。
+  // 巡检时才求值，故此处先用闭包占位，避免与 section 7 的创建顺序耦合。
+  let isAwaitingUserInput: (peer: string) => boolean = () => false;
   const dispatchProactiveEvent = async (event: SystemWakeupEvent): Promise<void> => {
     // 冷场搭话必须拿得到有效被动锚点才能发信；无锚点时直接跳过，绝不降级为纯主动消息
     if (event.kind === 'idle_reply') {
@@ -291,7 +294,10 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     () => ({
       config: currentConfig(),
       dispatch: dispatchProactiveEvent,
-      isSessionBusy: (peer: string) => sessionManager.isBusy(peer),
+      // 等待提问答复或审批决策期间暂停全部计时，恢复后重新累计完整窗口
+      isAwaitingUserInput: (peer: string) => isAwaitingUserInput(peer),
+      // 活跃会话门控：口径与 `/状态` 命令一致，无活跃会话的 peer 一律跳过
+      hasActiveSession: (peer: string) => sessionManager.hasActiveSession(peer),
       knownPeers: () => {
         try {
           return db.getAllSessionStates().map((s) => s.peer);
@@ -466,6 +472,16 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   } catch (channelErr) {
     logger.warn?.('[Plugin] 注册 Kujira 提问渠道异常:', channelErr);
   }
+
+  // 回填「等待用户输入」判活：提问或审批任一挂起即视为等待中，主动能力暂停计时。
+  isAwaitingUserInput = (peer: string): boolean => {
+    try {
+      return questionProvider.isWaiting(peer) || approvalResponder.isWaiting(peer);
+    } catch {
+      // 判活异常一律视为未等待，绝不因巡检探针异常而永久冻结计时
+      return false;
+    }
+  };
 
   const unregisterApproval = (ctx as any).on?.(
     'approval/request',
@@ -870,7 +886,9 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
           content,
           time: receivedAt,
         },
-        activeConfig
+        activeConfig,
+        // 真实发送者 openid：聚合轮次据此登记审批发起人，使轮内可正常使用审批/提问工具
+        openid
       );
       logger.debug?.(`[Plugin] 消息已入聚合池 (peer: ${peer}, 窗口: ${activeConfig.aggregation_interval_mins ?? 2} 分钟)`);
       return;

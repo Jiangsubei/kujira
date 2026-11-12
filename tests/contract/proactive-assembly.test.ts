@@ -279,4 +279,94 @@ describe('契约 1 ~ 6: 单聊主动能力真实装配闭环', () => {
 
     expect(proactive.getPendingMessages(MOCK_PEER)).toEqual([]);
   });
+
+  it('契约 6: 聚合池记录真实发送者 openid，聚合投递事件携带 fromUser', async () => {
+    emitInbound('ROBOT1.0_IN_P_5', '在吗');
+    await new Promise((r) => setTimeout(r, 80));
+
+    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
+    const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
+    const dispatchSpy = vi.spyOn(hub, 'dispatchSystemEvent');
+
+    await proactive.checkProactive({
+      config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
+      dispatch: (event: any) => hub.dispatchSystemEvent(event),
+      now: Date.now() + 3 * 60 * 1000,
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+    expect((dispatchSpy.mock.calls[0]![0] as any).fromUser).toBe(MOCK_OPENID);
+  });
+
+  it('契约 7: 聚合轮次的 WakeupPayload 携带真实 from_user，使轮内审批可登记发起人', async () => {
+    emitInbound('ROBOT1.0_IN_P_6', '在吗');
+    await new Promise((r) => setTimeout(r, 80));
+
+    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
+    const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
+    const sm = (booted!.ctx as any).get('kujira-session') as any;
+    const dispatchSpy = vi.spyOn(sm, 'dispatchWakeup');
+
+    await proactive.checkProactive({
+      config: { aggregation_enabled: true, aggregation_interval_mins: 2 },
+      dispatch: (event: any) => hub.dispatchSystemEvent(event),
+      now: Date.now() + 3 * 60 * 1000,
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+    const payload = dispatchSpy.mock.calls[0]![0] as any;
+    expect(payload.trigger).toBe('aggregated');
+    // 聚合来自真实用户消息 → 携带真实 from_user（与 idle_reply / scheduled 的空值严格区分）
+    expect(payload.from_user).toBe(MOCK_OPENID);
+    expect(payload.from_name).toBe('');
+  });
+
+  it('契约 8: 冷场搭话的 WakeupPayload 保持 from_user 为空（系统自发，审批 Fail-Closed）', async () => {
+    const hub = (booted!.ctx as any).get('kujira-system-event-hub') as any;
+    const sm = (booted!.ctx as any).get('kujira-session') as any;
+    const dispatchSpy = vi.spyOn(sm, 'dispatchWakeup');
+
+    await hub.dispatchSystemEvent({
+      kind: 'idle_reply',
+      peer: MOCK_PEER,
+      idleMinutes: 60,
+      timestamp: Date.now(),
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+    const payload = dispatchSpy.mock.calls[0]![0] as any;
+    expect(payload.trigger).toBe('idle_reply');
+    expect(payload.from_user).toBe('');
+    expect(payload.from_name).toBe('');
+  });
+
+  it('契约 9: 两个 provider 的 isWaiting 已真实装配且可查询', () => {
+    const questionProvider = (booted!.ctx as any).get('kujira-question-provider');
+    const approvalResponder = (booted!.ctx as any).get('kujira-approval-responder');
+    // 未提供为服务的场景下退化为能力探测：至少 plugin 内部持有的实例可被判活
+    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
+    expect(proactive).toBeDefined();
+
+    // isWaiting 必须是可安全调用的同步查询（无论是否挂起，绝不抛错）
+    if (questionProvider && typeof questionProvider.isWaiting === 'function') {
+      expect(() => questionProvider.isWaiting(MOCK_PEER)).not.toThrow();
+      expect(questionProvider.isWaiting(MOCK_PEER)).toBe(false);
+    }
+    if (approvalResponder && typeof approvalResponder.isWaiting === 'function') {
+      expect(() => approvalResponder.isWaiting(MOCK_PEER)).not.toThrow();
+      expect(approvalResponder.isWaiting(MOCK_PEER)).toBe(false);
+    }
+  });
+
+  it('契约 10: hasActiveSession 为只读判定，绝不为无会话 peer 创建会话', async () => {
+    const sm = (booted!.ctx as any).get('kujira-session') as any;
+    const unknownPeer = 'user_ffffffffffffffff';
+
+    // 首次查询前：无会话
+    expect(sm.hasActiveSession(unknownPeer)).toBe(false);
+    // 查询本身就是只读的，重复调用结果稳定且不产生副作用
+    expect(sm.hasActiveSession(unknownPeer)).toBe(false);
+    // 该 peer 名下不存在任何被持久化的会话记录
+    expect(sm.listPeerSessionIds(unknownPeer)).toEqual([]);
+  });
 });

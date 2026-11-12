@@ -10,9 +10,15 @@
 
 /**
  * 「真实 QQ 单聊发送者」触发的唤醒类型：只有这些唤醒才能成为审批申请人锚点。
- * 系统触发（scheduled / proactive / idle）不在此列，不登记发起人，审批保持 Fail-Closed。
+ *
+ * - `direct` / `quote`：真实入站消息的即时唤醒；
+ * - `aggregated`：消息聚合回复。其池内每条消息均来自真实入站 `C2C_MESSAGE_CREATE`
+ *   事件，`from_user` 是真实发送者 openid，属于「真实用户消息的延迟投递」，
+ *   因此同样具备登记资格——聚合轮次内的审批与提问工具必须可正常使用。
+ *
+ * 系统自发触发（scheduled / idle_reply / proactive / idle）不在此列，审批保持 Fail-Closed。
  */
-const REAL_SENDER_WAKEUP_TRIGGERS = new Set(['direct', 'quote']);
+const REAL_SENDER_WAKEUP_TRIGGERS = new Set(['direct', 'quote', 'aggregated']);
 
 /**
  * 内部系统伪身份标识集合：即便误传入真实触发类型中，也绝不允许登记为审批申请人。

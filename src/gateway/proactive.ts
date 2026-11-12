@@ -21,6 +21,18 @@ export interface ProactiveManagerOptions {
   dispatch?: (event: SystemWakeupEvent) => Promise<unknown> | unknown;
   /** 会话繁忙时跳过本轮，保留池内消息等待下一轮 */
   isSessionBusy?: (peer: string) => boolean;
+  /**
+   * 是否正在等待用户输入（提问 / 审批挂起）。
+   * 返回 true 时暂停该 peer 的全部计时：暂停期间不计时、不投递，
+   * 且每轮巡检把计时锚点推到当前时刻，使恢复后从此刻重新累计完整窗口。
+   */
+  isAwaitingUserInput?: (peer: string) => boolean;
+  /**
+   * 该 peer 是否存在**当前活跃会话**。
+   * 判定口径与 `/状态` 命令一致：以 peer 当前映射的会话为准。
+   * 缺省（未提供）时放行，保持对既有调用方的向后兼容。
+   */
+  hasActiveSession?: (peer: string) => boolean;
   now?: number;
   /** 已知会话 peer 枚举器：用于冷场搭话扫描（仅 user_ 单聊会话参与） */
   knownPeers?: () => string[];
@@ -42,6 +54,8 @@ interface PeerState {
 export class ProactiveManager {
   private readonly states = new Map<string, PeerState>();
   private readonly pending = new Map<string, AggregatedMessage[]>();
+  /** peer → 该池内消息的真实发送者 openid（用于聚合轮次登记审批发起人） */
+  private readonly fromUsers = new Map<string, string>();
   private timer: NodeJS.Timeout | null = null;
 
   private stateOf(peer: string): PeerState {
@@ -65,14 +79,21 @@ export class ProactiveManager {
    * 将一条普通消息记入聚合池。
    * 仅在 `aggregation_enabled` 开启时生效；关闭时不入池（由上层保持即时唤醒语义）。
    * 无论是否入池，都会刷新人类发言时间，保证冷场判定准确。
+   *
+   * @param fromUser 该消息真实发送者 openid，用于聚合轮次登记审批发起人
    */
   recordMessage(
     peer: string,
     message: AggregatedMessage,
-    config: BridgePluginConfig
+    config: BridgePluginConfig,
+    fromUser?: string
   ): void {
     if (!peer) return;
     this.recordHumanMessage(peer, message.time);
+
+    if (typeof fromUser === 'string' && fromUser.trim() !== '') {
+      this.fromUsers.set(peer, fromUser.trim());
+    }
 
     if (!config.aggregation_enabled) {
       return;
@@ -147,19 +168,40 @@ export class ProactiveManager {
       const st = this.states.get(peer);
       if (!st) continue;
 
+      // 0. 活跃会话门控：无当前活跃会话的 peer 一律跳过（口径对齐 `/状态` 命令），
+      //    池内消息与计时锚点原样保留，待会话恢复活跃后继续。
+      if (options.hasActiveSession && !options.hasActiveSession(peer)) continue;
+
       // 1. 会话繁忙：保留池内消息与窗口计时，跳过本轮避免与进行中的回合冲突
       if (options.isSessionBusy?.(peer)) continue;
 
-      // 2. 聚合回复优先
+      // 2. 等待用户输入（提问 / 审批挂起）：暂停计时。
+      //    把两个计时锚点持续推到当前时刻，等价于「暂停期间不计时」，
+      //    恢复后的第一个巡检会把起点定在当下，重新累计完整窗口后才投递。
+      if (options.isAwaitingUserInput?.(peer)) {
+        if (st.windowStartedAt !== undefined) {
+          st.windowStartedAt = now;
+        }
+        if (st.lastHumanAt !== undefined) {
+          st.lastHumanAt = now;
+        }
+        // 暂停期间不投递、不消耗池内消息，但也不重置 idleFired：
+        // 若本沉默周期已搭过话，恢复后不应立刻再搭一次。
+        continue;
+      }
+
+      // 3. 聚合回复优先
       if (config.aggregation_enabled && this.isAggregationDue(peer, config, now)) {
         const messages = this.consumePendingMessages(peer);
         if (messages.length === 0) continue;
         const intervalMins = Number(config.aggregation_interval_mins ?? 0);
+        const fromUser = this.fromUsers.get(peer);
         try {
           await dispatch({
             kind: 'aggregated_messages',
             peer,
             messages,
+            ...(fromUser ? { fromUser } : {}),
             ...(Number.isFinite(intervalMins) && intervalMins > 0 ? { intervalMinutes: intervalMins } : {}),
             timestamp: now,
           });
@@ -169,7 +211,7 @@ export class ProactiveManager {
         continue;
       }
 
-      // 3. 冷场主动搭话（池为空且沉默达阈值）
+      // 4. 冷场主动搭话（池为空且沉默达阈值）
       if (!config.idle_reply_enabled) continue;
       if (st.idleFired) continue;
       if (this.getPendingMessages(peer).length > 0) continue;
@@ -225,5 +267,6 @@ export class ProactiveManager {
     this.stopChecker();
     this.states.clear();
     this.pending.clear();
+    this.fromUsers.clear();
   }
 }

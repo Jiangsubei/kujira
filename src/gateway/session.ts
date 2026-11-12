@@ -474,6 +474,49 @@ export class SessionManager {
     return isKujiraSession(sessionId);
   }
 
+  /**
+   * 只读判定：该 peer 是否存在**当前活跃会话**（口径与 `/状态` 命令一致）。
+   *
+   * 严格无副作用——绝不创建、绝不持久化、绝不重新分配会话。
+   * 判定顺序：
+   * 1. 内存映射的当前会话 → 校验活跃或物理存在；
+   * 2. DB 记录的 current_session_id → 校验活跃或物理存在；
+   * 3. 兜底扫描该 peer 名下仍未归档的会话（如重启后内存未预热）。
+   *
+   * 注意：**不可**用 {@link peerToSessionId} 实现本方法——后者带有创建与落库副作用。
+   */
+  public hasActiveSession(peerOrSessionId: string): boolean {
+    if (!peerOrSessionId) return false;
+
+    const peer = isKujiraSession(peerOrSessionId)
+      ? this.sessionIdToPeer(peerOrSessionId)
+      : peerOrSessionId;
+
+    // 1. 内存映射
+    const cached = this.peerCurrentSessionId.get(peer);
+    if (cached && this.isSessionActiveOrPresent(cached)) {
+      return true;
+    }
+
+    // 2. DB 记录
+    try {
+      const record = this.persistence.getSessionState(peer);
+      if (record?.current_session_id && this.isSessionActiveOrPresent(record.current_session_id)) {
+        return true;
+      }
+    } catch {
+      // 存储未就绪时忽略，继续走兜底扫描
+    }
+
+    // 3. 兜底：该 peer 名下任一未归档且物理存在的会话
+    try {
+      const list = this.listPeerSessionIds(peer);
+      return list.some((sid) => this.isSessionActiveOrPresent(sid));
+    } catch {
+      return false;
+    }
+  }
+
   public isQQSession(sessionId: string): boolean {
     return isKujiraSession(sessionId);
   }
