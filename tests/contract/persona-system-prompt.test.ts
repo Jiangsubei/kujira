@@ -65,9 +65,11 @@ describe('契约测试: System Prompt 动态段注入与非空保底 (System Pro
     const behaviorText = manager.getProvider('kujira:behavior')?.provide(null, {
       peer: peerA,
     });
-    expect(behaviorText).toContain('## 行为准则 (Behavior Guidelines)');
-    expect(behaviorText).toContain('使用简洁明了的 Markdown 列表回答。');
-    expect(behaviorText).toContain('记忆工具规则');
+    // 用户配置了自定义行为准则时，必须原样注入，一字不追加默认规则
+    expect(behaviorText).toBe(
+      '## 行为准则 (Behavior Guidelines)\n\n使用简洁明了的 Markdown 列表回答。'
+    );
+    expect(behaviorText).not.toContain('记忆工具规则');
 
     unregister();
   });
@@ -88,6 +90,8 @@ describe('契约测试: System Prompt 动态段注入与非空保底 (System Pro
     const behaviorText = manager.getProvider('kujira:behavior')?.provide(null, {});
     expect(behaviorText.length).toBeGreaterThan(0);
     expect(behaviorText).toContain(DEFAULT_BEHAVIOR);
+    // 仅在用户未配置行为准则时，默认值中的记忆工具指引才会出现
+    expect(behaviorText).toContain('记忆工具规则');
     // Kujira 单聊支持原生 Markdown (msg_type=2)
     expect(behaviorText).toContain('Markdown');
     expect(behaviorText).not.toContain('严禁使用 Markdown');

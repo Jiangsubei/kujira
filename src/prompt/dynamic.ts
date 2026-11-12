@@ -14,8 +14,7 @@ import {
 } from './snapshot.js';
 import {
   DEFAULT_PERSONA,
-  DEFAULT_BEHAVIOR,
-  DEFAULT_MEMORY_GUIDANCE,
+  resolveEffectiveBehavior,
   DEFAULT_FACE_STORE_MAX,
 } from '../constants/index.js';
 
@@ -56,14 +55,7 @@ export function registerKujiraDynamicPrompt(
     qqOnly: false,
     provide: (_session: any, assembleCtx: any) => {
       if (isExplicitNonQQSession(assembleCtx)) return '';
-      let effectiveBehavior = (getBehavior() || '').trim() || DEFAULT_BEHAVIOR;
-      if (
-        !effectiveBehavior.includes('记忆工具规则') &&
-        !effectiveBehavior.includes('create_memory')
-      ) {
-        effectiveBehavior = `${effectiveBehavior}\n${DEFAULT_MEMORY_GUIDANCE}`.trim();
-      }
-      return formatBehaviorContext(effectiveBehavior);
+      return formatBehaviorContext(resolveEffectiveBehavior(getBehavior()));
     },
   });
   return () => {

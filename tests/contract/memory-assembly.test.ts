@@ -12,6 +12,7 @@ import { bootDshKujira, type BootedDsh } from '../../src/boot.js';
 import { setupMemoryService } from '../../src/memory/index.js';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { setupSnapshotHub } from '../../src/prompt/snapshot.js';
+import { DEFAULT_BEHAVIOR } from '../../src/constants/index.js';
 import { openidToPeer, openidToSessionBaseId } from '../../src/utils/peer.js';
 
 const MOCK_OPENID_1 = 'A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6';
@@ -205,7 +206,7 @@ describe('契约测试: EN-003 Memory 单聊双层记忆体系真实装配与 Pr
     db.close();
   });
 
-  it('契约 6: 主 Agent System Prompt 行为准则段包含记忆工具被动调用指引 (与 Background Review 职责分离)', async () => {
+  it('契约 6: 自定义 behavior 原样注入，仅在未配置时回落到含记忆指引的 DEFAULT_BEHAVIOR', async () => {
     booted = await bootDshKujira({
       dshHome: tmpDir,
       mountPlugin: false,
@@ -231,10 +232,24 @@ describe('契约测试: EN-003 Memory 单聊双层记忆体系真实装配与 Pr
       .join('\n');
 
     expect(injectedTexts).toContain('重要约束：测试行为');
-    expect(injectedTexts).toContain('记忆工具规则');
-    expect(injectedTexts).toContain('不必每轮都调用记忆工具');
-    expect(injectedTexts).toContain('create_memory');
+    // 用户已配置行为准则：不得追加任何默认记忆工具指引
+    expect(injectedTexts).not.toContain('记忆工具规则');
+    expect(injectedTexts).not.toContain('不必每轮都调用记忆工具');
+    expect(injectedTexts).not.toContain('create_memory');
 
+    // 仅在未配置行为准则时，才回落到 DEFAULT_BEHAVIOR（其中包含记忆工具指引）
+    const disposeEmptyPrompt = registerKujiraDynamicPrompt(
+      ctx,
+      () => '测试人格',
+      () => ''
+    );
+    const defaultBehaviorText = snapshotManager
+      .getProvider('kujira:behavior')
+      ?.provide(null, {});
+    expect(defaultBehaviorText).toContain(DEFAULT_BEHAVIOR);
+    expect(defaultBehaviorText).toContain('记忆工具规则');
+
+    disposeEmptyPrompt();
     disposePrompt();
     snapshotManager.dispose();
   });

@@ -130,6 +130,15 @@ export const DEFAULT_BEHAVIOR =
   '- ' +
   DEFAULT_MEMORY_GUIDANCE;
 
+/**
+ * 解析生效的行为准则：仅在用户未配置（空白）时回落到 DEFAULT_BEHAVIOR
+ * （默认值本身已包含记忆工具指引）；用户配置了任意字符则原样返回，绝不追加任何默认内容。
+ */
+export function resolveEffectiveBehavior(configured?: string | null): string {
+  const trimmed = (configured || '').trim();
+  return trimmed || DEFAULT_BEHAVIOR;
+}
+
 // ---------------------------------------------------------------------------
 // 核心配置默认值单一真相源 (与 BridgePluginConfig 15 项核心配置对齐)
 // ---------------------------------------------------------------------------

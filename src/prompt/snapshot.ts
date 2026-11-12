@@ -9,8 +9,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import {
   DEFAULT_PERSONA,
-  DEFAULT_BEHAVIOR,
-  DEFAULT_MEMORY_GUIDANCE,
+  resolveEffectiveBehavior,
   DEFAULT_FACE_STORE_MAX,
 } from '../constants/index.js';
 import type { MessageDatabase } from '../storage/database.js';
@@ -401,16 +400,7 @@ export function setupSnapshotHub(options: SetupSnapshotHubOptions): SnapshotMana
   });
 
   const getEffectivePersona = () => (options.getPersona?.() || '').trim() || DEFAULT_PERSONA;
-  const getEffectiveBehavior = () => {
-    let b = (options.getBehavior?.() || '').trim() || DEFAULT_BEHAVIOR;
-    if (
-      !b.includes('记忆工具规则') &&
-      !b.includes('create_memory')
-    ) {
-      b = `${b}\n${DEFAULT_MEMORY_GUIDANCE}`.trim();
-    }
-    return b;
-  };
+  const getEffectiveBehavior = () => resolveEffectiveBehavior(options.getBehavior?.());
 
   // 1. 通道 A: 人格设定 (kujira:persona, order: 30)
   manager.registerProvider({
