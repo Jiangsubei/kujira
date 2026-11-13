@@ -598,6 +598,11 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
     expect(prompt).toMatch(/2026-11-13 14:05:00/);
     expect(prompt).toMatch(/1\.\s*\[msg_12\]/);
     expect(prompt).toMatch(/2\.\s*\[msg_13\]/);
+    // 纯文本消息：正文与消息头同一行，与正常直接入站消息的格式一致
+    expect(prompt).toMatch(/1\. \[msg_12\] \[2026-11-13 14:04:00\] 在吗/);
+    expect(prompt).not.toMatch(/\[msg_12\][^\n]*\n\s*在吗/);
+    // 带引用/附件的消息：消息头独占一行，引用、附件、正文依次另起行
+    expect(prompt).toMatch(/2\. \[msg_13\] \[2026-11-13 14:04:30\]\n/);
     expect(prompt).toContain('在吗');
     expect(prompt).toContain('那个接口一直 403');
     expect(prompt).toContain('[引用回复:');

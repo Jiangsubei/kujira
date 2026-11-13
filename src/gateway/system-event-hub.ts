@@ -32,8 +32,9 @@ export function formatTimeOnly(timestamp: number): string {
 }
 
 /**
- * 把聚合池中的一条消息渲染为「序号 + 短 ID + 时间」的逐条段落。
- * 引用快照与附件占位符各占一行，正文单独一行。
+ * 把聚合池中的一条消息渲染为逐条段落（`序号. [短 ID] [时间] ...`）。
+ * - 纯文本消息：正文与消息头**同一行**，与正常直接入站消息的格式保持一致；
+ * - 带引用或附件：消息头独占一行，引用快照、附件占位符、正文依次缩进另起行。
  */
 function renderAggregatedMessageLines(
   messages: ReadonlyArray<{ short_id?: string; content: string; time: number; quoted?: { short_id?: string; time?: number; text: string }; attachments?: string[] }>
@@ -45,9 +46,19 @@ function renderAggregatedMessageLines(
     const header = [shortId ? `[${shortId}]` : '', timeStr ? `[${timeStr}]` : '']
       .filter(Boolean)
       .join(' ');
-    lines.push(`${index + 1}. ${header}`.trimEnd());
 
     const quoted = message.quoted;
+    const attachments = (message.attachments ?? []).filter(Boolean);
+    const body = message.content ?? '';
+
+    // 纯文本消息：正文直接跟在消息头同一行，与正常入站消息格式一致
+    if (!quoted && attachments.length === 0) {
+      lines.push(`${index + 1}. ${header} ${body}`.trimEnd());
+      return;
+    }
+
+    lines.push(`${index + 1}. ${header}`.trimEnd());
+
     if (quoted) {
       const qShortId =
         typeof quoted.short_id === 'string' && quoted.short_id.trim() ? quoted.short_id.trim() : '';
@@ -59,11 +70,11 @@ function renderAggregatedMessageLines(
       lines.push(`   [引用回复: "${qHeader}${qText}"]`);
     }
 
-    for (const attachment of message.attachments ?? []) {
-      if (attachment) lines.push(`   ${attachment}`);
+    for (const attachment of attachments) {
+      lines.push(`   ${attachment}`);
     }
 
-    if (message.content) lines.push(`   ${message.content}`);
+    if (body) lines.push(`   ${body}`);
   });
   return lines;
 }
