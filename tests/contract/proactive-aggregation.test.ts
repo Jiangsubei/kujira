@@ -8,6 +8,8 @@
  * - **不向模型喂消息**：系统事件只说「有新消息」，模型自调 read_chat_history；
  * - **自由周期时钟**：相位来自启用时刻，不因消息/投递/轮次重置；
  * - **两个开关完全解耦**：聚合与冷场搭话各自独立门控、各自阈值。
+ * - **冷场按周期重复唤醒**：沉默达标后唤醒；此后每再经过一个冷场周期才允许下一次。
+ *   出站消息不重置沉默起点，起点只看最近一次入站时间。
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -313,7 +315,37 @@ describe('契约 5: 冷场主动搭话', () => {
     expect(event.idleMinutes).toBe(60);
   });
 
-  it('单轮防死循环：同一次沉默周期内只搭话一次', async () => {
+  it('未满一个冷场周期不重复唤醒；满一个周期且用户仍无入站则再次唤醒', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const periodMs = 60 * 60 * 1000;
+    // 沉默起点冻结：模拟用户一直没有新的入站，机器人出站也不改这个时间
+    const opts = (now: number) =>
+      makeOptions({
+        config: idleConfig,
+        dispatch,
+        knownPeers: () => [PEER],
+        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        now,
+      });
+
+    await manager.checkProactive(opts(T0));
+    await manager.checkProactive(opts(T0 + periodMs - 1));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
+    await manager.checkProactive(opts(T0 + periodMs));
+    expect(dispatch).toHaveBeenCalledTimes(2);
+
+    await manager.checkProactive(opts(T0 + 2 * periodMs - 1));
+    expect(dispatch).toHaveBeenCalledTimes(2);
+
+    await manager.checkProactive(opts(T0 + 2 * periodMs));
+    expect(dispatch).toHaveBeenCalledTimes(3);
+    expect(dispatch.mock.calls.every((call) => (call[0] as any).kind === 'idle_reply')).toBe(true);
+  });
+
+  it('recordMessage 不得缩短冷场周期：冷却未满时即便沉默起点仍超阈值也不提前再唤醒', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
     const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
@@ -327,16 +359,19 @@ describe('契约 5: 冷场主动搭话', () => {
       });
 
     await manager.checkProactive(opts(T0));
-    await manager.checkProactive(opts(T0 + 600_000));
-    await manager.checkProactive(opts(T0 + 1_200_000));
+    // 入站标志本身不是冷场周期的复位开关；出站更没有这条入口
+    manager.recordMessage(PEER);
+    await manager.checkProactive(opts(T0 + 1000));
 
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it('人类新消息复位冷场标记，下一轮沉默可再次搭话', async () => {
+  it('人类新入站把沉默起点前移后，须重新沉默满一个周期才再唤醒', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
     const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const periodMs = 60 * 60 * 1000;
+    const humanAt = T0 + 10 * 60 * 1000;
 
     await manager.checkProactive(
       makeOptions({
@@ -349,16 +384,28 @@ describe('契约 5: 冷场主动搭话', () => {
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
 
-    // 人类回来了
     manager.recordMessage(PEER);
 
+    // 距上次唤醒已满一个周期，但新的入站沉默只有 50 分钟
     await manager.checkProactive(
       makeOptions({
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 + 100 * 60 * 1000,
-        now: T0 + 200 * 60 * 1000,
+        lastHumanMessageAt: () => humanAt,
+        now: T0 + periodMs,
+      })
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
+    // 从新入站时刻再沉默满一个周期
+    await manager.checkProactive(
+      makeOptions({
+        config: idleConfig,
+        dispatch,
+        knownPeers: () => [PEER],
+        lastHumanMessageAt: () => humanAt,
+        now: humanAt + periodMs,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(2);
@@ -443,6 +490,21 @@ describe('契约 5: 冷场主动搭话', () => {
       })
     );
     expect(dispatch).not.toHaveBeenCalled();
+
+    // 失败不消耗冷场周期，下一轮巡检可立即重试
+    await manager.checkProactive(
+      makeOptions({
+        config: idleConfig,
+        dispatch,
+        knownPeers: () => [PEER],
+        hasActiveSession: () => false,
+        ensureSession: () => true,
+        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        now: T0 + 1000,
+      })
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect((dispatch.mock.calls[0]![0] as any).kind).toBe('idle_reply');
   });
 });
 

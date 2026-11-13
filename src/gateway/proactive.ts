@@ -16,6 +16,9 @@
  *     投递、轮次结束而重置。消息恰好在 tick 前一秒到达并被一并带走，属自然节奏。
  *   - **等待用户输入时暂停**：提问/审批挂起期间跳过唤醒（池化到下一轮），
  *     时钟继续走，不冻结、不重置。
+ *   - **冷场按周期重复唤醒**：沉默达到阈值后唤醒一次；此后必须再经过一个
+ *     冷场周期，才允许下一次。模型是否调用发消息、是否输出结束，都不参与判断。
+ *     出站消息不重置沉默起点，起点只看库中最新入站时间。
  */
 
 import type { BridgePluginConfig } from '../types/index.js';
@@ -52,12 +55,16 @@ export interface ProactiveManagerOptions {
   now?: number;
 }
 
-/** 每 peer 的极简状态：只剩「有没有新消息」与冷场搭话的本轮标记 */
+/** 每 peer 的极简状态：只剩「有没有新消息」与上次冷场唤醒时刻 */
 interface PeerState {
   /** 自上次触发聚合以来是否有新增入站消息 */
   hasNewMessage: boolean;
-  /** 本轮沉默周期内是否已搭过话（防死循环，人类新消息时复位） */
-  idleFired: boolean;
+  /**
+   * 上次冷场唤醒时刻（毫秒）。
+   * null 表示本进程内尚未冷场唤醒过。
+   * 距今未满一个冷场周期则不再唤醒；只由冷场唤醒自身写下，入站与出站都不改它。
+   */
+  lastIdleWakeupAt: number | null;
 }
 
 export class ProactiveManager {
@@ -71,21 +78,21 @@ export class ProactiveManager {
   private stateOf(peer: string): PeerState {
     let st = this.states.get(peer);
     if (!st) {
-      st = { hasNewMessage: false, idleFired: false };
+      st = { hasNewMessage: false, lastIdleWakeupAt: null };
       this.states.set(peer, st);
     }
     return st;
   }
 
   /**
-   * 记录一次入站消息：只置「有新消息」标志并复位冷场标记。
+   * 记录一次入站消息：只置「有新消息」标志。
    * **不保存任何消息内容** —— 内容已在调用方落库。
+   * **不触碰冷场周期** —— 沉默起点只看库中最新入站时间；出站发送没有入口，不得调用本方法。
    */
   recordMessage(peer: string): void {
     if (!peer) return;
     const st = this.stateOf(peer);
     st.hasNewMessage = true;
-    st.idleFired = false;
   }
 
   /** 查询某会话当前是否标记为「有新消息」（只读，不消费） */
@@ -190,11 +197,14 @@ export class ProactiveManager {
       }
     }
 
-    // ---- 2. 冷场主动搭话：独立于聚合时钟，按沉默时长判定 ----
+    // ---- 2. 冷场主动搭话：独立于聚合时钟 ----
+    // 两道闸门同时满足才唤醒：沉默时长达标，且距上次冷场唤醒已满一个周期。
+    // 模型发消息或输出结束都不参与；出站也不重置沉默起点。
     if (!idleEnabled) return;
 
     const timeoutMins = Number(config.idle_reply_timeout_mins ?? 0);
     if (!Number.isFinite(timeoutMins) || timeoutMins <= 0) return;
+    const timeoutMs = timeoutMins * 60 * 1000;
 
     const candidates = new Set<string>(this.states.keys());
     for (const peer of options.knownPeers?.() ?? []) {
@@ -203,28 +213,30 @@ export class ProactiveManager {
 
     for (const peer of candidates) {
       const st = this.stateOf(peer);
-      if (st.idleFired) continue;
+      // 距上次冷场唤醒未满一个周期：不再触发
+      if (st.lastIdleWakeupAt !== null && now - st.lastIdleWakeupAt < timeoutMs) continue;
       // 本轮刚投递过聚合：绝不在同一轮叠加搭话
       if (aggregatedThisTick.has(peer)) continue;
       // 池内有新消息时优先让聚合处理，绝不叠加搭话
       // （仅当聚合开启时该标志才有意义；聚合关闭时不应因标志残留而永久挡住搭话）
       if (aggregationEnabled && st.hasNewMessage) continue;
-      // 等待用户输入期间同样暂停搭话
+      // 等待用户输入期间同样暂停搭话（不记下唤醒时刻，恢复后仍可触发）
       if (options.isAwaitingUserInput?.(peer)) continue;
 
-      // 沉默起点以库中最新消息时间为准，重启后依然准确
+      // 沉默起点以库中最新入站消息时间为准，重启后依然准确。出站消息不写入该时间。
       const lastHumanAt = options.lastHumanMessageAt?.(peer) ?? null;
       if (typeof lastHumanAt !== 'number') continue;
-      if (now - lastHumanAt < timeoutMins * 60 * 1000) continue;
+      if (now - lastHumanAt < timeoutMs) continue;
 
       // 会话不存在时尝试建立（仅对「曾经互动过」的 peer——候选集已按此过滤）
+      // 建立失败不记唤醒时刻，下一轮巡检可立即重试
       if (options.hasActiveSession && !options.hasActiveSession(peer)) {
         const ready = await options.ensureSession?.(peer);
         if (!ready) continue;
       }
 
-      // 先置标记再投递：即便异常也不重复搭话
-      st.idleFired = true;
+      // 先记下唤醒时刻再投递：投递异常也不会在同一周期内紧循环
+      st.lastIdleWakeupAt = now;
       try {
         await dispatch({
           kind: 'idle_reply',
@@ -233,7 +245,7 @@ export class ProactiveManager {
           timestamp: now,
         });
       } catch {
-        // 静默容错，标记保持已置位
+        // 静默容错，唤醒时刻保持已记下
       }
     }
   }

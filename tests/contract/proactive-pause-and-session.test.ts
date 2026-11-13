@@ -128,6 +128,19 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
     );
 
     expect(dispatch).not.toHaveBeenCalled();
+
+    // 暂停不消耗冷场周期，解除后同一沉默可立即唤醒
+    await manager.checkProactive(
+      makeOptions({
+        config: idleOnly,
+        dispatch,
+        knownPeers: () => [PEER],
+        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        now: T0,
+      })
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect((dispatch.mock.calls[0]![0] as any).kind).toBe('idle_reply');
   });
 });
 
