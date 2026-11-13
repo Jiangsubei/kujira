@@ -57,7 +57,7 @@ import {
 } from './gateway/wakeup.js';
 import { SessionManager } from './gateway/session.js';
 import { SystemEventHub } from './gateway/system-event-hub.js';
-import { ProactiveManager } from './gateway/proactive.js';
+import { ProactiveManager, shouldPoolInbound } from './gateway/proactive.js';
 import type { SystemWakeupEvent } from './types/system-event.js';
 import {
   describeInboundAttachments,
@@ -65,7 +65,7 @@ import {
 } from './attachment/classify.js';
 import { serializeAttachments } from './attachment/store.js';
 import { localizeInboundAttachments } from './attachment/localize.js';
-import { renderAttachment } from './attachment/render.js';
+import { renderAttachment, renderAttachments } from './attachment/render.js';
 import { mapWithConcurrency } from './utils/concurrency.js';
 import { OutboundStreamBridge } from './outbound/stream.js';
 import { recordOutboundSelfMessage } from './outbound/self-record.js';
@@ -248,11 +248,24 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
 
   const turnInitiatorTracker = new TurnInitiatorTracker({ maxExpectations: 256 });
   sessionManager.setTurnInitiatorTracker(turnInitiatorTracker);
+  // turn/end 聚合 flush 的挂载点：section 4.1 创建管理器后回填，避免顺序耦合
+  let flushAggregatedOnTurnEnd: ((peer: string) => void) | null = null;
   const unregisterTurnInitiator = (ctx as any).on?.('session/event', (session: any, event: any) => {
     try {
       turnInitiatorTracker.observe(session, event);
     } catch (err) {
       logger.warn?.('[Plugin] 本轮唤醒者追踪器处理 session/event 失败:', err);
+    }
+    try {
+      if (event?.type === 'turn/end') {
+        const sessionId = session?.id === undefined || session?.id === null ? '' : String(session.id);
+        if (sessionId && sessionManager.isKujiraSession(sessionId)) {
+          const peer = sessionManager.sessionIdToPeer(sessionId);
+          if (peer) flushAggregatedOnTurnEnd?.(peer);
+        }
+      }
+    } catch (err) {
+      logger.warn?.('[Plugin] turn/end 聚合 flush 调度失败:', err);
     }
   });
 
@@ -301,36 +314,41 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
     await systemEventHub.dispatchSystemEvent(event);
   };
-  proactiveManager.startChecker(
-    () => ({
-      config: currentConfig(),
-      dispatch: dispatchProactiveEvent,
-      // 等待提问答复或审批决策期间跳过唤醒，新消息累积到下一轮
-      isAwaitingUserInput: (peer: string) => isAwaitingUserInput(peer),
-      // 活跃会话门控：口径与 `/状态` 命令一致
-      hasActiveSession: (peer: string) => sessionManager.hasActiveSession(peer),
-      // 冷场搭话时：曾有互动但会话已不在 → 允许新建会话后唤醒
-      ensureSession: (peer: string) => sessionManager.ensureSession(peer),
-      // 沉默起点以库中最新入站消息为准，重启后依然准确
-      lastHumanMessageAt: (peer: string) => {
-        try {
-          const slot = db.getLatestValidInboundSlot(peer);
-          return slot?.received_at ?? null;
-        } catch {
-          return null;
-        }
-      },
-      // 仅「曾经真实互动过」的 peer（peer_openid_map 已登记）才参与冷场搭话扫描
-      knownPeers: () => {
-        try {
-          return db.getAllPeers();
-        } catch {
-          return [];
-        }
-      },
-    }),
-    PROACTIVE_CHECK_INTERVAL_MS
-  );
+  const buildProactiveOptions = () => ({
+    config: currentConfig(),
+    dispatch: dispatchProactiveEvent,
+    // 等待提问答复或审批决策期间跳过投递，池保留到下一轮
+    isAwaitingUserInput: (peer: string) => isAwaitingUserInput(peer),
+    // Agent 正在运行一轮时绝不打断，由 turn/end flush 投递
+    isAgentRunning: (peer: string) => sessionManager.isAgentRunning(peer),
+    // 活跃会话门控：口径与 `/状态` 命令一致
+    hasActiveSession: (peer: string) => sessionManager.hasActiveSession(peer),
+    // 冷场搭话 / 聚合重试时：曾有互动但会话已不在 → 允许新建会话
+    ensureSession: (peer: string) => sessionManager.ensureSession(peer),
+    // 沉默起点以库中最新入站消息为准，重启后依然准确
+    lastHumanMessageAt: (peer: string) => {
+      try {
+        const slot = db.getLatestValidInboundSlot(peer);
+        return slot?.received_at ?? null;
+      } catch {
+        return null;
+      }
+    },
+    // 仅「曾经真实互动过」的 peer（peer_openid_map 已登记）才参与冷场搭话扫描
+    knownPeers: () => {
+      try {
+        return db.getAllPeers();
+      } catch {
+        return [];
+      }
+    },
+  });
+  proactiveManager.startChecker(buildProactiveOptions, PROACTIVE_CHECK_INTERVAL_MS);
+  flushAggregatedOnTurnEnd = (peer: string) => {
+    void proactiveManager
+      .flushPendingMessages(peer, { ...buildProactiveOptions(), now: Date.now() })
+      .catch((err) => logger.warn?.('[Plugin] turn/end 聚合 flush 失败:', err));
+  };
 
   const taskScheduler = new TaskScheduler({
     systemEventHub,
@@ -897,15 +915,62 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
 
     // 拦截 5：消息聚合回复门控
-    // 聚合开启时，普通消息**不进入 session、不即时唤醒**，仅落库并置「有新消息」标志。
-    // 模型在周期检查点被唤醒后，自行调用 read_chat_history 取回内容——我们不再维护消息池。
-    // 聚合期间绝不发送 `msg_type=6` 输入中提示（否则「正在输入」会长时间挂着）。
+    // 聚合开启时，普通消息默认入内存池等待轮次边界投递；
+    // 唯一例外是「一轮正在运行 + new_message_behavior = steer」——即时插话，不入池。
+    // 提问/审批答案、wait_for_user_messages 收集都在此之前被消费，天然不入池。
     const activeConfig = currentConfig();
     if (activeConfig.aggregation_enabled) {
       outboundBridge.trackInboundContext(peer, inboundContext);
-      proactiveManager.recordMessage(peer);
+
+      const behavior: 'steer' | 'queue' =
+        activeConfig.new_message_behavior === 'queue' ? 'queue' : 'steer';
+      const agentRunning = sessionManager.isAgentRunning(peer);
+      const pooled = shouldPoolInbound({
+        aggregationEnabled: true,
+        behavior,
+        isAgentRunning: agentRunning,
+      });
+
+      if (!pooled) {
+        // 插话：消息原样即时给到运行中的 Agent，不收集、不等待周期
+        try {
+          await sessionManager.dispatchWakeup(decision.payload, {
+            onMessageCreated: (userMsg) => {
+              if (userMsg?.id) {
+                outboundBridge.trackPendingMessage(userMsg.id, peer, inboundContext);
+              }
+            },
+          });
+        } catch (err) {
+          logger.error?.('[Plugin] 聚合期间即时插话唤醒失败:', err);
+        }
+        return;
+      }
+
+      // 附件占位符单独成行；正文中的同一占位符剔除，避免重复展示
+      const renderedAttachments = renderAttachments(descriptors);
+      let aggregatedText = content;
+      for (const attachment of renderedAttachments) {
+        aggregatedText = aggregatedText.split(attachment).join('');
+      }
+      aggregatedText = aggregatedText
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+      proactiveManager.recordMessage(
+        peer,
+        {
+          ...(savedShortId ? { short_id: savedShortId } : {}),
+          content: aggregatedText,
+          time: receivedAt,
+          ...(decision.payload.quoted ? { quoted: decision.payload.quoted } : {}),
+          ...(renderedAttachments.length > 0 ? { attachments: renderedAttachments } : {}),
+        },
+        openid
+      );
       logger.debug?.(
-        `[Plugin] 消息已落库并标记待聚合 (peer: ${peer}, 周期: ${activeConfig.aggregation_interval_mins ?? 2} 分钟)`
+        `[Plugin] 消息已入聚合池 (peer: ${peer}, 运行中: ${agentRunning}, 模式: ${behavior})`
       );
       return;
     }

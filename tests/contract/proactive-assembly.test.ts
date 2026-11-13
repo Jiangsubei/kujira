@@ -185,29 +185,34 @@ describe('单聊主动能力真实装配闭环', () => {
     });
   }
 
-  it('契约 1: 真实装配后 kujira-proactive 可获取，且暴露极简布尔标志 API', () => {
+  it('契约 1: 真实装配后 kujira-proactive 暴露内存消息池 API', () => {
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
     expect(proactive).toBeDefined();
     expect(typeof proactive.checkProactive).toBe('function');
     expect(typeof proactive.recordMessage).toBe('function');
     expect(typeof proactive.hasPendingMessage).toBe('function');
-    // 消息池 API 必须已删除
-    expect(proactive.getPendingMessages).toBeUndefined();
-    expect(proactive.consumePendingMessages).toBeUndefined();
+    expect(typeof proactive.getPendingMessages).toBe('function');
+    expect(typeof proactive.flushPendingMessages).toBe('function');
+    // 旧的「布尔消费」API 已删除
+    expect(proactive.consumePendingMessage).toBeUndefined();
   });
 
-  it('契约 2: 聚合开启时入站消息只置标志，不唤醒、不进 session、不发输入中提示', async () => {
+  it('契约 2: 聚合开启且空闲时入站消息只入池，不唤醒、不进 session、不发输入中提示', async () => {
     emitInbound('ROBOT1.0_IN_P_1', '在吗');
     await new Promise((r) => setTimeout(r, 120));
 
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
     expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(true);
+    const pending = proactive.getPendingMessages(MOCK_PEER) as any[];
+    expect(pending).toHaveLength(1);
+    expect(pending[0].content).toBe('在吗');
+    expect(pending[0].short_id).toBeTruthy();
 
     // 不产生任何出站（尤其不得发 msg_type=6 输入中提示）
     expect(outboundRequests).toHaveLength(0);
   });
 
-  it('契约 3: 自由周期时钟到点后经 SystemEventHub 真实投递聚合唤醒，事件不带消息内容', async () => {
+  it('契约 3: 自由周期时钟到点后经 SystemEventHub 真实投递聚合唤醒，事件逐条携带消息', async () => {
     emitInbound('ROBOT1.0_IN_P_2', '在吗');
     emitInbound('ROBOT1.0_IN_P_3', '那个接口一直 403');
     await new Promise((r) => setTimeout(r, 120));
@@ -234,15 +239,16 @@ describe('单聊主动能力真实装配闭环', () => {
     const event = dispatchSpy.mock.calls[0]![0] as any;
     expect(event.kind).toBe('aggregated_messages');
     expect(event.peer).toBe(MOCK_PEER);
-    // 绝不携带消息内容
-    expect(event.messages).toBeUndefined();
+    expect(event.reason).toBe('period');
+    expect(event.messages.map((m: any) => m.content)).toEqual(['在吗', '那个接口一直 403']);
 
-    // 标志已消费
+    // 投递成功后池清空
     expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(false);
   });
 
-  it('契约 4: 聚合轮次的 WakeupPayload 提示词要求模型自调 read_chat_history，且携带真实 from_user', async () => {
+  it('契约 4: 聚合轮次的 WakeupPayload 逐条注入消息内容，并提示 read_chat_history 可选回溯', async () => {
     emitInbound('ROBOT1.0_IN_P_4', '在吗');
+    emitInbound('ROBOT1.0_IN_P_5', '那个接口一直 403');
     await new Promise((r) => setTimeout(r, 120));
 
     const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
@@ -267,9 +273,27 @@ describe('单聊主动能力真实装配闭环', () => {
     expect(payload.trigger).toBe('aggregated');
     expect(payload.from_user).toBe(MOCK_OPENID);
     expect(payload.from_name).toBe('');
-    // 提示词强制自调工具，且不含消息正文
+    // 逐条注入正文，同时保留 read_chat_history 作为可选回溯
+    expect(payload.content).toContain('在吗');
+    expect(payload.content).toContain('那个接口一直 403');
     expect(payload.content).toContain('read_chat_history');
-    expect(payload.content).not.toContain('那个接口');
+    expect(payload.content).not.toContain(MOCK_PEER);
+  });
+
+  it('契约 10: 一轮运行中 steer → 即时插话不入池，池保持为空', async () => {
+    const sm = (booted!.ctx as any).get('kujira-session') as any;
+    const proactive = (booted!.ctx as any).get('kujira-proactive') as any;
+    const wakeSpy = vi.spyOn(sm, 'dispatchWakeup').mockResolvedValue(undefined);
+    vi.spyOn(sm, 'isAgentRunning').mockReturnValue(true);
+
+    emitInbound('ROBOT1.0_IN_P_STEER', '等等，先别发');
+    await new Promise((r) => setTimeout(r, 120));
+
+    expect(proactive.hasPendingMessage(MOCK_PEER)).toBe(false);
+    expect(wakeSpy).toHaveBeenCalledTimes(1);
+    const payload = wakeSpy.mock.calls[0]![0] as any;
+    expect(payload.trigger).toBe('direct');
+    expect(payload.content).toBe('等等，先别发');
   });
 
   it('契约 5: 冷场搭话 payload 保持 from_user 为空（系统自发，审批 Fail-Closed）', async () => {

@@ -14,17 +14,22 @@ export interface WakeupQuotedInfo {
 }
 
 /**
- * 消息聚合池中的一条待回复消息（精简契约：全部使用短 ID，绝不透出长 `ROBOT1.0_` 锚点）
- * @deprecated 聚合已改为「不携带消息内容、由模型自调 read_chat_history」，
- *   该类型仅保留供历史调用方过渡，新代码请勿使用。
+ * 消息聚合池中的一条待回复消息（精简契约：全部使用短 ID，绝不透出长 `ROBOT1.0_` 锚点）。
+ *
+ * 池只保存「尚未投递」的真实入站消息；提问/审批答案、wait_for_user_messages 收集
+ * 以及运行中 steer 即时投递的消息都不入池，因此模型不会重复看到已处理内容。
  */
 export interface AggregatedMessage {
   /** 单聊短消息 ID（如 `msg_<n>`），入池时已解析 */
   short_id?: string;
-  /** 归一化后的消息正文（含附件占位符与引用前缀） */
+  /** 归一化后的消息正文（不含引用前缀与附件占位符） */
   content: string;
   /** 消息时间戳（毫秒） */
   time: number;
+  /** 引用回复快照：渲染时独立成行 */
+  quoted?: WakeupQuotedInfo;
+  /** 附件占位符（如 `[图片: ...]`）：渲染时每条独立成行 */
+  attachments?: string[];
 }
 
 export interface WakeupPayload {

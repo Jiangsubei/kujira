@@ -240,6 +240,15 @@ export class SessionAgentRunner {
     return agents?.get?.(sessionId as any);
   }
 
+  /** 只读判定：该 peer / 会话的 Agent 当前是否正在运行一轮 */
+  public isAgentRunning(peerOrSessionId: string): boolean {
+    try {
+      return this.getAgent(peerOrSessionId)?.status === 'running';
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * 拦截 Web UI 发送消息 (sessionController.prompt)：
    * 当 Kujira 会话处于活跃状态或独占持有时，强制拒绝并返回只读提示
@@ -626,7 +635,15 @@ export class SessionAgentRunner {
       options?.onMessageCreated?.(userMsg);
       const isAgentRunning = (agent as any).status === 'running';
       const behavior = this.resolveNewMessageBehavior();
-      if (isAgentRunning && behavior === 'steer' && typeof (agent as any).steer === 'function') {
+      // 聚合批次只允许在轮次边界投递：绝不 steer 打断进行中的轮次，
+      // 一律 followup 排队到下一轮（turn/end / 空闲 tick 都是这个入口）。
+      const isAggregatedBatch = payload.trigger === 'aggregated';
+      if (
+        !isAggregatedBatch &&
+        isAgentRunning &&
+        behavior === 'steer' &&
+        typeof (agent as any).steer === 'function'
+      ) {
         (agent as any).steer(userMsg);
       } else {
         agent.followup(userMsg);

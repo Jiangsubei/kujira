@@ -32,6 +32,43 @@ export function formatTimeOnly(timestamp: number): string {
 }
 
 /**
+ * 把聚合池中的一条消息渲染为「序号 + 短 ID + 时间」的逐条段落。
+ * 引用快照与附件占位符各占一行，正文单独一行。
+ */
+function renderAggregatedMessageLines(
+  messages: ReadonlyArray<{ short_id?: string; content: string; time: number; quoted?: { short_id?: string; time?: number; text: string }; attachments?: string[] }>
+): string[] {
+  const lines: string[] = [];
+  messages.forEach((message, index) => {
+    const shortId = typeof message.short_id === 'string' && message.short_id.trim() ? message.short_id.trim() : '';
+    const timeStr = message.time ? formatDateTime(message.time) : '';
+    const header = [shortId ? `[${shortId}]` : '', timeStr ? `[${timeStr}]` : '']
+      .filter(Boolean)
+      .join(' ');
+    lines.push(`${index + 1}. ${header}`.trimEnd());
+
+    const quoted = message.quoted;
+    if (quoted) {
+      const qShortId =
+        typeof quoted.short_id === 'string' && quoted.short_id.trim() ? quoted.short_id.trim() : '';
+      const qTime = typeof quoted.time === 'number' && quoted.time > 0 ? formatDateTime(quoted.time) : '';
+      const qHeader = [qShortId ? `[${qShortId}]` : '', qTime ? `[${qTime}]` : '']
+        .filter(Boolean)
+        .join(' ');
+      const qText = quoted.text ? ` ${quoted.text}` : '';
+      lines.push(`   [引用回复: "${qHeader}${qText}"]`);
+    }
+
+    for (const attachment of message.attachments ?? []) {
+      if (attachment) lines.push(`   ${attachment}`);
+    }
+
+    if (message.content) lines.push(`   ${message.content}`);
+  });
+  return lines;
+}
+
+/**
  * 格式化系统事件的标准提示词文本（QQ 官方 Bot 单聊）。
  * 骨架：双换行分段、中文冒号标引、行为引导置底。
  */
@@ -55,17 +92,36 @@ export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
     }
 
     case 'aggregated_messages': {
-      // 关键设计：绝不携带任何消息内容或消息列表。
-      // 数据库是唯一可信源，模型必须自行调用 read_chat_history 取回新消息。
-      const guide =
-        '（说明：用户在你的上一条回复之后又发来了新消息。' +
-        '你必须先调用 read_chat_history 工具，查看自你上次回复以来有什么新消息，再判断如何回复。' +
-        '如果此时回复会打扰用户，或者没有值得回应的内容，直接输出 [结束] 即可。' +
-        '表现自然，切勿向用户透露消息聚合、或系统唤醒等任何后台痕迹。）';
+      const messages = Array.isArray(event.messages) ? event.messages : [];
+
+      // 无消息快照的历史调用：保留「有新消息，去读历史」的兜底语义
+      if (messages.length === 0) {
+        const guide =
+          '（说明：用户在你的上一条回复之后又发来了新消息。' +
+          '你必须先调用 read_chat_history 工具，查看自你上次回复以来有什么新消息，再判断如何回复。' +
+          '如果此时回复会打扰用户，或者没有值得回应的内容，直接输出 [结束] 即可。' +
+          '表现自然，切勿向用户透露消息聚合、或系统唤醒等任何后台痕迹。）';
+
+        return (
+          `系统事件：[消息聚合]${timeStr ? ` [${timeStr}]` : ''}\n\n` +
+          `会话状态：检测到自上次回复以来有新的用户消息待查看。\n\n` +
+          guide
+        );
+      }
+
+      const count = messages.length;
+      const isTurnEnd = event.reason === 'turn_end';
+      const stateLine = isTurnEnd
+        ? `会话状态：你上一轮处理期间，用户又发来了 ${count} 条新消息。`
+        : `会话状态：自你上次回复以来，用户发来了 ${count} 条新消息。`;
+      const guide = isTurnEnd
+        ? '（说明：以上消息是在你上一轮回复过程中到达的。请先判断它们是否已经被你上一条回复覆盖，或者只是补充、闲聊、情绪表达而无需回应；若已经回应过，或此刻再回复会显得重复、打扰，直接输出 [结束] 即可。确实需要补充回应时，直接针对新内容自然作答；如需更早的上下文，可调用 read_chat_history。切勿向用户透露消息聚合或系统唤醒等任何后台痕迹。）'
+        : '（说明：以上是本轮周期内聚合的用户消息，已按时间顺序逐条列出，可直接针对内容回复；如需回顾更早的上下文，可调用 read_chat_history 查询。若此时回复会打扰用户，或没有值得回应的内容，直接输出 [结束] 即可。表现自然，切勿向用户透露消息聚合或系统唤醒等任何后台痕迹。）';
 
       return (
         `系统事件：[消息聚合]${timeStr ? ` [${timeStr}]` : ''}\n\n` +
-        `会话状态：检测到自上次回复以来有新的用户消息待查看。\n\n` +
+        `${stateLine}\n\n` +
+        `${renderAggregatedMessageLines(messages).join('\n')}\n\n` +
         guide
       );
     }

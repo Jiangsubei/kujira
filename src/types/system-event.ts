@@ -7,6 +7,8 @@
  */
 
 /** 系统事件类型辨识标签 */
+import type { AggregatedMessage } from './wakeup.js';
+
 export type SystemEventKind = 'scheduled_task' | 'aggregated_messages' | 'idle_reply';
 
 /** 定时任务系统事件 */
@@ -23,14 +25,22 @@ export interface ScheduledTaskEvent {
 }
 
 /**
- * 消息聚合回复事件：自由周期时钟到点后，告知模型「有新消息」。
+ * 消息聚合回复事件：轮次边界（自由周期 tick 或 turn/end flush）投递内存池。
  *
- * 关键设计：**事件本身不携带任何消息内容**。数据库是唯一可信源，
- * 模型必须自行调用 `read_chat_history` 取回新消息后再决定是否回复。
+ * 事件携带逐条待回复消息，模型可直接据此回复；如需更早上下文，
+ * 仍可自行调用 `read_chat_history` 回溯。
  */
 export interface AggregatedMessagesEvent {
   kind: 'aggregated_messages';
   peer: string;
+  /** 待投递消息快照（按时间顺序；存在时提示词逐条列出） */
+  messages?: AggregatedMessage[];
+  /**
+   * 投递时机：
+   * - `period`：自由周期时钟到点（会话空闲时）
+   * - `turn_end`：一轮处理结束后的排队消息 flush
+   */
+  reason?: 'period' | 'turn_end';
   /**
    * 触发本轮聚合的真实发送者身份（peer 内真实用户 openid）。
    * 聚合轮次源于真实用户的入站消息，故具备审批发起人资格；

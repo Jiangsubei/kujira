@@ -470,6 +470,19 @@ export class SessionManager {
     return this.agentRunner.isSessionBusy(sessionId) || this.agentRunner.isSessionBusy(peerOrSessionId);
   }
 
+  /**
+   * 只读判定：该 peer / 会话的 Agent 当前是否正在运行一轮。
+   * 无活跃会话时直接返回 false，绝不触发会话创建。
+   */
+  public isAgentRunning(peerOrSessionId: string): boolean {
+    if (!peerOrSessionId) return false;
+    const peer = isKujiraSession(peerOrSessionId)
+      ? this.sessionIdToPeer(peerOrSessionId)
+      : peerOrSessionId;
+    if (!peer || !this.hasActiveSession(peer)) return false;
+    return this.agentRunner.isAgentRunning(peer);
+  }
+
   public isKujiraSession(sessionId: string): boolean {
     return isKujiraSession(sessionId);
   }

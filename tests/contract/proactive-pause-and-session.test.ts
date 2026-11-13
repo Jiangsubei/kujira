@@ -27,6 +27,11 @@ const BASE_CONFIG = {
 
 const T0 = 1_000_000;
 
+/** 构造一条入池消息 */
+function msg(text = '测试消息', time = T0) {
+  return { content: text, time };
+}
+
 function makeOptions(overrides: Record<string, any> = {}) {
   const { config: configOverride, now, ...rest } = overrides;
   return {
@@ -41,7 +46,7 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
 
-    manager.recordMessage(PEER);
+    manager.recordMessage(PEER, msg());
     // 建立相位
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
 
@@ -60,7 +65,7 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
 
-    manager.recordMessage(PEER);
+    manager.recordMessage(PEER, msg());
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
     await manager.checkProactive(
       makeOptions({ dispatch, now: T0 + 120_000, isAwaitingUserInput: () => true })
@@ -75,14 +80,14 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
 
-    manager.recordMessage(PEER);
+    manager.recordMessage(PEER, msg());
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
     await manager.checkProactive(
       makeOptions({ dispatch, now: T0 + 120_000, isAwaitingUserInput: () => true })
     );
 
     // 暂停期间又来了新消息
-    manager.recordMessage(PEER);
+    manager.recordMessage(PEER, msg());
     expect(manager.hasPendingMessage(PEER)).toBe(true);
 
     await manager.checkProactive(makeOptions({ dispatch, now: T0 + 240_000 }));
@@ -94,8 +99,8 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
 
-    manager.recordMessage(PEER);
-    manager.recordMessage(PEER_B);
+    manager.recordMessage(PEER, msg());
+    manager.recordMessage(PEER_B, msg());
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
 
     await manager.checkProactive(
@@ -150,7 +155,7 @@ describe('契约 2: 活跃会话门控', () => {
     const dispatch = vi.fn(async () => {});
     const ensureSession = vi.fn(async () => true);
 
-    manager.recordMessage(PEER);
+    manager.recordMessage(PEER, msg());
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
     await manager.checkProactive(
       makeOptions({ dispatch, now: T0 + 120_000, hasActiveSession: () => false, ensureSession })
@@ -161,12 +166,12 @@ describe('契约 2: 活跃会话门控', () => {
     expect((dispatch.mock.calls[0]![0] as any).kind).toBe('aggregated_messages');
   });
 
-  it('聚合：无活跃会话且 ensureSession 失败时跳过，标志已消费', async () => {
+  it('聚合：无活跃会话且 ensureSession 失败时跳过，池完整保留待重试', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
     const ensureSession = vi.fn(async () => false);
 
-    manager.recordMessage(PEER);
+    manager.recordMessage(PEER, msg());
     await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
     await manager.checkProactive(
       makeOptions({ dispatch, now: T0 + 120_000, hasActiveSession: () => false, ensureSession })
@@ -174,6 +179,7 @@ describe('契约 2: 活跃会话门控', () => {
 
     expect(ensureSession).toHaveBeenCalledWith(PEER);
     expect(dispatch).not.toHaveBeenCalled();
+    expect(manager.hasPendingMessage(PEER)).toBe(true);
   });
 
   it('冷场搭话：有 peer 记录但无会话 → 建会话后搭话', async () => {

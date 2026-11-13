@@ -170,4 +170,53 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
 
     await sessionManager.dispose();
   });
+
+  it('契约 4: 聚合批次（trigger=aggregated）即便 agent 运行中且配置 steer，也强制 followup 排队，绝不打断当前轮', async () => {
+    const steerSpy = vi.fn();
+    const followupSpy = vi.fn();
+
+    const mockAgent: any = {
+      status: 'running',
+      steer: steerSpy,
+      followup: followupSpy,
+      session: { id: SID_1 },
+    };
+
+    mockCtx.config = { new_message_behavior: 'steer' };
+    mockCtx.get = vi.fn((key: string) => {
+      if (key === 'agents') {
+        return {
+          get: () => mockAgent,
+          create: vi.fn().mockResolvedValue({ agent: mockAgent }),
+          resume: vi.fn().mockResolvedValue({ agent: mockAgent }),
+        };
+      }
+      return undefined;
+    });
+
+    const sessionManager = new SessionManager(mockCtx, tmpHome);
+
+    const userMsg = await sessionManager.dispatchWakeup({
+      trigger: 'aggregated',
+      peer: PEER_1,
+      from_user: OPENID_1,
+      from_name: '',
+      content: '系统事件：[消息聚合]',
+      timestamp: Date.now(),
+      is_system: true,
+      system_event: {
+        kind: 'aggregated_messages',
+        peer: PEER_1,
+        messages: [{ short_id: 'msg_1', content: '在吗', time: Date.now() }],
+        reason: 'turn_end',
+      },
+    });
+
+    expect(userMsg).toBeDefined();
+    expect(steerSpy).not.toHaveBeenCalled();
+    expect(followupSpy).toHaveBeenCalledTimes(1);
+    expect(followupSpy).toHaveBeenCalledWith(userMsg);
+
+    await sessionManager.dispose();
+  });
 });
