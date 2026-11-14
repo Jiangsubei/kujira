@@ -205,7 +205,7 @@ pnpm test          # 完整构建测试（pnpm build + vitest run）
 - [系统架构与设计哲学 (docs/architecture.md)](docs/architecture.md)：仿生动态时序引擎数学模型、正向网关、静默出站体系深度解析。
 - [运行时配置全景参考 (docs/configuration.md)](docs/configuration.md)：23 项核心配置详尽字典、调优配方与自愈机制。
 - [Agent 工具集与斜杠命令手册 (docs/tools-and-commands.md)](docs/tools-and-commands.md)：16 大专属工具 Lossless JSON 契约与 10 大命令。
-- [常见问题排查与实测手册 (docs/troubleshooting.md)](docs/troubleshooting.md)：频控、2 分钟撤回、Markdown 渲染、探针使用指南。
+- [常见问题排查与实测手册 (docs/troubleshooting.md)](docs/troubleshooting.md)：实测避坑（40054005 跨天去重、40034024 ID混淆、流式 50015001、2 分钟撤回）、探针使用指南。
 
 ---
 

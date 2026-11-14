@@ -35,7 +35,7 @@ kujira 作为 DeepSeek Harness (DSH) 的 Cordis 插件运行，在腾讯 QQ 开�
 |  |                                PerPeerSerialSender                                 |  |
 |  |                              (单对端出站串行化发送队列)                             |  |
 |  |                                + InboundReplySlots                                |  |
-|  |                       (被动回复槽位复用锚点，解决 50015001)                       |  |
+|  |                     (入站锚点与单调槽位管理，防 40054005 与 50015001)                     |  |
 |  +-----------------------------------------------------------------------------------+  |
 |                                             ^                                           |
 |                                             | (OpenAPI / WebSocket Gateway v2)          |
@@ -78,7 +78,7 @@ kujira 作为 DeepSeek Harness (DSH) 的 Cordis 插件运行，在腾讯 QQ 开�
    - 工具集隔离：预设挂载 `kujira/tools`（包含 16 大单聊专属工具），**绝不向 WebUI 常规会话泄露**。
 5. **出站桥接与串行下发**：
    - 启动出方向事件流拦截器（`OutboundStreamBridge`）与单对端串行发送器（`PerPeerSerialSender`）；
-   - 挂载 `InboundReplySlots`，在 60 分钟 / 4 次被动有效窗口内自动复用入站 `msg_id`，规避无配额主动消息报错（`50015001`）。
+   - 挂载 `InboundReplySlots`，维护持久化入站锚点与单调递增 `msg_seq` 槽位，彻底杜绝 `40054005` 跨天去重拒绝，保障流式接口规避无锚点 `50015001` 异常，并在锚点失效时平滑降级普通主动消息。
 6. **WebUI 设置卡片与 REST 路由**：
    - 注册 `/plugins/kujira/config` REST 路由，全面接入宿主 `connection` 服务鉴权（Fail-Closed 策略）；
    - 凭据提交执行只写保护，禁止明文回显；支持 23 项核心配置项 volatile 动态热更新。
@@ -231,7 +231,7 @@ stateDiagram-v2
 kujira 在本地采用嵌入式 SQLite（`better-sqlite3`）维护单聊核心状态表：
 - `messages`：记录入站/出站消息时间戳、短 ID、真实 ID、媒体路径与内容摘要；
 - `peer_openid_map`：维护 QQ 官方 32 位大写十六进制 `openid` 与内部对端 `peer` 的双向索引；
-- `inbound_reply_slots`：被动回复窗口跟踪表。记录每个入站消息的被动回复可用次数（上限 4 次）与 60 分钟过期时间戳；
+- `inbound_reply_slots`：入站回复槽位跟踪表。记录每个入站 `msg_id` 的 `last_seq` 消费进度与失效标记，为跨轮次回复提供防 `40054005` 幂等去重保障与出站/入站 ID 强隔离；
 - `slang_terms`：黑话知识库条目表（记录触发情境、招牌例句与使用计数）。
 
 ### 6.2 Markdown 双层记忆与字符预算硬拒绝
