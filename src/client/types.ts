@@ -2,7 +2,7 @@ import type React from 'react';
 import type { BridgePluginConfig, CredentialStatusSummary } from '../types/index.js';
 import type { KujiraFormModel } from './model.js';
 
-export type SettingsTabId = 'connection' | 'persona' | 'memory' | 'face' | 'slang';
+export type SettingsTabId = 'connection' | 'reply' | 'persona' | 'memory' | 'face' | 'slang';
 
 export interface TabItem {
   id: SettingsTabId;
@@ -10,7 +10,8 @@ export interface TabItem {
 }
 
 export const SETTINGS_TABS: readonly TabItem[] = [
-  { id: 'connection', label: '连接与对话' },
+  { id: 'connection', label: '常规' },
+  { id: 'reply', label: '回复节奏' },
   { id: 'persona', label: '人格与准则' },
   { id: 'memory', label: '记忆' },
   { id: 'face', label: '表情包' },

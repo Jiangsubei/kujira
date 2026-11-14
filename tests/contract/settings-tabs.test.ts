@@ -16,7 +16,7 @@ import {
 } from '../../src/client/card.js';
 import type { CredentialStatusSummary } from '../../src/types/index.js';
 
-describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨 Tab 保存 (Settings Tabs Contract)', () => {
+describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨 Tab 保存 (Settings Tabs Contract)', () => {
   let controller: CardController;
   let mockSaveSettings: ReturnType<typeof vi.fn>;
 
@@ -42,15 +42,18 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
     return html;
   }
 
-  describe('1. 5 分区 Tab 渲染与已下线 Tab 排他契约', () => {
-    it('卡片展开后必须渲染且仅渲染 5 个官方 Tab，彻底移除主动回复与权限安全 Tab', () => {
+  describe('1. 6 分区 Tab 渲染与已下线 Tab 排他契约', () => {
+    it('卡片展开后必须渲染且仅渲染 6 个官方 Tab，彻底移除主动回复与权限安全 Tab', () => {
       const html = renderCard();
 
       expect(html).toContain('role="tablist"');
       expect(html).toContain('aria-label="设置分区"');
 
       expect(html).toContain('id="kujira-tab-connection"');
-      expect(html).toContain('连接与对话');
+      expect(html).toContain('常规');
+
+      expect(html).toContain('id="kujira-tab-reply"');
+      expect(html).toContain('回复节奏');
 
       expect(html).toContain('id="kujira-tab-persona"');
       expect(html).toContain('人格与准则');
@@ -66,12 +69,13 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
 
       expect(SETTINGS_TABS.map((t) => t.id)).toEqual([
         'connection',
+        'reply',
         'persona',
         'memory',
         'face',
         'slang',
       ]);
-      expect(SETTINGS_TABS).toHaveLength(5);
+      expect(SETTINGS_TABS).toHaveLength(6);
 
       expect(html).not.toContain('kujira-tab-proactive');
       expect(html).not.toContain('security');
@@ -87,13 +91,14 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
     });
   });
 
-  describe('2. 默认展示 Tab 1 (连接与对话) 及只写凭据表单契约', () => {
-    it('默认 activeTab 为 connection，对应 panel 可见且其他 4 个 panel 隐藏', () => {
+  describe('2. 默认展示 Tab 1 (常规) 及只写凭据表单契约', () => {
+    it('默认 activeTab 为 connection，对应 panel 可见且其他 5 个 panel 隐藏', () => {
       const html = renderCard();
 
       expect(html).toMatch(/id="kujira-tab-connection"[^>]*aria-selected="true"/);
       expect(html).toMatch(/id="kujira-tab-connection"[^>]*kujira_tabActive/);
 
+      expect(html).toMatch(/id="kujira-tab-reply"[^>]*aria-selected="false"/);
       expect(html).toMatch(/id="kujira-tab-persona"[^>]*aria-selected="false"/);
       expect(html).toMatch(/id="kujira-tab-memory"[^>]*aria-selected="false"/);
       expect(html).toMatch(/id="kujira-tab-face"[^>]*aria-selected="false"/);
@@ -102,13 +107,14 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(html).toMatch(/id="kujira-tabpanel-connection"[^>]*role="tabpanel"/);
       expect(html).not.toMatch(/id="kujira-tabpanel-connection"[^>]*hidden/);
 
+      expect(html).toMatch(/id="kujira-tabpanel-reply"[^>]*hidden/);
       expect(html).toMatch(/id="kujira-tabpanel-persona"[^>]*hidden/);
       expect(html).toMatch(/id="kujira-tabpanel-memory"[^>]*hidden/);
       expect(html).toMatch(/id="kujira-tabpanel-face"[^>]*hidden/);
       expect(html).toMatch(/id="kujira-tabpanel-slang"[^>]*hidden/);
     });
 
-    it('Tab 1 包含 2 个只写凭据框（不回显明文）与 2 个对话/媒体配置项，不再暴露已固化的 markdown_enabled / input_notify_enabled 开关', () => {
+    it('Tab 1 包含 2 个只写凭据框（不回显明文）与 1 个媒体保留天数配置项，不再包含 new_message_behavior 或主动聚合/搭话', () => {
       const credStatus: CredentialStatusSummary = {
         appId: { configured: true, source: 'file', writable: true },
         appSecret: { configured: false, writable: true },
@@ -117,7 +123,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       const html = renderCard({ credentialsStatus: credStatus });
 
       const connectionPanelMatch = html.match(
-        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
+        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-reply")/
       );
       expect(connectionPanelMatch).not.toBeNull();
       const connectionHtml = connectionPanelMatch![0];
@@ -135,14 +141,17 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).toMatch(/id="kujira-cred-app-secret"[^>]*value=""/);
       expect(connectionHtml).toContain('未配置');
 
-      // 3. new_message_behavior
-      expect(connectionHtml).toContain('id="kujira-new-message-behavior"');
-      expect(connectionHtml).toContain('value="steer"');
-      expect(connectionHtml).toContain('value="queue"');
-
-      // 4. image_ttl_days
+      // 3. image_ttl_days
       expect(connectionHtml).toContain('id="kujira-image-ttl"');
       expect(connectionHtml).toContain('image_ttl_days');
+
+      // 4. 已迁入 Tab 2 的 new_message_behavior 与仿生回复配置项不在 Tab 1
+      expect(connectionHtml).not.toContain('kujira-new-message-behavior');
+      expect(connectionHtml).not.toContain('new_message_behavior');
+      expect(connectionHtml).not.toContain('kujira-aggregation-enabled');
+      expect(connectionHtml).not.toContain('aggregation_enabled');
+      expect(connectionHtml).not.toContain('kujira-idle-reply-enabled');
+      expect(connectionHtml).not.toContain('idle_reply_enabled');
 
       // 5. 已固化为默认开启而移除的开关与历史字段不存在
       expect(connectionHtml).not.toContain('kujira-markdown-enabled');
@@ -156,46 +165,56 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).not.toContain('aliases');
     });
 
-    it('Tab 1 追加仿生主动能力配置：聚合开关/区间/秒回/搭话开关/区间/偏好，且各子项随各自开关联动禁用', () => {
-      const html = renderCard({ initialTab: 'connection' });
-      const connectionPanelMatch = html.match(
-        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
+    it('Tab 2 (回复节奏) 置顶展示 new_message_behavior，并展示聚合/搭话/仿生互动各项及联动禁用', () => {
+      const html = renderCard({ initialTab: 'reply' });
+      const replyPanelMatch = html.match(
+        /id="kujira-tabpanel-reply"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
       );
-      expect(connectionPanelMatch).not.toBeNull();
-      const connectionHtml = connectionPanelMatch![0];
+      expect(replyPanelMatch).not.toBeNull();
+      const replyHtml = replyPanelMatch![0];
 
-      // 1. 仿生主动能力控件齐全
-      expect(connectionHtml).toContain('id="kujira-aggregation-enabled"');
-      expect(connectionHtml).toContain('id="kujira-aggregation-min-seconds"');
-      expect(connectionHtml).toContain('id="kujira-aggregation-max-seconds"');
-      expect(connectionHtml).toContain('id="kujira-instant-reply-enabled"');
-      expect(connectionHtml).toContain('id="kujira-idle-reply-enabled"');
-      expect(connectionHtml).toContain('id="kujira-idle-reply-min-mins"');
-      expect(connectionHtml).toContain('id="kujira-idle-reply-max-mins"');
-      expect(connectionHtml).toContain('id="kujira-proactive-attitude"');
+      // 1. 置顶项 new_message_behavior
+      expect(replyHtml).toContain('id="kujira-new-message-behavior"');
+      expect(replyHtml).toContain('value="steer"');
+      expect(replyHtml).toContain('value="queue"');
 
-      // 2. 默认全关时，区间与秒回项均被联动禁用
-      expect(connectionHtml).toMatch(/id="kujira-aggregation-min-seconds"[^>]*disabled/);
-      expect(connectionHtml).toMatch(/id="kujira-aggregation-max-seconds"[^>]*disabled/);
-      expect(connectionHtml).toMatch(/id="kujira-instant-reply-enabled"[^>]*disabled/);
-      expect(connectionHtml).toMatch(/id="kujira-idle-reply-min-mins"[^>]*disabled/);
-      expect(connectionHtml).toMatch(/id="kujira-idle-reply-max-mins"[^>]*disabled/);
+      // 严格验证 new_message_behavior 位于 aggregation_enabled 之前（严格置顶）
+      const newMsgPos = replyHtml.indexOf('id="kujira-new-message-behavior"');
+      const aggPos = replyHtml.indexOf('id="kujira-aggregation-enabled"');
+      expect(newMsgPos).toBeLessThan(aggPos);
 
-      // 3. 默认值渲染（聚合 10s~60s / 搭话 30m~120m / 偏好 balanced）
-      expect(connectionHtml).toMatch(/id="kujira-aggregation-min-seconds"[^>]*value="10"/);
-      expect(connectionHtml).toMatch(/id="kujira-aggregation-max-seconds"[^>]*value="60"/);
-      expect(connectionHtml).toMatch(/id="kujira-idle-reply-min-mins"[^>]*value="30"/);
-      expect(connectionHtml).toMatch(/id="kujira-idle-reply-max-mins"[^>]*value="120"/);
-      expect(connectionHtml).toContain('id="kujira-proactive-attitude-option-balanced"');
-      expect(connectionHtml).toMatch(/id="kujira-proactive-attitude-option-balanced"[^>]*aria-checked="true"/);
+      // 2. 仿生主动能力控件齐全
+      expect(replyHtml).toContain('id="kujira-aggregation-enabled"');
+      expect(replyHtml).toContain('id="kujira-aggregation-min-seconds"');
+      expect(replyHtml).toContain('id="kujira-aggregation-max-seconds"');
+      expect(replyHtml).toContain('id="kujira-instant-reply-enabled"');
+      expect(replyHtml).toContain('id="kujira-idle-reply-enabled"');
+      expect(replyHtml).toContain('id="kujira-idle-reply-min-mins"');
+      expect(replyHtml).toContain('id="kujira-idle-reply-max-mins"');
+      expect(replyHtml).toContain('id="kujira-proactive-attitude"');
 
-      // 4. 开启后对应数值项解禁
+      // 3. 默认全关时，区间与秒回项均被联动禁用
+      expect(replyHtml).toMatch(/id="kujira-aggregation-min-seconds"[^>]*disabled/);
+      expect(replyHtml).toMatch(/id="kujira-aggregation-max-seconds"[^>]*disabled/);
+      expect(replyHtml).toMatch(/id="kujira-instant-reply-enabled"[^>]*disabled/);
+      expect(replyHtml).toMatch(/id="kujira-idle-reply-min-mins"[^>]*disabled/);
+      expect(replyHtml).toMatch(/id="kujira-idle-reply-max-mins"[^>]*disabled/);
+
+      // 4. 默认值渲染（聚合 10s~60s / 搭话 30m~120m / 偏好 balanced）
+      expect(replyHtml).toMatch(/id="kujira-aggregation-min-seconds"[^>]*value="10"/);
+      expect(replyHtml).toMatch(/id="kujira-aggregation-max-seconds"[^>]*value="60"/);
+      expect(replyHtml).toMatch(/id="kujira-idle-reply-min-mins"[^>]*value="30"/);
+      expect(replyHtml).toMatch(/id="kujira-idle-reply-max-mins"[^>]*value="120"/);
+      expect(replyHtml).toContain('id="kujira-proactive-attitude-option-balanced"');
+      expect(replyHtml).toMatch(/id="kujira-proactive-attitude-option-balanced"[^>]*aria-checked="true"/);
+
+      // 5. 开启后对应数值项解禁
       const enabledHtml = renderCard({
-        initialTab: 'connection',
+        initialTab: 'reply',
         initialConfig: { aggregation_enabled: true, idle_reply_enabled: true },
       });
       const enabledPanel = enabledHtml.match(
-        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
+        /id="kujira-tabpanel-reply"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
       )![0];
       expect(enabledPanel).not.toMatch(/id="kujira-aggregation-min-seconds"[^>]*disabled/);
       expect(enabledPanel).not.toMatch(/id="kujira-aggregation-max-seconds"[^>]*disabled/);
@@ -203,17 +222,17 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(enabledPanel).not.toMatch(/id="kujira-idle-reply-min-mins"[^>]*disabled/);
       expect(enabledPanel).not.toMatch(/id="kujira-idle-reply-max-mins"[^>]*disabled/);
 
-      // 5. 绝不复用已废弃的旧键名
-      expect(connectionHtml).not.toContain('aggregation_interval_mins');
-      expect(connectionHtml).not.toContain('idle_reply_timeout_mins');
-      expect(connectionHtml).not.toContain('proactive_reply_enabled');
-      expect(connectionHtml).not.toContain('proactive_idle_timeout_mins');
-      expect(connectionHtml).not.toContain('proactive_buffer_size');
+      // 6. 绝不复用已废弃的旧键名
+      expect(replyHtml).not.toContain('aggregation_interval_mins');
+      expect(replyHtml).not.toContain('idle_reply_timeout_mins');
+      expect(replyHtml).not.toContain('proactive_reply_enabled');
+      expect(replyHtml).not.toContain('proactive_idle_timeout_mins');
+      expect(replyHtml).not.toContain('proactive_buffer_size');
     });
   });
 
   describe('3. 各 Tab 控件完整性契约', () => {
-    it('切换到 Tab 2 (人格与准则) 时展示对应 2 个 TextArea 字段', () => {
+    it('切换到 Tab 3 (人格与准则) 时展示对应 2 个 TextArea 字段', () => {
       const html = renderCard({ initialTab: 'persona' });
 
       expect(html).toMatch(/id="kujira-tab-persona"[^>]*aria-selected="true"/);
@@ -229,7 +248,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(personaHtml).toContain('行为准则 (behavior)');
     });
 
-    it('切换到 Tab 3 (记忆) 时仅展示 3 个单聊核心记忆配置项，绝不包含群聊预算', () => {
+    it('切换到 Tab 4 (记忆) 时仅展示 3 个单聊核心记忆配置项，绝不包含群聊预算', () => {
       const html = renderCard({ initialTab: 'memory' });
 
       expect(html).toMatch(/id="kujira-tab-memory"[^>]*aria-selected="true"/);
@@ -252,6 +271,9 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
     it('setActiveTab 正确触发 onTabChange 回调通知', () => {
       const onTabChange = vi.fn();
       renderCard({ onTabChange });
+
+      controller.setActiveTab('reply');
+      expect(onTabChange).toHaveBeenCalledWith('reply');
 
       controller.setActiveTab('memory');
       expect(onTabChange).toHaveBeenCalledWith('memory');
@@ -306,7 +328,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(controller.credentialsStatus).toEqual(nextStatus);
     });
 
-    it('在 Tab 1 与 Tab 2/Tab 3 跨 Tab 修改时草稿保留且未保存标识持续生效', () => {
+    it('在 Tab 1 与 Tab 2/Tab 3/Tab 4 跨 Tab 修改时草稿保留且未保存标识持续生效', () => {
       renderCard({
         initialConfig: {
           new_message_behavior: 'steer',
@@ -317,6 +339,10 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
 
       expect(controller.isDirty).toBe(false);
 
+      controller.handleFieldChange('image_ttl_days', 14);
+      expect(controller.isDirty).toBe(true);
+
+      controller.setActiveTab('reply');
       controller.handleFieldChange('new_message_behavior', 'queue');
       expect(controller.isDirty).toBe(true);
       expect(controller.model.getDraft().new_message_behavior).toBe('queue');
@@ -333,6 +359,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
 
       controller.setActiveTab('connection');
       const finalDraft = controller.model.getDraft();
+      expect(finalDraft.image_ttl_days).toBe(14);
       expect(finalDraft.new_message_behavior).toBe('queue');
       expect(finalDraft.persona).toBe('单聊助手');
       expect(finalDraft.user_profile_budget_chars).toBe(3000);
