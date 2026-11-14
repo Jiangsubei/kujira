@@ -54,21 +54,23 @@ export class KujiraFormModel {
   }
 
   setField<K extends keyof BridgePluginConfig>(key: K, value: BridgePluginConfig[K]) {
-    this.draft[key] = value;
+    this.draft = { ...this.draft, [key]: value };
   }
 
   resetField<K extends keyof BridgePluginConfig>(key: K) {
     if (this.baseDefaults[key] !== undefined) {
-      this.draft[key] = this.baseDefaults[key];
+      this.draft = { ...this.draft, [key]: this.baseDefaults[key] };
     } else {
-      delete this.draft[key];
+      const next = { ...this.draft };
+      delete next[key];
+      this.draft = next;
     }
   }
 
   isOverridden<K extends keyof BridgePluginConfig>(key: K): boolean {
     const draftVal = this.draft[key];
+    if (draftVal === undefined) return false;
     const defaultVal = this.baseDefaults[key];
-    if (draftVal === undefined && defaultVal === undefined) return false;
     return draftVal !== defaultVal;
   }
 

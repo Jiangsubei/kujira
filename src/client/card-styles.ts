@@ -89,6 +89,12 @@ const KUJIRA_CARD_CSS = `
 .kujira_modalPreviewBox{width:100%;max-height:220px;height:220px;display:flex;align-items:center;justify-content:center;background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden;padding:8px;box-sizing:border-box}
 .kujira_modalPreviewImg{max-width:100%;max-height:100%;object-fit:contain}
 .kujira_modalFooterRow{display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:12px 16px;border-top:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);box-sizing:border-box}
+.kujira_segContainer{display:inline-flex;align-items:center;background:var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.04));border:1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.12));border-radius:8px;padding:3px;gap:4px;width:fit-content;max-width:100%;box-sizing:border-box}
+.kujira_segBtn{appearance:none;background:transparent;border:1.5px solid transparent;color:var(--dsw-alias-label-secondary, #9ca3af);font:inherit;font-size:13px;font-weight:500;line-height:1.4;padding:5px 18px;border-radius:6px;cursor:pointer;transition:all .16s ease;outline:none;text-align:center;user-select:none;white-space:nowrap}
+.kujira_segBtn:hover:not(:disabled):not([aria-checked="true"]){color:var(--dsw-alias-label-primary, #ffffff);background:rgba(255, 255, 255, 0.04)}
+.kujira_segBtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary, #388bfd);outline-offset:1px}
+.kujira_segBtn:disabled{opacity:.4;cursor:not-allowed}
+.kujira_segBtnActive,.kujira_segBtn[aria-checked="true"]{border-color:var(--dsw-alias-brand-primary, #388bfd) !important;background:var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));color:var(--dsw-alias-label-primary, #ffffff);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.1)}
 `;
 
 export function injectCardStyles(): void {
@@ -121,6 +127,9 @@ export const cardStyle = {
   failed: 'kujira_failed',
   discard: 'kujira_discard',
   save: 'kujira_save',
+  segContainer: 'kujira_segContainer',
+  segBtn: 'kujira_segBtn',
+  segBtnActive: 'kujira_segBtnActive',
 };
 
 export const sectionStyle = {
@@ -157,6 +166,9 @@ export const fieldStyle = {
   invalid: 'kujira_invalid',
   hint: 'kujira_hint',
   checkbox: 'kujira_checkbox',
+  segContainer: 'kujira_segContainer',
+  segBtn: 'kujira_segBtn',
+  segBtnActive: 'kujira_segBtnActive',
 };
 
 export const faceStyle = {

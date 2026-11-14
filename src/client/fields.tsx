@@ -178,51 +178,6 @@ export interface SegmentedFieldProps<T extends string = string> {
   onChange: (value: T) => void;
 }
 
-const segmentedContainerStyle: React.CSSProperties = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  background: 'var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.04))',
-  border: '1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.12))',
-  borderRadius: '8px',
-  padding: '3px',
-  gap: '4px',
-  width: 'fit-content',
-  maxWidth: '100%',
-  boxSizing: 'border-box',
-};
-
-const segmentedBtnBaseStyle: React.CSSProperties = {
-  appearance: 'none',
-  background: 'transparent',
-  border: '1.5px solid transparent',
-  color: 'var(--dsw-alias-label-secondary, #9ca3af)',
-  font: 'inherit',
-  fontSize: '13px',
-  fontWeight: 500,
-  lineHeight: '1.4',
-  padding: '5px 18px',
-  borderRadius: '6px',
-  cursor: 'pointer',
-  transition: 'all 0.16s ease',
-  outline: 'none',
-  textAlign: 'center',
-  userSelect: 'none',
-  whiteSpace: 'nowrap',
-};
-
-const segmentedBtnActiveStyle: React.CSSProperties = {
-  background: 'var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08))',
-  borderColor: 'var(--dsw-alias-brand-primary, #388bfd)',
-  color: 'var(--dsw-alias-label-primary, #ffffff)',
-  fontWeight: 600,
-  boxShadow: '0 1px 2px rgba(0, 0, 0, 0.1)',
-};
-
-const segmentedBtnDisabledStyle: React.CSSProperties = {
-  opacity: 0.4,
-  cursor: 'not-allowed',
-};
-
 export function SegmentedField<T extends string = string>(
   props: SegmentedFieldProps<T>
 ): React.JSX.Element {
@@ -269,18 +224,8 @@ export function SegmentedField<T extends string = string>(
         data-testid={id}
         role="radiogroup"
         aria-labelledby={`${id}-label`}
-        style={segmentedContainerStyle}
+        className={fieldStyle.segContainer}
       >
-        <style>{`
-          .kujira-seg-btn:hover:not(:disabled):not([aria-checked="true"]) {
-            color: var(--dsw-alias-label-primary, #ffffff) !important;
-            background: rgba(255, 255, 255, 0.04) !important;
-          }
-          .kujira-seg-btn:focus-visible {
-            outline: 2px solid var(--dsw-alias-brand-primary, #388bfd);
-            outline-offset: 1px;
-          }
-        `}</style>
         {options.map((opt) => {
           const isSelected = opt.value === value;
           const optId = `${id}-option-${opt.value}`;
@@ -293,12 +238,7 @@ export function SegmentedField<T extends string = string>(
               role="radio"
               aria-checked={isSelected}
               disabled={disabled}
-              className={`kujira-seg-btn ${isSelected ? 'kujira-seg-btn-active' : ''}`}
-              style={{
-                ...segmentedBtnBaseStyle,
-                ...(isSelected ? segmentedBtnActiveStyle : {}),
-                ...(disabled ? segmentedBtnDisabledStyle : {}),
-              }}
+              className={`${fieldStyle.segBtn}${isSelected ? ` ${fieldStyle.segBtnActive}` : ''}`}
               onClick={() => {
                 if (!disabled && opt.value !== value) {
                   onChange(opt.value);
