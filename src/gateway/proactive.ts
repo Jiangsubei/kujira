@@ -1,26 +1,65 @@
 /**
- * kujira: 单聊主动能力管理器 (ProactiveManager)
+ * kujira: 单聊仿生时序主动能力管理器 (ProactiveManager)
  *
  * 只服务 QQ 官方 Bot 单聊（C2C），管理两件彼此解耦的事：
- *   1. 消息聚合回复：周期内把未投递消息池化，轮次边界一次性逐条注入；
- *   2. 冷场主动搭话：长时间无新消息时，由系统自发唤醒模型主动发起话题。
+ *   1. 仿生消息聚合回复：基于 Peer 独立的事件驱动时序器，结合历史动量、
+ *      温和折减（25%）、下限锁定与高热度概率秒回；
+ *   2. 仿生潜水主动搭话：长时间无新消息时，在随机区间 [T_idle_min, T_idle_max] 内
+ *      采样潜水目标时刻，由系统自发唤醒模型主动发起话题。
  *
- * 设计要点：
- *   - **纯内存消息池**：池只装「尚未投递」的真实入站消息，投递成功后清空，
- *     投递失败整批保留待重试；数据库仍是历史记录的唯一可信源。
- *   - **不在池内做去重判断**：提问/审批答案、`wait_for_user_messages` 收集、
- *     运行中 steer 即时投递的消息都由上层拦截，根本不入池，因此模型不会重复看到。
- *   - **只在轮次边界投递**：空闲时由自由周期时钟 tick；运行中绝不打断，
- *     等 `turn/end` 由 `flushPendingMessages` 投递。
- *   - **自由周期时钟**：相位来自插件启动（或配置启用）时刻，不因消息到达、
- *     投递、轮次结束而重置。
- *   - **等待用户输入时暂停**：提问/审批挂起期间跳过 tick 与 flush，池保留。
- *   - **冷场按周期重复唤醒**：沉默达到阈值后唤醒一次；此后必须再经过一个
- *     冷场周期，才允许下一次。出站消息不重置沉默起点，起点只看库中最新入站时间。
+ * 核心设计：
+ *   - **纯内存消息池**：池只装「尚未投递」的真实入站消息，投递成功后清空；
+ *   - **Peer 独立事件驱动**：彻底废弃全局固定自由时钟，每 Peer 独立维护时钟与下限锁定状态；
+ *   - **温和折减与下限锁定**：周期内新消息温和折减 25% 剩余时间；一旦触及底限锁定，
+ *     后续新消息绝不推迟，到点自然释放，彻底防饥饿并保障拟人插话体感；
+ *   - **秒回机制**：连续热聊高活跃度下支持概率秒回（targetWakeupAt = now）；
+ *   - **等待用户输入时暂停**：提问/审批挂起期间跳过 tick 与 flush，池与时序完整保留。
  */
 
-import type { AggregatedMessage, BridgePluginConfig } from '../types/index.js';
+import type { AggregatedMessage, BridgePluginConfig, ProactiveAttitude } from '../types/index.js';
 import type { SystemWakeupEvent } from '../types/system-event.js';
+import {
+  DEFAULT_AGGREGATION_ENABLED,
+  DEFAULT_AGGREGATION_MIN_SECONDS,
+  DEFAULT_AGGREGATION_MAX_SECONDS,
+  DEFAULT_IDLE_REPLY_ENABLED,
+  DEFAULT_IDLE_REPLY_MIN_MINS,
+  DEFAULT_IDLE_REPLY_MAX_MINS,
+  DEFAULT_PROACTIVE_ATTITUDE,
+  DEFAULT_INSTANT_REPLY_ENABLED,
+} from '../constants/index.js';
+import {
+  computeTurnDelta,
+  computeTurnMomentum,
+  computeActivityScore,
+  sampleInterval,
+  isInstantReplyTriggered,
+  type CompletedTurnSummary,
+} from './proactive/momentum.js';
+
+export type { CompletedTurnSummary, ProactiveAttitude };
+
+/** 消息入池时的可选上下文（微观时延、历史动量、时间与运行状态） */
+export interface RecordMessageContext {
+  recentTurns?: CompletedTurnSummary[];
+  lastBotOutboundAt?: number | null;
+  now?: number;
+  isAgentRunning?: boolean;
+  config?: BridgePluginConfig;
+  rng?: () => number;
+}
+
+/** Peer 时序状态只读快照（供契约测试断言） */
+export interface PeerTimingSnapshot {
+  cycleStartTime: number | null;
+  targetWakeupAt: number | null;
+  floorWakeupAt: number | null;
+  isFloorLocked: boolean;
+  idleTargetWakeupAt: number | null;
+  lastIdleWakeupAt: number | null;
+  pendingCount: number;
+  delivering: boolean;
+}
 
 export interface ProactiveManagerOptions {
   config: BridgePluginConfig;
@@ -28,7 +67,7 @@ export interface ProactiveManagerOptions {
   dispatch?: (event: SystemWakeupEvent) => Promise<unknown> | unknown;
   /**
    * 是否正在等待用户输入（提问 / 审批挂起）。
-   * 返回 true 时跳过本轮 tick 与 flush，池完整保留。
+   * 返回 true 时跳过本轮 tick 与 flush，池与时序完整保留。
    */
   isAwaitingUserInput?: (peer: string) => boolean;
   /**
@@ -37,7 +76,7 @@ export interface ProactiveManagerOptions {
    */
   isAgentRunning?: (peer: string) => boolean;
   /**
-   * 该 peer 是否存在**当前活跃会话**。
+   * 该 peer 是否存在当前活跃会话。
    * - 聚合：无活跃会话时尝试 ensureSession，失败则保留池等下次重试；
    * - 冷场搭话：返回 false 时按「曾有互动但会话已不在」处理，允许新建会话后唤醒。
    */
@@ -48,16 +87,22 @@ export interface ProactiveManagerOptions {
    */
   ensureSession?: (peer: string) => Promise<boolean> | boolean;
   /**
-   * 取该 peer 最后一条**入站**消息时间（毫秒）；无记录返回 null。
+   * 取该 peer 最后一条入站消息时间（毫秒）；无记录返回 null。
    * 以数据库为准，进程重启后沉默时长依然准确。
    */
   lastHumanMessageAt?: (peer: string) => number | null;
+  /** 取该 peer 上一轮 Bot 出站回复时间（毫秒）；无记录返回 null */
+  lastBotOutboundAt?: (peer: string) => number | null;
+  /** 取该 peer 最近已完成轮次摘要（用于宏观动量计算） */
+  recentTurns?: (peer: string) => CompletedTurnSummary[];
   /** 枚举「曾经真实互动过」的 peer（peer_openid_map 中已登记的），用于冷场搭话扫描 */
   knownPeers?: () => string[];
   now?: number;
+  /** 可选的自定义伪随机生成器，用于确定性单测断言 */
+  rng?: () => number;
 }
 
-/** 每 peer 的池状态：只保存未投递消息与冷场时刻 */
+/** 每 peer 的独立池与时序状态 */
 interface PeerState {
   /** 尚未投递的消息（按时间升序） */
   pending: AggregatedMessage[];
@@ -65,12 +110,18 @@ interface PeerState {
   lastFromUser?: string;
   /** 投递单飞锁：同一 peer 任何时刻只允许一个投递在途 */
   delivering: boolean;
-  /**
-   * 上次冷场唤醒时刻（毫秒）。
-   * null 表示本进程内尚未冷场唤醒过。
-   * 距今未满一个冷场周期则不再唤醒；只由冷场唤醒自身写下，入站与出站都不改它。
-   */
+  /** 上次冷场唤醒时刻（毫秒），null 表示进程内尚未冷场唤醒过 */
   lastIdleWakeupAt: number | null;
+  /** 聚合周期启动时刻（毫秒），null 表示当前无活动聚合周期 */
+  cycleStartTime: number | null;
+  /** 当前目标触发时刻（毫秒） */
+  targetWakeupAt: number | null;
+  /** 绝对硬底线时刻（毫秒，cycleStartTime + T_min） */
+  floorWakeupAt: number | null;
+  /** 是否已触底下限锁定 */
+  isFloorLocked: boolean;
+  /** 目标冷场唤醒时刻（毫秒） */
+  idleTargetWakeupAt: number | null;
 }
 
 /**
@@ -80,7 +131,7 @@ interface PeerState {
  * - 聚合开启且 Agent 正在运行：
  *   - `steer`：即时插话，不入池；
  *   - `queue`：入池，等本轮 `turn/end` 一次性注入；
- * - 聚合开启且空闲：入池，等自由周期 tick。
+ * - 聚合开启且空闲：入池，等事件驱动倒计时到点。
  */
 export function shouldPoolInbound(params: {
   aggregationEnabled: boolean;
@@ -108,35 +159,185 @@ function cloneMessage(message: AggregatedMessage): AggregatedMessage {
   };
 }
 
+interface ResolvedProactiveConfig {
+  aggregation_enabled: boolean;
+  aggregation_min_seconds: number;
+  aggregation_max_seconds: number;
+  idle_reply_enabled: boolean;
+  idle_reply_min_mins: number;
+  idle_reply_max_mins: number;
+  proactive_attitude: ProactiveAttitude;
+  instant_reply_enabled: boolean;
+}
+
+function resolveProactiveConfig(cfg?: BridgePluginConfig): ResolvedProactiveConfig {
+  const c = cfg ?? {};
+
+  const hasMinMins = typeof c.idle_reply_min_mins === 'number';
+  const hasMaxMins = typeof c.idle_reply_max_mins === 'number';
+  const legacyTimeoutMins =
+    typeof (c as any).idle_reply_timeout_mins === 'number'
+      ? (c as any).idle_reply_timeout_mins
+      : undefined;
+
+  let idleMinMins = hasMinMins ? c.idle_reply_min_mins! : DEFAULT_IDLE_REPLY_MIN_MINS;
+  let idleMaxMins = hasMaxMins ? c.idle_reply_max_mins! : DEFAULT_IDLE_REPLY_MAX_MINS;
+
+  if (!hasMinMins && !hasMaxMins && legacyTimeoutMins !== undefined) {
+    idleMinMins = legacyTimeoutMins;
+    idleMaxMins = legacyTimeoutMins;
+  }
+
+  const hasMinSec = typeof c.aggregation_min_seconds === 'number';
+  const hasMaxSec = typeof c.aggregation_max_seconds === 'number';
+  const legacyIntervalMins =
+    typeof (c as any).aggregation_interval_mins === 'number'
+      ? (c as any).aggregation_interval_mins
+      : undefined;
+
+  let aggMinSec = hasMinSec ? c.aggregation_min_seconds! : DEFAULT_AGGREGATION_MIN_SECONDS;
+  let aggMaxSec = hasMaxSec ? c.aggregation_max_seconds! : DEFAULT_AGGREGATION_MAX_SECONDS;
+
+  if (!hasMinSec && !hasMaxSec && legacyIntervalMins !== undefined) {
+    aggMinSec = legacyIntervalMins * 60;
+    aggMaxSec = legacyIntervalMins * 60;
+  }
+
+  return {
+    aggregation_enabled: Boolean(c.aggregation_enabled ?? DEFAULT_AGGREGATION_ENABLED),
+    aggregation_min_seconds: aggMinSec,
+    aggregation_max_seconds: aggMaxSec,
+    idle_reply_enabled: Boolean(c.idle_reply_enabled ?? DEFAULT_IDLE_REPLY_ENABLED),
+    idle_reply_min_mins: idleMinMins,
+    idle_reply_max_mins: idleMaxMins,
+    proactive_attitude: (c.proactive_attitude as ProactiveAttitude) || DEFAULT_PROACTIVE_ATTITUDE,
+    instant_reply_enabled: Boolean(c.instant_reply_enabled ?? DEFAULT_INSTANT_REPLY_ENABLED),
+  };
+}
+
 export class ProactiveManager {
   private readonly states = new Map<string, PeerState>();
   private timer: NodeJS.Timeout | null = null;
-  /** 自由周期时钟的下一次到点时刻 */
-  private nextTickAt = 0;
-  /** 当前生效的周期长度（毫秒），用于识别配置变更并重新对齐时钟 */
-  private activeIntervalMs = 0;
+  private lastOptions?: ProactiveManagerOptions;
+
+  constructor(private defaultOptions?: ProactiveManagerOptions) {}
 
   private stateOf(peer: string): PeerState {
     let st = this.states.get(peer);
     if (!st) {
-      st = { pending: [], delivering: false, lastIdleWakeupAt: null };
+      st = {
+        pending: [],
+        delivering: false,
+        lastIdleWakeupAt: null,
+        cycleStartTime: null,
+        targetWakeupAt: null,
+        floorWakeupAt: null,
+        isFloorLocked: false,
+        idleTargetWakeupAt: null,
+      };
       this.states.set(peer, st);
     }
     return st;
   }
 
   /**
-   * 记录一条尚未投递的入站消息：入池并刷新真实发送者。
-   * 调用方负责拦截已消费的消息（提问/审批答案、wait 收集、steer 即时投递），
-   * 本方法不做任何去重或内容裁剪。
+   * 记录一条尚未投递的入站消息：入池、刷新发送者，并在 Agent 空闲时驱动仿生时序器。
    */
-  recordMessage(peer: string, message: AggregatedMessage, fromUser?: string): void {
+  recordMessage(
+    peer: string,
+    message: AggregatedMessage,
+    fromUser?: string,
+    context?: RecordMessageContext
+  ): void {
     if (!peer || !message) return;
     const st = this.stateOf(peer);
     st.pending.push(cloneMessage(message));
     st.pending.sort((a, b) => a.time - b.time);
     const uid = typeof fromUser === 'string' ? fromUser.trim() : '';
     if (uid) st.lastFromUser = uid;
+
+    const config = resolveProactiveConfig(
+      context?.config ?? this.defaultOptions?.config ?? this.lastOptions?.config
+    );
+    const isAgentRunning =
+      context?.isAgentRunning ??
+      this.defaultOptions?.isAgentRunning?.(peer) ??
+      this.lastOptions?.isAgentRunning?.(peer) ??
+      false;
+
+    // 若 Agent 正在运行：消息只入池排队，等待 turn/end flush，绝不启动或修改时钟
+    if (isAgentRunning) {
+      return;
+    }
+
+    const now =
+      context?.now ??
+      (typeof message.time === 'number' && message.time > 0 ? message.time : Date.now());
+
+    const minSec = Math.max(1, config.aggregation_min_seconds);
+    const maxSec = Math.max(minSec, config.aggregation_max_seconds);
+    const minMs = minSec * 1000;
+    const maxMs = maxSec * 1000;
+    const attitude = config.proactive_attitude;
+    const rng = context?.rng ?? this.defaultOptions?.rng ?? this.lastOptions?.rng ?? Math.random;
+
+    if (st.cycleStartTime === null) {
+      // 首条入站消息：事件驱动启动新聚合周期
+      const lastBotOutboundAt =
+        context?.lastBotOutboundAt ??
+        this.defaultOptions?.lastBotOutboundAt?.(peer) ??
+        this.lastOptions?.lastBotOutboundAt?.(peer) ??
+        null;
+      const recentTurns =
+        context?.recentTurns ??
+        this.defaultOptions?.recentTurns?.(peer) ??
+        this.lastOptions?.recentTurns?.(peer) ??
+        [];
+      const turnDelta = computeTurnDelta(now, lastBotOutboundAt);
+      const momentum = computeTurnMomentum(recentTurns);
+      const activityScore = computeActivityScore({ turnDelta, momentum });
+
+      if (
+        config.instant_reply_enabled &&
+        isInstantReplyTriggered({
+          enabled: true,
+          activityScore,
+          attitude,
+          rng,
+        })
+      ) {
+        // 命中高热度秒回：targetWakeupAt 设为当前时刻，即刻到点
+        st.cycleStartTime = now;
+        st.targetWakeupAt = now;
+        st.floorWakeupAt = now;
+        st.isFloorLocked = true;
+      } else {
+        // 常规聚合区间采样
+        const durationMs = sampleInterval(minMs, maxMs, attitude, activityScore, rng);
+        st.cycleStartTime = now;
+        st.targetWakeupAt = now + durationMs;
+        st.floorWakeupAt = now + minMs;
+        st.isFloorLocked = st.targetWakeupAt <= st.floorWakeupAt;
+      }
+    } else {
+      // 周期内追加新消息：温和折减 25% 与下限锁定
+      if (st.isFloorLocked) {
+        // 已触底下限锁定：绝不推迟、绝不改动 targetWakeupAt
+        return;
+      }
+
+      const remaining = Math.max(0, (st.targetWakeupAt ?? now) - now);
+      const newRemaining = remaining * 0.75;
+      const newTarget = now + newRemaining;
+      const floor = st.floorWakeupAt ?? (st.cycleStartTime + minMs);
+
+      if (newTarget <= floor) {
+        st.targetWakeupAt = floor;
+        st.isFloorLocked = true;
+      } else {
+        st.targetWakeupAt = newTarget;
+      }
+    }
   }
 
   /** 查询某会话池内是否有未投递消息（只读，不消费） */
@@ -154,46 +355,25 @@ export class ProactiveManager {
     return this.states.get(peer)?.lastFromUser;
   }
 
+  /** 获取 Peer 时序状态只读快照（供契约测试断言） */
+  getPeerTiming(peer: string): PeerTimingSnapshot | null {
+    const st = this.states.get(peer);
+    if (!st) return null;
+    return {
+      cycleStartTime: st.cycleStartTime,
+      targetWakeupAt: st.targetWakeupAt,
+      floorWakeupAt: st.floorWakeupAt,
+      isFloorLocked: st.isFloorLocked,
+      idleTargetWakeupAt: st.idleTargetWakeupAt,
+      lastIdleWakeupAt: st.lastIdleWakeupAt,
+      pendingCount: st.pending.length,
+      delivering: st.delivering,
+    };
+  }
+
   /** 清空某会话全部状态（会话被外部删除等场景） */
   clearPeer(peer: string): void {
     this.states.delete(peer);
-  }
-
-  private resolveIntervalMs(config: BridgePluginConfig): number {
-    const mins = Number(config.aggregation_interval_mins ?? 0);
-    if (!Number.isFinite(mins) || mins <= 0) return 0;
-    return mins * 60 * 1000;
-  }
-
-  /**
-   * 推进自由周期时钟：返回本次是否应当 tick。
-   * 周期变更（用户改配置）时立即以当前时刻重新对齐相位。
-   */
-  private advanceClock(config: BridgePluginConfig, now: number): boolean {
-    const intervalMs = this.resolveIntervalMs(config);
-    if (intervalMs <= 0) {
-      this.activeIntervalMs = 0;
-      this.nextTickAt = 0;
-      return false;
-    }
-
-    // 周期变更：重新对齐相位，避免残留旧周期节奏
-    if (this.activeIntervalMs !== intervalMs) {
-      this.activeIntervalMs = intervalMs;
-      this.nextTickAt = now + intervalMs;
-      return false;
-    }
-
-    if (this.nextTickAt === 0) {
-      this.nextTickAt = now + intervalMs;
-      return false;
-    }
-
-    if (now < this.nextTickAt) return false;
-
-    // 与真实时钟对齐推进，绝不因巡检迟到而累积"补发"多次 tick
-    this.nextTickAt = now + intervalMs;
-    return true;
   }
 
   /**
@@ -217,23 +397,19 @@ export class ProactiveManager {
 
     st.delivering = true;
     try {
-      const intervalMins = Number(options.config.aggregation_interval_mins ?? 0);
       await dispatch({
         kind: 'aggregated_messages',
         peer,
         messages: batch,
         reason,
         ...(st.lastFromUser ? { fromUser: st.lastFromUser } : {}),
-        ...(reason === 'period' && Number.isFinite(intervalMins) && intervalMins > 0
-          ? { intervalMinutes: intervalMins }
-          : {}),
         timestamp: now,
       });
       // 只移除本次快照，投递期间新到的消息保留
       st.pending = st.pending.filter((message) => !originals.includes(message));
       return true;
     } catch {
-      // 投递失败整批保留，下一次 tick / flush 重试
+      // 投递失败整批保留，下一次重试
       return false;
     } finally {
       st.delivering = false;
@@ -242,13 +418,24 @@ export class ProactiveManager {
 
   /**
    * 轮次结束（`turn/end`）时投递排队消息。
-   * 仅在聚合开启、池非空、非等待用户输入且会话可用时投递；单飞防重。
+   * 投递成功后重置周期时钟与潜水闹钟。
    */
   async flushPendingMessages(peer: string, options: ProactiveManagerOptions): Promise<boolean> {
-    if (!options.config.aggregation_enabled || !options.dispatch) return false;
+    this.lastOptions = options;
+    const config = resolveProactiveConfig(options.config);
+    if (!config.aggregation_enabled || !options.dispatch) return false;
 
     const st = this.states.get(peer);
-    if (!st || st.pending.length === 0) return false;
+    if (!st || st.pending.length === 0) {
+      if (st) {
+        st.cycleStartTime = null;
+        st.targetWakeupAt = null;
+        st.floorWakeupAt = null;
+        st.isFloorLocked = false;
+        st.idleTargetWakeupAt = null;
+      }
+      return false;
+    }
     if (st.delivering) return false;
     if (options.isAwaitingUserInput?.(peer)) return false;
 
@@ -257,101 +444,168 @@ export class ProactiveManager {
       if (!ready) return false;
     }
 
-    return this.deliverPending(peer, st, 'turn_end', options);
+    const delivered = await this.deliverPending(peer, st, 'turn_end', options);
+    if (delivered) {
+      st.cycleStartTime = null;
+      st.targetWakeupAt = null;
+      st.floorWakeupAt = null;
+      st.isFloorLocked = false;
+      st.idleTargetWakeupAt = null;
+    }
+    return delivered;
   }
 
   /**
-   * 集中巡检：推进自由周期时钟，到点则投递池内的周期消息；冷场搭话独立判定。
+   * 集中巡检：遍历各 peer，检查聚合事件驱动到点与仿生潜水搭话。
    */
   async checkProactive(options: ProactiveManagerOptions): Promise<void> {
-    const { config, dispatch } = options;
+    this.lastOptions = options;
+    const { dispatch } = options;
     if (!dispatch) return;
 
+    const config = resolveProactiveConfig(options.config);
     const now = options.now ?? Date.now();
-    const aggregationEnabled = Boolean(config.aggregation_enabled);
-    const idleEnabled = Boolean(config.idle_reply_enabled);
+    const aggregationEnabled = config.aggregation_enabled;
+    const idleEnabled = config.idle_reply_enabled;
 
-    // 聚合关闭：池失去投递通道，直接清空（消息仍在库中，可由 read_chat_history 捡回）
+    // 聚合关闭：池失去投递通道，直接清空并重置聚合时钟
     if (!aggregationEnabled) {
       for (const st of this.states.values()) {
         st.pending = [];
         st.lastFromUser = undefined;
+        st.cycleStartTime = null;
+        st.targetWakeupAt = null;
+        st.floorWakeupAt = null;
+        st.isFloorLocked = false;
       }
     }
 
     if (!aggregationEnabled && !idleEnabled) return;
 
-    // ---- 1. 聚合回复：自由周期时钟到点才处理 ----
+    // ---- 1. 聚合回复：事件驱动倒计时到点触发 ----
     const deliveredThisTick = new Set<string>();
-    if (aggregationEnabled && this.advanceClock(config, now)) {
-      const peers = new Set<string>();
+    if (aggregationEnabled) {
       for (const [peer, st] of this.states) {
-        if (st.pending.length > 0) peers.add(peer);
-      }
+        if (st.pending.length === 0) {
+          st.cycleStartTime = null;
+          st.targetWakeupAt = null;
+          st.floorWakeupAt = null;
+          st.isFloorLocked = false;
+          continue;
+        }
 
-      for (const peer of peers) {
-        // 等待用户输入：跳过本轮，池保留，等恢复后一并处理
+        // 门控检查：等待用户输入期间跳过，保留池与时钟
         if (options.isAwaitingUserInput?.(peer)) continue;
         // Agent 正在运行：绝不打断，池保留到 turn/end flush
         if (options.isAgentRunning?.(peer)) continue;
-        // 无活跃会话：尝试建立（消息仍在池与库中），失败保留待重试
+
+        // 若时序尚未初始化（如运行中入池或首条入池时未获配置），在此补齐初始化
+        if (st.cycleStartTime === null) {
+          const firstMsgTime = st.pending[0]?.time ?? now;
+          const cycleStart = Math.min(now, firstMsgTime);
+          const minSec = Math.max(1, config.aggregation_min_seconds);
+          const maxSec = Math.max(minSec, config.aggregation_max_seconds);
+          const minMs = minSec * 1000;
+          const maxMs = maxSec * 1000;
+          const durationMs = sampleInterval(
+            minMs,
+            maxMs,
+            config.proactive_attitude,
+            0.5,
+            options.rng
+          );
+          st.cycleStartTime = cycleStart;
+          st.targetWakeupAt = cycleStart + durationMs;
+          st.floorWakeupAt = cycleStart + minMs;
+          st.isFloorLocked = st.targetWakeupAt <= st.floorWakeupAt;
+        }
+
+        // 到点检查
+        if (st.targetWakeupAt !== null && now < st.targetWakeupAt) {
+          continue;
+        }
+
+        // 无活跃会话：尝试建立，失败保留待重试
         if (options.hasActiveSession && !options.hasActiveSession(peer)) {
           const ready = await options.ensureSession?.(peer);
           if (!ready) continue;
         }
 
-        const st = this.states.get(peer);
-        if (!st) continue;
-        if (await this.deliverPending(peer, st, 'period', options)) {
+        const delivered = await this.deliverPending(peer, st, 'period', options);
+        if (delivered) {
           deliveredThisTick.add(peer);
+          st.cycleStartTime = null;
+          st.targetWakeupAt = null;
+          st.floorWakeupAt = null;
+          st.isFloorLocked = false;
         }
       }
     }
 
-    // ---- 2. 冷场主动搭话：独立于聚合时钟 ----
-    // 两道闸门同时满足才唤醒：沉默时长达标，且距上次冷场唤醒已满一个周期。
-    // 模型发消息或输出结束都不参与；出站也不重置沉默起点。
+    // ---- 2. 仿生潜水主动搭话：独立于聚合时钟 ----
     if (!idleEnabled) return;
 
-    const timeoutMins = Number(config.idle_reply_timeout_mins ?? 0);
-    if (!Number.isFinite(timeoutMins) || timeoutMins <= 0) return;
-    const timeoutMs = timeoutMins * 60 * 1000;
+    const minMins = Math.max(1, config.idle_reply_min_mins);
+    const maxMins = Math.max(minMins, config.idle_reply_max_mins);
+    const idleMinMs = minMins * 60 * 1000;
+    const idleMaxMs = maxMins * 60 * 1000;
 
     const candidates = new Set<string>(this.states.keys());
     for (const peer of options.knownPeers?.() ?? []) {
-      if (typeof peer === 'string' && peer.startsWith('user_')) candidates.add(peer);
+      if (typeof peer === 'string') candidates.add(peer);
     }
 
     for (const peer of candidates) {
       const st = this.stateOf(peer);
-      // 距上次冷场唤醒未满一个周期：不再触发
-      if (st.lastIdleWakeupAt !== null && now - st.lastIdleWakeupAt < timeoutMs) continue;
+
       // 本轮刚投递过聚合：绝不在同一轮叠加搭话
       if (deliveredThisTick.has(peer)) continue;
       // 池内有未投递消息时优先让聚合处理，绝不叠加搭话
       if (aggregationEnabled && st.pending.length > 0) continue;
-      // 等待用户输入期间同样暂停搭话（不记下唤醒时刻，恢复后仍可触发）
+      // 等待用户输入期间同样暂停搭话（不消耗冷场周期，恢复后仍可触发）
       if (options.isAwaitingUserInput?.(peer)) continue;
 
       // 沉默起点以库中最新入站消息时间为准，重启后依然准确。出站消息不写入该时间。
       const lastHumanAt = options.lastHumanMessageAt?.(peer) ?? null;
       if (typeof lastHumanAt !== 'number') continue;
-      if (now - lastHumanAt < timeoutMs) continue;
 
-      // 会话不存在时尝试建立（仅对「曾经互动过」的 peer——候选集已按此过滤）
-      // 建立失败不记唤醒时刻，下一轮巡检可立即重试
+      // 沉默基准时刻：若有过冷场唤醒，取两者较晚者；若无冷场唤醒记录，直接取 lastHumanAt
+      const baseSilenceTime =
+        typeof st.lastIdleWakeupAt === 'number'
+          ? Math.max(lastHumanAt, st.lastIdleWakeupAt)
+          : lastHumanAt;
+
+      // 若尚未设置潜水唤醒目标或人类入站把沉默基准后移，重新在 [T_min, T_max] 采样
+      if (st.idleTargetWakeupAt === null || st.idleTargetWakeupAt < baseSilenceTime) {
+        const idleDurationMs = sampleInterval(
+          idleMinMs,
+          idleMaxMs,
+          config.proactive_attitude,
+          0.5,
+          options.rng
+        );
+        st.idleTargetWakeupAt = baseSilenceTime + idleDurationMs;
+      }
+
+      // 未达潜水唤醒目标时刻：不搭话
+      if (now < st.idleTargetWakeupAt) continue;
+
+      // 会话不存在时尝试建立，建立失败不记唤醒时刻，下一轮巡检重试
       if (options.hasActiveSession && !options.hasActiveSession(peer)) {
         const ready = await options.ensureSession?.(peer);
         if (!ready) continue;
       }
 
-      // 先记下唤醒时刻再投递：投递异常也不会在同一周期内紧循环
+      // 触发唤醒：记录唤醒时刻，清空潜水目标（下次巡检将基于新 baseSilenceTime 采样）
       st.lastIdleWakeupAt = now;
+      st.idleTargetWakeupAt = null;
+      const idleMinutes = Math.max(1, Math.round((now - lastHumanAt) / 60_000));
+
       try {
         await dispatch({
           kind: 'idle_reply',
           peer,
-          idleMinutes: timeoutMins,
+          idleMinutes,
           timestamp: now,
         });
       } catch {
@@ -360,7 +614,7 @@ export class ProactiveManager {
     }
   }
 
-  /** 启动后台巡检定时器（默认 60 秒扫描一次，由内部时钟判断是否到点） */
+  /** 启动后台巡检定时器（默认 60 秒扫描一次） */
   startChecker(getOptions: () => ProactiveManagerOptions, intervalMs = 60_000): void {
     this.stopChecker();
     this.timer = setInterval(async () => {
@@ -386,7 +640,5 @@ export class ProactiveManager {
   dispose(): void {
     this.stopChecker();
     this.states.clear();
-    this.nextTickAt = 0;
-    this.activeIntervalMs = 0;
   }
 }

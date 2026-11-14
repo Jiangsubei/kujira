@@ -1,18 +1,31 @@
 import React from 'react';
-import { ValueField, SwitchField } from '../fields.js';
+import { ValueField, SwitchField, SegmentedField } from '../fields.js';
 import { cardStyle, fieldStyle } from '../card-styles.js';
 import type {
   BridgePluginConfig,
   CredentialSlotStatus,
   CredentialStatusSummary,
+  ProactiveAttitude,
 } from '../../types/index.js';
 import {
   DEFAULT_IMAGE_TTL_DAYS,
   DEFAULT_NEW_MESSAGE_BEHAVIOR,
-  DEFAULT_AGGREGATION_INTERVAL_MINS,
-  DEFAULT_IDLE_REPLY_TIMEOUT_MINS,
+  DEFAULT_AGGREGATION_ENABLED,
+  DEFAULT_AGGREGATION_MIN_SECONDS,
+  DEFAULT_AGGREGATION_MAX_SECONDS,
+  DEFAULT_IDLE_REPLY_ENABLED,
+  DEFAULT_IDLE_REPLY_MIN_MINS,
+  DEFAULT_IDLE_REPLY_MAX_MINS,
+  DEFAULT_PROACTIVE_ATTITUDE,
+  DEFAULT_INSTANT_REPLY_ENABLED,
 } from '../../constants/index.js';
 import type { KujiraFormModel } from '../model.js';
+
+const PROACTIVE_ATTITUDE_OPTIONS: Array<{ value: ProactiveAttitude; label: string }> = [
+  { value: 'enthusiastic', label: '热情' },
+  { value: 'balanced', label: '均衡' },
+  { value: 'aloof', label: '冷淡' },
+];
 
 export interface ConnectionTabProps {
   active: boolean;
@@ -157,10 +170,10 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
         label="连续消息聚合回复 (aggregation_enabled)"
         hint={
           draft.aggregation_enabled
-            ? '按固定节奏周期性检查新消息，到点后由模型自行回看聊天记录并统一回复；不逐条即时应答，等待用户答题或审批期间自动跳过'
-            : '开启后，用户连续发送的多条消息不再逐条即时回复，而是按固定节奏统一查看并回复'
+            ? '按事件驱动与仿生动态节奏聚合新消息，到点后由模型统一回复；不逐条即时应答，等待用户答题或审批期间自动跳过'
+            : '开启后，用户连续发送的多条消息不再逐条即时回复，而是按仿生动态节奏统一合并回复'
         }
-        checked={draft.aggregation_enabled ?? false}
+        checked={draft.aggregation_enabled ?? DEFAULT_AGGREGATION_ENABLED}
         disabled={saving}
         overridden={model.isOverridden('aggregation_enabled')}
         onReset={() => onResetField('aggregation_enabled')}
@@ -168,21 +181,52 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
       />
 
       <ValueField
-        id="kujira-aggregation-interval-mins"
-        label="聚合检查周期 (aggregation_interval_mins)"
-        hint={`每隔多少分钟检查一次新消息并统一回复，节奏从开启时起算 (默认 ${DEFAULT_AGGREGATION_INTERVAL_MINS} 分钟)`}
-        placeholder={String(DEFAULT_AGGREGATION_INTERVAL_MINS)}
+        id="kujira-aggregation-min-seconds"
+        label="聚合最小时长 (aggregation_min_seconds)"
+        hint={`连续消息聚合等待的下限硬底线，即使多条消息快速折减也不会低于此时长 (单位秒，默认 ${DEFAULT_AGGREGATION_MIN_SECONDS})`}
+        placeholder={String(DEFAULT_AGGREGATION_MIN_SECONDS)}
         numeric
-        value={String(draft.aggregation_interval_mins ?? DEFAULT_AGGREGATION_INTERVAL_MINS)}
+        value={String(draft.aggregation_min_seconds ?? DEFAULT_AGGREGATION_MIN_SECONDS)}
         disabled={saving || !draft.aggregation_enabled}
-        overridden={model.isOverridden('aggregation_interval_mins')}
-        onReset={() => onResetField('aggregation_interval_mins')}
-        onChange={(val) =>
+        overridden={model.isOverridden('aggregation_min_seconds')}
+        onReset={() => onResetField('aggregation_min_seconds')}
+        onChange={(val) => {
+          const parsed = parseInt(val, 10);
           onFieldChange(
-            'aggregation_interval_mins',
-            parseInt(val, 10) || DEFAULT_AGGREGATION_INTERVAL_MINS
-          )
-        }
+            'aggregation_min_seconds',
+            Number.isNaN(parsed) ? DEFAULT_AGGREGATION_MIN_SECONDS : parsed
+          );
+        }}
+      />
+
+      <ValueField
+        id="kujira-aggregation-max-seconds"
+        label="聚合最大时长 (aggregation_max_seconds)"
+        hint={`连续消息聚合等待的上限，初始随机采样的最长等待时间 (单位秒，默认 ${DEFAULT_AGGREGATION_MAX_SECONDS})`}
+        placeholder={String(DEFAULT_AGGREGATION_MAX_SECONDS)}
+        numeric
+        value={String(draft.aggregation_max_seconds ?? DEFAULT_AGGREGATION_MAX_SECONDS)}
+        disabled={saving || !draft.aggregation_enabled}
+        overridden={model.isOverridden('aggregation_max_seconds')}
+        onReset={() => onResetField('aggregation_max_seconds')}
+        onChange={(val) => {
+          const parsed = parseInt(val, 10);
+          onFieldChange(
+            'aggregation_max_seconds',
+            Number.isNaN(parsed) ? DEFAULT_AGGREGATION_MAX_SECONDS : parsed
+          );
+        }}
+      />
+
+      <SwitchField
+        id="kujira-instant-reply-enabled"
+        label="允许在连续热聊时概率秒回 (instant_reply_enabled)"
+        hint="开启后，在会话处于高热度时允许突破聚合等待下限，在 0~2 秒内极速响应"
+        checked={draft.instant_reply_enabled ?? DEFAULT_INSTANT_REPLY_ENABLED}
+        disabled={saving || !draft.aggregation_enabled}
+        overridden={model.isOverridden('instant_reply_enabled')}
+        onReset={() => onResetField('instant_reply_enabled')}
+        onChange={(checked) => onFieldChange('instant_reply_enabled', checked)}
       />
 
       <SwitchField
@@ -193,7 +237,7 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
             ? '长时间没有新消息时，由模型自主判断是否主动发起话题；等待用户答题或审批期间同样跳过'
             : '开启后，单聊长时间无新消息时模型会主动找话题；需存在可用的被动回复锚点才会发信'
         }
-        checked={draft.idle_reply_enabled ?? false}
+        checked={draft.idle_reply_enabled ?? DEFAULT_IDLE_REPLY_ENABLED}
         disabled={saving}
         overridden={model.isOverridden('idle_reply_enabled')}
         onReset={() => onResetField('idle_reply_enabled')}
@@ -201,21 +245,53 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
       />
 
       <ValueField
-        id="kujira-idle-reply-timeout-mins"
-        label="冷场判定阈值 (idle_reply_timeout_mins)"
-        hint={`连续多少分钟没有新消息视为冷场 (默认 ${DEFAULT_IDLE_REPLY_TIMEOUT_MINS} 分钟)`}
-        placeholder={String(DEFAULT_IDLE_REPLY_TIMEOUT_MINS)}
+        id="kujira-idle-reply-min-mins"
+        label="潜水搭话最小沉默时长 (idle_reply_min_mins)"
+        hint={`单聊无新消息后主动搭话的最早尝试时间 (单位分钟，默认 ${DEFAULT_IDLE_REPLY_MIN_MINS})`}
+        placeholder={String(DEFAULT_IDLE_REPLY_MIN_MINS)}
         numeric
-        value={String(draft.idle_reply_timeout_mins ?? DEFAULT_IDLE_REPLY_TIMEOUT_MINS)}
+        value={String(draft.idle_reply_min_mins ?? DEFAULT_IDLE_REPLY_MIN_MINS)}
         disabled={saving || !draft.idle_reply_enabled}
-        overridden={model.isOverridden('idle_reply_timeout_mins')}
-        onReset={() => onResetField('idle_reply_timeout_mins')}
-        onChange={(val) =>
+        overridden={model.isOverridden('idle_reply_min_mins')}
+        onReset={() => onResetField('idle_reply_min_mins')}
+        onChange={(val) => {
+          const parsed = parseInt(val, 10);
           onFieldChange(
-            'idle_reply_timeout_mins',
-            parseInt(val, 10) || DEFAULT_IDLE_REPLY_TIMEOUT_MINS
-          )
-        }
+            'idle_reply_min_mins',
+            Number.isNaN(parsed) ? DEFAULT_IDLE_REPLY_MIN_MINS : parsed
+          );
+        }}
+      />
+
+      <ValueField
+        id="kujira-idle-reply-max-mins"
+        label="潜水搭话最大沉默时长 (idle_reply_max_mins)"
+        hint={`单聊无新消息后主动搭话的最迟尝试时间 (单位分钟，默认 ${DEFAULT_IDLE_REPLY_MAX_MINS})`}
+        placeholder={String(DEFAULT_IDLE_REPLY_MAX_MINS)}
+        numeric
+        value={String(draft.idle_reply_max_mins ?? DEFAULT_IDLE_REPLY_MAX_MINS)}
+        disabled={saving || !draft.idle_reply_enabled}
+        overridden={model.isOverridden('idle_reply_max_mins')}
+        onReset={() => onResetField('idle_reply_max_mins')}
+        onChange={(val) => {
+          const parsed = parseInt(val, 10);
+          onFieldChange(
+            'idle_reply_max_mins',
+            Number.isNaN(parsed) ? DEFAULT_IDLE_REPLY_MAX_MINS : parsed
+          );
+        }}
+      />
+
+      <SegmentedField
+        id="kujira-proactive-attitude"
+        label="互动偏好 (proactive_attitude)"
+        hint="调节仿生动态时钟的随机采样偏置：热情（偏向最小时长，反应迅速、潜水间隔短）；均衡（均匀随机分布）；冷淡（偏向最大时长，节奏沉着、留白多）"
+        value={draft.proactive_attitude ?? DEFAULT_PROACTIVE_ATTITUDE}
+        options={PROACTIVE_ATTITUDE_OPTIONS}
+        disabled={saving}
+        overridden={model.isOverridden('proactive_attitude')}
+        onReset={() => onResetField('proactive_attitude')}
+        onChange={(val) => onFieldChange('proactive_attitude', val)}
       />
     </div>
   );

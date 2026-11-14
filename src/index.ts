@@ -58,6 +58,7 @@ import {
 import { SessionManager } from './gateway/session.js';
 import { SystemEventHub } from './gateway/system-event-hub.js';
 import { ProactiveManager, shouldPoolInbound } from './gateway/proactive.js';
+import { extractRecentTurnsFromRecords } from './gateway/proactive/momentum.js';
 import type { SystemWakeupEvent } from './types/system-event.js';
 import {
   describeInboundAttachments,
@@ -332,6 +333,25 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
         return slot?.received_at ?? null;
       } catch {
         return null;
+      }
+    },
+    // 上一轮 Bot 出站回复时刻（微观时延计算）
+    lastBotOutboundAt: (peer: string) => {
+      try {
+        const history = db.readHistory(peer, { limit: 15, order: 'desc' });
+        const botMsg = history.messages.find((m) => m.self === true);
+        return botMsg?.time ?? null;
+      } catch {
+        return null;
+      }
+    },
+    // 最近已完成交互轮次摘要（宏观历史动量计算）
+    recentTurns: (peer: string) => {
+      try {
+        const history = db.readHistory(peer, { limit: 30, order: 'desc' });
+        return extractRecentTurnsFromRecords(history.messages).recentTurns;
+      } catch {
+        return [];
       }
     },
     // 仅「曾经真实互动过」的 peer（peer_openid_map 已登记）才参与冷场搭话扫描
@@ -967,7 +987,12 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
           ...(decision.payload.quoted ? { quoted: decision.payload.quoted } : {}),
           ...(renderedAttachments.length > 0 ? { attachments: renderedAttachments } : {}),
         },
-        openid
+        openid,
+        {
+          config: activeConfig,
+          isAgentRunning: agentRunning,
+          now: receivedAt,
+        }
       );
       logger.debug?.(
         `[Plugin] 消息已入聚合池 (peer: ${peer}, 运行中: ${agentRunning}, 模式: ${behavior})`

@@ -114,14 +114,32 @@ export const DEFAULT_SLANG_EVICT_POLICY = 'reject' as const;
 /** 消息聚合回复总开关 (默认关闭，需用户显式开启) */
 export const DEFAULT_AGGREGATION_ENABLED = false;
 
-/** 消息聚合周期窗口 (单位: 分钟，默认 2 分钟) */
-export const DEFAULT_AGGREGATION_INTERVAL_MINS = 2;
+/** 连续消息聚合等待最小时长 (单位: 秒，默认 10 秒，硬底线) */
+export const DEFAULT_AGGREGATION_MIN_SECONDS = 10;
+
+/** 连续消息聚合等待最大时长 (单位: 秒，默认 60 秒) */
+export const DEFAULT_AGGREGATION_MAX_SECONDS = 60;
 
 /** 冷场主动搭话总开关 (默认关闭，需用户显式开启) */
 export const DEFAULT_IDLE_REPLY_ENABLED = false;
 
-/** 冷场判定阈值 (单位: 分钟，默认 60 分钟) */
+/** 潜水主动搭话最小沉默时长 (单位: 分钟，默认 30 分钟) */
+export const DEFAULT_IDLE_REPLY_MIN_MINS = 30;
+
+/** 潜水主动搭话最大沉默时长 (单位: 分钟，默认 120 分钟) */
+export const DEFAULT_IDLE_REPLY_MAX_MINS = 120;
+
+/** @deprecated 旧版过渡期常量（不在有效配置 DEFAULT_BASE_CONFIG 中，仅供未迁移模块引用） */
+export const DEFAULT_AGGREGATION_INTERVAL_MINS = 2;
+
+/** @deprecated 旧版过渡期常量（不在有效配置 DEFAULT_BASE_CONFIG 中，仅供未迁移模块引用） */
 export const DEFAULT_IDLE_REPLY_TIMEOUT_MINS = 60;
+
+/** 仿生主动互动偏好分段 ('enthusiastic' 热情 | 'balanced' 均衡 | 'aloof' 冷淡，默认 'balanced') */
+export const DEFAULT_PROACTIVE_ATTITUDE = 'balanced' as const;
+
+/** 允许在连续热聊时概率秒回 (突破聚合下限，默认 false) */
+export const DEFAULT_INSTANT_REPLY_ENABLED = false;
 
 /** 主动能力集中巡检周期 (固定 60 秒，与 TaskScheduler 兜底扫描同频) */
 export const PROACTIVE_CHECK_INTERVAL_MS = 60 * 1000;
@@ -159,7 +177,7 @@ export function resolveEffectiveBehavior(configured?: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// 核心配置默认值单一真相源 (与 BridgePluginConfig 19 项核心配置对齐)
+// 核心配置默认值单一真相源 (与 BridgePluginConfig 对齐)
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_BASE_CONFIG = {
@@ -179,7 +197,14 @@ export const DEFAULT_BASE_CONFIG = {
   slang_evict_policy: DEFAULT_SLANG_EVICT_POLICY,
   slang_storage_path: DEFAULT_SLANG_STORAGE_PATH,
   aggregation_enabled: DEFAULT_AGGREGATION_ENABLED,
-  aggregation_interval_mins: DEFAULT_AGGREGATION_INTERVAL_MINS,
+  aggregation_min_seconds: DEFAULT_AGGREGATION_MIN_SECONDS,
+  aggregation_max_seconds: DEFAULT_AGGREGATION_MAX_SECONDS,
   idle_reply_enabled: DEFAULT_IDLE_REPLY_ENABLED,
-  idle_reply_timeout_mins: DEFAULT_IDLE_REPLY_TIMEOUT_MINS,
+  idle_reply_min_mins: DEFAULT_IDLE_REPLY_MIN_MINS,
+  idle_reply_max_mins: DEFAULT_IDLE_REPLY_MAX_MINS,
+  proactive_attitude: DEFAULT_PROACTIVE_ATTITUDE,
+  instant_reply_enabled: DEFAULT_INSTANT_REPLY_ENABLED,
 };
+
+/** 插件默认核心配置 (与 DEFAULT_BASE_CONFIG 恒等) */
+export const DEFAULT_BRIDGE_CONFIG = DEFAULT_BASE_CONFIG;

@@ -3,17 +3,20 @@
  *
  * 契约测试: 单聊消息聚合回复与冷场主动搭话 (Kujira Proactive Aggregation & Idle Reply)
  *
- * 设计基线（最终对齐版）：
- * - **不维护消息池**：数据库是唯一可信源，管理器只维护「是否有新消息」布尔标志；
- * - **不向模型喂消息**：系统事件只说「有新消息」，模型自调 read_chat_history；
- * - **自由周期时钟**：相位来自启用时刻，不因消息/投递/轮次重置；
- * - **两个开关完全解耦**：聚合与冷场搭话各自独立门控、各自阈值。
- * - **冷场按周期重复唤醒**：沉默达标后唤醒；此后每再经过一个冷场周期才允许下一次。
- *   出站消息不重置沉默起点，起点只看最近一次入站时间。
+ * 仿生时序与事件驱动基线：
+ * - **纯内存消息池**：池只装尚未投递的真实入站消息，投递成功后清空；
+ * - **Peer 独立事件驱动**：彻底废弃全局固定周期时钟，每 Peer 独立维护时钟与下限锁定状态；
+ * - **温和折减与下限锁定**：周期内新消息温和折减 25% 剩余时间；一旦触及底限锁定，后续新消息绝不推迟；
+ * - **高热度秒回**：开启 instant_reply_enabled 且高活跃度时支持即刻唤醒；
+ * - **仿生潜水主动搭话**：在随机区间 [T_idle_min, T_idle_max] 内采样潜水目标时刻唤醒。
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { ProactiveManager, shouldPoolInbound } from '../../src/gateway/proactive.js';
+import {
+  ProactiveManager,
+  shouldPoolInbound,
+  type CompletedTurnSummary,
+} from '../../src/gateway/proactive.js';
 import { formatSystemEventPrompt } from '../../src/gateway/system-event-hub.js';
 import { formatWakeupPrompt } from '../../src/gateway/external-prompt.js';
 import { DEFAULT_BASE_CONFIG } from '../../src/constants/index.js';
@@ -24,12 +27,16 @@ const PEER_B = 'user_b1b2c3d4e5f60708';
 
 const BASE_CONFIG = {
   aggregation_enabled: true,
-  aggregation_interval_mins: 2,
+  aggregation_min_seconds: 10,
+  aggregation_max_seconds: 60,
   idle_reply_enabled: true,
-  idle_reply_timeout_mins: 60,
+  idle_reply_min_mins: 30,
+  idle_reply_max_mins: 120,
+  proactive_attitude: 'balanced' as const,
+  instant_reply_enabled: false,
 };
 
-/** T0：启用时刻。时钟相位由此起算。 */
+/** T0：基准时刻。时序以此起算。 */
 const T0 = 1_000_000;
 
 /** 构造一条入池消息（池只收集未投递的真实入站消息） */
@@ -86,104 +93,176 @@ describe('契约 1: 内存消息池按序收集周期内未投递消息', () => 
   });
 });
 
-describe('契约 2: 自由周期时钟', () => {
-  it('相位以启用时刻起算，未到第一个周期不触发', async () => {
+describe('契约 2: 基于 Peer 独立的事件驱动仿生时序器与动态折减', () => {
+  it('首条入站事件驱动启动时序器，采样 [min, max] 设定 targetWakeupAt 与 floorWakeupAt', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    manager.recordMessage(PEER, msg());
+    // rng 返回 0.5，平衡偏好下 (10 + 50 * 0.5) = 35s = 35_000ms
+    manager.recordMessage(PEER, msg('测试消息', T0), undefined, { rng: () => 0.5 });
 
-    // 首个 tick 只是建立相位，不触发
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
+    const timing = manager.getPeerTiming(PEER);
+    expect(timing).not.toBeNull();
+    expect(timing!.cycleStartTime).toBe(T0);
+    expect(timing!.floorWakeupAt).toBe(T0 + 10_000);
+    expect(timing!.targetWakeupAt).toBe(T0 + 35_000);
+    expect(timing!.isFloorLocked).toBe(false);
+
+    // 未到点（30秒后），不触发唤醒
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 30_000 }));
     expect(dispatch).not.toHaveBeenCalled();
 
-    // 未满 2 分钟
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 60_000 }));
-    expect(dispatch).not.toHaveBeenCalled();
-  });
-
-  it('到点且池非空 → 投递一次聚合事件，携带逐条消息；投递成功后清空', async () => {
-    const manager = new ProactiveManager();
-    const dispatch = vi.fn(async () => {});
-    manager.recordMessage(PEER, msg());
-
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 120_000 }));
-
+    // 到点（35秒后），触发一次聚合唤醒并清空时钟与池
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 35_000 }));
     expect(dispatch).toHaveBeenCalledTimes(1);
     const event = dispatch.mock.calls[0]![0] as any;
     expect(event.kind).toBe('aggregated_messages');
     expect(event.peer).toBe(PEER);
-    expect(event.intervalMinutes).toBe(2);
     expect(event.reason).toBe('period');
-    // 携带逐条消息内容
     expect(event.messages).toHaveLength(1);
     expect(event.messages[0].content).toBe('测试消息');
 
     expect(manager.hasPendingMessage(PEER)).toBe(false);
+    expect(manager.getPeerTiming(PEER)?.cycleStartTime).toBeNull();
+    expect(manager.getPeerTiming(PEER)?.targetWakeupAt).toBeNull();
   });
 
-  it('到点但标志为假 → 不唤醒（空转 tick 不消耗任何资源）', async () => {
+  it('周期内追加新消息执行温和折减 25% 剩余时间', async () => {
+    const manager = new ProactiveManager();
+    // 初始采样 target = T0 + 35_000, floor = T0 + 10_000
+    manager.recordMessage(PEER, msg('第一条', T0), undefined, { rng: () => 0.5 });
+
+    // 在 T0 + 5_000 追加新消息：距目标尚余 30_000ms，折减 25% 后余 22_500ms
+    // 新目标时刻 = T0 + 5_000 + 22_500 = T0 + 27_500
+    manager.recordMessage(PEER, msg('第二条', T0 + 5_000));
+
+    const timing = manager.getPeerTiming(PEER);
+    expect(timing!.targetWakeupAt).toBe(T0 + 27_500);
+    expect(timing!.floorWakeupAt).toBe(T0 + 10_000);
+    expect(timing!.isFloorLocked).toBe(false);
+  });
+
+  it('触底下限锁定：多次折减触及底限后锁定，后续持续追加绝不推迟', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
+    // 初始采样设定一个较紧凑的初始等待：T0 + 14_000, floor = T0 + 10_000
+    manager.recordMessage(PEER, msg('第一条', T0), undefined, { rng: () => 0.08 });
+    expect(manager.getPeerTiming(PEER)!.targetWakeupAt).toBe(T0 + 14_000);
+    expect(manager.getPeerTiming(PEER)!.isFloorLocked).toBe(false);
 
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 120_000 }));
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 240_000 }));
+    // 在 T0 + 2_000 追加：余 12_000ms，折减 25% 剩 9_000ms，新目标 = T0 + 11_000
+    manager.recordMessage(PEER, msg('第二条', T0 + 2_000));
+    expect(manager.getPeerTiming(PEER)!.targetWakeupAt).toBe(T0 + 11_000);
+    expect(manager.getPeerTiming(PEER)!.isFloorLocked).toBe(false);
 
+    // 在 T0 + 4_000 追加：余 7_000ms，折减 25% 剩 5_250ms，新目标 = T0 + 9_250 <= floor (T0 + 10_000)
+    // 触底锁定！
+    manager.recordMessage(PEER, msg('第三条', T0 + 4_000));
+    const timingLocked = manager.getPeerTiming(PEER);
+    expect(timingLocked!.isFloorLocked).toBe(true);
+    expect(timingLocked!.targetWakeupAt).toBe(T0 + 10_000);
+
+    // 触底锁定后，用户继续连发消息（在 T0 + 6_000, T0 + 8_000）：绝不推迟，目标时刻锁定不动！
+    manager.recordMessage(PEER, msg('第四条', T0 + 6_000));
+    manager.recordMessage(PEER, msg('第五条', T0 + 8_000));
+    const timingAfter = manager.getPeerTiming(PEER);
+    expect(timingAfter!.isFloorLocked).toBe(true);
+    expect(timingAfter!.targetWakeupAt).toBe(T0 + 10_000);
+    expect(manager.getPendingMessages(PEER)).toHaveLength(5);
+
+    // 未到底限时刻（T0 + 9_999）不投递
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 9_999 }));
     expect(dispatch).not.toHaveBeenCalled();
-  });
 
-  it('自由周期时钟严格推进：连续两个周期各触发一次，间隔恒为周期长度', async () => {
-    const manager = new ProactiveManager();
-    const dispatch = vi.fn(async () => {});
-
-    manager.recordMessage(PEER, msg());
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
-
-    // 第一个周期
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 120_000 }));
-    manager.recordMessage(PEER, msg());
-    // 第二个周期
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 240_000 }));
-
-    expect(dispatch).toHaveBeenCalledTimes(2);
-  });
-
-  it('时钟不因消息到达时刻重置：窗口中途来的消息等到下一个 tick 统一带走', async () => {
-    const manager = new ProactiveManager();
-    const dispatch = vi.fn(async () => {});
-
-    manager.recordMessage(PEER, msg());
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
-
-    // 周期中途来消息
-    manager.recordMessage(PEER, msg());
-    // 仍未到点
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 60_000 }));
-    expect(dispatch).not.toHaveBeenCalled();
-
-    // 到点统一触发
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 120_000 }));
+    // 到底限时刻（T0 + 10_000）立即自然释放投递全部 5 条消息
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 10_000 }));
     expect(dispatch).toHaveBeenCalledTimes(1);
+    const event = dispatch.mock.calls[0]![0] as any;
+    expect(event.messages).toHaveLength(5);
+    expect(manager.hasPendingMessage(PEER)).toBe(false);
   });
 
-  it('周期配置变更时重新对齐相位', async () => {
+  it('秒回机制：开启 instant_reply_enabled 且高活跃度时触发秒回（targetWakeupAt = now）', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const instantConfig = {
+      ...BASE_CONFIG,
+      instant_reply_enabled: true,
+      proactive_attitude: 'enthusiastic' as const,
+    };
+
+    // 模拟连聊高热度微观时延 2 秒，宏观动量 1.0
+    const recentTurns: CompletedTurnSummary[] = [
+      { inboundAt: T0 - 2000, lastBotOutboundAt: T0 - 4000, messageCount: 3 },
+    ];
+    manager.recordMessage(PEER, msg('热聊消息', T0), undefined, {
+      config: instantConfig,
+      lastBotOutboundAt: T0 - 2000,
+      recentTurns,
+      rng: () => 0.1, // 保证命中秒回判定
+    });
+
+    const timing = manager.getPeerTiming(PEER);
+    expect(timing!.targetWakeupAt).toBe(T0);
+    expect(timing!.isFloorLocked).toBe(true);
+
+    // checkProactive 在当前时刻即可触发投递，突破硬底线
+    await manager.checkProactive(makeOptions({ config: instantConfig, dispatch, now: T0 }));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect((dispatch.mock.calls[0]![0] as any).reason).toBe('period');
+  });
+
+  it('秒回机制：关闭 instant_reply_enabled 时即使高活跃度也走常规等待', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const configNoInstant = {
+      ...BASE_CONFIG,
+      instant_reply_enabled: false,
+    };
+
+    manager.recordMessage(PEER, msg('消息', T0), undefined, {
+      config: configNoInstant,
+      lastBotOutboundAt: T0 - 1000,
+      rng: () => 0.1,
+    });
+
+    const timing = manager.getPeerTiming(PEER);
+    // 不秒回，targetWakeupAt 严格 >= floorWakeupAt (T0 + 10_000)
+    expect(timing!.targetWakeupAt).toBeGreaterThanOrEqual(T0 + 10_000);
+
+    // 在 T0 调用不触发
+    await manager.checkProactive(makeOptions({ config: configNoInstant, dispatch, now: T0 }));
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('按 Peer 严格隔离独立时钟与下限锁定状态', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
 
-    manager.recordMessage(PEER, msg());
-    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
+    // Peer A 收到消息启动时钟
+    manager.recordMessage(PEER, msg('A1', T0), undefined, { rng: () => 0.5 });
+    expect(manager.getPeerTiming(PEER)?.targetWakeupAt).toBe(T0 + 35_000);
+    // Peer B 此时池空无时序状态
+    expect(manager.getPeerTiming(PEER_B)).toBeNull();
 
-    // 改成 5 分钟：重新对齐，此前不会触发
-    await manager.checkProactive(
-      makeOptions({ dispatch, now: T0 + 120_000, config: { aggregation_interval_mins: 5 } })
-    );
-    expect(dispatch).not.toHaveBeenCalled();
+    // Peer B 在 T0 + 10_000 收到消息，独立启动时钟（基于 T0 + 10_000）
+    manager.recordMessage(PEER_B, msg('B1', T0 + 10_000), undefined, { rng: () => 0.5 });
+    expect(manager.getPeerTiming(PEER_B)?.targetWakeupAt).toBe(T0 + 10_000 + 35_000);
 
-    await manager.checkProactive(
-      makeOptions({ dispatch, now: T0 + 120_000 + 300_000, config: { aggregation_interval_mins: 5 } })
-    );
+    // Peer A 到点 T0 + 35_000 投递，Peer B 仍未到点
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 35_000 }));
     expect(dispatch).toHaveBeenCalledTimes(1);
+    expect((dispatch.mock.calls[0]![0] as any).peer).toBe(PEER);
+    expect(manager.hasPendingMessage(PEER)).toBe(false);
+    expect(manager.hasPendingMessage(PEER_B)).toBe(true);
+  });
+
+  it('池为空时空转 tick 不唤醒且不消耗任何资源', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 }));
+    await manager.checkProactive(makeOptions({ dispatch, now: T0 + 120_000 }));
+    expect(dispatch).not.toHaveBeenCalled();
   });
 });
 
@@ -300,43 +379,50 @@ describe('契约 5: 冷场主动搭话', () => {
     expect(dispatch).not.toHaveBeenCalled();
   });
 
-  it('沉默未达阈值不搭话；达到阈值则触发一次', async () => {
+  it('仿生潜水搭话在 [T_idle_min, T_idle_max] 内随机采样，未达目标时刻不搭话，达到则触发一次', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
-
-    await manager.checkProactive(
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 30,
+      idle_reply_max_mins: 120,
+    };
+    // rng 返回 0 采样下限 30 分钟 (1,800,000ms)
+    // 用户最后发信于 T0
+    const humanAt = T0;
+    const opts = (now: number) =>
       makeOptions({
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 30 * 60 * 1000,
-        now: T0,
-      })
-    );
+        lastHumanMessageAt: () => humanAt,
+        now,
+        rng: () => 0,
+      });
+
+    // 沉默 29 分钟：未达目标时刻
+    await manager.checkProactive(opts(T0 + 29 * 60 * 1000));
     expect(dispatch).not.toHaveBeenCalled();
 
-    await manager.checkProactive(
-      makeOptions({
-        config: idleConfig,
-        dispatch,
-        knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 60 * 60 * 1000,
-        now: T0,
-      })
-    );
+    // 沉默满 30 分钟：达到潜水目标时刻，触发搭话
+    await manager.checkProactive(opts(T0 + 30 * 60 * 1000));
     expect(dispatch).toHaveBeenCalledTimes(1);
     const event = dispatch.mock.calls[0]![0] as any;
     expect(event.kind).toBe('idle_reply');
-    expect(event.idleMinutes).toBe(60);
+    expect(event.idleMinutes).toBe(30);
   });
 
-  it('未满一个冷场周期不重复唤醒；满一个周期且用户仍无入站则再次唤醒', async () => {
+  it('未满一个采样冷场周期不重复唤醒；满一个周期且用户仍无入站则再次唤醒', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 60,
+      idle_reply_max_mins: 60,
+    };
     const periodMs = 60 * 60 * 1000;
-    // 沉默起点冻结：模拟用户一直没有新的入站，机器人出站也不改这个时间
     const opts = (now: number) =>
       makeOptions({
         config: idleConfig,
@@ -364,7 +450,12 @@ describe('契约 5: 冷场主动搭话', () => {
   it('recordMessage 不得缩短冷场周期：冷却未满时即便沉默起点仍超阈值也不提前再唤醒', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 60,
+      idle_reply_max_mins: 60,
+    };
     const opts = (now: number) =>
       makeOptions({
         config: idleConfig,
@@ -375,7 +466,6 @@ describe('契约 5: 冷场主动搭话', () => {
       });
 
     await manager.checkProactive(opts(T0));
-    // 入站标志本身不是冷场周期的复位开关；出站更没有这条入口
     manager.recordMessage(PEER, msg());
     await manager.checkProactive(opts(T0 + 1000));
 
@@ -385,7 +475,12 @@ describe('契约 5: 冷场主动搭话', () => {
   it('人类新入站把沉默起点前移后，须重新沉默满一个周期才再唤醒', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 60,
+      idle_reply_max_mins: 60,
+    };
     const periodMs = 60 * 60 * 1000;
     const humanAt = T0 + 10 * 60 * 1000;
 
@@ -431,17 +526,16 @@ describe('契约 5: 冷场主动搭话', () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
 
-    manager.recordMessage(PEER, msg());
+    manager.recordMessage(PEER, msg(), undefined, { rng: () => 0 });
     await manager.checkProactive(
       makeOptions({
         dispatch,
-        dispatch2: undefined,
         knownPeers: () => [PEER],
         lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
         now: T0,
       })
     );
-    // 相位建立，未到点
+    // 未到点（10s）
     expect(dispatch).not.toHaveBeenCalled();
 
     await manager.checkProactive(
@@ -449,7 +543,7 @@ describe('契约 5: 冷场主动搭话', () => {
         dispatch,
         knownPeers: () => [PEER],
         lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0 + 120_000,
+        now: T0 + 10_000,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -470,7 +564,12 @@ describe('契约 5: 冷场主动搭话', () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
     const ensureSession = vi.fn(async () => true);
-    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 60,
+      idle_reply_max_mins: 60,
+    };
 
     await manager.checkProactive(
       makeOptions({
@@ -492,7 +591,12 @@ describe('契约 5: 冷场主动搭话', () => {
   it('建立会话失败则不搭话', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const idleConfig = { ...BASE_CONFIG, aggregation_enabled: false };
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 60,
+      idle_reply_max_mins: 60,
+    };
 
     await manager.checkProactive(
       makeOptions({
@@ -528,11 +632,17 @@ describe('契约 6: 两个开关完全解耦', () => {
   it('仅开聚合：不搭话', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const config = { aggregation_enabled: true, aggregation_interval_mins: 2, idle_reply_enabled: false };
+    const config = {
+      ...BASE_CONFIG,
+      aggregation_enabled: true,
+      aggregation_min_seconds: 10,
+      aggregation_max_seconds: 60,
+      idle_reply_enabled: false,
+    };
 
-    manager.recordMessage(PEER, msg());
+    manager.recordMessage(PEER, msg(), undefined, { rng: () => 0 });
     await manager.checkProactive(makeOptions({ config, dispatch, now: T0 }));
-    await manager.checkProactive(makeOptions({ config, dispatch, now: T0 + 120_000 }));
+    await manager.checkProactive(makeOptions({ config, dispatch, now: T0 + 10_000 }));
     expect((dispatch.mock.calls[0]![0] as any).kind).toBe('aggregated_messages');
 
     await manager.checkProactive(
@@ -550,7 +660,13 @@ describe('契约 6: 两个开关完全解耦', () => {
   it('仅开搭话：聚合不触发，冷场照常搭话', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
-    const config = { aggregation_enabled: false, idle_reply_enabled: true, idle_reply_timeout_mins: 60 };
+    const config = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_enabled: true,
+      idle_reply_min_mins: 60,
+      idle_reply_max_mins: 60,
+    };
 
     manager.recordMessage(PEER, msg());
     await manager.checkProactive(makeOptions({ config, dispatch, now: T0 }));
@@ -866,35 +982,45 @@ describe('契约 12: 入站分流决策（聚合关闭 / 空闲入池 / 运行�
 });
 
 describe('契约 9: 配置项四方同源与默认值', () => {
-  const NEW_KEYS = [
+  const PROACTIVE_KEYS = [
     'aggregation_enabled',
-    'aggregation_interval_mins',
+    'aggregation_min_seconds',
+    'aggregation_max_seconds',
     'idle_reply_enabled',
-    'idle_reply_timeout_mins',
+    'idle_reply_min_mins',
+    'idle_reply_max_mins',
+    'proactive_attitude',
+    'instant_reply_enabled',
   ] as const;
 
-  it('4 个新键在 Schema 与 DEFAULT_BASE_CONFIG 中同时存在且默认值一致', () => {
+  it('8 个仿生主动能力配置键在 Schema 与 DEFAULT_BASE_CONFIG 中同时存在且默认值一致', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const parsed = BridgeConfigSchema({});
     const unwrap = (val: any) => (typeof val?.get === 'function' ? val.get() : val);
 
-    for (const key of NEW_KEYS) {
+    for (const key of PROACTIVE_KEYS) {
       expect(schemaShape[key]).toBeDefined();
       expect(schemaShape[key]?.meta?.volatile).toBe(true);
       expect(unwrap((parsed as any)[key])).toEqual((DEFAULT_BASE_CONFIG as any)[key]);
     }
   });
 
-  it('默认值：聚合关闭 / 周期 2 分钟 / 搭话关闭 / 阈值 60 分钟', () => {
+  it('默认值：聚合关闭 / [10s, 60s] / 搭话关闭 / [30m, 120m] / balanced / instant_reply 关闭', () => {
     expect(DEFAULT_BASE_CONFIG.aggregation_enabled).toBe(false);
-    expect(DEFAULT_BASE_CONFIG.aggregation_interval_mins).toBe(2);
+    expect(DEFAULT_BASE_CONFIG.aggregation_min_seconds).toBe(10);
+    expect(DEFAULT_BASE_CONFIG.aggregation_max_seconds).toBe(60);
     expect(DEFAULT_BASE_CONFIG.idle_reply_enabled).toBe(false);
-    expect(DEFAULT_BASE_CONFIG.idle_reply_timeout_mins).toBe(60);
+    expect(DEFAULT_BASE_CONFIG.idle_reply_min_mins).toBe(30);
+    expect(DEFAULT_BASE_CONFIG.idle_reply_max_mins).toBe(120);
+    expect(DEFAULT_BASE_CONFIG.proactive_attitude).toBe('balanced');
+    expect(DEFAULT_BASE_CONFIG.instant_reply_enabled).toBe(false);
   });
 
-  it('未知 proactive_* 旧键仍被自愈引擎剔除', () => {
+  it('旧版过渡期字段与未知 proactive_* 键已彻底剔除或不受理', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     for (const dead of [
+      'aggregation_interval_mins',
+      'idle_reply_timeout_mins',
       'proactive_reply_enabled',
       'proactive_interval_mins',
       'proactive_buffer_size',

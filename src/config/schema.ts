@@ -23,9 +23,13 @@ import {
   DEFAULT_SLANG_EVICT_POLICY,
   DEFAULT_SLANG_STORAGE_PATH,
   DEFAULT_AGGREGATION_ENABLED,
-  DEFAULT_AGGREGATION_INTERVAL_MINS,
+  DEFAULT_AGGREGATION_MIN_SECONDS,
+  DEFAULT_AGGREGATION_MAX_SECONDS,
   DEFAULT_IDLE_REPLY_ENABLED,
-  DEFAULT_IDLE_REPLY_TIMEOUT_MINS,
+  DEFAULT_IDLE_REPLY_MIN_MINS,
+  DEFAULT_IDLE_REPLY_MAX_MINS,
+  DEFAULT_PROACTIVE_ATTITUDE,
+  DEFAULT_INSTANT_REPLY_ENABLED,
 } from '../constants/index.js';
 import type { BridgePluginConfig } from '../types/index.js';
 
@@ -110,21 +114,41 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_AGGREGATION_ENABLED)
     .volatile()
     .description('消息聚合回复总开关：开启后连续消息按周期窗口合并为一次回复'),
-  aggregation_interval_mins: z
+  aggregation_min_seconds: z
     .number()
-    .default(DEFAULT_AGGREGATION_INTERVAL_MINS)
+    .default(DEFAULT_AGGREGATION_MIN_SECONDS)
     .volatile()
-    .description('消息聚合周期窗口 (单位: 分钟，默认 2 分钟)'),
+    .description('聚合等待最小时长 (单位: 秒，默认 10 秒，硬底线)'),
+  aggregation_max_seconds: z
+    .number()
+    .default(DEFAULT_AGGREGATION_MAX_SECONDS)
+    .volatile()
+    .description('聚合等待最大时长 (单位: 秒，默认 60 秒)'),
   idle_reply_enabled: z
     .boolean()
     .default(DEFAULT_IDLE_REPLY_ENABLED)
     .volatile()
     .description('冷场主动搭话总开关：长时间无新消息时主动发起话题'),
-  idle_reply_timeout_mins: z
+  idle_reply_min_mins: z
     .number()
-    .default(DEFAULT_IDLE_REPLY_TIMEOUT_MINS)
+    .default(DEFAULT_IDLE_REPLY_MIN_MINS)
     .volatile()
-    .description('冷场判定阈值 (单位: 分钟，默认 60 分钟)'),
+    .description('潜水主动搭话最小沉默时长 (单位: 分钟，默认 30 分钟)'),
+  idle_reply_max_mins: z
+    .number()
+    .default(DEFAULT_IDLE_REPLY_MAX_MINS)
+    .volatile()
+    .description('潜水主动搭话最大沉默时长 (单位: 分钟，默认 120 分钟)'),
+  proactive_attitude: z
+    .union([z.const('enthusiastic'), z.const('balanced'), z.const('aloof')])
+    .default(DEFAULT_PROACTIVE_ATTITUDE)
+    .volatile()
+    .description('互动偏好分段 (enthusiastic: 热情, balanced: 均衡, aloof: 冷淡)'),
+  instant_reply_enabled: z
+    .boolean()
+    .default(DEFAULT_INSTANT_REPLY_ENABLED)
+    .volatile()
+    .description('允许在连续热聊时概率秒回 (突破聚合下限，默认 false)'),
 });
 
 export type { BridgePluginConfig };

@@ -73,7 +73,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       ]);
       expect(SETTINGS_TABS).toHaveLength(5);
 
-      expect(html).not.toContain('proactive');
+      expect(html).not.toContain('kujira-tab-proactive');
       expect(html).not.toContain('security');
       expect(html).not.toContain('kujira-tab-tools');
       expect(html).not.toContain('napcat');
@@ -156,7 +156,7 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).not.toContain('aliases');
     });
 
-    it('Tab 1 追加 4 项主动能力配置：聚合开关/聚合窗口/搭话开关/搭话阈值，且窗口与阈值随各自开关联动禁用', () => {
+    it('Tab 1 追加仿生主动能力配置：聚合开关/区间/秒回/搭话开关/区间/偏好，且各子项随各自开关联动禁用', () => {
       const html = renderCard({ initialTab: 'connection' });
       const connectionPanelMatch = html.match(
         /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
@@ -164,19 +164,30 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       expect(connectionPanelMatch).not.toBeNull();
       const connectionHtml = connectionPanelMatch![0];
 
-      // 1. 四个控件齐全
+      // 1. 仿生主动能力控件齐全
       expect(connectionHtml).toContain('id="kujira-aggregation-enabled"');
-      expect(connectionHtml).toContain('id="kujira-aggregation-interval-mins"');
+      expect(connectionHtml).toContain('id="kujira-aggregation-min-seconds"');
+      expect(connectionHtml).toContain('id="kujira-aggregation-max-seconds"');
+      expect(connectionHtml).toContain('id="kujira-instant-reply-enabled"');
       expect(connectionHtml).toContain('id="kujira-idle-reply-enabled"');
-      expect(connectionHtml).toContain('id="kujira-idle-reply-timeout-mins"');
+      expect(connectionHtml).toContain('id="kujira-idle-reply-min-mins"');
+      expect(connectionHtml).toContain('id="kujira-idle-reply-max-mins"');
+      expect(connectionHtml).toContain('id="kujira-proactive-attitude"');
 
-      // 2. 默认全关时，两个数值项均被禁用（避免无意义配置）
-      expect(connectionHtml).toMatch(/id="kujira-aggregation-interval-mins"[^>]*disabled/);
-      expect(connectionHtml).toMatch(/id="kujira-idle-reply-timeout-mins"[^>]*disabled/);
+      // 2. 默认全关时，区间与秒回项均被联动禁用
+      expect(connectionHtml).toMatch(/id="kujira-aggregation-min-seconds"[^>]*disabled/);
+      expect(connectionHtml).toMatch(/id="kujira-aggregation-max-seconds"[^>]*disabled/);
+      expect(connectionHtml).toMatch(/id="kujira-instant-reply-enabled"[^>]*disabled/);
+      expect(connectionHtml).toMatch(/id="kujira-idle-reply-min-mins"[^>]*disabled/);
+      expect(connectionHtml).toMatch(/id="kujira-idle-reply-max-mins"[^>]*disabled/);
 
-      // 3. 默认值渲染（聚合窗口 2 分钟 / 搭话阈值 60 分钟）
-      expect(connectionHtml).toMatch(/id="kujira-aggregation-interval-mins"[^>]*value="2"/);
-      expect(connectionHtml).toMatch(/id="kujira-idle-reply-timeout-mins"[^>]*value="60"/);
+      // 3. 默认值渲染（聚合 10s~60s / 搭话 30m~120m / 偏好 balanced）
+      expect(connectionHtml).toMatch(/id="kujira-aggregation-min-seconds"[^>]*value="10"/);
+      expect(connectionHtml).toMatch(/id="kujira-aggregation-max-seconds"[^>]*value="60"/);
+      expect(connectionHtml).toMatch(/id="kujira-idle-reply-min-mins"[^>]*value="30"/);
+      expect(connectionHtml).toMatch(/id="kujira-idle-reply-max-mins"[^>]*value="120"/);
+      expect(connectionHtml).toContain('id="kujira-proactive-attitude-option-balanced"');
+      expect(connectionHtml).toMatch(/id="kujira-proactive-attitude-option-balanced"[^>]*aria-checked="true"/);
 
       // 4. 开启后对应数值项解禁
       const enabledHtml = renderCard({
@@ -186,10 +197,15 @@ describe('契约测试: Web UI 设置卡 5 分区 Tab、只写凭据表单与跨
       const enabledPanel = enabledHtml.match(
         /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
       )![0];
-      expect(enabledPanel).not.toMatch(/id="kujira-aggregation-interval-mins"[^>]*disabled/);
-      expect(enabledPanel).not.toMatch(/id="kujira-idle-reply-timeout-mins"[^>]*disabled/);
+      expect(enabledPanel).not.toMatch(/id="kujira-aggregation-min-seconds"[^>]*disabled/);
+      expect(enabledPanel).not.toMatch(/id="kujira-aggregation-max-seconds"[^>]*disabled/);
+      expect(enabledPanel).not.toMatch(/id="kujira-instant-reply-enabled"[^>]*disabled/);
+      expect(enabledPanel).not.toMatch(/id="kujira-idle-reply-min-mins"[^>]*disabled/);
+      expect(enabledPanel).not.toMatch(/id="kujira-idle-reply-max-mins"[^>]*disabled/);
 
-      // 5. 绝不复用已废弃的群聊 proactive_* 键名
+      // 5. 绝不复用已废弃的旧键名
+      expect(connectionHtml).not.toContain('aggregation_interval_mins');
+      expect(connectionHtml).not.toContain('idle_reply_timeout_mins');
       expect(connectionHtml).not.toContain('proactive_reply_enabled');
       expect(connectionHtml).not.toContain('proactive_idle_timeout_mins');
       expect(connectionHtml).not.toContain('proactive_buffer_size');

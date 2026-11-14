@@ -4,6 +4,9 @@
 
 export type DshPermissionPreset = 'read-only' | 'workspace-write' | 'danger-full-access';
 
+/** 仿生主动互动偏好分段 ('enthusiastic' 热情 | 'balanced' 均衡 | 'aloof' 冷淡) */
+export type ProactiveAttitude = 'enthusiastic' | 'balanced' | 'aloof';
+
 /** QQ 官方 Bot 开放平台凭据（仅通过 DSH ctx.credentials 安全存储，不写入配置文件） */
 export interface QqCredential {
   appId: string;
@@ -25,7 +28,7 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（19 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（23 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
@@ -59,10 +62,22 @@ export interface BridgePluginConfig {
   slang_storage_path?: string;
   /** 消息聚合回复总开关：开启后用户连续发送的消息按周期窗口聚合，一次性交给模型回复 */
   aggregation_enabled?: boolean;
-  /** 消息聚合周期窗口 (单位: 分钟，默认 2 分钟)：每隔该时长抓取一次未回复消息池 */
-  aggregation_interval_mins?: number;
+  /** 聚合等待最小时长 (单位: 秒，默认 10 秒，硬底线) */
+  aggregation_min_seconds?: number;
+  /** 聚合等待最大时长 (单位: 秒，默认 60 秒) */
+  aggregation_max_seconds?: number;
   /** 冷场主动搭话总开关：长时间无新消息时主动发起话题 */
   idle_reply_enabled?: boolean;
-  /** 冷场判定阈值 (单位: 分钟，默认 60 分钟)：沉默达到该时长后触发主动搭话 */
+  /** 潜水主动搭话最小沉默时长 (单位: 分钟，默认 30 分钟) */
+  idle_reply_min_mins?: number;
+  /** 潜水主动搭话最大沉默时长 (单位: 分钟，默认 120 分钟) */
+  idle_reply_max_mins?: number;
+  /** 互动偏好分段 ('enthusiastic' 热情 | 'balanced' 均衡 | 'aloof' 冷淡，默认 'balanced') */
+  proactive_attitude?: ProactiveAttitude;
+  /** 允许在连续热聊时概率秒回 (突破聚合下限，默认 false) */
+  instant_reply_enabled?: boolean;
+  /** @deprecated 旧版过渡期类型兼容占位（已从 Schema、默认值与有效配置彻底清除） */
+  aggregation_interval_mins?: number;
+  /** @deprecated 旧版过渡期类型兼容占位（已从 Schema、默认值与有效配置彻底清除） */
   idle_reply_timeout_mins?: number;
 }

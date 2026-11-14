@@ -29,17 +29,21 @@ const EXPECTED_15_KEYS = [
   'slang_storage_path',
 ] as const;
 
-/** 新增的单聊主动能力配置键（消息聚合回复 + 冷场主动搭话），共 4 项 */
+/** 新增的单聊仿生主动能力配置键（消息聚合回复 + 冷场主动搭话），共 8 项 */
 const PROACTIVE_KEYS = [
   'aggregation_enabled',
-  'aggregation_interval_mins',
+  'aggregation_min_seconds',
+  'aggregation_max_seconds',
   'idle_reply_enabled',
-  'idle_reply_timeout_mins',
+  'idle_reply_min_mins',
+  'idle_reply_max_mins',
+  'proactive_attitude',
+  'instant_reply_enabled',
 ] as const;
 
-const EXPECTED_19_KEYS = [...EXPECTED_15_KEYS, ...PROACTIVE_KEYS] as const;
+const EXPECTED_23_KEYS = [...EXPECTED_15_KEYS, ...PROACTIVE_KEYS] as const;
 
-describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+describe('契约测试: Kujira 23 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -50,23 +54,23 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 19 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 19 项合法键', () => {
+  describe('1. 单一真相源与 23 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 23 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(19);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_19_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_19_KEYS].sort());
+      expect(validKeys.size).toBe(23);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_23_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_23_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_19_KEYS) {
+      for (const field of EXPECTED_23_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_19_KEYS) {
+      for (const field of EXPECTED_23_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'
@@ -84,6 +88,9 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
         // 已固化为默认开启而废除的配置开关
         'markdown_enabled',
         'input_notify_enabled',
+        // 旧聚合与冷场固定分钟数配置（彻底清除，由仿生动态区间全面取代）
+        'aggregation_interval_mins',
+        'idle_reply_timeout_mins',
         // 旧 NapCat & 凭据键
         'ws_port',
         'ws_token',
@@ -131,14 +138,16 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
   });
 
   describe('2. 纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
-    it('分离 19 项合法字段与 markdown_enabled / input_notify_enabled / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
+    it('分离 23 项合法字段与 markdown_enabled / input_notify_enabled / 旧固定分钟数 / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
       const dirtyInput = {
         image_ttl_days: 14,
         new_message_behavior: 'queue',
         persona: '测试单聊人格',
-        // 以下均为已废除键，必须全部剔除（含 markdown_enabled 与 input_notify_enabled）
+        // 以下均为已废除键，必须全部剔除（含 markdown_enabled 与 input_notify_enabled 及旧固定分钟数）
         markdown_enabled: false,
         input_notify_enabled: true,
+        aggregation_interval_mins: 2,
+        idle_reply_timeout_mins: 60,
         ws_port: 3001,
         ws_token: 'legacy-ws-token',
         bot_qq: '1000000021',
@@ -164,6 +173,8 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
         [
           'markdown_enabled',
           'input_notify_enabled',
+          'aggregation_interval_mins',
+          'idle_reply_timeout_mins',
           'ws_port',
           'ws_token',
           'bot_qq',
@@ -245,6 +256,8 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
         '    image_ttl_days: 7',
         '    markdown_enabled: true',
         '    input_notify_enabled: false',
+        '    aggregation_interval_mins: 2',
+        '    idle_reply_timeout_mins: 60',
         '    ws_port: 3001',
         '    ws_token: "legacy-token"',
         '    bot_qq: "1000000000"',
@@ -279,6 +292,8 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
         [
           'markdown_enabled',
           'input_notify_enabled',
+          'aggregation_interval_mins',
+          'idle_reply_timeout_mins',
           'ws_port',
           'ws_token',
           'bot_qq',
@@ -296,9 +311,11 @@ describe('契约测试: Kujira 19 项配置 Schema 与物理自愈引擎 (Config
       expect(updated).toContain('image_ttl_days: 7');
       expect(updated).toContain('persona: "保留的合法单聊人格"');
 
-      // 所有死键（含 markdown_enabled / input_notify_enabled）及其多行子块已物理删除
+      // 所有死键（含 markdown_enabled / input_notify_enabled 及旧固定分钟数）及其多行子块已物理删除
       expect(updated).not.toContain('markdown_enabled');
       expect(updated).not.toContain('input_notify_enabled');
+      expect(updated).not.toContain('aggregation_interval_mins');
+      expect(updated).not.toContain('idle_reply_timeout_mins');
       expect(updated).not.toContain('ws_port');
       expect(updated).not.toContain('ws_token');
       expect(updated).not.toContain('bot_qq');
