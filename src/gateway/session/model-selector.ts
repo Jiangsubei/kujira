@@ -4,13 +4,23 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import type { ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
+import type { ModelSelection } from '@deepseek-ai/dsh-agent';
 import type { SessionPersistenceManager } from './persistence.js';
 
 const KUJIRA_DEFAULT_MODEL_KEY = 'kujira_default_model';
 
+/**
+ * Kujira 内部维护的会话级模型选择引用。
+ * DSH 0.2.2 起 `ModelSelectionRef` 不再由 `@deepseek-ai/dsh-agent` 导出，
+ * 模型选择的生效路径为 agentOptions / `agent.model.select()`，此处仅作插件内状态缓存。
+ */
+export interface KujiraModelSelectionRef {
+  current: ModelSelection;
+  assembled?: unknown;
+}
+
 export class SessionModelSelector {
-  private selectionMap = new Map<string, ModelSelectionRef>();
+  private selectionMap = new Map<string, KujiraModelSelectionRef>();
   private kujiraDefaultModel?: ModelSelection;
 
   constructor(
@@ -160,7 +170,7 @@ export class SessionModelSelector {
     return this.getKujiraDefaultModel();
   }
 
-  public getOrCreateSelectionRef(sessionId: string): ModelSelectionRef {
+  public getOrCreateSelectionRef(sessionId: string): KujiraModelSelectionRef {
     let ref = this.selectionMap.get(sessionId);
     if (!ref) {
       ref = {

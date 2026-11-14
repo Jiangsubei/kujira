@@ -149,12 +149,11 @@ describe('契约测试: DSH 真实服务装配与 Kujira 插件挂载 (Assembly 
     });
     const webAgent = webHandle.agent || webHandle;
     const denied = await tools.execute({
-      name: 'read_chat_history',
-      arguments: {},
+      calls: [{ type: 'tool-call', id: 'call-web-denied', name: 'read_chat_history', arguments: '{}' }],
       agent: webAgent,
       signal: new AbortController().signal,
     });
-    expect(denied.isError).toBe(true);
+    expect(denied.results[0]?.result.isError).toBe(true);
 
     // Kujira 会话 agent (挂载 kujira-session 预设)
     const qqHandle = await booted.ctx.agents.create({
@@ -167,12 +166,11 @@ describe('契约测试: DSH 真实服务装配与 Kujira 插件挂载 (Assembly 
     });
     const qqAgent = qqHandle.agent || qqHandle;
     const allowed = await tools.execute({
-      name: 'read_chat_history',
-      arguments: {},
+      calls: [{ type: 'tool-call', id: 'call-qq-allowed', name: 'read_chat_history', arguments: '{}' }],
       agent: qqAgent,
       signal: new AbortController().signal,
     });
-    expect(allowed.isError).toBe(false);
+    expect(allowed.results[0]?.result.isError).toBe(false);
   });
 
   it('B3-契约 6: system-prompt/assemble 呈现侧预设隔离 — Web 装配不含 Kujira 工具，Kujira 装配含全量', async () => {

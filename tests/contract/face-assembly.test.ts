@@ -203,12 +203,11 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
 
     const tools: any = booted.ctx.get('tools');
     const denied = await tools.execute({
-      name: 'list_faces',
-      arguments: {},
+      calls: [{ type: 'tool-call', id: 'call-face-web-denied', name: 'list_faces', arguments: '{}' }],
       agent: webAgent,
       signal: new AbortController().signal,
     });
-    expect(denied.isError).toBe(true);
+    expect(denied.results[0]?.result.isError).toBe(true);
 
     // 2. Kujira 单聊会话 Agent: 挂载 kujira-session 预设 (含 kujira/tools)，assemble 包含全量 4 个表情工具，调用放行
     const qqHandle = await booted.ctx.agents.create({
@@ -225,12 +224,11 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     expect(qqFaces.map((t) => t.name).sort()).toEqual([...FACE_TOOL_NAMES].sort());
 
     const allowed = await tools.execute({
-      name: 'list_faces',
-      arguments: {},
+      calls: [{ type: 'tool-call', id: 'call-face-qq-allowed', name: 'list_faces', arguments: '{}' }],
       agent: qqAgent,
       signal: new AbortController().signal,
     });
-    expect(allowed.isError).toBe(false);
+    expect(allowed.results[0]?.result.isError).toBe(false);
   });
 
   it('装配 4: collect_face 默认落盘目录为 .dsh/kujira/faces（规范绝对路径），绝不受 cwd 漂移影响', async () => {

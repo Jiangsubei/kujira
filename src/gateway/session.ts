@@ -5,7 +5,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import type { Agent, AgentHandle, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentHandle, ModelSelection } from '@deepseek-ai/dsh-agent';
 import type { MessageDatabase } from '../storage/database.js';
 import type { WakeupPayload } from '../types/index.js';
 import type { TurnInitiatorTracker } from '../approval/turn-initiator.js';
@@ -53,7 +53,7 @@ import {
 } from './session/id-resolver.js';
 import { SessionWorkspaceManager } from './session/workspace.js';
 import { SessionPersistenceManager } from './session/persistence.js';
-import { SessionModelSelector } from './session/model-selector.js';
+import { SessionModelSelector, type KujiraModelSelectionRef } from './session/model-selector.js';
 import { SessionAgentRunner } from './session/agent-runner.js';
 
 export class SessionManager {
@@ -309,7 +309,7 @@ export class SessionManager {
     return this.modelSelector.getDefaultModelSelection();
   }
 
-  public getOrCreateSelectionRef(sessionId: string): ModelSelectionRef {
+  public getOrCreateSelectionRef(sessionId: string): KujiraModelSelectionRef {
     return this.modelSelector.getOrCreateSelectionRef(sessionId);
   }
 

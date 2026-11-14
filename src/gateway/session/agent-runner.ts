@@ -380,7 +380,7 @@ export class SessionAgentRunner {
 
     const setupFn = (agentCtx: any) => {
       if (typeof agentCtx?.on === 'function') {
-        installModelSelection(agentCtx, selectionRef);
+        installModelSelection(agentCtx);
       }
       const presets: any =
         agentCtx?.get?.('agentPresets') || (this.ctx as any).agentPresets;
