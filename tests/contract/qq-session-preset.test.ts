@@ -221,4 +221,39 @@ describe('契约测试: Kujira 单聊会话专属预设装配与工具隔离 (QQ
     const instructionsPlugin = plugins.find((p: any) => p.id === 'agent-instructions');
     expect(instructionsPlugin.config?.maxBytes).toBe(65536);
   });
+
+  it('契约 7: 动态挂载/注册 kujira-session 预设时，必须向 Cordis 上下文广播 settings/document-updated(agent-preset-registry) 事件，确保 DSH 前端 UI 免重启即时刷新', async () => {
+    const freshHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-preset-refresh-'));
+    const freshBoot = await bootDshKujira({
+      dshHome: freshHome,
+      mountPlugin: false,
+      extraPatches: [
+        {
+          id: 'agent-preset-registry',
+          config: { default: QQ_PRESET_ID },
+        },
+      ],
+    });
+
+    try {
+      let eventFired = false;
+      freshBoot.ctx.on('settings/document-updated', (ns: string) => {
+        if (ns === 'agent-preset-registry') {
+          eventFired = true;
+        }
+      });
+
+      await freshBoot.ctx.plugin(KujiraPlugin, {
+        face_enabled: false,
+        slang_enabled: false,
+      });
+
+      // 等待异步 inject 与事件循环
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(eventFired).toBe(true);
+    } finally {
+      await freshBoot.dispose().catch(() => {});
+      await fsp.rm(freshHome, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 });

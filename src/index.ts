@@ -489,17 +489,26 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   provideService(ctx, 'kujira-outbound-bridge', outboundBridge);
   provideService(ctx, 'kujira-proactive', proactiveManager);
 
-  (ctx as any).inject?.(['agentPresets'], (presetCtx: Context) => {
+  (ctx as any).inject?.(['agentPresets'], async (presetCtx: Context) => {
     const agentPresetsSvc = (presetCtx as any).agentPresets;
     if (agentPresetsSvc && typeof agentPresetsSvc.register === 'function') {
-      agentPresetsSvc.list?.().then((presetsList: any[]) => {
+      try {
+        const presetsList = await agentPresetsSvc.list?.();
         const exists = Array.isArray(presetsList) && presetsList.some((p: any) => p.id === QQ_PRESET_ID);
         if (!exists) {
-          agentPresetsSvc.register(getRuntimePresetDefinition()).catch((err: any) => {
-            logger.debug?.(`[Plugin] 动态注册 ${QQ_PRESET_ID} 预设已跳过或失败:`, err?.message);
-          });
+          await agentPresetsSvc.register(getRuntimePresetDefinition());
         }
-      }).catch(() => {});
+        // 核心装配：向 Cordis 根上下文广播 settings/document-updated 事件，
+        // 触发 dsh-api-remotes 向前端客户端推送变更，通知 dsh-client-ui-agent-preset 重新执行 list 并刷新 Store，
+        // 从而实现安装插件后无需重启 DSH 即可即时呈现 Kujira 预设。
+        const targetCtx = (presetCtx as any).root ?? presetCtx;
+        targetCtx.emit?.('settings/document-updated', 'agent-preset-registry');
+        setTimeout(() => {
+          targetCtx.emit?.('settings/document-updated', 'agent-preset-registry');
+        }, 50);
+      } catch (err: any) {
+        logger.debug?.(`[Plugin] 动态注册/刷新 ${QQ_PRESET_ID} 预设异常:`, err?.message);
+      }
     }
   });
 
