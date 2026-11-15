@@ -126,8 +126,7 @@
 
 ### 3.1 为什么发送消息后，机器人没有立刻回复？
 - **原因**：
-  - 当前开启了 `aggregation_enabled: true`（连续消息聚合）；
-  - 系统在收到第一条消息后，会在 `[aggregation_min_seconds, aggregation_max_seconds]`（默认 10s~60s）之间随机采样等待时长，给用户留出补充打字的空间。
+  - 检查是否手动开启了 `aggregation_enabled: true`（连续消息聚合，默认关闭）；若已开启，系统在收到第一条消息后，会在 `[aggregation_min_seconds, aggregation_max_seconds]`（默认 10s~60s）之间随机采样等待时长，给用户留出补充打字的空间。
 - **调优方案**：
   - 若追求极速响应（例如工作助手场景），可在设置面板中：
     1. 将 `aggregation_min_seconds` 设为 `3`；

@@ -82,7 +82,7 @@
 
 #### 8. `collect_face`（收录新表情）
 - **输入**：`file_path: string`（通常来自聊天中用户发送并落盘的图片路径）、`tags: string[]`（标签列表）、`emotion: string`（主导情绪）。
-- **逻辑**：将图片收纳进表情目录，记录至数据库，受 `face_store_max` 与 LRU 淘汰策略约束。
+- **逻辑**：将图片收纳进表情目录，记录至数据库，受 `face_store_max` 与满额淘汰策略（默认 `reject` 拒绝新增，支持配置 `evict_lru` 淘汰）约束。
 
 #### 9. `manage_faces`（维护表情资产）
 - **输入**：`action: 'delete' | 'update'`, `face_id: string`, `tags?: string[]`, `emotion?: string`。

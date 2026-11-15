@@ -97,7 +97,7 @@ export const DEFAULT_FACE_STORE_MAX = 100;
 
 export const DEFAULT_FACE_QUERY_LIMIT = 100;
 
-export const DEFAULT_FACE_EVICT_POLICY = 'evict_lru' as const;
+export const DEFAULT_FACE_EVICT_POLICY = 'reject' as const;
 
 export const DEFAULT_FACE_GRACE_PERIOD_DAYS = 7;
 
