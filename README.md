@@ -2,6 +2,8 @@
 
 <p align="center">
   <img src="./icon.svg" width="128" height="128" alt="kujira logo" />
+  <br />
+  <sub>图标形象源自 B 站用户 <strong>ZipZipPipe</strong> 与 <strong>上善无形</strong>（社区开源共创形象）</sub>
 </p>
 
 <p align="center">
@@ -209,7 +211,8 @@ pnpm test          # 完整构建测试（pnpm build + vitest run）
 
 ---
 
-## 📄 License & Author
+## 📄 License & Credits
 
-- **License**: [MIT](LICENSE)
+- **Logo & Artwork**: 图标形象源自 B 站用户 **ZipZipPipe** 与 **上善无形**，为社区开源共创形象，特别致谢创作者对社区的支持与贡献！
 - **Author**: Jiangsubei
+- **License**: [MIT](LICENSE)
