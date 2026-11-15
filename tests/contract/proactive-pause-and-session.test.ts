@@ -126,9 +126,9 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
         config: idleOnly,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        lastHumanMessageAt: () => T0,
         isAwaitingUserInput: () => true,
-        now: T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
 
@@ -140,8 +140,8 @@ describe('契约 1: 等待用户输入时跳过唤醒，消息累积到下一轮
         config: idleOnly,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -195,8 +195,8 @@ describe('契约 2: 活跃会话门控', () => {
         knownPeers: () => [PEER],
         hasActiveSession: () => false,
         ensureSession,
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
 
@@ -218,8 +218,8 @@ describe('契约 2: 活跃会话门控', () => {
         knownPeers: () => [PEER],
         hasActiveSession: () => true,
         ensureSession,
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
 

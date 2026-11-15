@@ -423,26 +423,32 @@ describe('契约 5: 冷场主动搭话', () => {
       idle_reply_max_mins: 60,
     };
     const periodMs = 60 * 60 * 1000;
+    const humanAt = T0;
     const opts = (now: number) =>
       makeOptions({
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        lastHumanMessageAt: () => humanAt,
         now,
       });
 
-    await manager.checkProactive(opts(T0));
-    await manager.checkProactive(opts(T0 + periodMs - 1));
+    // 刚满 60 分钟触发第 1 次
+    await manager.checkProactive(opts(T0 + periodMs));
     expect(dispatch).toHaveBeenCalledTimes(1);
 
-    await manager.checkProactive(opts(T0 + periodMs));
-    expect(dispatch).toHaveBeenCalledTimes(2);
-
+    // 距上次唤醒未满 60 分钟不重复唤醒
     await manager.checkProactive(opts(T0 + 2 * periodMs - 1));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
+    // 距上次唤醒满 60 分钟且用户仍无入站触发第 2 次
+    await manager.checkProactive(opts(T0 + 2 * periodMs));
     expect(dispatch).toHaveBeenCalledTimes(2);
 
-    await manager.checkProactive(opts(T0 + 2 * periodMs));
+    await manager.checkProactive(opts(T0 + 3 * periodMs - 1));
+    expect(dispatch).toHaveBeenCalledTimes(2);
+
+    await manager.checkProactive(opts(T0 + 3 * periodMs));
     expect(dispatch).toHaveBeenCalledTimes(3);
     expect(dispatch.mock.calls.every((call) => (call[0] as any).kind === 'idle_reply')).toBe(true);
   });
@@ -456,18 +462,22 @@ describe('契约 5: 冷场主动搭话', () => {
       idle_reply_min_mins: 60,
       idle_reply_max_mins: 60,
     };
+    const periodMs = 60 * 60 * 1000;
+    const humanAt = T0;
     const opts = (now: number) =>
       makeOptions({
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        lastHumanMessageAt: () => humanAt,
         now,
       });
 
-    await manager.checkProactive(opts(T0));
+    await manager.checkProactive(opts(T0 + periodMs));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
     manager.recordMessage(PEER, msg());
-    await manager.checkProactive(opts(T0 + 1000));
+    await manager.checkProactive(opts(T0 + periodMs + 1000));
 
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
@@ -482,29 +492,30 @@ describe('契约 5: 冷场主动搭话', () => {
       idle_reply_max_mins: 60,
     };
     const periodMs = 60 * 60 * 1000;
-    const humanAt = T0 + 10 * 60 * 1000;
+    const humanAt0 = T0;
+    const humanAt1 = T0 + periodMs + 10 * 60 * 1000;
 
     await manager.checkProactive(
       makeOptions({
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0,
+        lastHumanMessageAt: () => humanAt0,
+        now: T0 + periodMs,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
 
     manager.recordMessage(PEER, msg());
 
-    // 距上次唤醒已满一个周期，但新的入站沉默只有 50 分钟
+    // 距上次唤醒已满一个周期，但新的入站沉默只有 50 分钟（不足 60 分钟）
     await manager.checkProactive(
       makeOptions({
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => humanAt,
-        now: T0 + periodMs,
+        lastHumanMessageAt: () => humanAt1,
+        now: T0 + 2 * periodMs,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -515,11 +526,58 @@ describe('契约 5: 冷场主动搭话', () => {
         config: idleConfig,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => humanAt,
-        now: humanAt + periodMs,
+        lastHumanMessageAt: () => humanAt1,
+        now: humanAt1 + periodMs,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('重启或离线恢复时，若采样目标已落在过去，绝不追溯补发唤醒，而是以当前时刻为基准重新顺延下一轮计时', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 30,
+      idle_reply_max_mins: 60,
+    };
+    // 假设固定采样 40 分钟
+    const rng = () => 10 / 30; // 30 + 30 * (10/30) = 40 分钟
+    // 用户最后发信于 200 分钟前
+    const humanAt = T0 - 200 * 60 * 1000;
+
+    const runCheck = async (now: number) => {
+      await manager.checkProactive(
+        makeOptions({
+          config: idleConfig,
+          dispatch,
+          knownPeers: () => [PEER],
+          lastHumanMessageAt: () => humanAt,
+          now,
+          rng,
+        })
+      );
+    };
+
+    // T0 首次巡检（模拟 DSH 重启）：目标落在过去 (T0 - 160m)，必须顺延至未来 T0 + 40m，严禁立即触发
+    await runCheck(T0);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    // 重启后过了 1 分钟（模拟 60s 巡检 tick）：未到顺延后的目标时刻，绝不触发
+    await runCheck(T0 + 60 * 1000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    // 重启后过了 39 分钟：未满 40 分钟，绝不触发
+    await runCheck(T0 + 39 * 60 * 1000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    // 重启后满 40 分钟：达到顺延后的目标时刻，自然触发搭话
+    await runCheck(T0 + 40 * 60 * 1000);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    const event = dispatch.mock.calls[0]![0] as any;
+    expect(event.kind).toBe('idle_reply');
+    expect(event.idleMinutes).toBe(240); // 200 + 40 = 240 分钟真实沉默时长
   });
 
   it('在未到期的潜水闹钟期内用户发送新消息，潜水闹钟必须顺延重置，距新入站消息不足下限时长绝不提前唤醒', async () => {
@@ -652,8 +710,8 @@ describe('契约 5: 冷场主动搭话', () => {
         knownPeers: () => [PEER],
         hasActiveSession: () => false,
         ensureSession,
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
 
@@ -679,8 +737,8 @@ describe('契约 5: 冷场主动搭话', () => {
         knownPeers: () => [PEER],
         hasActiveSession: () => false,
         ensureSession: () => false,
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
     expect(dispatch).not.toHaveBeenCalled();
@@ -693,8 +751,8 @@ describe('契约 5: 冷场主动搭话', () => {
         knownPeers: () => [PEER],
         hasActiveSession: () => false,
         ensureSession: () => true,
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0 + 1000,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000 + 1000,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -752,8 +810,8 @@ describe('契约 6: 两个开关完全解耦', () => {
         config,
         dispatch,
         knownPeers: () => [PEER],
-        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
-        now: T0 + 10 * 3600 * 1000,
+        lastHumanMessageAt: () => T0,
+        now: T0 + 60 * 60 * 1000,
       })
     );
     expect(dispatch).toHaveBeenCalledTimes(1);

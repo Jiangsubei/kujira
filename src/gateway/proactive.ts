@@ -603,7 +603,23 @@ export class ProactiveManager {
           0.5,
           options.rng
         );
-        st.idleTargetWakeupAt = baseSilenceTime + idleDurationMs;
+        const calculatedTarget = baseSilenceTime + idleDurationMs;
+
+        // 重启或离线恢复防追溯门控：
+        // 若计算出的目标时刻已落在过去（calculatedTarget < now），说明在系统关闭期间本轮搭话已错过。
+        // 绝不追溯补发！直接视为本轮已跳过，以当前时刻为新起点重新开始下一轮计时。
+        if (calculatedTarget < now) {
+          const nextDurationMs = sampleInterval(
+            idleMinMs,
+            idleMaxMs,
+            config.proactive_attitude,
+            0.5,
+            options.rng
+          );
+          st.idleTargetWakeupAt = now + nextDurationMs;
+        } else {
+          st.idleTargetWakeupAt = calculatedTarget;
+        }
         st.lastSampledBaseTime = baseSilenceTime;
       }
 
