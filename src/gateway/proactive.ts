@@ -122,6 +122,8 @@ interface PeerState {
   isFloorLocked: boolean;
   /** 目标冷场唤醒时刻（毫秒） */
   idleTargetWakeupAt: number | null;
+  /** 上次计算潜水目标所依据的沉默基准时刻（毫秒） */
+  lastSampledBaseTime: number | null;
 }
 
 /**
@@ -234,6 +236,7 @@ export class ProactiveManager {
         floorWakeupAt: null,
         isFloorLocked: false,
         idleTargetWakeupAt: null,
+        lastSampledBaseTime: null,
       };
       this.states.set(peer, st);
     }
@@ -255,6 +258,10 @@ export class ProactiveManager {
     st.pending.sort((a, b) => a.time - b.time);
     const uid = typeof fromUser === 'string' ? fromUser.trim() : '';
     if (uid) st.lastFromUser = uid;
+
+    // 用户有新入站消息：会话已活跃，历史潜水搭话闹钟立即失效作废
+    st.idleTargetWakeupAt = null;
+    st.lastSampledBaseTime = null;
 
     const config = resolveProactiveConfig(
       context?.config ?? this.defaultOptions?.config ?? this.lastOptions?.config
@@ -433,6 +440,7 @@ export class ProactiveManager {
         st.floorWakeupAt = null;
         st.isFloorLocked = false;
         st.idleTargetWakeupAt = null;
+        st.lastSampledBaseTime = null;
       }
       return false;
     }
@@ -451,6 +459,7 @@ export class ProactiveManager {
       st.floorWakeupAt = null;
       st.isFloorLocked = false;
       st.idleTargetWakeupAt = null;
+      st.lastSampledBaseTime = null;
     }
     return delivered;
   }
@@ -538,6 +547,8 @@ export class ProactiveManager {
           st.targetWakeupAt = null;
           st.floorWakeupAt = null;
           st.isFloorLocked = false;
+          st.idleTargetWakeupAt = null;
+          st.lastSampledBaseTime = null;
         }
       }
     }
@@ -564,10 +575,15 @@ export class ProactiveManager {
       if (aggregationEnabled && st.pending.length > 0) continue;
       // 等待用户输入期间同样暂停搭话（不消耗冷场周期，恢复后仍可触发）
       if (options.isAwaitingUserInput?.(peer)) continue;
+      // Agent 正在运行：绝不打断，等待当前轮次完成（彻底杜绝在思考/生成时插队唤醒）
+      if (options.isAgentRunning?.(peer)) continue;
 
       // 沉默起点以库中最新入站消息时间为准，重启后依然准确。出站消息不写入该时间。
       const lastHumanAt = options.lastHumanMessageAt?.(peer) ?? null;
       if (typeof lastHumanAt !== 'number') continue;
+
+      // 核心硬底线：当前距离用户最新消息不足潜水下限时长（idle_reply_min_mins）时，严格跳过，绝不搭话
+      if (now - lastHumanAt < idleMinMs) continue;
 
       // 沉默基准时刻：若有过冷场唤醒，取两者较晚者；若无冷场唤醒记录，直接取 lastHumanAt
       const baseSilenceTime =
@@ -575,8 +591,11 @@ export class ProactiveManager {
           ? Math.max(lastHumanAt, st.lastIdleWakeupAt)
           : lastHumanAt;
 
-      // 若尚未设置潜水唤醒目标或人类入站把沉默基准后移，重新在 [T_min, T_max] 采样
-      if (st.idleTargetWakeupAt === null || st.idleTargetWakeupAt < baseSilenceTime) {
+      // 距离最近唤醒或最新入站基准同样须满足最小潜水时长
+      if (now - baseSilenceTime < idleMinMs) continue;
+
+      // 若尚未设置潜水唤醒目标或基准时刻已发生变化（人类新发消息或刚刚冷场唤醒），重新在 [T_min, T_max] 采样
+      if (st.idleTargetWakeupAt === null || st.lastSampledBaseTime !== baseSilenceTime) {
         const idleDurationMs = sampleInterval(
           idleMinMs,
           idleMaxMs,
@@ -585,6 +604,7 @@ export class ProactiveManager {
           options.rng
         );
         st.idleTargetWakeupAt = baseSilenceTime + idleDurationMs;
+        st.lastSampledBaseTime = baseSilenceTime;
       }
 
       // 未达潜水唤醒目标时刻：不搭话
@@ -599,7 +619,8 @@ export class ProactiveManager {
       // 触发唤醒：记录唤醒时刻，清空潜水目标（下次巡检将基于新 baseSilenceTime 采样）
       st.lastIdleWakeupAt = now;
       st.idleTargetWakeupAt = null;
-      const idleMinutes = Math.max(1, Math.round((now - lastHumanAt) / 60_000));
+      st.lastSampledBaseTime = null;
+      const idleMinutes = Math.max(minMins, Math.round((now - lastHumanAt) / 60_000));
 
       try {
         await dispatch({

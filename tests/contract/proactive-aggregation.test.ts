@@ -522,6 +522,80 @@ describe('契约 5: 冷场主动搭话', () => {
     expect(dispatch).toHaveBeenCalledTimes(2);
   });
 
+  it('在未到期的潜水闹钟期内用户发送新消息，潜水闹钟必须顺延重置，距新入站消息不足下限时长绝不提前唤醒', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 30,
+      idle_reply_max_mins: 60,
+    };
+    // 首次在 T0 采样潜水目标，假设采样出 35 分钟（T0 + 35m）
+    const rng = () => 5 / 30; // 30 + 30 * (5/30)^1 = 35 分钟
+    let currentHumanAt = T0;
+
+    const runCheck = async (now: number) => {
+      await manager.checkProactive(
+        makeOptions({
+          config: idleConfig,
+          dispatch,
+          knownPeers: () => [PEER],
+          lastHumanMessageAt: () => currentHumanAt,
+          now,
+          rng,
+        })
+      );
+    };
+
+    // T0 首次巡检：采样出 T0 + 35m，未到点不搭话
+    await runCheck(T0);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    // 到了 T0 + 34m，用户发了一条新消息！
+    currentHumanAt = T0 + 34 * 60 * 1000;
+    manager.recordMessage(PEER, msg());
+
+    // 到了原定目标时刻 T0 + 35m（距新消息仅过了 1 分钟）：绝不可触发搭话！
+    await runCheck(T0 + 35 * 60 * 1000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    // 到了 T0 + 34m + 29m（距新消息过了 29 分钟，不足 30 分钟下限）：绝不可触发搭话！
+    await runCheck(currentHumanAt + 29 * 60 * 1000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    // 到了 T0 + 34m + 35m（距新消息沉默满新采样的 35 分钟）：触发搭话
+    await runCheck(currentHumanAt + 35 * 60 * 1000);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect((dispatch.mock.calls[0]![0] as any).kind).toBe('idle_reply');
+    expect((dispatch.mock.calls[0]![0] as any).idleMinutes).toBe(35);
+  });
+
+  it('Agent 正在运行时，潜水主动搭话巡检必须跳过，绝不打断正在生成的会话', async () => {
+    const manager = new ProactiveManager();
+    const dispatch = vi.fn(async () => {});
+    const idleConfig = {
+      ...BASE_CONFIG,
+      aggregation_enabled: false,
+      idle_reply_min_mins: 30,
+      idle_reply_max_mins: 60,
+    };
+
+    // 已经沉默 120 分钟，但 Agent 正在运行一轮回复
+    await manager.checkProactive(
+      makeOptions({
+        config: idleConfig,
+        dispatch,
+        knownPeers: () => [PEER],
+        lastHumanMessageAt: () => T0 - 120 * 60 * 1000,
+        isAgentRunning: () => true,
+        now: T0,
+      })
+    );
+
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it('有待处理新消息时优先聚合，绝不叠加搭话', async () => {
     const manager = new ProactiveManager();
     const dispatch = vi.fn(async () => {});
