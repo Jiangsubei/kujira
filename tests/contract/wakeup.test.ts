@@ -380,7 +380,7 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
       )
     ).toBe('笑死');
 
-    // 3. 商城表情搭配正文 / 多商城表情
+    // 3. 商城表情搭配正文就地转换 / 句中就地转换 / 多商城表情
     expect(
       parseNormalizedContent(
         makeEvent({
@@ -388,7 +388,15 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
         }),
         []
       )
-    ).toBe('哈哈哈 [表情: 内有坏猫]');
+    ).toBe('[表情: 内有坏猫] 哈哈哈');
+    expect(
+      parseNormalizedContent(
+        makeEvent({
+          content: '看看 <faceType=4,faceId="",ext="eyJ0ZXh0IjoiW+WGheacieWdj+eMq10ifQ=="> 这个',
+        }),
+        []
+      )
+    ).toBe('看看 [表情: 内有坏猫] 这个');
     expect(
       parseNormalizedContent(
         makeEvent({
@@ -448,6 +456,19 @@ describe('契约测试: 卡片消息 (message_type=3 + ark_data) 与富媒体/�
         },
       ])
     ).toBe('[表情包:/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg]');
+
+    // 5. 句中插入自定义表情包搭配正文：就地替换在原始位置
+    const inlineStickerEvent = makeEvent({
+      id: 'ROBOT1.0_sticker_002',
+      content: '看看 <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 可爱吗',
+      attachments: stickerEvent.attachments,
+    });
+    const inlineStickerDecision = await shouldWakeup(inlineStickerEvent, {
+      descriptors: stickerDescriptors,
+    });
+    expect(inlineStickerDecision.payload?.content).toBe(
+      '看看 [表情包:/dsh/kujira/downloads/image/user_mock/custom_sticker.jpg] 可爱吗'
+    );
   });
 
   it('契约 11: 图片一律不写入视觉载荷，只以 content 内本地路径供模型按需 read_image', async () => {

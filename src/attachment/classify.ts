@@ -114,6 +114,17 @@ function decodeFaceExtText(rawExt: string): string | undefined {
 }
 
 /**
+ * 提取单个 `<faceType=...,ext="...">` 标签内的语义文本。
+ */
+export function extractSingleFaceXmlText(tag: string): string | undefined {
+  if (typeof tag !== 'string' || tag === '') return undefined;
+  const extMatch = FACE_XML_EXT_ATTR_RE.exec(tag);
+  if (!extMatch) return undefined;
+  const rawExt = extMatch[1] ?? extMatch[2] ?? '';
+  return decodeFaceExtText(rawExt);
+}
+
+/**
  * 从 `<faceType=...,ext="...">` 标签提取并解码 `ext.text` 语义文本（如商城/系统表情名称）。
  */
 export function extractFaceXmlTexts(content?: string): string[] {

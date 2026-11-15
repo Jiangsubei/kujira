@@ -984,22 +984,14 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
         return;
       }
 
-      // 附件占位符单独成行；正文中的同一占位符剔除，避免重复展示
+      // 保持消息正文完整语流（含就地转换后的表情与行内附件占位符），不强行挖空剔除
       const renderedAttachments = renderAttachments(descriptors);
-      let aggregatedText = content;
-      for (const attachment of renderedAttachments) {
-        aggregatedText = aggregatedText.split(attachment).join('');
-      }
-      aggregatedText = aggregatedText
-        .replace(/[ \t]+\n/g, '\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
 
       proactiveManager.recordMessage(
         peer,
         {
           ...(savedShortId ? { short_id: savedShortId } : {}),
-          content: aggregatedText,
+          content,
           time: receivedAt,
           ...(decision.payload.quoted ? { quoted: decision.payload.quoted } : {}),
           ...(renderedAttachments.length > 0 ? { attachments: renderedAttachments } : {}),

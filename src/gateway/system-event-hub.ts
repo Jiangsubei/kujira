@@ -33,8 +33,8 @@ export function formatTimeOnly(timestamp: number): string {
 
 /**
  * 把聚合池中的一条消息渲染为逐条段落（`序号. [短 ID] [时间] ...`）。
- * - 纯文本消息：正文与消息头**同一行**，与正常直接入站消息的格式保持一致；
- * - 带引用或附件：消息头独占一行，引用快照、附件占位符、正文依次缩进另起行。
+ * - 单条消息保持紧凑行内呈现：消息头、引用回复、正文与行内附件保持在同一行（与直接唤醒消息的语流格式完全对齐）；
+ * - 用户正文原生的换行自然保留（后续行缩进），避免在单条消息内部生硬拆行导致语义断裂。
  */
 function renderAggregatedMessageLines(
   messages: ReadonlyArray<{ short_id?: string; content: string; time: number; quoted?: { short_id?: string; time?: number; text: string }; attachments?: string[] }>
@@ -48,17 +48,7 @@ function renderAggregatedMessageLines(
       .join(' ');
 
     const quoted = message.quoted;
-    const attachments = (message.attachments ?? []).filter(Boolean);
-    const body = message.content ?? '';
-
-    // 纯文本消息：正文直接跟在消息头同一行，与正常入站消息格式一致
-    if (!quoted && attachments.length === 0) {
-      lines.push(`${index + 1}. ${header} ${body}`.trimEnd());
-      return;
-    }
-
-    lines.push(`${index + 1}. ${header}`.trimEnd());
-
+    let quotedStr = '';
     if (quoted) {
       const qShortId =
         typeof quoted.short_id === 'string' && quoted.short_id.trim() ? quoted.short_id.trim() : '';
@@ -67,14 +57,39 @@ function renderAggregatedMessageLines(
         .filter(Boolean)
         .join(' ');
       const qText = quoted.text ? ` ${quoted.text}` : '';
-      lines.push(`   [引用回复: "${qHeader}${qText}"]`);
+      quotedStr = `[引用回复: "${qHeader}${qText}"]`;
     }
 
-    for (const attachment of attachments) {
-      lines.push(`   ${attachment}`);
+    let body = message.content ?? '';
+    const attachments = (message.attachments ?? []).filter(Boolean);
+    const missingAttachments: string[] = [];
+    for (const att of attachments) {
+      if (!body.includes(att)) {
+        missingAttachments.push(att);
+      }
+    }
+    if (missingAttachments.length > 0) {
+      body = body ? `${body} ${missingAttachments.join(' ')}` : missingAttachments.join(' ');
     }
 
-    if (body) lines.push(`   ${body}`);
+    const linePrefix = `${index + 1}. ${header}`.trimEnd();
+    const inlineContent = [quotedStr, body].filter(Boolean).join(' ');
+
+    if (!inlineContent) {
+      lines.push(linePrefix);
+      return;
+    }
+
+    // 若正文原生包含换行符，首行紧接消息头，后续换行行适当缩进呈现
+    if (inlineContent.includes('\n')) {
+      const parts = inlineContent.split('\n');
+      lines.push(`${linePrefix} ${parts[0]}`.trimEnd());
+      for (let i = 1; i < parts.length; i++) {
+        lines.push(`   ${parts[i]}`.trimEnd());
+      }
+    } else {
+      lines.push(`${linePrefix} ${inlineContent}`.trimEnd());
+    }
   });
   return lines;
 }

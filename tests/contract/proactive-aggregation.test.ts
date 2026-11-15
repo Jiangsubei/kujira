@@ -849,8 +849,11 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
     // 纯文本消息：正文与消息头同一行，与正常直接入站消息的格式一致
     expect(prompt).toMatch(/1\. \[msg_12\] \[2026-11-13 14:04:00\] 在吗/);
     expect(prompt).not.toMatch(/\[msg_12\][^\n]*\n\s*在吗/);
-    // 带引用/附件的消息：消息头独占一行，引用、附件、正文依次另起行
-    expect(prompt).toMatch(/2\. \[msg_13\] \[2026-11-13 14:04:30\]\n/);
+    // 带引用/附件的消息：保持同一行自然呈现，不强行拆行断裂
+    expect(prompt).toMatch(
+      /2\. \[msg_13\] \[2026-11-13 14:04:30\] \[引用回复: "\[msg_10\] \[2026-11-13 14:03:30\] 前文"\] 那个接口一直 403 \[图片: \/tmp\/a\.png\]/
+    );
+    expect(prompt).not.toMatch(/2\. \[msg_13\][^\n]*\n\s*\[/);
     expect(prompt).toContain('在吗');
     expect(prompt).toContain('那个接口一直 403');
     expect(prompt).toContain('[引用回复:');
@@ -878,6 +881,28 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
     expect(prompt).toMatch(/你上一条回复覆盖|已经回应过/);
     expect(prompt).toContain('直接输出 [结束]');
     expect(prompt).toContain('read_chat_history');
+  });
+
+  it('带行内就地附件的正文在聚合投递时完整保留在同一行且位置不颠倒', () => {
+    const prompt = formatSystemEventPrompt({
+      kind: 'aggregated_messages',
+      peer: PEER,
+      messages: [
+        {
+          short_id: 'msg_21',
+          content: '第一张看这个 [图片: /tmp/cat.png] 第二张看这个 [图片: /tmp/dog.png] 麻烦帮我看看',
+          time: PERIOD_TS - 10_000,
+          attachments: ['[图片: /tmp/cat.png]', '[图片: /tmp/dog.png]'],
+        },
+      ],
+      reason: 'period',
+      timestamp: PERIOD_TS,
+    });
+
+    expect(prompt).toContain(
+      '1. [msg_21] [2026-11-13 14:04:50] 第一张看这个 [图片: /tmp/cat.png] 第二张看这个 [图片: /tmp/dog.png] 麻烦帮我看看'
+    );
+    expect(prompt).not.toMatch(/\[msg_21\][^\n]*\n\s*\[图片/);
   });
 
   it('无消息的历史调用仍回落到「有新消息待查看」提示', () => {

@@ -10,7 +10,13 @@
 
 import type { FaceRecord, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
-import { extractFaceXmlTexts, hasFaceXmlTag, isPureStickerMessage, stripFaceXmlTags } from '../attachment/classify.js';
+import {
+  extractFaceXmlTexts,
+  extractSingleFaceXmlText,
+  hasFaceXmlTag,
+  isPureStickerMessage,
+  stripFaceXmlTags,
+} from '../attachment/classify.js';
 import {
   formatFacePlaceholder as renderFacePlaceholder,
   renderAttachment,
@@ -278,17 +284,51 @@ export function parseNormalizedContent(
   }
 
   // 3. 普通文本 / 富媒体 / 引用回复（message_type === 0 / 103）
-  const parts: string[] = [];
-  if (cleanText !== '') {
-    parts.push(cleanText);
+  let text = rawContent;
+  const consumedAttachments = new Set<number>();
+
+  if (hadFaceTag) {
+    const FACE_TAG_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/g;
+    text = text.replace(FACE_TAG_RE, (match) => {
+      // 1. 若有待消费的表情包附件（kind === 'sticker' 且尚未消费），优先就地就位
+      const stickerIdx = descriptors.findIndex(
+        (d, idx) => d.kind === 'sticker' && !consumedAttachments.has(idx)
+      );
+      if (stickerIdx >= 0 && renderedAttachments[stickerIdx]) {
+        consumedAttachments.add(stickerIdx);
+        return renderedAttachments[stickerIdx]!;
+      }
+
+      // 2. 尝试提取 ext.text 商城/官方表情文本就地转换
+      const faceText = extractSingleFaceXmlText(match);
+      if (faceText) {
+        return `[表情: ${faceText}]`;
+      }
+
+      return '';
+    });
+
+    // 连续占位符之间补充空格分隔，并规整多余连续空格，保留原有换行
+    text = text.replace(/\]\s*\[/g, '] [');
+    text = text
+      .split('\n')
+      .map((line) => line.replace(/[ \t]{2,}/g, ' ').trim())
+      .join('\n')
+      .trim();
+  } else {
+    text = cleanText;
   }
-  if (renderedAttachments.length > 0) {
-    parts.push(...renderedAttachments);
-  } else if (hadFaceTag) {
-    const faceTexts = extractFaceXmlTexts(rawContent);
-    if (faceTexts.length > 0) {
-      parts.push(...faceTexts.map((t) => `[表情: ${t}]`));
-    }
+
+  const unconsumedAttachments = renderedAttachments.filter(
+    (_, idx) => !consumedAttachments.has(idx)
+  );
+
+  const parts: string[] = [];
+  if (text !== '') {
+    parts.push(text);
+  }
+  if (unconsumedAttachments.length > 0) {
+    parts.push(...unconsumedAttachments);
   }
 
   if (parts.length === 0) {
