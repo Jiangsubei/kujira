@@ -664,6 +664,80 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       expect(readResult.body.config.image_ttl_days).toBe(21);
       expect(readResult.body.config.persona).toBe('元气伙伴');
     });
+
+    it('提交空字符串/纯空白 persona 与 behavior 时，服务端自愈回填为 DEFAULT_PERSONA / DEFAULT_BEHAVIOR，防空白配置污染持久化层', async () => {
+      let handler: any;
+      let persistedSettings: Record<string, unknown> = {};
+      const mutateMock = vi.fn().mockImplementation(async (_ns: string, ops: any[]) => {
+        for (const op of ops) {
+          if (op.op === 'set') {
+            persistedSettings[op.path[0]] = op.value;
+          }
+        }
+        return { ok: true };
+      });
+
+      let currentConfig: BridgePluginConfig = {
+        new_message_behavior: 'steer',
+        image_ttl_days: 7,
+        persona: '',
+        behavior: '   ',
+      };
+
+      const mockCtx: any = {
+        get: vi.fn((name) => {
+          if (name === 'connection') return { requestRejection: () => undefined };
+          if (name === 'webServer') {
+            return {
+              register: (route: any) => {
+                handler = route.handler;
+                return () => {};
+              },
+            };
+          }
+          if (name === 'settings') {
+            return { mutate: mutateMock };
+          }
+          return undefined;
+        }),
+        inject: vi.fn(),
+      };
+
+      const reconcileMock = vi.fn().mockImplementation(async (payload) => {
+        if (payload) currentConfig = { ...currentConfig, ...payload };
+      });
+
+      registerConfigRoute(mockCtx, () => currentConfig, reconcileMock, {
+        dshHome: tmpHome,
+        cwd: tmpCwd,
+        env: {},
+      });
+
+      // 1. GET 请求遇到当前配置为人设空白时，必须自愈回退到默认值
+      const readReq1 = createMockReq('GET');
+      const { res: readRes1, getResult: getReadResult1 } = createMockRes();
+      await handler(readReq1, readRes1);
+      const readResult1 = await getReadResult1();
+      expect(readResult1.status).toBe(200);
+      expect(readResult1.body.config.persona).toBe(DEFAULT_BASE_CONFIG.persona);
+      expect(readResult1.body.config.behavior).toBe(DEFAULT_BASE_CONFIG.behavior);
+
+      // 2. POST 提交空白 persona / behavior，服务端必须自愈回填默认值并写入 settings
+      const saveReq = createMockReq('POST', {
+        persona: '   ',
+        behavior: '',
+      });
+      const { res: saveRes, getResult: getSaveResult } = createMockRes();
+      await handler(saveReq, saveRes);
+      const saveResult = await getSaveResult();
+
+      expect(saveResult.status).toBe(200);
+      expect(saveResult.body.ok).toBe(true);
+      expect(saveResult.body.config.persona).toBe(DEFAULT_BASE_CONFIG.persona);
+      expect(saveResult.body.config.behavior).toBe(DEFAULT_BASE_CONFIG.behavior);
+      expect(persistedSettings.persona).toBe(DEFAULT_BASE_CONFIG.persona);
+      expect(persistedSettings.behavior).toBe(DEFAULT_BASE_CONFIG.behavior);
+    });
   });
 
   describe('4. HTTP 协议规范与工具函数契约', () => {

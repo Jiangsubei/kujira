@@ -206,7 +206,7 @@ export function useCardState(
         }
         clearCredentialDrafts();
       } else {
-        const dirtyDraft = model.getDraft();
+        const dirtyDraft = model.normalizeDraft();
         const bodyPayload = credPayload
           ? { ...dirtyDraft, credentials: credPayload }
           : dirtyDraft;

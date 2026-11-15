@@ -19,6 +19,7 @@ import {
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
   PROACTIVE_CHECK_INTERVAL_MS,
+  DEFAULT_BASE_CONFIG,
 } from './constants/index.js';
 
 const QQ_INBOUND_MSG_TYPE_FORWARD = 102;
@@ -193,7 +194,14 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   const currentConfig = (): BridgePluginConfig => {
     const fromSettings = readHostSettingsConfig(ctx);
     const fromArgs = extractConfigValues(config);
-    return sanitizeConfigPayload(mergeBridgeConfigs(fromArgs, fromSettings)).valid;
+    const merged = sanitizeConfigPayload(mergeBridgeConfigs(fromArgs, fromSettings)).valid;
+    if (typeof merged.persona === 'string' && merged.persona.trim() === '') {
+      merged.persona = DEFAULT_BASE_CONFIG.persona;
+    }
+    if (typeof merged.behavior === 'string' && merged.behavior.trim() === '') {
+      merged.behavior = DEFAULT_BASE_CONFIG.behavior;
+    }
+    return merged;
   };
 
   // 1. 初始化存储层（SQLite 与本地媒体管理）

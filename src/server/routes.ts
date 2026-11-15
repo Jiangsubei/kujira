@@ -131,6 +131,12 @@ export function registerConfigRoute(
           Promise.resolve(sanitizeConfigPayload(rawCfg)),
           describeCredentials(ctx, credOptions),
         ]);
+        if (typeof cleanCfg.persona === 'string' && cleanCfg.persona.trim() === '') {
+          cleanCfg.persona = DEFAULT_BASE_CONFIG.persona;
+        }
+        if (typeof cleanCfg.behavior === 'string' && cleanCfg.behavior.trim() === '') {
+          cleanCfg.behavior = DEFAULT_BASE_CONFIG.behavior;
+        }
         sendJson(res, 200, {
           ok: true,
           credentials: credStatus,
@@ -163,6 +169,14 @@ export function registerConfigRoute(
 
         // 自愈过滤：仅保留 100% 符合当前 15 项 Schema 的干净配置字段，剔除任何已下线或未知字段
         const { valid: cleanPayload, removed } = sanitizeConfigPayload(settingsCandidate);
+
+        // 自愈空白 persona / behavior：若提交空白，回填为默认基线，防空白配置污染持久化层
+        if (typeof cleanPayload.persona === 'string' && cleanPayload.persona.trim() === '') {
+          cleanPayload.persona = DEFAULT_BASE_CONFIG.persona;
+        }
+        if (typeof cleanPayload.behavior === 'string' && cleanPayload.behavior.trim() === '') {
+          cleanPayload.behavior = DEFAULT_BASE_CONFIG.behavior;
+        }
 
         // 先处理可选凭据写入/清除（留空不覆盖既有凭据）
         const clearKeys: CredentialInputKey[] = Array.isArray(rawClearCredentials)

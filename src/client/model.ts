@@ -15,6 +15,10 @@ export interface FormModelOptions {
   baseDefaults?: Partial<BridgePluginConfig>;
 }
 
+function isBlankFallbackKey(key: keyof BridgePluginConfig): boolean {
+  return key === 'persona' || key === 'behavior';
+}
+
 export class KujiraFormModel {
   private initialValues: Partial<BridgePluginConfig>;
   private draft: Partial<BridgePluginConfig>;
@@ -22,19 +26,47 @@ export class KujiraFormModel {
   private baseDefaults: Partial<BridgePluginConfig>;
 
   constructor(options: FormModelOptions = {}) {
-    this.initialValues = { ...options.initialValues };
-    this.draft = { ...options.initialValues };
     this.revision = options.revision ?? 0;
     this.baseDefaults = { ...options.baseDefaults };
+    const sanitized = this.sanitizeInitialValues(options.initialValues, options.baseDefaults);
+    this.initialValues = sanitized;
+    this.draft = { ...sanitized };
+  }
+
+  private sanitizeInitialValues(
+    values?: Partial<BridgePluginConfig>,
+    baseDefaults?: Partial<BridgePluginConfig>
+  ): Partial<BridgePluginConfig> {
+    const out = { ...values };
+    const defaults = baseDefaults || this.baseDefaults || {};
+    for (const key of ['persona', 'behavior'] as const) {
+      if (typeof out[key] === 'string' && out[key]!.trim() === '') {
+        if (defaults[key] !== undefined) {
+          out[key] = defaults[key];
+        } else {
+          delete out[key];
+        }
+      }
+    }
+    return out;
   }
 
   setInitialValues(values: Partial<BridgePluginConfig>) {
-    this.initialValues = { ...values };
-    this.draft = { ...values };
+    const sanitized = this.sanitizeInitialValues(values);
+    this.initialValues = sanitized;
+    this.draft = { ...sanitized };
   }
 
   setBaseDefaults(defaults: Partial<BridgePluginConfig>) {
     this.baseDefaults = { ...defaults };
+    const sanitized = this.sanitizeInitialValues(this.initialValues, defaults);
+    this.initialValues = sanitized;
+    if (typeof this.draft.persona === 'string' && this.draft.persona.trim() === '') {
+      if (defaults.persona) this.draft.persona = defaults.persona;
+    }
+    if (typeof this.draft.behavior === 'string' && this.draft.behavior.trim() === '') {
+      if (defaults.behavior) this.draft.behavior = defaults.behavior;
+    }
   }
 
   markClean() {
@@ -70,8 +102,24 @@ export class KujiraFormModel {
   isOverridden<K extends keyof BridgePluginConfig>(key: K): boolean {
     const draftVal = this.draft[key];
     if (draftVal === undefined) return false;
+    if (isBlankFallbackKey(key) && typeof draftVal === 'string' && draftVal.trim() === '') {
+      return false;
+    }
     const defaultVal = this.baseDefaults[key];
     return draftVal !== defaultVal;
+  }
+
+  normalizeDraft(): Partial<BridgePluginConfig> {
+    const normalized = { ...this.draft };
+    for (const key of ['persona', 'behavior'] as const) {
+      if (typeof normalized[key] === 'string' && normalized[key]!.trim() === '') {
+        if (this.baseDefaults[key] !== undefined) {
+          normalized[key] = this.baseDefaults[key];
+        }
+      }
+    }
+    this.draft = normalized;
+    return normalized;
   }
 
   isDirty(): boolean {
@@ -104,6 +152,7 @@ export class KujiraFormModel {
     ) => Promise<SaveSettingsResult | void>;
     extraPayload?: Omit<SaveSettingsPayload, keyof BridgePluginConfig>;
   }): Promise<SaveSettingsResult | void> {
+    this.normalizeDraft();
     const payload: SaveSettingsPayload = {
       ...this.draft,
       ...(callbacks.extraPayload || {}),

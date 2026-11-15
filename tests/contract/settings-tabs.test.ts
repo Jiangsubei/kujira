@@ -475,4 +475,83 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(controller.isDirty).toBe(true);
     });
   });
+
+  describe('7. 人格与行为准则清空重置与保存回填契约 (方案三)', () => {
+    it('清空 persona / behavior 输入框（变成空白字符）时，isOverridden 即刻转为 false 且不显示已自定义徽章', () => {
+      renderCard({
+        baseDefaults: DEFAULT_BASE_CONFIG,
+        initialConfig: {
+          persona: '自定义旧人设',
+          behavior: '自定义旧准则',
+        },
+        initialTab: 'persona',
+      });
+
+      // 初始自定义状态
+      expect(controller.model.isOverridden('persona')).toBe(true);
+      expect(controller.model.isOverridden('behavior')).toBe(true);
+
+      // 清空 persona（纯空白）
+      controller.handleFieldChange('persona', '   ');
+      // 方案三核心断言：清空时立刻视为未自定义
+      expect(controller.model.isOverridden('persona')).toBe(false);
+      // 输入框内容保持用户编辑的空白（方便切窗口复制粘贴，不强行塞入文字打扰用户）
+      expect(controller.model.getDraft().persona).toBe('   ');
+
+      // 清空 behavior
+      controller.handleFieldChange('behavior', '');
+      expect(controller.model.isOverridden('behavior')).toBe(false);
+      expect(controller.model.getDraft().behavior).toBe('');
+    });
+
+    it('清空 persona / behavior 后点击保存更改，提交载荷与 draft 自动回填为默认提示词，状态维持未自定义', async () => {
+      renderCard({
+        baseDefaults: DEFAULT_BASE_CONFIG,
+        initialConfig: {
+          persona: '自定义旧人设',
+          behavior: '自定义旧准则',
+        },
+        initialTab: 'persona',
+      });
+
+      // 用户把人设和行为准则清理掉
+      controller.handleFieldChange('persona', '');
+      controller.handleFieldChange('behavior', '  ');
+      expect(controller.isDirty).toBe(true);
+
+      // 点击保存
+      await controller.handleSave();
+
+      // 1. 提交给后端/onSaveSettings 的必须是 DEFAULT_BASE_CONFIG，绝非空字符串
+      expect(mockSaveSettings).toHaveBeenCalledTimes(1);
+      const [savedPayload] = mockSaveSettings.mock.calls[0];
+      expect(savedPayload.persona).toBe(DEFAULT_BASE_CONFIG.persona);
+      expect(savedPayload.behavior).toBe(DEFAULT_BASE_CONFIG.behavior);
+
+      // 2. 保存后，前端 draft 必须自动回填为默认提示词，不再是空的
+      expect(controller.model.getDraft().persona).toBe(DEFAULT_BASE_CONFIG.persona);
+      expect(controller.model.getDraft().behavior).toBe(DEFAULT_BASE_CONFIG.behavior);
+
+      // 3. 状态恢复为未自定义
+      expect(controller.model.isOverridden('persona')).toBe(false);
+      expect(controller.model.isOverridden('behavior')).toBe(false);
+      expect(controller.isDirty).toBe(false);
+    });
+
+    it('打开设置时若外部配置存在历史残留空字符串 persona / behavior，前端自动自愈回退为默认提示词且显示为未自定义', () => {
+      renderCard({
+        baseDefaults: DEFAULT_BASE_CONFIG,
+        initialConfig: {
+          persona: '',
+          behavior: '   ',
+        },
+        initialTab: 'persona',
+      });
+
+      expect(controller.model.getDraft().persona).toBe(DEFAULT_BASE_CONFIG.persona);
+      expect(controller.model.getDraft().behavior).toBe(DEFAULT_BASE_CONFIG.behavior);
+      expect(controller.model.isOverridden('persona')).toBe(false);
+      expect(controller.model.isOverridden('behavior')).toBe(false);
+    });
+  });
 });
