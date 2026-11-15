@@ -181,7 +181,7 @@ dsh plugin add kujira
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/Jiangsubei/dsh-napcat-bridge.git
+git clone https://github.com/Jiangsubei/kujira.git
 cd Kujira
 
 # 2. 安装依赖并编译

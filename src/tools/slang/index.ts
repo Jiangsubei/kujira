@@ -1,5 +1,5 @@
 /**
- * dsh-napcat-bridge: 黑话学习与管理 Agent 工具集聚合导出
+ * kujira: 黑话学习与管理 Agent 工具集聚合导出
  */
 
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';

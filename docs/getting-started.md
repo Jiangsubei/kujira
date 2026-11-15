@@ -59,7 +59,7 @@ dsh plugin add kujira
 
 ```bash
 # 1. 克隆代码库
-git clone https://github.com/Jiangsubei/dsh-napcat-bridge.git
+git clone https://github.com/Jiangsubei/kujira.git
 cd Kujira
 
 # 2. 安装依赖并执行全套构建（包含预设同步、tsc 编译与客户端 WebUI 面板构建）

@@ -43,12 +43,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Jiangsubei/dsh-napcat-bridge.git"
+    "url": "git+https://github.com/Jiangsubei/kujira.git"
   },
   "bugs": {
-    "url": "https://github.com/Jiangsubei/dsh-napcat-bridge/issues"
+    "url": "https://github.com/Jiangsubei/kujira/issues"
   },
-  "homepage": "https://github.com/Jiangsubei/dsh-napcat-bridge#readme",
+  "homepage": "https://github.com/Jiangsubei/kujira#readme",
   "publishConfig": {
     "access": "public"
   },
@@ -57,6 +57,7 @@
     "dsh": ">=0.2.2-0"
   },
   "scripts": {
+    "prepublishOnly": "pnpm run build && pnpm run check:privacy",
     "build": "tsx scripts/sync-patch.ts && tsc && npm run build:client",
     "build:client": "tsx scripts/build-client.ts",
     "sync:patch": "tsx scripts/sync-patch.ts",
