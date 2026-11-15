@@ -292,8 +292,8 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
 
-    const res1 = await sendTool.execute({ text: '到点啦，记得喝水~' }, { agent });
-    const res2 = await sendTool.execute({ text: '再提醒一次，补充水分' }, { agent });
+    const res1 = await sendTool.execute({ message: '到点啦，记得喝水~' }, { agent });
+    const res2 = await sendTool.execute({ message: '再提醒一次，补充水分' }, { agent });
     expect(res1.success).toBe(true);
     expect(res1.message_id).toBe('msg_self_1');
     expect((res1 as any).ref_idx).toBeUndefined();
@@ -345,7 +345,7 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_STALE_IN_2');
     expect((bridge.getActiveTurnContext(MOCK_PEER) as any)?.is_synthetic).toBeFalsy();
 
-    const res3 = await sendTool.execute({ text: '棒棒哒！' }, { agent });
+    const res3 = await sendTool.execute({ message: '棒棒哒！' }, { agent });
     expect(res3.success).toBe(true);
     expect(res3.message_id).toBe('msg_self_3');
     const latestTextPost = postedMessages.filter((m) => m.msg_type !== 6).pop();
@@ -409,7 +409,7 @@ describe('契约测试: scheduled_task / is_synthetic 唤醒与入站锚点隔�
 
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
-    const sendRes = await sendTool.execute({ text: '周期打卡' }, { agent });
+    const sendRes = await sendTool.execute({ message: '周期打卡' }, { agent });
     expect(sendRes.success).toBe(true);
     expect(sendRes.message_id).toBe('msg_self_1');
 

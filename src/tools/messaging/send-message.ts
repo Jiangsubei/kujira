@@ -45,11 +45,11 @@ export async function sendQqMessage(
   const ctx = { ...getGlobalToolContext(), ...context };
 
   // 1. 参数非空与 6000 字符硬拦截校验
-  if (!params || typeof params.text !== 'string' || params.text.trim() === '') {
+  if (!params || typeof params.message !== 'string' || params.message.trim() === '') {
     return toLosslessJson({ success: false, error: '发送内容不能为空。' });
   }
 
-  const charCount = [...params.text].length;
+  const charCount = [...params.message].length;
   if (charCount > QQ_SEND_MESSAGE_MAX_CHARS) {
     return toLosslessJson({
       success: false,
@@ -102,8 +102,8 @@ export async function sendQqMessage(
   try {
     const res =
       !ctx.outboundBridge && ctx.sender
-        ? await ctx.sender.enqueue(peer, () => bridge.sendTextReply(peer, params.text, sendOptions))
-        : await bridge.sendTextReply(peer, params.text, sendOptions);
+        ? await ctx.sender.enqueue(peer, () => bridge.sendTextReply(peer, params.message, sendOptions))
+        : await bridge.sendTextReply(peer, params.message, sendOptions);
 
     if (!res.ok) {
       const codePart = res.code !== undefined ? ` (code=${res.code})` : '';
@@ -119,7 +119,7 @@ export async function sendQqMessage(
         : undefined;
     const shortId = resolveOutboundShortId(ctx, bridge, peer, rawMsgId);
 
-    const previewBase = params.text.trim();
+    const previewBase = params.message.trim();
     const previewChars = [...previewBase];
     const sentPreview =
       previewChars.length > 60 ? `${previewChars.slice(0, 60).join('')}...` : previewBase;
@@ -141,13 +141,13 @@ export function createSendQqMessageTool(context?: ContextSource): ToolDefinition
   return defineTool({
     name: 'send_qq_message',
     description:
-      `向当前 QQ 单聊会话发送文本或 Markdown 消息。注意：你的直接文本回复是内部日志，用户不可见；若要向用户发言、回答问题、同步进展或输出结论，必须调用本工具传入 text 参数。单聊原生完整支持 Markdown 富文本格式（包括标题、列表、表格、加粗、引用、代码块与链接等，使用 \`#\` 标题时建议保留空格）。单次发送上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符；若要发送的内容较长，或包含多个不同要点、转折与独立意思，可以拆分成多条简短消息，多次调用本工具分开发送。引用回复默认不使用 reply_to：私聊中逐条引用很不自然，日常一问一答、连续短对话、回复刚收到的那条消息都直接传 text 即可，省略 reply_to。仅当需要锚定某条具体消息时才传入其短消息 ID（如 msg_12 或 msg_self_8）——被回复的那条已隔了较久、被后面的消息冲散；用户明确要求引用或回复某条；用户一次发来多条并列问题或图片需逐条对应；或明确指代某条更早的历史消息。发送图片、音视频或文件请使用 send_file，发送表情包请使用 send_face，向用户提问或抉择可使用 ask_user_question。`,
+      `向当前 QQ 单聊会话发送文本或 Markdown 消息。注意：你的直接文本回复是内部日志，用户不可见；若要向用户发言、回答问题、同步进展或输出结论，必须调用本工具传入 message 参数。单聊原生完整支持 Markdown 富文本格式（包括标题、列表、表格、加粗、引用、代码块与链接等，使用 \`#\` 标题时建议保留空格）。单次发送上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符；若要发送的内容较长，或包含多个不同要点、转折与独立意思，可以拆分成多条简短消息，多次调用本工具分开发送。引用回复默认不使用 reply_to：私聊中逐条引用很不自然，日常一问一答、连续短对话、回复刚收到的那条消息都直接传 message 即可，省略 reply_to。仅当需要锚定某条具体消息时才传入其短消息 ID（如 msg_12 或 msg_self_8）——被回复的那条已隔了较久、被后面的消息冲散；用户明确要求引用或回复某条；用户一次发来多条并列问题或图片需逐条对应；或明确指代某条更早的历史消息。发送图片、音视频或文件请使用 send_file，发送表情包请使用 send_face，向用户提问或抉择可使用 ask_user_question。`,
     parameters: {
-      text: {
+      message: {
         type: 'string',
         required: true,
         description:
-          `要发送给用户的聊天正文（原生支持 Markdown 排版，单次上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符，超长请分条发送）。直接填写展示给用户的原始文本，禁止附加任何 XML/HTML 标签、标签闭合符或外层包裹标记。`,
+          `要发送给用户的消息正文（原生支持 Markdown 排版，单次上限 ${QQ_SEND_MESSAGE_MAX_CHARS} 字符，超长请分条发送）。直接传入想要发送的消息正文。`,
       },
       reply_to: {
         type: 'string',

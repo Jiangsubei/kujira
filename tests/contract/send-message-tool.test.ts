@@ -185,20 +185,26 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
   });
 
   it('1.3 send_qq_message 执行校验：空文本、非单聊会话与群聊 peer 安全拒绝', async () => {
-    const resEmpty = await sendQqMessage({ text: '   ' }, { peer: TEST_PEER });
+    const resEmpty = await sendQqMessage({ message: '   ' }, { peer: TEST_PEER });
     expect(resEmpty.success).toBe(false);
     expect(resEmpty.error).toContain('不能为空');
     assertNoUndefinedFields(resEmpty);
 
-    const resNonQQ = await sendQqMessage({ text: 'hello' }, { peer: 'web-session' });
+    const resNonQQ = await sendQqMessage({ message: 'hello' }, { peer: 'web-session' });
     expect(resNonQQ.success).toBe(false);
     expect(resNonQQ.error).toContain('QQ 聊天会话');
     assertNoUndefinedFields(resNonQQ);
 
-    const resGroupRejected = await sendQqMessage({ text: 'hello' }, { peer: 'group_3000000001' });
+    const resGroupRejected = await sendQqMessage({ message: 'hello' }, { peer: 'group_3000000001' });
     expect(resGroupRejected.success).toBe(false);
     expect(resGroupRejected.error).toContain('单聊');
     assertNoUndefinedFields(resGroupRejected);
+
+    // 旧 text 参数不再被兼容，若仅传 text 则视为缺少 message 明确报错以引导模型自愈
+    const resOldTextOnly = await sendQqMessage({ text: '历史遗留文本' } as any, { peer: TEST_PEER });
+    expect(resOldTextOnly.success).toBe(false);
+    expect(resOldTextOnly.error).toContain('不能为空');
+    assertNoUndefinedFields(resOldTextOnly);
   });
 
   it('1.4 send_qq_message 通过 OutboundStreamBridge 固定走原生 Markdown、支持短 ID reply_to、6000 字符硬拦截与短出站 ID 返回', async () => {
@@ -262,7 +268,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
 
     // 1. 固定原生 Markdown + 传入短 ID reply_to 自动换取 REFIDX_... + 返回短出站 ID（无 ref_idx）
     const resMd = await sendQqMessage(
-      { text: '#标题测试\n测试回复消息', reply_to: inboundRec.short_id! },
+      { message: '#标题测试\n测试回复消息', reply_to: inboundRec.short_id! },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
 
@@ -279,7 +285,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     // 2. 非法 reply_to（REFIDX_... / ROBOT1.0_...）直接本地拒绝，不调用网关
     const callsBeforeInvalid = mockGateway.sendC2CMessage.mock.calls.length;
     const resBadRef = await sendQqMessage(
-      { text: '非法引用', reply_to: 'REFIDX_INBOUND_123' },
+      { message: '非法引用', reply_to: 'REFIDX_INBOUND_123' },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
     expect(resBadRef.success).toBe(false);
@@ -292,7 +298,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     const exact6000Emoji = '🐳'.repeat(QQ_SEND_MESSAGE_MAX_CHARS);
     expect([...exact6000Emoji].length).toBe(6000);
     const res6000 = await sendQqMessage(
-      { text: exact6000Emoji },
+      { message: exact6000Emoji },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
     expect(res6000.success).toBe(true);
@@ -301,7 +307,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
 
     const callsBeforeOverLimit = mockGateway.sendC2CMessage.mock.calls.length;
     const res6001Ascii = await sendQqMessage(
-      { text: 'a'.repeat(QQ_SEND_MESSAGE_MAX_CHARS + 1) },
+      { message: 'a'.repeat(QQ_SEND_MESSAGE_MAX_CHARS + 1) },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
     expect(res6001Ascii.success).toBe(false);
@@ -311,7 +317,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     assertNoUndefinedFields(res6001Ascii);
 
     const res6001Emoji = await sendQqMessage(
-      { text: '🐳'.repeat(QQ_SEND_MESSAGE_MAX_CHARS + 1) },
+      { message: '🐳'.repeat(QQ_SEND_MESSAGE_MAX_CHARS + 1) },
       { peer: TEST_PEER, gateway: mockGateway, db }
     );
     expect(res6001Emoji.success).toBe(false);
@@ -330,7 +336,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
       uploadC2CMedia: vi.fn(),
     };
     const resNoDb = await sendQqMessage(
-      { text: '无 DB 短 ID 保护' },
+      { message: '无 DB 短 ID 保护' },
       { peer: TEST_PEER, openid: TEST_OPENID, gateway: noDbGateway }
     );
     expect(resNoDb.success).toBe(true);
@@ -338,7 +344,7 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     assertNoUndefinedFields(resNoDb);
   });
 
-  it('1.5 send_qq_message 工具描述与参数规范：包含分段发送与 6000 上限引导，禁止 XML/HTML 标签，移除 at_user 与 markdown', async () => {
+  it('1.5 send_qq_message 工具描述与参数规范：参数改名为 message 且包含分段发送与 6000 上限引导，移除 XML/HTML 标签警示，移除 at_user 与 markdown', async () => {
     const ctx = booted.ctx;
     const qqWs = path.join(tmpHome, 'qq-ws-desc');
     await fsp.mkdir(qqWs, { recursive: true });
@@ -360,15 +366,22 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
     );
     expect(sendTool.description).toContain('6000');
     expect(sendTool.description).toContain('Markdown');
+    expect(sendTool.description).toContain('message');
+    expect(sendTool.description).not.toContain('传入 text');
     const props = sendTool.parameters?.properties;
     expect(props?.at_user).toBeUndefined();
     expect(props?.markdown).toBeUndefined();
+    expect(props?.text).toBeUndefined();
+    expect(props?.message).toBeDefined();
+    expect(props?.message?.type).toBe('string');
     expect(props?.reply_to?.type).toBe('string');
     expect(props?.reply_to?.description).toContain('msg_12');
-    const textDesc = props?.text?.description;
-    expect(typeof textDesc).toBe('string');
-    expect(textDesc).toContain('直接填写展示给用户的原始文本');
-    expect(textDesc).toContain('禁止附加任何 XML/HTML 标签、标签闭合符或外层包裹标记');
+    const messageDesc = props?.message?.description;
+    expect(typeof messageDesc).toBe('string');
+    expect(messageDesc).toContain('要发送给用户的消息正文');
+    expect(messageDesc).toContain('直接传入想要发送的消息正文');
+    expect(messageDesc).not.toContain('XML/HTML');
+    expect(messageDesc).not.toContain('标签');
 
     // 验证 output.render 仅显示短 ID（不拼 ref_idx）
     const directTool = createSendQqMessageTool();

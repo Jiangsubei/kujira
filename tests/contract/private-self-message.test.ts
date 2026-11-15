@@ -236,7 +236,7 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
     const sendTool = toolsSvc.get('send_qq_message', agent);
     expect(sendTool).toBeDefined();
 
-    const sendRes = await sendTool.execute({ text: '最近一小时聊了代码和工具' }, { agent });
+    const sendRes = await sendTool.execute({ message: '最近一小时聊了代码和工具' }, { agent });
     expectLosslessJson(sendRes);
     expect(sendRes.success).toBe(true);
     expect(sendRes.message_id).toBe('msg_self_1');
@@ -314,7 +314,7 @@ describe('契约测试: 单聊出站自记录与 read_chat_history 查询闭环'
     const historyTool = toolsSvc.get('read_chat_history', agent);
     expect(historyTool).toBeDefined();
 
-    const sendRes = await sendTool.execute({ text: '我在呢喵', reply_to: 'msg_1' }, { agent });
+    const sendRes = await sendTool.execute({ message: '我在呢喵', reply_to: 'msg_1' }, { agent });
     expectLosslessJson(sendRes);
     expect(sendRes.success).toBe(true);
     expect(sendRes.message_id).toBe('msg_self_1');

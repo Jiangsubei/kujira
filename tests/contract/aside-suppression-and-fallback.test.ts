@@ -426,7 +426,7 @@ describe('契约 5: 真实装配下验证用户侧静默原则与被动锚点失
     expect(sendTool).toBeDefined();
 
     const res = await sendTool.execute(
-      { text: '显式发送正式消息' },
+      { message: '显式发送正式消息' },
       { agent: { session: { id: MOCK_SESSION_ID } } }
     );
     expect(res.success).toBe(true);

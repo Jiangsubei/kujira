@@ -308,7 +308,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
 
     // 0. 传入 REFIDX_... 或 ROBOT1.0_... 等非短 ID 必须被直接校验拦截，不打网关
     for (const invalidId of ['REFIDX_Q_IN_1', 'ROBOT1.0_Q_IN_1']) {
-      const rejected = await sendTool.execute({ text: '非法引用拦截', reply_to: invalidId }, { agent });
+      const rejected = await sendTool.execute({ message: '非法引用拦截', reply_to: invalidId }, { agent });
       expectLosslessJson(rejected);
       expect(rejected.success).toBe(false);
       expect(rejected.error).toContain('无效的 reply_to 短消息 ID');
@@ -316,7 +316,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     expect(sentBodies).toHaveLength(0);
 
     // 1. 传入入站短 ID ('msg_1')，经 getMessageByShortId 查得 REFIDX_Q_IN_1 后发送 message_reference，仅返回短出站 ID
-    const r1 = await sendTool.execute({ text: '引用入站短 ID', reply_to: 'msg_1' }, { agent });
+    const r1 = await sendTool.execute({ message: '引用入站短 ID', reply_to: 'msg_1' }, { agent });
     expectLosslessJson(r1);
     expect(r1.success).toBe(true);
     expect(r1.message_id).toBe('msg_self_1');
@@ -324,7 +324,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     expect(sentBodies[0].message_reference).toEqual({ message_id: 'REFIDX_Q_IN_1' });
 
     // 2. 传入出站短 ID ('msg_self_1')，同样可查库换取 REFIDX_Q_OUT_1 下发引用
-    const r2 = await sendTool.execute({ text: '引用出站短 ID', reply_to: 'msg_self_1' }, { agent });
+    const r2 = await sendTool.execute({ message: '引用出站短 ID', reply_to: 'msg_self_1' }, { agent });
     expectLosslessJson(r2);
     expect(r2.success).toBe(true);
     expect(r2.message_id).toBe('msg_self_2');
@@ -333,7 +333,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
 
     // 3. 超长（<=6000 字符且 >16 KiB UTF-8 字节）分片回复仅首片附 message_reference，后续分片不重复携带
     const longText = `${'🐳'.repeat(4500)}\n${'🐳'.repeat(1000)}`;
-    const r3 = await sendTool.execute({ text: longText, reply_to: 'msg_1' }, { agent });
+    const r3 = await sendTool.execute({ message: longText, reply_to: 'msg_1' }, { agent });
     expectLosslessJson(r3);
     expect(r3.success).toBe(true);
     expect(r3.message_id).toMatch(/^msg_self_[1-9]\d*$/);
@@ -343,7 +343,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
 
     // 4. 目标消息 ('msg_2') 无 ref_idx 时不伪造 message_reference
     const beforeIdx = sentBodies.length;
-    const r4 = await sendTool.execute({ text: '无索引兜底', reply_to: 'msg_2' }, { agent });
+    const r4 = await sendTool.execute({ message: '无索引兜底', reply_to: 'msg_2' }, { agent });
     expectLosslessJson(r4);
     expect(r4.success).toBe(true);
     expect(sentBodies[beforeIdx].message_reference).toBeUndefined();
@@ -408,7 +408,7 @@ describe('契约测试: 单聊引用闭环真实装配 (Quote Assembly Contract)
     // 3. 机器人发出出站消息（返回 ext_info.ref_idx=REFIDX_Q_OUT_1），随后用户引用该出站消息
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
-    const sent = await sendTool.execute({ text: '这是机器人之前发的话' }, { agent });
+    const sent = await sendTool.execute({ message: '这是机器人之前发的话' }, { agent });
     expectLosslessJson(sent);
     expect(sent.success).toBe(true);
     expect(sent.message_id).toBe('msg_self_1');

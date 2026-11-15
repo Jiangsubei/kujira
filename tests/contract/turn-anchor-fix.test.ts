@@ -291,7 +291,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     // 合成上下文下调用 send_qq_message 仍使用真实入站锚点 ROBOT1.0_ANCHOR_REAL_1，工具返回短 ID
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
-    const res = await sendTool.execute({ text: '定时汇报' }, { agent });
+    const res = await sendTool.execute({ message: '定时汇报' }, { agent });
     expect(res.success).toBe(true);
     expect(res.message_id).toBe('msg_self_1');
     expect((res as any).ref_idx).toBeUndefined();
@@ -351,7 +351,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
 
-    const r1 = await sendTool.execute({ text: '第一句回复' }, { agent });
+    const r1 = await sendTool.execute({ message: '第一句回复' }, { agent });
     expect(r1.success).toBe(true);
     expect(r1.message_id).toBe('msg_self_1');
     expect((r1 as any).ref_idx).toBeUndefined();
@@ -371,7 +371,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
 
     // 出站 ROBOT1.0_OUT_ANCHOR_1 绝不进入 inbound_reply_slots，锚点仍是 ROBOT1.0_ANCHOR_IN_2
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_IN_2');
-    const r2 = await sendTool.execute({ text: '第二句回复' }, { agent });
+    const r2 = await sendTool.execute({ message: '第二句回复' }, { agent });
     expect(r2.success).toBe(true);
     expect(r2.message_id).toBe('msg_self_2');
 
@@ -433,7 +433,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
 
-    const res = await sendTool.execute({ text: '重试成功消息' }, { agent });
+    const res = await sendTool.execute({ message: '重试成功消息' }, { agent });
     expect(res.success).toBe(true);
     expect(res.message_id).toBe('msg_self_1');
 
@@ -456,7 +456,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     }
 
     // 下次发送继续从 seq=5 单调递增
-    const resNext = await sendTool.execute({ text: '后续消息' }, { agent });
+    const resNext = await sendTool.execute({ message: '后续消息' }, { agent });
     expect(resNext.success).toBe(true);
     expect(resNext.message_id).toBe('msg_self_2');
     const allTextPosts = postedBodies.filter((b) => b.msg_type !== 6);
@@ -508,7 +508,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     const toolsSvc: any = booted.ctx.get('tools') || (booted.ctx as any).tools;
     const sendTool = toolsSvc.get('send_qq_message', agent);
 
-    const res1 = await sendTool.execute({ text: '超窗降级主动发送' }, { agent });
+    const res1 = await sendTool.execute({ message: '超窗降级主动发送' }, { agent });
     expect(res1.success).toBe(true);
     expect(res1.message_id).toBe('msg_self_1');
 
@@ -531,7 +531,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     }
 
     // 后续再次发送直接使用主动模式，不再尝试已失效锚点
-    const res2 = await sendTool.execute({ text: '延续主动发送' }, { agent });
+    const res2 = await sendTool.execute({ message: '延续主动发送' }, { agent });
     expect(res2.success).toBe(true);
     expect(res2.message_id).toBe('msg_self_2');
     const textPosts2 = postedBodies.filter((b) => b.msg_type !== 6);
@@ -554,7 +554,7 @@ describe('契约测试: 入站锚点隔离、40054005 重试与 40034128 主动�
     );
     expect(bridge.resolvePassiveMsgId(MOCK_PEER)).toBe('ROBOT1.0_ANCHOR_FRESH_1');
 
-    const res3 = await sendTool.execute({ text: '恢复被动回复' }, { agent });
+    const res3 = await sendTool.execute({ message: '恢复被动回复' }, { agent });
     expect(res3.success).toBe(true);
     expect(res3.message_id).toBe('msg_self_3');
     const textPosts3 = postedBodies.filter((b) => b.msg_type !== 6);

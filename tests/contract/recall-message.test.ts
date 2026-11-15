@@ -299,7 +299,7 @@ describe('契约 1-3: recall_message 真实装配、会话隔离与单聊撤回�
     expect(recallTool).toBeDefined();
 
     const originalText = '这条出站消息稍后撤回';
-    const sendRes = await sendTool.execute({ text: originalText }, { agent });
+    const sendRes = await sendTool.execute({ message: originalText }, { agent });
     expect(sendRes.success).toBe(true);
     expect(sendRes.message_id).toBe('msg_self_1');
     expect((sendRes as any).ref_idx).toBeUndefined();
@@ -380,7 +380,7 @@ describe('契约 1-3: recall_message 真实装配、会话隔离与单聊撤回�
     expect(recallTool).toBeDefined();
 
     // 先发送一条真实出站消息以便后续通过 msg_self_1 验证平台报错透传
-    const sendRes = await sendTool.execute({ text: '待验证撤回错误透传的消息' }, { agent });
+    const sendRes = await sendTool.execute({ message: '待验证撤回错误透传的消息' }, { agent });
     expect(sendRes.success).toBe(true);
     expect(sendRes.message_id).toBe('msg_self_1');
 

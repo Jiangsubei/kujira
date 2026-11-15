@@ -109,7 +109,7 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
     for (const invalidReplyTo of ['REFIDX_EXPLICIT_8888', 'ROBOT1.0_HIST_777', 'msg_0', '12345']) {
       const res = await sendQqMessage(
         {
-          text: '这是带非法引用的单聊消息',
+          message: '这是带非法引用的单聊消息',
           reply_to: invalidReplyTo,
         },
         {
@@ -154,7 +154,7 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
 
     const res = await sendQqMessage(
       {
-        text: '引用历史消息回复',
+        message: '引用历史消息回复',
         reply_to: inboundRec.short_id!,
       },
       {
@@ -177,7 +177,7 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
     // 也支持引用机器人自己的出站短消息 ID msg_self_1
     const resSelfQuote = await sendQqMessage(
       {
-        text: '引用自己上一条消息',
+        message: '引用自己上一条消息',
         reply_to: 'msg_self_1',
       },
       {
@@ -198,7 +198,7 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
     const { gateway, sent } = setupMockGateway();
 
     const res = await sendQqMessage(
-      { text: '普通单聊消息' },
+      { message: '普通单聊消息' },
       { gateway, db, peer: TEST_PEER }
     );
 
@@ -242,7 +242,7 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
 
     const res = await sendQqMessage(
       {
-        text: longText,
+        message: longText,
         reply_to: quoteTarget.short_id!,
       },
       {
@@ -296,10 +296,13 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
     const schemaProps = (tool.parameters as any)?.properties;
     expect(schemaProps?.at_user).toBeUndefined();
     expect(schemaProps?.markdown).toBeUndefined();
+    expect(schemaProps?.text).toBeUndefined();
+    expect(schemaProps?.message).toBeDefined();
+    expect(schemaProps?.message?.type).toBe('string');
     expect(schemaProps?.reply_to?.type).toBe('string');
 
     const res = await tool.execute(
-      { text: '通过工具执行下发', reply_to: targetRec.short_id! },
+      { message: '通过工具执行下发', reply_to: targetRec.short_id! },
       { agent: { session: { id: `${TEST_SESSION}-r1-2` } } } as any
     );
     expect((res as any).success).toBe(true);
@@ -312,7 +315,7 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
     });
 
     const denied = await sendQqMessage(
-      { text: '不允许群聊' },
+      { message: '不允许群聊' },
       { gateway, db, peer: 'group_3000000001' }
     );
     expect(denied.success).toBe(false);

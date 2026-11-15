@@ -91,7 +91,8 @@ export interface SendFileResult {
 }
 
 export interface SendQqMessageParams {
-  text: string;
+  /** 要发送给用户的消息正文（原生支持 Markdown 排版） */
+  message: string;
   /** 引用的目标短消息 ID（如 `msg_12` 或 `msg_self_8`） */
   reply_to?: string;
 }
