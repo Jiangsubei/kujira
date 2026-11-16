@@ -97,13 +97,14 @@ describe('Slang Tools Contract Tests', () => {
       const params = manageDef.parameters as any;
       expect(params.properties.action).toBeDefined();
       expect(params.required).toContain('action');
-      expect(params.properties.action.enum).toEqual(['list', 'edit', 'delete']);
+      expect(params.properties.action.enum).toEqual(['list', 'edit', 'delete', 'restore']);
       expect(params.properties.term).toBeDefined();
       expect(params.properties.tags).toBeDefined();
       expect(params.properties.aliases).toBeUndefined();
       expect(params.properties.definition).toBeDefined();
       expect(params.properties.example).toBeDefined();
       expect(params.properties.keyword).toBeDefined();
+      expect(params.properties.in_trash).toBeDefined();
       expect(params.properties.limit).toBeDefined();
     });
   });
@@ -375,6 +376,74 @@ describe('Slang Tools Contract Tests', () => {
       expect(resNotFound.success).toBe(false);
       expect(resNotFound.error).toContain('未找到');
     });
+
+    it('action=list with in_trash=true should list entries in 7-day recycle bin', async () => {
+      // 1. 删除 '牢大'
+      await manageSlang({ action: 'delete', term: '牢大' }, storage);
+
+      // 2. 正常检索：仅返回活跃条目
+      const activeList = await manageSlang({ action: 'list' }, storage);
+      expect(activeList.entries).toHaveLength(1);
+      expect(activeList.entries![0].term).toBe('开香槟');
+
+      // 3. 回收站检索：返回处于 7 天后悔期的条目
+      const trashList = await manageSlang({ action: 'list', in_trash: true }, storage);
+      expect(trashList.entries).toHaveLength(1);
+      expect(trashList.entries![0].term).toBe('牢大');
+      expect(trashList.total_matched).toBe(1);
+
+      // 4. 回收站空匹配提示
+      const emptyTrashList = await manageSlang({ action: 'list', in_trash: true, keyword: '不匹配' }, storage);
+      expect(emptyTrashList.message).toContain('回收站');
+    });
+
+    it('action=restore should recover a soft-deleted entry from recycle bin', async () => {
+      // 1. 删除 '牢大' 进入回收站
+      await manageSlang({ action: 'delete', term: '牢大' }, storage);
+      expect(storage.getStats().total).toBe(1);
+
+      // 2. 尝试重复 restore 活跃词条失败
+      const failRestoreActive = await manageSlang({ action: 'restore', term: '开香槟' }, storage);
+      expect(failRestoreActive.success).toBe(false);
+      expect(failRestoreActive.error).toContain('未在回收站中找到');
+
+      // 3. 从回收站成功复原
+      const res = await manageSlang({ action: 'restore', term: '牢大' }, storage);
+      expect(res.success).toBe(true);
+      expect(res.action).toBe('restore');
+      expect(res.entry?.term).toBe('牢大');
+      expect(storage.getStats().total).toBe(2);
+
+      // 4. 再次在活跃列表中可见
+      const activeList = await manageSlang({ action: 'list' }, storage);
+      expect(activeList.entries).toHaveLength(2);
+    });
+
+    it('record_slang should automatically restore entry if term exists in recycle bin', async () => {
+      // 1. 删除 '牢大'
+      await manageSlang({ action: 'delete', term: '牢大' }, storage);
+      expect(storage.getStats().total).toBe(1);
+
+      // 2. 重新用 record_slang 录入同名词条
+      const res = await recordSlang(
+        {
+          term: '牢大',
+          tags: '更新后的标签',
+          definition: '更新后的核心释义',
+          example: '更新后的典型例句',
+        },
+        storage
+      );
+
+      expect(res.success).toBe(true);
+      expect(res.action).toBe('created');
+      expect(res.entry.tags).toBe('更新后的标签');
+      expect(storage.getStats().total).toBe(2);
+
+      // 3. 回收站应为空
+      const trashList = await manageSlang({ action: 'list', in_trash: true }, storage);
+      expect(trashList.entries).toHaveLength(0);
+    });
   });
 
   describe('DSH Lossless JSON 契约测试 (Lossless JSON Compliance)', () => {
@@ -472,6 +541,20 @@ describe('Slang Tools Contract Tests', () => {
       const resDel = await (manageDef as any).execute({ action: 'delete', term: '不存在的词' });
       expect(resDel.success).toBe(false);
       assertNoUndefinedFields(resDel);
+
+      // 4. list (in_trash: true)
+      const resTrashList = await (manageDef as any).execute({ action: 'list', in_trash: true });
+      expect(resTrashList.success).toBe(true);
+      assertNoUndefinedFields(resTrashList);
+
+      // 5. restore 成功与失败
+      const resRestore = await (manageDef as any).execute({ action: 'restore', term: '开香槟' });
+      expect(resRestore.success).toBe(true);
+      assertNoUndefinedFields(resRestore);
+
+      const resRestoreFail = await (manageDef as any).execute({ action: 'restore', term: '开香槟' });
+      expect(resRestoreFail.success).toBe(false);
+      assertNoUndefinedFields(resRestoreFail);
     });
   });
 });

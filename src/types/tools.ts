@@ -128,6 +128,7 @@ export interface ListFacesParams {
   tag?: string;
   mood?: string;
   untagged?: boolean;
+  in_trash?: boolean;
   offset?: number;
   limit?: number;
 }
@@ -171,7 +172,7 @@ export interface CollectFaceResult {
 }
 
 export interface ManageFacesParams {
-  action: 'update' | 'delete' | 'query_quota' | 'evict';
+  action: 'update' | 'delete' | 'query_quota' | 'evict' | 'restore';
   face_id?: string;
   tags?: string[];
   mood?: string;
@@ -180,7 +181,7 @@ export interface ManageFacesParams {
 
 export interface ManageFacesResult {
   success: boolean;
-  action?: 'update' | 'delete' | 'query_quota' | 'evict';
+  action?: 'update' | 'delete' | 'query_quota' | 'evict' | 'restore';
   face_id?: string;
   total?: number;
   max_quota?: number;
@@ -274,13 +275,14 @@ export interface RecordSlangResult {
 }
 
 export interface ManageSlangParams {
-  action: 'list' | 'edit' | 'delete';
+  action: 'list' | 'edit' | 'delete' | 'restore';
   term?: string;
   new_term?: string;
   tags?: string;
   definition?: string;
   example?: string;
   keyword?: string;
+  in_trash?: boolean;
   offset?: number;
   limit?: number;
 }
@@ -288,7 +290,7 @@ export interface ManageSlangParams {
 export interface ManageSlangResult {
   [key: string]: any;
   success: boolean;
-  action: 'list' | 'edit' | 'delete';
+  action: 'list' | 'edit' | 'delete' | 'restore';
   entries?: SlangEntry[];
   entry?: SlangEntry;
   total?: number;

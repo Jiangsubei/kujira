@@ -88,6 +88,7 @@ export interface FaceQueryOptions {
   untagged?: boolean;
   enabledOnly?: boolean;
   includeDeleted?: boolean;
+  inTrash?: boolean;
   limit?: number;
   offset?: number;
   cursor?: string;
@@ -136,8 +137,17 @@ export interface SlangEntry {
   example?: string;
   query_count?: number;
   last_queried_at?: number | null;
+  deleted_at?: number | null;
   created_at?: number;
   updated_at?: number;
+}
+
+export interface SlangQueryOptions {
+  keyword?: string;
+  offset?: number;
+  limit?: number;
+  inTrash?: boolean;
+  includeDeleted?: boolean;
 }
 
 export interface SessionStateRecord {

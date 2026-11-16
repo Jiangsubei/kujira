@@ -694,6 +694,13 @@ export async function cleanExpiredMedia(
     } catch {}
   }
 
+  // 物理清理已过 7 天后悔期的黑话词条数据库记录
+  if (db && typeof (db as any).purgeExpiredSlang === 'function') {
+    try {
+      (db as any).purgeExpiredSlang(7);
+    } catch {}
+  }
+
   return { deletedFiles, freedBytes };
 }
 

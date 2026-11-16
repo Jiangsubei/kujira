@@ -900,4 +900,149 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     const snapshot = snapshotJsonValue(res);
     expect(snapshot).toBeDefined();
   });
+
+  it('契约 11: list_faces in_trash: true 能够筛选 7 天后悔期/已淘汰的表情包', async () => {
+    db.insertFace({
+      id: 'face_active',
+      file_path: '/path/active.png',
+      md5: 'md5_active',
+      source: 'manual',
+      tags: ['活跃'],
+      enabled: true,
+      size: 100,
+      format: 'png',
+    });
+
+    db.insertFace({
+      id: 'face_deleted',
+      file_path: '/path/deleted.png',
+      md5: 'md5_deleted',
+      source: 'manual',
+      tags: ['已删'],
+      enabled: true,
+      size: 100,
+      format: 'png',
+    });
+    db.deleteFace('face_deleted');
+
+    // 默认不查回收站
+    const activeRes = await listFaces({}, { db });
+    expect(activeRes.faces.map((f) => f.id)).toContain('face_active');
+    expect(activeRes.faces.map((f) => f.id)).not.toContain('face_deleted');
+
+    // 筛选回收站
+    const trashRes = await listFaces({ in_trash: true }, { db });
+    expect(trashRes.faces.map((f) => f.id)).toContain('face_deleted');
+    expect(trashRes.faces.map((f) => f.id)).not.toContain('face_active');
+    assertNoUndefinedFields(trashRes);
+  });
+
+  it('契约 12: manage_faces action: "restore" 支持从回收站复原表情并满足 Lossless JSON', async () => {
+    db.insertFace({
+      id: 'face_to_restore',
+      file_path: '/path/restore.png',
+      md5: 'md5_restore',
+      source: 'collect',
+      tags: ['待捞回'],
+      mood: '破防',
+      enabled: true,
+      size: 200,
+      format: 'png',
+    });
+    db.deleteFace('face_to_restore');
+
+    // 1. 缺少 face_id
+    const failNoId = await manageFaces({ action: 'restore' as any }, { db });
+    expect(failNoId.success).toBe(false);
+    expect(failNoId.error).toContain('缺少必填参数 face_id');
+
+    // 2. 成功捞回
+    const successRestore = await manageFaces(
+      { action: 'restore', face_id: 'face_to_restore' },
+      { db }
+    );
+    expect(successRestore.success).toBe(true);
+    expect(successRestore.action).toBe('restore');
+    expect(successRestore.face_id).toBe('face_to_restore');
+    expect(successRestore.message).toContain('已成功从回收站复原表情');
+    assertNoUndefinedFields(successRestore);
+
+    // 3. 验证数据库中已激活
+    const restoredFace = db.getFaceById('face_to_restore');
+    expect(restoredFace).not.toBeNull();
+    expect(restoredFace?.enabled).toBe(true);
+    expect(restoredFace?.deleted_at).toBeNull();
+
+    // 4. 对活跃表情再次 restore 友好提示无需复原
+    const repeatRestore = await manageFaces(
+      { action: 'restore', face_id: 'face_to_restore' },
+      { db }
+    );
+    expect(repeatRestore.success).toBe(true);
+    expect(repeatRestore.message).toContain('无需从回收站复原');
+    assertNoUndefinedFields(repeatRestore);
+  });
+
+  it('契约 13: manage_faces restore 在库容满额且为 reject 时拦截，为 evict_lru 时自动淘汰冷门表情', async () => {
+    db.insertFace(
+      {
+        id: 'f_active_1',
+        file_path: '/fa1.png',
+        md5: 'md5_fa1',
+        source: 'collect',
+        tags: ['冷门1'],
+        enabled: true,
+        size: 10,
+        format: 'png',
+      },
+      { max: 2, evictPolicy: 'reject' }
+    );
+
+    db.insertFace(
+      {
+        id: 'f_active_2',
+        file_path: '/fa2.png',
+        md5: 'md5_fa2',
+        source: 'manual',
+        tags: ['人工保护2'],
+        enabled: true,
+        size: 10,
+        format: 'png',
+      },
+      { max: 2, evictPolicy: 'reject' }
+    );
+
+    db.insertFace({
+      id: 'f_trashed',
+      file_path: '/ftrash.png',
+      md5: 'md5_ftrash',
+      source: 'collect',
+      tags: ['回收站'],
+      enabled: true,
+      size: 10,
+      format: 'png',
+    });
+    db.deleteFace('f_trashed');
+
+    // 满额且 reject：拦截报错
+    const rejectRestore = await manageFaces(
+      { action: 'restore', face_id: 'f_trashed' },
+      { db, faceStoreMax: 2, faceEvictPolicy: 'reject' }
+    );
+    expect(rejectRestore.success).toBe(false);
+    expect(rejectRestore.error).toMatch(/配额容量上限/);
+
+    // 满额且 evict_lru：淘汰 f_active_1，成功复原 f_trashed
+    const lruRestore = await manageFaces(
+      { action: 'restore', face_id: 'f_trashed' },
+      { db, faceStoreMax: 2, faceEvictPolicy: 'evict_lru' }
+    );
+    expect(lruRestore.success).toBe(true);
+
+    const activeList = db.queryFaces({ enabledOnly: true });
+    const activeIds = activeList.faces.map((f) => f.id);
+    expect(activeIds).toContain('f_trashed');
+    expect(activeIds).toContain('f_active_2');
+    expect(activeIds).not.toContain('f_active_1');
+  });
 });

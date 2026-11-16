@@ -145,18 +145,54 @@ export class SlangStorage {
       throw new Error('典型例句不能为空');
     }
 
-    const existing = this.db.getSlangEntry(cleanTerm, false);
+    const existing = this.db.getSlangEntry(cleanTerm, false, true);
     if (existing) {
+      if (existing.deleted_at === null || existing.deleted_at === undefined) {
+        const updated = this.db.updateSlangEntry(cleanTerm, {
+          tags: cleanTags,
+          definition: cleanDef,
+          example: cleanEx,
+        });
+        return {
+          action: 'updated',
+          entry: updated!,
+          total: this.db.getSlangCount(),
+          maxEntries: this.getMaxEntries(),
+        };
+      }
+
+      // 处于 7 天后悔期（回收站），复原并激活
+      const currentCount = this.db.getSlangCount();
+      const limit = this.getMaxEntries();
+      let evictedTerm: string | undefined;
+
+      if (currentCount >= limit) {
+        const policy = this.getEvictPolicy();
+        if (policy === 'reject') {
+          throw new Error(
+            `黑话知识库已达条数上限 (${currentCount}/${limit})，请先使用 manage_slang 删除过时条目后再添加。`
+          );
+        } else {
+          const evicted = this.db.evictSlangEntryLru();
+          if (evicted) {
+            evictedTerm = evicted.term;
+          }
+        }
+      }
+
       const updated = this.db.updateSlangEntry(cleanTerm, {
         tags: cleanTags,
         definition: cleanDef,
         example: cleanEx,
+        deleted_at: null,
       });
+
       return {
-        action: 'updated',
+        action: 'created',
         entry: updated!,
         total: this.db.getSlangCount(),
-        maxEntries: this.getMaxEntries(),
+        maxEntries: limit,
+        ...(evictedTerm ? { evictedTerm } : {}),
       };
     }
 
@@ -224,21 +260,67 @@ export class SlangStorage {
   }
 
   /**
-   * 删除词条
+   * 删除词条（软删除，保留 7 天后悔期）
    */
   public async deleteEntry(term: string): Promise<boolean> {
     return this.db.deleteSlangEntry(term.trim());
   }
 
   /**
-   * 分页检索/列出词条（同时返回过滤后的匹配总数，供 offset 分页使用）
+   * 从回收站复原黑话词条
+   */
+  public async restoreEntry(term: string): Promise<SlangEntry> {
+    const cleanTerm = term.trim();
+    if (!cleanTerm) {
+      throw new Error('执行 restore 操作必须提供目标黑话词条名称 (term)');
+    }
+
+    const existing = this.db.getSlangEntry(cleanTerm, false, true);
+    if (!existing || existing.deleted_at === null || existing.deleted_at === undefined) {
+      throw new Error(`未在回收站中找到黑话词条 "${cleanTerm}"`);
+    }
+
+    const currentCount = this.db.getSlangCount();
+    const limit = this.getMaxEntries();
+
+    if (currentCount >= limit) {
+      const policy = this.getEvictPolicy();
+      if (policy === 'reject') {
+        throw new Error(
+          `黑话知识库已达条数上限 (${currentCount}/${limit})，无法从回收站复原词条`
+        );
+      } else {
+        const evicted = this.db.evictSlangEntryLru();
+        if (!evicted) {
+          throw new Error(
+            `黑话知识库已达条数上限 (${currentCount}/${limit})，淘汰失败，无法复原词条`
+          );
+        }
+      }
+    }
+
+    const restored = this.db.restoreSlangEntry(cleanTerm);
+    if (!restored) {
+      throw new Error(`复原黑话词条 "${cleanTerm}" 失败`);
+    }
+
+    const entry = this.db.getSlangEntry(cleanTerm, false, false);
+    if (!entry) {
+      throw new Error(`获取复原后的词条 "${cleanTerm}" 失败`);
+    }
+    return entry;
+  }
+
+  /**
+   * 分页检索/列出词条（同时返回过滤后的匹配总数，供 offset 分页使用，支持筛选回收站）
    */
   public async listEntriesPage(
     keyword?: string,
     offset?: number,
-    limit?: number
+    limit?: number,
+    inTrash?: boolean
   ): Promise<{ entries: SlangEntry[]; total: number }> {
-    return this.db.querySlangEntries({ keyword, offset, limit });
+    return this.db.querySlangEntries({ keyword, offset, limit, inTrash });
   }
 
   /**
@@ -270,11 +352,14 @@ export class SlangStorage {
   /**
    * 获取当前存储状态统计
    */
-  public getStats(): { total: number; maxEntries: number; evictPolicy: 'reject' | 'evict_lru' } {
+  public getStats(): { total: number; maxEntries: number; evictPolicy: 'reject' | 'evict_lru'; inTrashCount?: number } {
+    const total = this.db.getSlangCount(false);
+    const totalAll = this.db.getSlangCount(true);
     return {
-      total: this.db.getSlangCount(),
+      total,
       maxEntries: this.getMaxEntries(),
       evictPolicy: this.getEvictPolicy(),
+      inTrashCount: Math.max(0, totalAll - total),
     };
   }
 

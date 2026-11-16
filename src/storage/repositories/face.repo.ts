@@ -234,12 +234,16 @@ export class FaceRepository {
     const whereClauses: string[] = [];
     const params: any[] = [];
 
-    if (!options.includeDeleted) {
-      whereClauses.push('deleted_at IS NULL');
-    }
+    if (options.inTrash) {
+      whereClauses.push('deleted_at IS NOT NULL');
+    } else {
+      if (!options.includeDeleted) {
+        whereClauses.push('deleted_at IS NULL');
+      }
 
-    if (options.enabledOnly ?? true) {
-      whereClauses.push('enabled = 1');
+      if (options.enabledOnly ?? true) {
+        whereClauses.push('enabled = 1');
+      }
     }
 
     if (options.mood && options.mood.trim()) {
@@ -320,8 +324,43 @@ export class FaceRepository {
     return info.changes > 0;
   }
 
-  restoreFace(id: string): boolean {
+  restoreFace(id: string, options?: { max?: number; evictPolicy?: 'reject' | 'evict_lru' }): boolean {
     const db = this.getDb();
+    const existing = db.prepare(`SELECT * FROM faces WHERE id = ?`).get(id) as any;
+    if (!existing) return false;
+    if (existing.deleted_at === null || existing.deleted_at === undefined) {
+      return true;
+    }
+
+    const maxFaces = options?.max;
+    if (typeof maxFaces === 'number' && maxFaces > 0) {
+      const activeCountRow = db.prepare(`SELECT COUNT(*) as cnt FROM faces WHERE deleted_at IS NULL`).get() as any;
+      const currentCount = Number(activeCountRow?.cnt ?? 0);
+
+      if (currentCount >= maxFaces) {
+        if (options?.evictPolicy === 'evict_lru') {
+          const candidate = db.prepare(`
+            SELECT id FROM faces
+            WHERE deleted_at IS NULL AND source != 'manual'
+            ORDER BY COALESCE(last_used_at, 0) ASC, added_at ASC
+            LIMIT 1
+          `).get() as any;
+
+          if (!candidate) {
+            throw new Error(`表情库已达配额容量上限 (${maxFaces})，且所有表情均为人工保护表情，无法淘汰以腾出空间复原表情`);
+          }
+
+          db.prepare(`
+            UPDATE faces
+            SET deleted_at = ?, enabled = 0
+            WHERE id = ?
+          `).run(Date.now(), candidate.id);
+        } else {
+          throw new Error(`表情库已达配额容量上限 (${maxFaces})，无法复原表情`);
+        }
+      }
+    }
+
     const info = db.prepare(`
       UPDATE faces
       SET deleted_at = NULL, enabled = 1

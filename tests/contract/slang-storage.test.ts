@@ -371,4 +371,70 @@ describe('SlangStorage Contract Tests', () => {
       service.dispose();
     });
   });
+
+  describe('Slang 7-Day Grace Period & Recycle Bin Operations', () => {
+    it('evict_lru and delete should soft-delete into recycle bin instead of physical removal', async () => {
+      const storage = new SlangStorage(db, 2, 'evict_lru');
+
+      await storage.recordEntry({
+        term: '词条1',
+        tags: '标签1',
+        definition: '释义1',
+        example: '例句1',
+      });
+
+      await storage.recordEntry({
+        term: '词条2',
+        tags: '标签2',
+        definition: '释义2',
+        example: '例句2',
+      });
+
+      // 满额触发 LRU 淘汰：淘汰查询次数最少的 词条1
+      const res3 = await storage.recordEntry({
+        term: '词条3',
+        tags: '标签3',
+        definition: '释义3',
+        example: '例句3',
+      });
+      expect(res3.evictedTerm).toBe('词条1');
+
+      // 活跃总数保持 2
+      expect(storage.getStats().total).toBe(2);
+      expect(storage.getStats().inTrashCount).toBe(1);
+
+      // 词条1 进入回收站，仍存在于数据库中
+      const rawRow = (db as any).db.prepare('SELECT * FROM slang_entries WHERE term = ?').get('词条1');
+      expect(rawRow).toBeDefined();
+      expect(rawRow.deleted_at).toBeGreaterThan(0);
+
+      // 查询回收站能够查到
+      const trash = await storage.listEntriesPage(undefined, undefined, undefined, true);
+      expect(trash.entries).toHaveLength(1);
+      expect(trash.entries[0].term).toBe('词条1');
+
+      // 手动删除 词条2
+      await storage.deleteEntry('词条2');
+      expect(storage.getStats().total).toBe(1);
+      expect(storage.getStats().inTrashCount).toBe(2);
+
+      // restoreEntry 复原 词条1
+      const restored = await storage.restoreEntry('词条1');
+      expect(restored.term).toBe('词条1');
+      expect(storage.getStats().total).toBe(2);
+      expect(storage.getStats().inTrashCount).toBe(1);
+
+      // purgeExpiredSlang 物理清理 7 天前过期的词条
+      // 模拟将 词条2 的 deleted_at 修改为 8 天前
+      const eightDaysAgo = Date.now() - 8 * 24 * 3600 * 1000;
+      (db as any).db.prepare('UPDATE slang_entries SET deleted_at = ? WHERE term = ?').run(eightDaysAgo, '词条2');
+
+      const purged = db.purgeExpiredSlang(7);
+      expect(purged).toContain('词条2');
+
+      // 词条2 已被物理销毁
+      const physicalRow = (db as any).db.prepare('SELECT * FROM slang_entries WHERE term = ?').get('词条2');
+      expect(physicalRow).toBeUndefined();
+    });
+  });
 });

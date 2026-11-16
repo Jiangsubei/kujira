@@ -9,6 +9,7 @@ import * as path from 'node:path';
 import { DEFAULT_FACE_STORE_MAX } from '../constants/index.js';
 import type {
   SlangEntry,
+  SlangQueryOptions,
   MessageRecord,
   InboundReplySlot,
   MediaUploadCacheRecord,
@@ -280,8 +281,8 @@ export class MessageDatabase {
     return this.faceRepo.deleteFace(id);
   }
 
-  restoreFace(id: string): boolean {
-    return this.faceRepo.restoreFace(id);
+  restoreFace(id: string, options?: { max?: number; evictPolicy?: 'reject' | 'evict_lru' }): boolean {
+    return this.faceRepo.restoreFace(id, options);
   }
 
   purgeExpiredFaces(graceDays: number = 7): string[] {
@@ -327,8 +328,8 @@ export class MessageDatabase {
 
   // ==================== 黑话词典 ====================
 
-  getSlangEntry(term: string, incrementQueryCount = false): SlangEntry | null {
-    return this.slangRepo.getSlangEntry(term, incrementQueryCount);
+  getSlangEntry(term: string, incrementQueryCount = false, includeDeleted = false): SlangEntry | null {
+    return this.slangRepo.getSlangEntry(term, incrementQueryCount, includeDeleted);
   }
 
   insertSlangEntry(entry: {
@@ -347,6 +348,7 @@ export class MessageDatabase {
       tags?: string;
       definition?: string;
       example?: string;
+      deleted_at?: number | null;
     }
   ): SlangEntry | null {
     return this.slangRepo.updateSlangEntry(term, updates);
@@ -356,7 +358,7 @@ export class MessageDatabase {
     return this.slangRepo.deleteSlangEntry(term);
   }
 
-  querySlangEntries(options: { keyword?: string; offset?: number; limit?: number } = {}): {
+  querySlangEntries(options: SlangQueryOptions = {}): {
     entries: SlangEntry[];
     total: number;
   } {
@@ -367,12 +369,20 @@ export class MessageDatabase {
     return this.slangRepo.getAllSlangEntriesForContext();
   }
 
-  getSlangCount(): number {
-    return this.slangRepo.getSlangCount();
+  getSlangCount(includeDeleted = false): number {
+    return this.slangRepo.getSlangCount(includeDeleted);
   }
 
   evictSlangEntryLru(): SlangEntry | null {
     return this.slangRepo.evictSlangEntryLru();
+  }
+
+  restoreSlangEntry(term: string): boolean {
+    return this.slangRepo.restoreSlangEntry(term);
+  }
+
+  purgeExpiredSlang(graceDays: number = 7): string[] {
+    return this.slangRepo.purgeExpiredSlang(graceDays);
   }
 
   close(): void {

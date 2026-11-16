@@ -30,10 +30,10 @@ export async function manageFaces(
   }
 
   const action = params?.action;
-  if (!action || !['update', 'delete', 'query_quota', 'evict'].includes(action)) {
+  if (!action || !['update', 'delete', 'query_quota', 'evict', 'restore'].includes(action)) {
     return toLosslessJson({
       success: false,
-      error: 'action 参数无效，必须为 update | delete | query_quota | evict 之一',
+      error: 'action 参数无效，必须为 update | delete | query_quota | evict | restore 之一',
     });
   }
 
@@ -215,6 +215,60 @@ export async function manageFaces(
     });
   }
 
+  // 5. restore: 根据 face_id 从回收站（7 天后悔期）复原表情
+  if (action === 'restore') {
+    const faceId = params.face_id?.trim();
+    if (!faceId) {
+      return toLosslessJson({
+        success: false,
+        error: 'restore 操作缺少必填参数 face_id',
+      });
+    }
+
+    const existing = ctx.db.getFaceById(faceId, { includeDeleted: true });
+    if (!existing) {
+      return toLosslessJson({
+        success: false,
+        error: `表情 ID "${faceId}" 不存在`,
+      });
+    }
+
+    if (existing.deleted_at === null || existing.deleted_at === undefined) {
+      return toLosslessJson({
+        success: true,
+        action: 'restore',
+        face_id: faceId,
+        message: `表情 "${faceId}" 当前处于活跃状态，无需从回收站复原`,
+      });
+    }
+
+    try {
+      const restored = ctx.db.restoreFace(faceId, {
+        max: ctx.faceStoreMax,
+        evictPolicy: ctx.faceEvictPolicy,
+      });
+
+      if (!restored) {
+        return toLosslessJson({
+          success: false,
+          error: `从回收站复原表情 "${faceId}" 失败`,
+        });
+      }
+
+      return toLosslessJson({
+        success: true,
+        action: 'restore',
+        face_id: faceId,
+        message: `已成功从回收站复原表情 "${faceId}"（标签: [${(existing.tags || []).join(', ')}]，情绪: ${existing.mood || '未设置'}）`,
+      });
+    } catch (err: any) {
+      return toLosslessJson({
+        success: false,
+        error: `复原表情 "${faceId}" 失败: ${err?.message || '未知错误'}`,
+      });
+    }
+  }
+
   return toLosslessJson({
     success: false,
     error: `未知操作: ${action}`,
@@ -225,18 +279,18 @@ export function createManageFacesTool(context?: ContextSource): ToolDefinition {
   return defineTool({
     name: 'manage_faces',
     description:
-      '管理与维护本地表情包库。用于补充或修改已有表情的标签/情绪、按 ID 删除表情、查询当前表情库存储配额占用，以及在库容满时按 LRU 或指定规则清理淘汰冷门表情。',
+      '管理与维护本地表情包库。用于补充或修改已有表情的标签/情绪、按 ID 删除表情、从 7 天后悔期回收站复原表情、查询当前表情库存储配额占用，以及在库容满时按 LRU 或指定规则清理淘汰冷门表情。',
     parameters: {
       action: {
         type: 'string',
         required: true,
-        enum: ['update', 'delete', 'query_quota', 'evict'],
+        enum: ['update', 'delete', 'query_quota', 'evict', 'restore'],
         description:
-          '操作类型: update (改标签/情绪), delete (删除表情), query_quota (查存储配额), evict (按 LRU 淘汰冷门表情)',
+          '操作类型: update (改标签/情绪), delete (删除表情), restore (从回收站复原表情), query_quota (查存储配额), evict (按 LRU 淘汰冷门表情)',
       },
       face_id: {
         type: 'string',
-        description: '目标表情 ID（action 为 update 或 delete 时必填）',
+        description: '目标表情 ID（action 为 update, delete 或 restore 时必填）',
       },
       tags: {
         type: 'array',

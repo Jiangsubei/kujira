@@ -49,14 +49,16 @@ export async function listFaces(
       message: '数据库不可用，暂时无法检索表情包。',
     });
   }
+  const inTrash = Boolean(params?.in_trash);
   const queryRes = ctx.db.queryFaces({
     query: params?.query,
     mood: params?.mood,
     tag: params?.tag,
     untagged: params?.untagged,
+    inTrash,
     limit,
     offset,
-    enabledOnly: true,
+    enabledOnly: !inTrash,
   });
 
   const faces: FaceSummaryItem[] = queryRes.faces.map((f) => {
@@ -77,16 +79,20 @@ export async function listFaces(
   });
 
   const hasMore = offset + faces.length < queryRes.total;
+  const unitName = inTrash ? '个回收站表情' : '个表情';
+  const defaultEmptyMsg = inTrash
+    ? '回收站中未找到符合条件的表情包。'
+    : '未找到符合条件的表情包。';
   const message =
     queryRes.total === 0
-      ? '未找到符合条件的表情包。'
+      ? defaultEmptyMsg
       : buildOffsetMessage({
           offset,
           returned: faces.length,
           totalMatched: queryRes.total,
           hasMore,
           ...(hasMore ? { nextOffset: offset + faces.length } : {}),
-          unit: '个表情',
+          unit: unitName,
         });
 
   const res: ListFacesResult = {
@@ -106,7 +112,7 @@ export function createListFacesTool(context?: ContextSource): ToolDefinition {
   return defineTool({
     name: 'list_faces',
     description:
-      '在机器人本地表情库中检索可用的表情包。用于斗图或需要情绪表达前，按情绪（mood）或标签（tag）查验可用库存；结果按收录时间倒序排列，每条带连续行号，可通过 offset/limit 分页。返回合法 face_id、标签、情绪及本地路径。翻页时按已展示条数自行推算 offset（例如已展示 1~20，则传 offset: 20）。检索到心仪表情后，使用其 face_id 配合 send_face 发送。',
+      '在机器人本地表情库中检索可用的表情包，或查看 7 天后悔期回收站中的表情。用于斗图或需要情绪表达前，按情绪（mood）或标签（tag）查验可用库存；结果按收录时间倒序排列，每条带连续行号，可通过 offset/limit 分页。返回合法 face_id、标签、情绪及本地路径。翻页时按已展示条数自行推算 offset（例如已展示 1~20，则传 offset: 20）。检索到心仪表情后，使用其 face_id 配合 send_face 发送；如需捞回回收站表情，设置 in_trash: true 检索后再调用 manage_faces 复原。',
     parameters: {
       query: {
         type: 'string',
@@ -123,6 +129,11 @@ export function createListFacesTool(context?: ContextSource): ToolDefinition {
       untagged: {
         type: 'boolean',
         description: '是否只检索尚未打标的表情（默认 false）。设为 true 可配合读图查看并调用 manage_faces 进行补标。',
+      },
+      in_trash: {
+        type: 'boolean',
+        description:
+          '是否仅检索处于 7 天后悔期（回收站/已淘汰/已删除）的表情包（默认 false）。设为 true 时可查看被淘汰或删除的冷门表情以便调用 manage_faces (action: "restore") 重新捞回。',
       },
       offset: {
         type: 'number',

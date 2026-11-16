@@ -55,6 +55,14 @@ function ensureAndBackfillShortIds(db: any): void {
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_peer_short_id ON messages (peer, short_id);`);
 }
 
+function ensureSlangDeletedAt(db: any): void {
+  const columns = db.prepare('PRAGMA table_info(slang_entries)').all() as Array<{ name: string }>;
+  const hasDeletedAt = columns.some((col) => col.name === 'deleted_at');
+  if (!hasDeletedAt) {
+    db.exec('ALTER TABLE slang_entries ADD COLUMN deleted_at INTEGER');
+  }
+}
+
 export function initDatabaseSchema(db: any): void {
   const run = db.transaction(() => {
     db.exec(`
@@ -177,6 +185,7 @@ export function initDatabaseSchema(db: any): void {
         example TEXT,
         query_count INTEGER NOT NULL DEFAULT 0,
         last_queried_at INTEGER,
+        deleted_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -184,8 +193,10 @@ export function initDatabaseSchema(db: any): void {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_slang_term ON slang_entries (term);
       CREATE INDEX IF NOT EXISTS idx_slang_query_count ON slang_entries (query_count);
       CREATE INDEX IF NOT EXISTS idx_slang_updated_at ON slang_entries (updated_at);
+      CREATE INDEX IF NOT EXISTS idx_slang_deleted_at ON slang_entries (deleted_at);
     `);
 
+    ensureSlangDeletedAt(db);
     ensureAndBackfillShortIds(db);
   });
 

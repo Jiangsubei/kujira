@@ -29,17 +29,21 @@ export async function manageSlang(
 
   if (action === 'list') {
     const keyword = params.keyword || params.term;
+    const inTrash = Boolean(params.in_trash);
     const offset = normalizeOffset(params.offset);
     const limit = normalizeLimit(params.limit, 20, 100);
     const { entries: allEntries, total: totalMatched } = await storage.listEntriesPage(
       keyword,
       offset,
-      limit
+      limit,
+      inTrash
     );
 
+    const unitName = inTrash ? '条回收站黑话词条' : '条黑话词条';
+    const emptyMsg = inTrash ? '回收站中未查询到任何匹配的黑话词条。' : '未查询到任何匹配的黑话词条。';
     const message =
       totalMatched === 0
-        ? '未查询到任何匹配的黑话词条。'
+        ? emptyMsg
         : buildOffsetMessage({
             offset,
             returned: allEntries.length,
@@ -48,7 +52,7 @@ export async function manageSlang(
             ...(offset + allEntries.length < totalMatched
               ? { nextOffset: offset + allEntries.length }
               : {}),
-            unit: '条黑话词条',
+            unit: unitName,
           });
 
     return toLosslessJson({
@@ -124,6 +128,34 @@ export async function manageSlang(
     });
   }
 
+  if (action === 'restore') {
+    if (!params.term || !params.term.trim()) {
+      return toLosslessJson({
+        success: false,
+        action: 'restore',
+        error: '执行 restore 操作必须提供目标黑话词条名称 (term)',
+      });
+    }
+    try {
+      const restored = await storage.restoreEntry(params.term);
+      const newStats = storage.getStats();
+      return toLosslessJson({
+        success: true,
+        action: 'restore',
+        entry: restored,
+        total: newStats.total,
+        max_entries: newStats.maxEntries,
+        message: `成功从回收站复原黑话词条 "${restored.term}" (当前总容量 ${newStats.total}/${newStats.maxEntries} 条)`,
+      });
+    } catch (err: any) {
+      return toLosslessJson({
+        success: false,
+        action: 'restore',
+        error: err?.message || '复原黑话词条失败',
+      });
+    }
+  }
+
   return toLosslessJson({
     success: false,
     action: action as any,
@@ -138,19 +170,19 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
   return defineTool({
     name: 'manage_slang',
     description:
-      '【知识库管理维护专用】管理与修缮全局黑话知识库（支持检索 list、修改 edit、删除 delete）。模型在准备修改 (edit) 或删除 (delete) 某个词条前，应先通过 list 检索查看其当前内容与已有标签。keyword 支持按标题、标签特征词或释义关键词进行检索与反查。日常首次收录新黑话请直接使用 record_slang。',
+      '【知识库管理维护专用】管理与修缮全局黑话知识库（支持检索 list、修改 edit、删除 delete、从 7 天后悔期回收站复原 restore）。模型在准备修改 (edit) 或删除 (delete) 某个词条前，应先通过 list 检索查看其当前内容与已有标签。keyword 支持按标题、标签特征词或释义关键词进行检索与反查；in_trash 可专门检索已淘汰/已删除词条并使用 restore 捞回。日常首次收录新黑话请直接使用 record_slang。',
     parameters: {
       action: {
         type: 'string',
         required: true,
-        enum: ['list', 'edit', 'delete'],
+        enum: ['list', 'edit', 'delete', 'restore'],
         description:
-          '操作类型：list (检索/列出已有黑话条目内容), edit (修改已有黑话的标签、释义或例句), delete (删除指定黑话)',
+          '操作类型：list (检索/列出已有黑话条目内容), edit (修改已有黑话的标签、释义或例句), delete (删除指定黑话), restore (从回收站复原已淘汰或删除的黑话)',
       },
       term: {
         type: 'string',
         description:
-          '目标黑话词条名称（action 为 edit 或 delete 时必填；action 为 list 时可选填用于匹配特定词条）',
+          '目标黑话词条名称（action 为 edit, delete 或 restore 时必填；action 为 list 时可选填用于匹配特定词条）',
       },
       new_term: {
         type: 'string',
@@ -173,6 +205,11 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
         type: 'string',
         description:
           '模糊搜索关键词（仅当 action 为 list 时生效，支持按标题、标签特征词或释义/例句关键词全文反查）',
+      },
+      in_trash: {
+        type: 'boolean',
+        description:
+          '是否仅检索处于 7 天后悔期（回收站/已淘汰/已删除）的黑话条目（仅当 action 为 list 时生效，默认 false）。设为 true 时可查看被淘汰条目以便调用 restore 捞回。',
       },
       offset: {
         type: 'number',
@@ -232,6 +269,7 @@ export function createManageSlangTool(storage: SlangStorage): ToolDefinition {
           ...(args.definition !== undefined ? { definition: String(args.definition) } : {}),
           ...(args.example !== undefined ? { example: String(args.example) } : {}),
           ...(args.keyword !== undefined ? { keyword: String(args.keyword) } : {}),
+          ...(typeof args.in_trash === 'boolean' ? { in_trash: args.in_trash } : {}),
           ...(typeof args.offset === 'number' ? { offset: args.offset } : {}),
           ...(typeof args.limit === 'number' ? { limit: args.limit } : {}),
         },
