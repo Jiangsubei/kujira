@@ -15,6 +15,7 @@ import type { QQMediaFileType, SendFaceParams, SendFaceResult } from '../../type
 import { DEFAULT_FACE_STORE_DIR, QQ_FILE_TYPE_IMAGE } from '../../constants/index.js';
 import { resolveDshPath } from '../../utils/path.js';
 import { buildOutboundFaceAttachment } from '../../attachment/outbound.js';
+import { prepareFaceOutboundPath } from './face-resizer.js';
 import {
   type ToolExecutionContext,
   type ContextSource,
@@ -93,10 +94,15 @@ export async function sendFace(
     return toLosslessJson({ success: false, error: `表情包本地文件不存在: ${localPath}` });
   }
 
+  const outboundFilePath = await prepareFaceOutboundPath({
+    localPath,
+    format: face.format,
+  });
+
   const attachment = buildOutboundFaceAttachment(face, localPath);
-  const fileName = path.basename(localPath) || `${face.id}.${face.format || 'png'}`;
+  const fileName = path.basename(outboundFilePath) || `${face.id}.${face.format || 'png'}`;
   const mediaInput = {
-    filePath: localPath,
+    filePath: outboundFilePath,
     fileType: QQ_FILE_TYPE_IMAGE as QQMediaFileType,
     fileName,
     attachments: [attachment],

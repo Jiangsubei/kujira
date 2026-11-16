@@ -24,6 +24,10 @@ export const DEFAULT_MEMORY_DIR = '.dsh/kujira/memory';
 
 export const DEFAULT_FACE_STORE_DIR = '.dsh/kujira/faces';
 
+export const DEFAULT_FACE_OUTBOUND_MAX_SIZE = 240;
+
+export const DEFAULT_FACE_THUMB_DIRNAME = 'thumb';
+
 export const DEFAULT_SLANG_STORAGE_PATH = '.dsh/kujira/slang/slang.md';
 
 // ---------------------------------------------------------------------------

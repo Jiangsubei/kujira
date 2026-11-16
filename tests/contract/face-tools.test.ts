@@ -8,6 +8,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
+import sharp from 'sharp';
 import { Context } from '@deepseek-ai/cordis';
 import { MessageDatabase } from '../../src/storage/database.js';
 import { OutboundStreamBridge } from '../../src/outbound/stream.js';
@@ -320,6 +321,60 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     const updated = db.getFaceById('face_doge');
     expect(updated?.use_count).toBe(1);
     expect(updated?.last_used_at).toBeGreaterThan(0);
+
+    bridge.dispose();
+  });
+
+  it('契约 2.1: send_face 遇到超大尺寸静态图片时，实际上传缩放到 240 的缩略图并生成缓存', async () => {
+    const largeImgPath = path.join(faceDir, 'large_cat.png');
+    await sharp({
+      create: {
+        width: 800,
+        height: 600,
+        channels: 4,
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      },
+    })
+      .png()
+      .toFile(largeImgPath);
+
+    db.insertFace({
+      id: 'face_large_cat',
+      file_path: largeImgPath,
+      md5: 'md5_large_cat',
+      source: 'manual',
+      tags: ['大猫'],
+      mood: '呆滞',
+      enabled: true,
+      size: fs.statSync(largeImgPath).size,
+      format: 'png',
+    });
+
+    let uploadedFileName = '';
+    mockGateway.uploadC2CMedia.mockImplementationOnce(async (_openid: string, data: Uint8Array, opts: any) => {
+      uploadedFileName = opts?.fileName ?? '';
+      const meta = await sharp(Buffer.from(data)).metadata();
+      expect(meta.width).toBe(240);
+      expect(meta.height).toBe(180);
+      return {
+        ok: true,
+        status: 200,
+        body: { file_uuid: 'face_uuid_large', file_info: 'face_file_info_large', ttl: 86400 },
+      };
+    });
+
+    const bridge = new OutboundStreamBridge(new Context(), { gateway: mockGateway, db });
+    const res = await sendFace(
+      { face_id: 'face_large_cat' },
+      {
+        db,
+        outboundBridge: bridge,
+        peer: USER_PEER,
+      }
+    );
+
+    expect(res.success).toBe(true);
+    expect(uploadedFileName).toContain('large_cat_240.png');
 
     bridge.dispose();
   });
