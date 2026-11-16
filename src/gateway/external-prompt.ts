@@ -8,7 +8,7 @@
  * 4. 适配 QQ 官方 Bot 单聊：绝不将长 `ROBOT1.0_...` 或 `REFIDX_...` 注入唤醒提示词。
  */
 
-import type { WakeupPayload } from '../types/index.js';
+import type { WakeupPayload, AggregatedMessage } from '../types/index.js';
 import { formatDateTime } from '../storage/time-parser.js';
 import { isShortMessageId, parseShortMessageId } from '../utils/short-id.js';
 import { formatSystemEventPrompt } from './system-event-hub.js';
@@ -114,9 +114,113 @@ export function formatExternalPrompt(payload: WakeupPayload): string {
 }
 
 /**
- * 统一唤醒提示词入口（系统事件静态委托给 SystemEventHub，外部消息走 formatExternalPrompt）
+ * 把聚合池中的一条消息渲染为逐条段落（`序号. [短 ID] [时间] ...`）。
+ * - 单条消息保持紧凑行内呈现：消息头、引用回复、正文与行内附件保持在同一行（与直接唤醒消息的语流格式完全对齐）；
+ * - 用户正文原生的换行自然保留（后续行缩进），避免在单条消息内部生硬拆行导致语义断裂。
+ */
+export function renderAggregatedMessageLines(
+  messages: ReadonlyArray<AggregatedMessage>
+): string[] {
+  const lines: string[] = [];
+  messages.forEach((message, index) => {
+    const shortId = typeof message.short_id === 'string' && message.short_id.trim() ? message.short_id.trim() : '';
+    const timeStr = message.time ? formatDateTime(message.time) : '';
+    const header = [shortId ? `[${shortId}]` : '', timeStr ? `[${timeStr}]` : '']
+      .filter(Boolean)
+      .join(' ');
+
+    const quoted = message.quoted;
+    let quotedStr = '';
+    if (quoted) {
+      const qShortId =
+        typeof quoted.short_id === 'string' && quoted.short_id.trim() ? quoted.short_id.trim() : '';
+      const qTime = typeof quoted.time === 'number' && quoted.time > 0 ? formatDateTime(quoted.time) : '';
+      const qHeader = [qShortId ? `[${qShortId}]` : '', qTime ? `[${qTime}]` : '']
+        .filter(Boolean)
+        .join(' ');
+      const qText = quoted.text ? ` ${quoted.text}` : '';
+      quotedStr = `[引用回复: "${qHeader}${qText}"]`;
+    }
+
+    let body = message.content ?? '';
+    const attachments = (message.attachments ?? []).filter(Boolean);
+    const missingAttachments: string[] = [];
+    for (const att of attachments) {
+      if (!body.includes(att)) {
+        missingAttachments.push(att);
+      }
+    }
+    if (missingAttachments.length > 0) {
+      body = body ? `${body} ${missingAttachments.join(' ')}` : missingAttachments.join(' ');
+    }
+
+    const linePrefix = `${index + 1}. ${header}`.trimEnd();
+    const inlineContent = [quotedStr, body].filter(Boolean).join(' ');
+
+    if (!inlineContent) {
+      lines.push(linePrefix);
+      return;
+    }
+
+    // 若正文原生包含换行符，首行紧接消息头，后续换行行适当缩进呈现
+    if (inlineContent.includes('\n')) {
+      const parts = inlineContent.split('\n');
+      lines.push(`${linePrefix} ${parts[0]}`.trimEnd());
+      for (let i = 1; i < parts.length; i++) {
+        lines.push(`   ${parts[i]}`.trimEnd());
+      }
+    } else {
+      lines.push(`${linePrefix} ${inlineContent}`.trimEnd());
+    }
+  });
+  return lines;
+}
+
+/**
+ * 格式化单聊消息聚合批次提示词（纯净自然聊天记录流）。
+ * 彻底剔除系统事件外壳与多余引导说明，呈现为：
+ *
+ * [消息聚合] [YYYY-MM-DD HH:mm:ss]
+ *
+ * 1. [msg_1] [YYYY-MM-DD HH:mm:ss] 消息 1
+ * 2. [msg_2] [YYYY-MM-DD HH:mm:ss] 消息 2
+ */
+export function formatAggregatedPrompt(event: {
+  timestamp?: number;
+  messages?: ReadonlyArray<AggregatedMessage>;
+}): string {
+  const now = event.timestamp || Date.now();
+  const timeStr = formatDateTime(now);
+  const header = `[消息聚合]${timeStr ? ` [${timeStr}]` : ''}`;
+
+  const messages = Array.isArray(event.messages) ? event.messages : [];
+  if (messages.length === 0) {
+    return header;
+  }
+
+  const lines = renderAggregatedMessageLines(messages);
+  return `${header}\n\n${lines.join('\n')}`;
+}
+
+/**
+ * 统一唤醒提示词入口（聚合消息走 formatAggregatedPrompt，系统事件走 SystemEventHub，外部直接消息走 formatExternalPrompt）
  */
 export function formatWakeupPrompt(payload: WakeupPayload): string {
+  if (payload.trigger === 'aggregated') {
+    if (payload.aggregated_messages && payload.aggregated_messages.length > 0) {
+      return formatAggregatedPrompt({
+        timestamp: payload.timestamp,
+        messages: payload.aggregated_messages,
+      });
+    }
+    if (payload.content) {
+      return payload.content;
+    }
+    return formatAggregatedPrompt({
+      timestamp: payload.timestamp,
+      messages: [],
+    });
+  }
   if (payload.is_system && payload.system_event) {
     return formatSystemEventPrompt(payload.system_event);
   }

@@ -60,7 +60,7 @@ import { SessionManager } from './gateway/session.js';
 import { SystemEventHub } from './gateway/system-event-hub.js';
 import { ProactiveManager, shouldPoolInbound } from './gateway/proactive.js';
 import { extractRecentTurnsFromRecords } from './gateway/proactive/momentum.js';
-import type { SystemWakeupEvent } from './types/system-event.js';
+import type { SystemWakeupEvent, AggregatedMessagesEvent } from './types/system-event.js';
 import {
   describeInboundAttachments,
   toMessageMediaFields,
@@ -312,7 +312,13 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   // 等待用户输入的判活回调：由下方 questionProvider / approvalResponder 装配后回填。
   // 巡检时才求值，故此处先用闭包占位，避免与 section 7 的创建顺序耦合。
   let isAwaitingUserInput: (peer: string) => boolean = () => false;
-  const dispatchProactiveEvent = async (event: SystemWakeupEvent): Promise<void> => {
+  const dispatchProactiveEvent = async (
+    event: SystemWakeupEvent | AggregatedMessagesEvent
+  ): Promise<void> => {
+    if (event.kind === 'aggregated_messages') {
+      await systemEventHub.dispatchAggregatedMessages(event);
+      return;
+    }
     // 冷场搭话必须拿得到有效被动锚点才能发信；无锚点时直接跳过，绝不降级为纯主动消息
     if (event.kind === 'idle_reply') {
       const anchor = outboundBridge.resolvePassiveMsgId(event.peer);
@@ -321,7 +327,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
         return;
       }
     }
-    await systemEventHub.dispatchSystemEvent(event);
+    await systemEventHub.dispatchSystemEvent(event as SystemWakeupEvent);
   };
   const buildProactiveOptions = () => ({
     config: currentConfig(),

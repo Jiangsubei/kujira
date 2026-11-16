@@ -6,10 +6,10 @@
  * 2. 系统事件充当本轮真人发起人导致审批 Fail-Closed 失效。
  */
 
-/** 系统事件类型辨识标签 */
+/** 系统事件类型辨识标签（仅限真正的内部系统自发事件） */
 import type { AggregatedMessage } from './wakeup.js';
 
-export type SystemEventKind = 'scheduled_task' | 'aggregated_messages' | 'idle_reply';
+export type SystemEventKind = 'scheduled_task' | 'idle_reply';
 
 /** 定时任务系统事件 */
 export interface ScheduledTaskEvent {
@@ -25,13 +25,13 @@ export interface ScheduledTaskEvent {
 }
 
 /**
- * 消息聚合回复事件：轮次边界（自由周期 tick 或 turn/end flush）投递内存池。
+ * 消息聚合批次载荷：轮次边界（自由周期 tick 或 turn/end flush）投递内存池。
  *
- * 事件携带逐条待回复消息，模型可直接据此回复；如需更早上下文，
- * 仍可自行调用 `read_chat_history` 回溯。
+ * 注：消息聚合本质是真实入站消息的批次延迟投递，不属于内部系统自发事件，
+ * 故已从 SystemWakeupEvent 中剥离，以纯净的自然聊天记录格式呈现给模型。
  */
 export interface AggregatedMessagesEvent {
-  kind: 'aggregated_messages';
+  kind?: 'aggregated_messages';
   peer: string;
   /** 待投递消息快照（按时间顺序；存在时提示词逐条列出） */
   messages?: AggregatedMessage[];
@@ -43,8 +43,7 @@ export interface AggregatedMessagesEvent {
   reason?: 'period' | 'turn_end';
   /**
    * 触发本轮聚合的真实发送者身份（peer 内真实用户 openid）。
-   * 聚合轮次源于真实用户的入站消息，故具备审批发起人资格；
-   * 与 `idle_reply` / `scheduled_task` 的「无真实发起人」严格区分。
+   * 聚合轮次源于真实用户的入站消息，具备审批发起人资格。
    */
   fromUser?: string;
   /** 聚合周期（分钟），仅用于上下文说明 */
@@ -64,5 +63,5 @@ export interface IdleReplyEvent {
   timestamp?: number;
 }
 
-/** 全量系统事件实体类型 */
-export type SystemWakeupEvent = ScheduledTaskEvent | AggregatedMessagesEvent | IdleReplyEvent;
+/** 全量系统内部事件实体类型（仅限无当轮用户输入的内部自发事件） */
+export type SystemWakeupEvent = ScheduledTaskEvent | IdleReplyEvent;

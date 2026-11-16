@@ -17,7 +17,7 @@
  */
 
 import type { AggregatedMessage, BridgePluginConfig, ProactiveAttitude } from '../types/index.js';
-import type { SystemWakeupEvent } from '../types/system-event.js';
+import type { SystemWakeupEvent, AggregatedMessagesEvent } from '../types/system-event.js';
 import {
   DEFAULT_AGGREGATION_ENABLED,
   DEFAULT_AGGREGATION_MIN_SECONDS,
@@ -63,8 +63,8 @@ export interface PeerTimingSnapshot {
 
 export interface ProactiveManagerOptions {
   config: BridgePluginConfig;
-  /** 统一投递入口：真实装配下由 SystemEventHub.dispatchSystemEvent 承接 */
-  dispatch?: (event: SystemWakeupEvent) => Promise<unknown> | unknown;
+  /** 统一投递入口：由 SystemEventHub / dispatch 承接 */
+  dispatch?: (event: SystemWakeupEvent | AggregatedMessagesEvent) => Promise<unknown> | unknown;
   /**
    * 是否正在等待用户输入（提问 / 审批挂起）。
    * 返回 true 时跳过本轮 tick 与 flush，池与时序完整保留。

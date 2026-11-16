@@ -273,10 +273,12 @@ describe('单聊主动能力真实装配闭环', () => {
     expect(payload.trigger).toBe('aggregated');
     expect(payload.from_user).toBe(MOCK_OPENID);
     expect(payload.from_name).toBe('');
-    // 逐条注入正文，同时保留 read_chat_history 作为可选回溯
+    expect(payload.is_system).toBeFalsy();
+    expect(payload.content).toMatch(/^\[消息聚合\]/);
+    expect(payload.content).not.toContain('系统事件');
+    expect(payload.content).not.toContain('read_chat_history');
     expect(payload.content).toContain('在吗');
     expect(payload.content).toContain('那个接口一直 403');
-    expect(payload.content).toContain('read_chat_history');
     expect(payload.content).not.toContain(MOCK_PEER);
   });
 

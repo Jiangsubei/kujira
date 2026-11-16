@@ -18,7 +18,7 @@ import {
   type CompletedTurnSummary,
 } from '../../src/gateway/proactive.js';
 import { formatSystemEventPrompt } from '../../src/gateway/system-event-hub.js';
-import { formatWakeupPrompt } from '../../src/gateway/external-prompt.js';
+import { formatWakeupPrompt, formatAggregatedPrompt } from '../../src/gateway/external-prompt.js';
 import { DEFAULT_BASE_CONFIG } from '../../src/constants/index.js';
 import { BridgeConfigSchema } from '../../src/config/schema.js';
 
@@ -832,18 +832,19 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
     },
   ];
 
-  it('周期投递：逐条列出短 ID、时间、引用与附件，且提示 read_chat_history 可选回溯', () => {
-    const prompt = formatSystemEventPrompt({
-      kind: 'aggregated_messages',
-      peer: PEER,
+  it('周期投递：精简格式化为自然记录 [消息聚合] [时间]，逐条列出短 ID、时间、引用与附件，无系统事件包装与说明引导', () => {
+    const prompt = formatAggregatedPrompt({
       messages: MESSAGES,
-      reason: 'period',
-      intervalMinutes: 2,
       timestamp: PERIOD_TS,
     });
 
-    expect(prompt).toContain('系统事件');
-    expect(prompt).toMatch(/2026-11-13 14:05:00/);
+    expect(prompt).toMatch(/^\[消息聚合\] \[2026-11-13 14:05:00\]/);
+    expect(prompt).not.toContain('系统事件');
+    expect(prompt).not.toContain('会话状态');
+    expect(prompt).not.toContain('说明');
+    expect(prompt).not.toContain('read_chat_history');
+    expect(prompt).not.toContain('[结束]');
+
     expect(prompt).toMatch(/1\.\s*\[msg_12\]/);
     expect(prompt).toMatch(/2\.\s*\[msg_13\]/);
     // 纯文本消息：正文与消息头同一行，与正常直接入站消息的格式一致
@@ -858,8 +859,6 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
     expect(prompt).toContain('那个接口一直 403');
     expect(prompt).toContain('[引用回复:');
     expect(prompt).toContain('[图片: /tmp/a.png]');
-    expect(prompt).toContain('read_chat_history');
-    expect(prompt).toContain('[结束]');
 
     // 绝不泄露 peer、长锚点或渠道前缀
     expect(prompt).not.toContain('[QQ私聊]');
@@ -868,25 +867,23 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
     expect(prompt).not.toContain('群聊');
   });
 
-  it('turn_end 投递：使用「上一轮处理期间」语义并引导避免重复回复', () => {
-    const prompt = formatSystemEventPrompt({
-      kind: 'aggregated_messages',
-      peer: PEER,
+  it('turn_end 投递：格式完全统一为 [消息聚合] [时间] 列表，无差异化说明引导', () => {
+    const prompt = formatAggregatedPrompt({
       messages: MESSAGES,
-      reason: 'turn_end',
       timestamp: PERIOD_TS,
     });
 
-    expect(prompt).toContain('上一轮处理期间');
-    expect(prompt).toMatch(/你上一条回复覆盖|已经回应过/);
-    expect(prompt).toContain('直接输出 [结束]');
-    expect(prompt).toContain('read_chat_history');
+    expect(prompt).toMatch(/^\[消息聚合\] \[2026-11-13 14:05:00\]/);
+    expect(prompt).not.toContain('系统事件');
+    expect(prompt).not.toContain('上一轮处理期间');
+    expect(prompt).not.toContain('read_chat_history');
+    expect(prompt).not.toContain('[结束]');
+    expect(prompt).toContain('在吗');
+    expect(prompt).toContain('那个接口一直 403');
   });
 
   it('带行内就地附件的正文在聚合投递时完整保留在同一行且位置不颠倒', () => {
-    const prompt = formatSystemEventPrompt({
-      kind: 'aggregated_messages',
-      peer: PEER,
+    const prompt = formatAggregatedPrompt({
       messages: [
         {
           short_id: 'msg_21',
@@ -895,31 +892,25 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
           attachments: ['[图片: /tmp/cat.png]', '[图片: /tmp/dog.png]'],
         },
       ],
-      reason: 'period',
       timestamp: PERIOD_TS,
     });
 
+    expect(prompt).toMatch(/^\[消息聚合\] \[2026-11-13 14:05:00\]/);
     expect(prompt).toContain(
       '1. [msg_21] [2026-11-13 14:04:50] 第一张看这个 [图片: /tmp/cat.png] 第二张看这个 [图片: /tmp/dog.png] 麻烦帮我看看'
     );
     expect(prompt).not.toMatch(/\[msg_21\][^\n]*\n\s*\[图片/);
   });
 
-  it('无消息的历史调用仍回落到「有新消息待查看」提示', () => {
-    const prompt = formatSystemEventPrompt({
-      kind: 'aggregated_messages',
-      peer: PEER,
-      intervalMinutes: 2,
+  it('无消息的防御调用返回纯聚合头 [消息聚合] [时间]，不含系统事件包装与说明', () => {
+    const prompt = formatAggregatedPrompt({
       timestamp: PERIOD_TS,
     });
 
-    expect(prompt).toContain('系统事件');
-    expect(prompt).toContain('read_chat_history');
-    expect(prompt).toContain('[结束]');
-    expect(prompt).not.toContain('[QQ私聊]');
-    expect(prompt).not.toContain(PEER);
-    expect(prompt).not.toContain('ROBOT1.0');
-    expect(prompt).not.toContain('[msg_');
+    expect(prompt).toBe('[消息聚合] [2026-11-13 14:05:00]');
+    expect(prompt).not.toContain('系统事件');
+    expect(prompt).not.toContain('read_chat_history');
+    expect(prompt).not.toContain('[结束]');
   });
 
   it('冷场搭话提示词为系统事件语义，不含真实用户消息内容', () => {
@@ -941,7 +932,7 @@ describe('契约 7: 聚合提示词逐条列出消息，保留 read_chat_history
 });
 
 describe('契约 8: 唤醒提示词统一入口正确分派两类新事件', () => {
-  it('aggregated / idle_reply 均经 formatWakeupPrompt 分派到系统事件格式化', () => {
+  it('aggregated 分派到自然聚合格式，idle_reply 分派到系统事件格式化', () => {
     const aggregated = formatWakeupPrompt({
       peer: PEER,
       trigger: 'aggregated',
@@ -949,10 +940,15 @@ describe('契约 8: 唤醒提示词统一入口正确分派两类新事件', () 
       from_name: '',
       content: '',
       timestamp: 1_000_000,
-      is_system: true,
-      system_event: { kind: 'aggregated_messages', peer: PEER, intervalMinutes: 2 },
+      is_system: false,
+      aggregated_messages: [
+        { short_id: 'msg_1', content: '测试消息', time: 1_000_000 },
+      ],
     });
-    expect(aggregated).toContain('read_chat_history');
+    expect(aggregated).toMatch(/^\[消息聚合\]/);
+    expect(aggregated).toContain('测试消息');
+    expect(aggregated).not.toContain('系统事件');
+    expect(aggregated).not.toContain('read_chat_history');
     expect(aggregated).not.toContain('[QQ私聊]');
 
     const idle = formatWakeupPrompt({

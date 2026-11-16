@@ -55,9 +55,11 @@ export interface WakeupPayload {
   from_name: string;
   content: string;
   quoted?: WakeupQuotedInfo;
-  /** 是否为系统内部生成的事件（定时任务、聚合投递、冷场搭话） */
+  /** 是否为系统内部生成的事件（定时任务、冷场搭话） */
   is_system?: boolean;
   /** 对应的强类型系统事件实体（由 SystemEventHub 统一注入） */
   system_event?: SystemWakeupEvent;
+  /** 消息聚合快照列表（当 trigger === 'aggregated' 时提供） */
+  aggregated_messages?: AggregatedMessage[];
   timestamp: number;
 }

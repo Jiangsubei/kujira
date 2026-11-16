@@ -201,15 +201,10 @@ describe('契约测试: 运行中新消息行为模式 (New Message Behavior: St
       peer: PEER_1,
       from_user: OPENID_1,
       from_name: '',
-      content: '系统事件：[消息聚合]',
+      content: '[消息聚合]',
       timestamp: Date.now(),
-      is_system: true,
-      system_event: {
-        kind: 'aggregated_messages',
-        peer: PEER_1,
-        messages: [{ short_id: 'msg_1', content: '在吗', time: Date.now() }],
-        reason: 'turn_end',
-      },
+      is_system: false,
+      aggregated_messages: [{ short_id: 'msg_1', content: '在吗', time: Date.now() }],
     });
 
     expect(userMsg).toBeDefined();

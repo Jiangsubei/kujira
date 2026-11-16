@@ -12,6 +12,9 @@ import type { OutboundBridgeLike } from './session/types.js';
 import type { ScheduledTaskEvent, SystemWakeupEvent, AggregatedMessagesEvent, IdleReplyEvent } from '../types/system-event.js';
 import type { WakeupPayload } from '../types/index.js';
 import { formatDateTime } from '../storage/time-parser.js';
+import { formatAggregatedPrompt, renderAggregatedMessageLines } from './external-prompt.js';
+
+export { formatAggregatedPrompt, renderAggregatedMessageLines };
 
 export interface SystemEventSessionManager {
   dispatchWakeup(
@@ -32,73 +35,14 @@ export function formatTimeOnly(timestamp: number): string {
 }
 
 /**
- * 把聚合池中的一条消息渲染为逐条段落（`序号. [短 ID] [时间] ...`）。
- * - 单条消息保持紧凑行内呈现：消息头、引用回复、正文与行内附件保持在同一行（与直接唤醒消息的语流格式完全对齐）；
- * - 用户正文原生的换行自然保留（后续行缩进），避免在单条消息内部生硬拆行导致语义断裂。
- */
-function renderAggregatedMessageLines(
-  messages: ReadonlyArray<{ short_id?: string; content: string; time: number; quoted?: { short_id?: string; time?: number; text: string }; attachments?: string[] }>
-): string[] {
-  const lines: string[] = [];
-  messages.forEach((message, index) => {
-    const shortId = typeof message.short_id === 'string' && message.short_id.trim() ? message.short_id.trim() : '';
-    const timeStr = message.time ? formatDateTime(message.time) : '';
-    const header = [shortId ? `[${shortId}]` : '', timeStr ? `[${timeStr}]` : '']
-      .filter(Boolean)
-      .join(' ');
-
-    const quoted = message.quoted;
-    let quotedStr = '';
-    if (quoted) {
-      const qShortId =
-        typeof quoted.short_id === 'string' && quoted.short_id.trim() ? quoted.short_id.trim() : '';
-      const qTime = typeof quoted.time === 'number' && quoted.time > 0 ? formatDateTime(quoted.time) : '';
-      const qHeader = [qShortId ? `[${qShortId}]` : '', qTime ? `[${qTime}]` : '']
-        .filter(Boolean)
-        .join(' ');
-      const qText = quoted.text ? ` ${quoted.text}` : '';
-      quotedStr = `[引用回复: "${qHeader}${qText}"]`;
-    }
-
-    let body = message.content ?? '';
-    const attachments = (message.attachments ?? []).filter(Boolean);
-    const missingAttachments: string[] = [];
-    for (const att of attachments) {
-      if (!body.includes(att)) {
-        missingAttachments.push(att);
-      }
-    }
-    if (missingAttachments.length > 0) {
-      body = body ? `${body} ${missingAttachments.join(' ')}` : missingAttachments.join(' ');
-    }
-
-    const linePrefix = `${index + 1}. ${header}`.trimEnd();
-    const inlineContent = [quotedStr, body].filter(Boolean).join(' ');
-
-    if (!inlineContent) {
-      lines.push(linePrefix);
-      return;
-    }
-
-    // 若正文原生包含换行符，首行紧接消息头，后续换行行适当缩进呈现
-    if (inlineContent.includes('\n')) {
-      const parts = inlineContent.split('\n');
-      lines.push(`${linePrefix} ${parts[0]}`.trimEnd());
-      for (let i = 1; i < parts.length; i++) {
-        lines.push(`   ${parts[i]}`.trimEnd());
-      }
-    } else {
-      lines.push(`${linePrefix} ${inlineContent}`.trimEnd());
-    }
-  });
-  return lines;
-}
-
-/**
  * 格式化系统事件的标准提示词文本（QQ 官方 Bot 单聊）。
  * 骨架：双换行分段、中文冒号标引、行为引导置底。
  */
 export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
+  if ((event as any)?.kind === 'aggregated_messages') {
+    return formatAggregatedPrompt(event as any);
+  }
+
   const now = event.timestamp || Date.now();
   const timeStr = formatDateTime(now);
 
@@ -113,41 +57,6 @@ export function formatSystemEventPrompt(event: SystemWakeupEvent): string {
         `系统事件：[定时任务]${taskTag}${timeStr ? ` [${timeStr}]` : ''}${ruleLine}\n\n` +
         `任务内容：\n` +
         `${event.prompt}\n\n` +
-        guide
-      );
-    }
-
-    case 'aggregated_messages': {
-      const messages = Array.isArray(event.messages) ? event.messages : [];
-
-      // 无消息快照的历史调用：保留「有新消息，去读历史」的兜底语义
-      if (messages.length === 0) {
-        const guide =
-          '（说明：用户在你的上一条回复之后又发来了新消息。' +
-          '你必须先调用 read_chat_history 工具，查看自你上次回复以来有什么新消息，再判断如何回复。' +
-          '如果此时回复会打扰用户，或者没有值得回应的内容，直接输出 [结束] 即可。' +
-          '表现自然，切勿向用户透露消息聚合、或系统唤醒等任何后台痕迹。）';
-
-        return (
-          `系统事件：[消息聚合]${timeStr ? ` [${timeStr}]` : ''}\n\n` +
-          `会话状态：检测到自上次回复以来有新的用户消息待查看。\n\n` +
-          guide
-        );
-      }
-
-      const count = messages.length;
-      const isTurnEnd = event.reason === 'turn_end';
-      const stateLine = isTurnEnd
-        ? `会话状态：你上一轮处理期间，用户又发来了 ${count} 条新消息。`
-        : `会话状态：自你上次回复以来，用户发来了 ${count} 条新消息。`;
-      const guide = isTurnEnd
-        ? '（说明：以上消息是在你上一轮回复过程中到达的。请先判断它们是否已经被你上一条回复覆盖，或者只是补充、闲聊、情绪表达而无需回应；若已经回应过，或此刻再回复会显得重复、打扰，直接输出 [结束] 即可。确实需要补充回应时，直接针对新内容自然作答；如需更早的上下文，可调用 read_chat_history。切勿向用户透露消息聚合或系统唤醒等任何后台痕迹。）'
-        : '（说明：以上是本轮周期内聚合的用户消息，已按时间顺序逐条列出，可直接针对内容回复；如需回顾更早的上下文，可调用 read_chat_history 查询。若此时回复会打扰用户，或没有值得回应的内容，直接输出 [结束] 即可。表现自然，切勿向用户透露消息聚合或系统唤醒等任何后台痕迹。）';
-
-      return (
-        `系统事件：[消息聚合]${timeStr ? ` [${timeStr}]` : ''}\n\n` +
-        `${stateLine}\n\n` +
-        `${renderAggregatedMessageLines(messages).join('\n')}\n\n` +
         guide
       );
     }
@@ -189,10 +98,62 @@ export class SystemEventHub {
 
   /** 分发单聊消息聚合回复唤醒（周期窗口到点，整批未回复消息一次性投递） */
   public async dispatchAggregatedMessages(
-    event: Omit<AggregatedMessagesEvent, 'kind'>,
+    event: AggregatedMessagesEvent,
     options?: { onMessageCreated?: (userMsg: any) => void }
   ): Promise<any> {
-    return this.dispatchSystemEvent({ kind: 'aggregated_messages', ...event }, options);
+    const peer = event.peer;
+    const now = event.timestamp || Date.now();
+    const promptText = formatAggregatedPrompt(event);
+
+    const trigger: WakeupPayload['trigger'] = 'aggregated';
+
+    let realFromUser = '';
+    const explicit = typeof event.fromUser === 'string' ? event.fromUser.trim() : '';
+    if (explicit) {
+      realFromUser = explicit;
+    } else if (this.options.resolveOpenid) {
+      try {
+        realFromUser = this.options.resolveOpenid(peer)?.trim() ?? '';
+      } catch {
+        realFromUser = '';
+      }
+    }
+
+    const outboundBridge = this.options.outboundBridge ?? this.options.sessionManager.getOutboundBridge?.();
+    if (outboundBridge) {
+      outboundBridge.trackInboundContext(peer, {
+        from_user: realFromUser,
+        trigger,
+        is_synthetic: false,
+      });
+    }
+
+    const payload: WakeupPayload = {
+      peer,
+      trigger,
+      from_name: '',
+      from_user: realFromUser,
+      content: promptText,
+      timestamp: now,
+      is_system: false,
+      aggregated_messages: event.messages,
+      ...(event.intervalMinutes !== undefined
+        ? { aggregation_interval_mins: event.intervalMinutes }
+        : {}),
+    };
+
+    return this.options.sessionManager.dispatchWakeup(payload, {
+      onMessageCreated: (userMsg) => {
+        if (outboundBridge && userMsg?.id) {
+          outboundBridge.trackPendingMessage?.(userMsg.id, peer, {
+            from_user: realFromUser,
+            trigger,
+            is_synthetic: false,
+          });
+        }
+        options?.onMessageCreated?.(userMsg);
+      },
+    });
   }
 
   /** 分发单聊冷场主动搭话唤醒 */
@@ -210,19 +171,17 @@ export class SystemEventHub {
     event: SystemWakeupEvent,
     options?: { onMessageCreated?: (userMsg: any) => void }
   ): Promise<any> {
+    if ((event as any)?.kind === 'aggregated_messages') {
+      return this.dispatchAggregatedMessages(event as any, options);
+    }
+
     const peer = event.peer;
     const now = event.timestamp || Date.now();
     const promptText = formatSystemEventPrompt(event);
 
-    // 事件类型 → 底层唤醒触发类型映射（聚合投递仍属系统合成事件，审批保持 Fail-Closed）
     const trigger: WakeupPayload['trigger'] =
-      event.kind === 'aggregated_messages'
-        ? 'aggregated'
-        : event.kind === 'idle_reply'
-          ? 'idle_reply'
-          : 'scheduled';
+      event.kind === 'idle_reply' ? 'idle_reply' : 'scheduled';
 
-    // 出站合成上下文自动挂载：仅传 is_synthetic: true，绝不传入 msg_id: undefined 擦除历史有效被动锚点
     const outboundBridge = this.options.outboundBridge ?? this.options.sessionManager.getOutboundBridge?.();
     if (outboundBridge) {
       outboundBridge.trackInboundContext(peer, {
@@ -232,42 +191,17 @@ export class SystemEventHub {
       });
     }
 
-    // 构造干净的 WakeupPayload。
-    // 关键区分：聚合投递来自真实用户消息（携带真实 from_user），具备审批发起人资格；
-    // 定时任务与冷场搭话为系统自发，from_user 严格留空，审批保持 Fail-Closed。
-    const isAggregated = event.kind === 'aggregated_messages';
-    let realFromUser = '';
-    if (isAggregated) {
-      const explicit = typeof event.fromUser === 'string' ? event.fromUser.trim() : '';
-      if (explicit) {
-        realFromUser = explicit;
-      } else if (this.options.resolveOpenid) {
-        try {
-          realFromUser = this.options.resolveOpenid(peer)?.trim() ?? '';
-        } catch {
-          realFromUser = '';
-        }
-      }
-    }
-
     const payload: WakeupPayload = {
       peer,
       trigger,
       from_name: '',
-      from_user: realFromUser,
+      from_user: '',
       content: promptText,
       timestamp: now,
       is_system: true,
       system_event: event,
       ...(event.kind === 'scheduled_task'
         ? { task_id: event.taskId, task_type: event.taskType, task_rule: event.taskRule }
-        : {}),
-      ...(isAggregated
-        ? {
-            ...(event.intervalMinutes !== undefined
-              ? { aggregation_interval_mins: event.intervalMinutes }
-              : {}),
-          }
         : {}),
       ...(event.kind === 'idle_reply' ? { idle_minutes: event.idleMinutes } : {}),
     };
