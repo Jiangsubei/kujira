@@ -80,7 +80,6 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
           payload,
         },
       })),
-      sendC2CStreamMessage: vi.fn(),
       sendInputNotify: vi.fn(),
       deleteC2CMessage: vi.fn(),
       uploadC2CMedia: vi.fn(),
@@ -239,7 +238,6 @@ describe('契约 1: send_qq_message 工具装配与单聊隔离契约', () => {
           },
         };
       }),
-      sendC2CStreamMessage: vi.fn(),
       sendInputNotify: vi.fn(),
       deleteC2CMessage: vi.fn(),
       uploadC2CMedia: vi.fn(),

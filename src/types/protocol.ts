@@ -150,33 +150,6 @@ export interface QQSendMessageResponse {
   };
 }
 
-/** 单聊流式消息发送请求体（POST /v2/users/{openid}/stream_messages） */
-export interface QQStreamMessagePayload {
-  /** 实测均支持；工程侧默认使用 'append' 以规避 replace 前缀篡改报错 40007 */
-  input_mode: 'append' | 'replace';
-  /** 1=流式输出中, 10=最终完成帧 */
-  input_state: 1 | 10;
-  /** 从 0 开始单调递增的分片序号 */
-  index: number;
-  content_type: 'markdown' | 'text';
-  /** 单次请求实测上限 [20414, 20426) UTF-8 字节 */
-  content_raw: string;
-  /** 首片返回 id 后，后续分片必须传入 */
-  stream_msg_id?: string;
-  /** 流式接口严禁无 msg_id 主动发送（必报 50015001） */
-  msg_id: string;
-  /** 与普通/富媒体共享 per-msg_id 去重槽位 */
-  msg_seq: number;
-}
-
-/** 单聊流式消息响应体 */
-export interface QQStreamMessageResponse {
-  id: string;
-  /** 实测全程恒为 0，不可作为长度预算依据 */
-  remain_msg_len?: number;
-  timestamp?: string;
-}
-
 /** 官方富媒体上传文件类型：1=图片, 2=视频, 3=语音, 4=文件 */
 export type QQMediaFileType = 1 | 2 | 3 | 4;
 

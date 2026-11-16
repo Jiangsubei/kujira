@@ -96,7 +96,6 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
           },
         };
       }),
-      sendC2CStreamMessage: vi.fn(),
       sendInputNotify: vi.fn(),
       deleteC2CMessage: vi.fn(),
       emitMessageSent: vi.fn(),

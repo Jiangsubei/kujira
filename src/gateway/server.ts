@@ -8,7 +8,6 @@
  * 3. 安全事件分发：onC2CMessage、onDispatch（安全脱敏记录 FRIEND_ADD 等非消息事件）、onReady、onMessageSent；
  * 4. 完整 REST 客户端（不抛未包装异常，统一返回 QQApiResult，日志脱敏不输出 secret/token/query）：
  *    - sendC2CMessage (`POST /v2/users/{openid}/messages`)
- *    - sendC2CStreamMessage (`POST /v2/users/{openid}/stream_messages`)
  *    - sendInputNotify (`msg_type=6, input_type=1, input_second=60`)
  *    - deleteC2CMessage (`DELETE /v2/users/{openid}/messages/{message_id}`)
  *    - uploadC2CMedia（严格 1-based parts[].index 升序 + 累积 offset + 单片 block_size + 裸 PUT + upload_part_finish + /files，
@@ -49,8 +48,6 @@ import type {
   QQReadyEvent,
   QQSendMessagePayload,
   QQSendMessageResponse,
-  QQStreamMessagePayload,
-  QQStreamMessageResponse,
   QQUploadPrepareResponse,
   QqCredential,
 } from '../types/index.js';
@@ -171,7 +168,6 @@ const DEFAULT_AUTH_RETRY_DELAY_MS = 200;
 const DEFAULT_MEDIA_CACHE_TTL_SEC = 86_400;
 const TOKEN_401_RETRY_CODE = 401;
 const ERR_INVALID_MARKDOWN = 40034011;
-const ERR_STREAM_MISSING_MSG_ID = 50015001;
 
 const OP_DISPATCH = 0;
 const OP_HEARTBEAT = 1;
@@ -1019,31 +1015,6 @@ export class KujiraGatewayClient {
     }
 
     return res;
-  }
-
-  /**
-   * 发送单聊流式消息 (`POST /v2/users/{openid}/stream_messages`)。
-   * 护栏：必须携带有效入站 `msg_id`（无 `msg_id` 必报 `50015001`）。
-   */
-  async sendC2CStreamMessage(
-    openid: string,
-    payload: QQStreamMessagePayload
-  ): Promise<QQApiResult<QQStreamMessageResponse>> {
-    if (!openid || typeof openid !== 'string' || !isValidOpenid(openid)) {
-      return { ok: false, status: 400, message: '无效的目标 openid', body: null as any };
-    }
-    if (!payload?.msg_id || typeof payload.msg_id !== 'string' || payload.msg_id.trim() === '') {
-      return {
-        ok: false,
-        status: 400,
-        code: ERR_STREAM_MISSING_MSG_ID,
-        message: '流式消息必须携带有效入站 msg_id（无 msg_id 必报 50015001）',
-        body: null as any,
-      };
-    }
-
-    const url = `${this.apiBase}/v2/users/${encodeURIComponent(openid)}/stream_messages`;
-    return this.authedJsonRequest<QQStreamMessageResponse>('POST', url, payload);
   }
 
   /**

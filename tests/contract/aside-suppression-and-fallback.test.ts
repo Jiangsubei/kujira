@@ -115,7 +115,6 @@ describe('契约 1 ~ 4: OutboundStreamBridge 用户侧静默原则单元契约',
         sent.push({ openid, payload });
         return { ok: true, status: 200, body: { id: 'ROBOT1.0_MOCK_OUT' } };
       },
-      sendC2CStreamMessage: async () => ({ ok: true, status: 200, body: { id: 'STREAM_1' } }),
       sendInputNotify: async () => ({ ok: true, status: 200, body: { id: 'NOTIFY_1' } }),
       deleteC2CMessage: async () => ({ ok: true, status: 200, body: {} }),
       uploadC2CMedia: async () => ({ ok: true, status: 200, body: { file_info: 'fi' } }),

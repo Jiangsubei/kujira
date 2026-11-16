@@ -94,7 +94,6 @@ describe('契约 1 ~ 6: send_qq_message 单聊引用与分片规则契约', () =
           },
         };
       }),
-      sendC2CStreamMessage: vi.fn(),
       sendInputNotify: vi.fn(),
       deleteC2CMessage: vi.fn(),
       uploadC2CMedia: vi.fn(),

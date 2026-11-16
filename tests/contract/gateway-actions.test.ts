@@ -6,7 +6,6 @@
  * - `getAccessToken` singleflight 并发合并、提前 60s (`QQ_TOKEN_REFRESH_MARGIN_MS`) 自动刷新、401 退避重取；
  * - WSS Gateway `HELLO` -> `IDENTIFY (intents = 1 << 25)` -> `READY` -> `getStatus()` / `onC2CMessage` / `onDispatch('FRIEND_ADD')`；
  * - `sendC2CMessage`: `msg_type=2` 空内容本地拦截 (`40034011`) & 剔除冗余 `content`、`msg_type=0`、`onMessageSent` 事件；
- * - `sendC2CStreamMessage`: 空 `msg_id` 本地拦截 (`50015001`) 与合法发送；
  * - `sendInputNotify`: `msg_type=6` 跳过 `onMessageSent` 自记录；
  * - `deleteC2CMessage`: 支持 `?hidetip=true`；
  * - `uploadC2CMedia`: 1-based `parts[].index` 升序 + `block_size` 四步分片 + 裸 PUT + `media_upload_cache` 24h 复用 + 软限降级 `file_type=4` + `>200MB` 硬上限拒收；
@@ -343,9 +342,6 @@ describe('契约测试: KujiraGatewayClient Official Bot v2 全协议动作契�
           ext_info: { ref_idx: `REFIDX_OUT_${outIdx}` },
         });
       }
-      if (url.endsWith('/stream_messages') && method === 'POST') {
-        return jsonResponse({ id: 'STREAM_OUT_1', remain_msg_len: 0 });
-      }
       if (method === 'DELETE') {
         return jsonResponse({});
       }
@@ -409,34 +405,7 @@ describe('契约测试: KujiraGatewayClient Official Bot v2 全协议动作契�
       text: '纯文本回复',
     });
 
-    // 4. sendC2CStreamMessage 空 msg_id 本地拦截 50015001
-    const countBeforeStream = requests.length;
-    const badStream = await client.sendC2CStreamMessage(MOCK_OPENID, {
-      input_mode: 'append',
-      input_state: 1,
-      index: 0,
-      content_type: 'markdown',
-      content_raw: 'delta',
-      msg_id: '   ',
-      msg_seq: 3,
-    });
-    expect(badStream.ok).toBe(false);
-    expect(badStream.code).toBe(50015001);
-    expect(requests).toHaveLength(countBeforeStream);
-
-    const goodStream = await client.sendC2CStreamMessage(MOCK_OPENID, {
-      input_mode: 'append',
-      input_state: 1,
-      index: 0,
-      content_type: 'markdown',
-      content_raw: 'delta',
-      msg_id: 'ROBOT1.0_IN_1',
-      msg_seq: 3,
-    });
-    expect(goodStream.ok).toBe(true);
-    expect(goodStream.body.id).toBe('STREAM_OUT_1');
-
-    // 5. sendInputNotify msg_type=6 跳过 onMessageSent 自记录
+    // 4. sendInputNotify msg_type=6 跳过 onMessageSent 自记录
     const notifyRes = await client.sendInputNotify(MOCK_OPENID, 'ROBOT1.0_IN_1', 4);
     expect(notifyRes.ok).toBe(true);
     const notifyReq = requests[requests.length - 1]!;
@@ -448,7 +417,7 @@ describe('契约测试: KujiraGatewayClient Official Bot v2 全协议动作契�
     });
     expect(sentEvents).toHaveLength(2); // 未增加
 
-    // 6. deleteC2CMessage ?hidetip=true 与默认撤回
+    // 5. deleteC2CMessage ?hidetip=true 与默认撤回
     const delHide = await client.deleteC2CMessage(MOCK_OPENID, 'ROBOT1.0_OUT_1', true);
     expect(delHide.ok).toBe(true);
     expect(requests[requests.length - 1]!.method).toBe('DELETE');

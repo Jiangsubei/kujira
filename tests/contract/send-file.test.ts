@@ -100,7 +100,6 @@ function stubGateway(overrides: Record<string, any> = {}, targetDb?: MessageData
         },
       };
     }),
-    sendC2CStreamMessage: vi.fn(),
     sendInputNotify: vi.fn(),
     deleteC2CMessage: vi.fn(),
     emitMessageSent: vi.fn(),
