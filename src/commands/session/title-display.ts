@@ -29,7 +29,7 @@ export function resolveBaseSessionTitle(
 }
 
 /**
- * 解析指定 peer 下全部会话的展示条目（升序：旧→新，序号 1..N 与 /会话 <序号> 严格对齐）。
+ * 解析指定 peer 下全部会话的展示条目（降序：新→旧，序号 1..N 与 /会话 <序号> 严格对齐）。
  * 仅当同一 peer 下存在多个相同基础标题时，才为重名组内会话追加版本后缀 `(#N)`。
  */
 export function resolvePeerSessionDisplayEntries(
@@ -40,7 +40,7 @@ export function resolvePeerSessionDisplayEntries(
   const rawSessions = sm?.listPeerSessionIds?.(peer) ?? [];
   const sessions =
     rawSessions.length > 0
-      ? rawSessions
+      ? [...rawSessions].reverse()
       : currentSidFallback
         ? [currentSidFallback]
         : [];

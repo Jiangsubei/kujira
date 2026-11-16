@@ -293,9 +293,9 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       expect(listRes.handled).toBe(true);
       expect(listRes.success).toBe(true);
       expect(listRes.reply).toContain('历史会话列表');
-      expect(listRes.reply).toContain('3. [当前] 新会话 (#3)');
+      expect(listRes.reply).toContain('1. [当前] 新会话 (#3)');
       expect(listRes.reply).toContain('2. 新会话 (#2)');
-      expect(listRes.reply).toContain('1. 单聊调试主题');
+      expect(listRes.reply).toContain('3. 单聊调试主题');
       expect(listRes.reply).not.toContain('单聊调试主题 (#1)');
       expect(listRes.reply).not.toContain(`[kujira-user-${hash}`);
       expect(listRes.reply).toContain('- 按标题切换：/会话 <标题或关键字>');
@@ -303,8 +303,8 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       expect(listRes.reply).not.toContain('私聊:');
       expect(listRes.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
 
-      // 1. 按序号切换
-      const resume1Res = await handleSlashCommand('/会话 1', {
+      // 1. 按序号切换（3 对应列表第 3 行的最早会话「单聊调试主题」）
+      const resume1Res = await handleSlashCommand('/会话 3', {
         userId: peer,
         session: s3,
         ctx: booted.ctx,
@@ -417,9 +417,9 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
         sessionManager,
       });
       expect(listRes.success).toBe(true);
-      expect(listRes.reply).toContain('3. [当前] 日常闲聊 (#3)');
+      expect(listRes.reply).toContain('1. [当前] 日常闲聊 (#3)');
       expect(listRes.reply).toContain('2. 日常闲聊 (#2)');
-      expect(listRes.reply).toContain('1. 工作讨论');
+      expect(listRes.reply).toContain('3. 工作讨论');
       expect(listRes.reply).not.toContain('工作讨论 (#1)');
       expect(listRes.reply).not.toContain(`[kujira-user-${hash}`);
 
@@ -455,8 +455,8 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       expect(ambiguousRes.error).toContain('发现多个匹配的会话');
       expect(ambiguousRes.error).toContain('/会话 <序号>');
       expect(ambiguousRes.error).toContain('/会话 日常闲聊 (#3)');
+      expect(ambiguousRes.error).toContain('- 1. 日常闲聊 (#3)');
       expect(ambiguousRes.error).toContain('- 2. 日常闲聊 (#2)');
-      expect(ambiguousRes.error).toContain('- 3. 日常闲聊 (#3)');
       expect(ambiguousRes.error).not.toContain(`[kujira-user-${hash}`);
 
       // 输入完整带版本标题可直接命中切换
@@ -470,8 +470,8 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       expect(exactDupRes.reply).toBe('已切换到会话：日常闲聊 (#2)');
       expect(sessionManager.peerToSessionId(peer)).toBe(`kujira-user-${hash}-2`);
 
-      // 按序号也可直接切换
-      const byNumRes = await handleSlashCommand('/会话 3', {
+      // 按序号也可直接切换（序号 1 对应当前最新的日常闲聊 (#3)）
+      const byNumRes = await handleSlashCommand('/会话 1', {
         userId: peer,
         session: a2.session,
         ctx: booted.ctx,

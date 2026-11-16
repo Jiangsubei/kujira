@@ -55,7 +55,7 @@ export async function handleSessionCommand(
       };
     }
     const currentSid = sm.peerToSessionId(peer);
-    const lines = [...entries].reverse().map((entry) => {
+    const lines = entries.map((entry) => {
       const isCurrent = entry.sid === currentSid ? ' [当前]' : '';
       return `${entry.num}.${isCurrent} ${entry.label}`;
     });
@@ -85,7 +85,7 @@ export async function handleSessionCommand(
       const candidates = matched
         .map((entry) => `- ${entry.num}. ${entry.label}`)
         .join('\n');
-      const exampleLabel = matched[matched.length - 1]!.label;
+      const exampleLabel = matched[0]!.label;
       return {
         handled: true,
         success: false,

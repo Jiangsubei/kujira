@@ -207,9 +207,9 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
         sessionManager,
       });
       expect(untitledList.success).toBe(true);
-      expect(untitledList.reply).toContain('3. [当前] 代码审查');
+      expect(untitledList.reply).toContain('1. [当前] 代码审查');
       expect(untitledList.reply).toContain('2. 新会话 (#2)');
-      expect(untitledList.reply).toContain('1. 新会话 (#1)');
+      expect(untitledList.reply).toContain('3. 新会话 (#1)');
       expect(untitledList.reply).not.toContain('代码审查 (#3)');
       expect(untitledList.reply).not.toContain(`[${SID}`);
 
@@ -245,9 +245,9 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
         sessionManager,
       });
       expect(dupList.success).toBe(true);
-      expect(dupList.reply).toContain('3. [当前] 代码审查');
+      expect(dupList.reply).toContain('1. [当前] 代码审查');
       expect(dupList.reply).toContain('2. 日常闲聊 (#2)');
-      expect(dupList.reply).toContain('1. 日常闲聊 (#1)');
+      expect(dupList.reply).toContain('3. 日常闲聊 (#1)');
       expect(dupList.reply).not.toContain(`[${SID}`);
 
       const multiMatch = await handleSessionCommand('日常闲聊', {
@@ -258,8 +258,8 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
       });
       expect(multiMatch.success).toBe(false);
       expect(multiMatch.error).toContain('发现多个匹配的会话');
-      expect(multiMatch.error).toContain('- 1. 日常闲聊 (#1)');
       expect(multiMatch.error).toContain('- 2. 日常闲聊 (#2)');
+      expect(multiMatch.error).toContain('- 3. 日常闲聊 (#1)');
 
       const resumeSpy = vi.spyOn(sessionManager, 'resumeSession').mockReturnValue(true);
       try {
@@ -276,15 +276,72 @@ describe('Kujira 顶层工作区与原生 AI 会话标题契约测试', () => {
         });
         expect(resumeSpy).toHaveBeenLastCalledWith(PEER, `${SID}-2`);
 
-        const switchByNum1 = await handleSessionCommand('1', {
+        const switchByNum3 = await handleSessionCommand('3', {
           userId: PEER,
           session: { id: `${SID}-2` } as any,
           ctx,
           sessionManager,
         });
-        expect(switchByNum1.success).toBe(true);
-        expect(switchByNum1.reply).toBe('已切换到会话：日常闲聊 (#1)');
+        expect(switchByNum3.success).toBe(true);
+        expect(switchByNum3.reply).toBe('已切换到会话：日常闲聊 (#1)');
         expect(resumeSpy).toHaveBeenLastCalledWith(PEER, SID);
+
+        const switchByNum1 = await handleSessionCommand('1', {
+          userId: PEER,
+          session: { id: SID } as any,
+          ctx,
+          sessionManager,
+        });
+        expect(switchByNum1.success).toBe(true);
+        expect(switchByNum1.reply).toBe('已切换到会话：代码审查');
+        expect(resumeSpy).toHaveBeenLastCalledWith(PEER, `${SID}-3`);
+      } finally {
+        resumeSpy.mockRestore();
+      }
+    });
+
+    it('契约: 2 个会话场景下序号从上至下正序映射，/会话 2 准确切换到旧会话，/会话 1 切换到最新会话', async () => {
+      // SID 为旧会话，SID-2 为当前最新会话
+      await sessionManager.getOrCreateAgent(PEER);
+      sessionManager.markSessionCleared(PEER);
+      await sessionManager.getOrCreateAgent(PEER);
+
+      titleStore.set(SID, '大肥鱼在干什么呢');
+      // SID-2 保持未命名「新会话」
+
+      const listRes = await handleSessionCommand('', {
+        userId: PEER,
+        session: { id: `${SID}-2` } as any,
+        ctx,
+        sessionManager,
+      });
+      expect(listRes.success).toBe(true);
+      expect(listRes.reply).toContain('1. [当前] 新会话');
+      expect(listRes.reply).toContain('2. 大肥鱼在干什么呢');
+
+      const resumeSpy = vi.spyOn(sessionManager, 'resumeSession').mockReturnValue(true);
+      try {
+        // 用户输入 /会话 2 必须准确切换到底部的「大肥鱼在干什么呢」(SID)，绝不误切回「新会话」
+        const switchOld = await handleSessionCommand('2', {
+          userId: PEER,
+          session: { id: `${SID}-2` } as any,
+          ctx,
+          sessionManager,
+        });
+        expect(switchOld.success).toBe(true);
+        expect(switchOld.reply).toBe('已切换到会话：大肥鱼在干什么呢');
+        expect(resumeSpy).toHaveBeenLastCalledWith(PEER, SID);
+
+        // 用户输入 /会话 1 切换到顶部的「新会话」(SID-2)
+        const switchNew = await handleSessionCommand('1', {
+          userId: PEER,
+          session: { id: SID } as any,
+          ctx,
+          sessionManager,
+        });
+        expect(switchNew.success).toBe(true);
+        expect(switchNew.reply).toBe('已切换到会话：新会话');
+        expect(resumeSpy).toHaveBeenLastCalledWith(PEER, `${SID}-2`);
       } finally {
         resumeSpy.mockRestore();
       }
