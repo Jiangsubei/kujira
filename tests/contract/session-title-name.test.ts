@@ -143,8 +143,8 @@ describe('契约测试: 原生 AI 会话标题与 /会话 /状态 展示对齐',
       });
       expect(listRes.handled).toBe(true);
       expect(listRes.success).toBe(true);
-      expect(listRes.reply).toContain('2. [当前] 新会话');
-      expect(listRes.reply).toContain('1. 调试图片下载失败');
+      expect(listRes.reply).toContain('1. [当前] 新会话');
+      expect(listRes.reply).toContain('2. 调试图片下载失败');
       expect(listRes.reply).not.toContain('调试图片下载失败 (#1)');
       expect(listRes.reply).not.toContain('新会话 #2');
       expect(listRes.reply).not.toContain('新会话 (#2)');
@@ -220,8 +220,8 @@ describe('契约测试: 原生 AI 会话标题与 /会话 /状态 展示对齐',
         sessionManager,
       });
       expect(untitledList.success).toBe(true);
-      expect(untitledList.reply).toContain('2. [当前] 新会话 (#2)');
-      expect(untitledList.reply).toContain('1. 新会话 (#1)');
+      expect(untitledList.reply).toContain('1. [当前] 新会话 (#2)');
+      expect(untitledList.reply).toContain('2. 新会话 (#1)');
       expect(untitledList.reply).not.toContain(`[${MOCK_SID_3}`);
 
       const untitledMulti = await handleSlashCommand('/会话 新会话', {
@@ -232,8 +232,8 @@ describe('契约测试: 原生 AI 会话标题与 /会话 /状态 展示对齐',
       });
       expect(untitledMulti.success).toBe(false);
       expect(untitledMulti.error).toContain('发现多个匹配的会话');
-      expect(untitledMulti.error).toContain('- 1. 新会话 (#1)');
-      expect(untitledMulti.error).toContain('- 2. 新会话 (#2)');
+      expect(untitledMulti.error).toContain('- 1. 新会话 (#2)');
+      expect(untitledMulti.error).toContain('- 2. 新会话 (#1)');
 
       // 两个同名「日常闲聊」与一个无重名「架构讨论」共存
       a1.session.append('session/title', {
@@ -265,9 +265,9 @@ describe('契约测试: 原生 AI 会话标题与 /会话 /状态 展示对齐',
         sessionManager,
       });
       expect(mixedList.success).toBe(true);
-      expect(mixedList.reply).toContain('3. [当前] 架构讨论');
+      expect(mixedList.reply).toContain('1. [当前] 架构讨论');
       expect(mixedList.reply).toContain('2. 日常闲聊 (#2)');
-      expect(mixedList.reply).toContain('1. 日常闲聊 (#1)');
+      expect(mixedList.reply).toContain('3. 日常闲聊 (#1)');
       expect(mixedList.reply).not.toContain('架构讨论 (#3)');
       expect(mixedList.reply).not.toContain(`[${MOCK_SID_3}`);
 
@@ -300,8 +300,8 @@ describe('契约测试: 原生 AI 会话标题与 /会话 /状态 展示对齐',
       });
       expect(multiMatch.success).toBe(false);
       expect(multiMatch.error).toContain('发现多个匹配的会话');
-      expect(multiMatch.error).toContain('- 1. 日常闲聊 (#1)');
       expect(multiMatch.error).toContain('- 2. 日常闲聊 (#2)');
+      expect(multiMatch.error).toContain('- 3. 日常闲聊 (#1)');
       expect(multiMatch.error).toContain('/会话 <序号>');
       expect(multiMatch.error).toContain('/会话 日常闲聊 (#2)');
 
