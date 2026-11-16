@@ -292,6 +292,18 @@ export class SessionManager {
     return this.modelSelector.resolveDefaultEffort(provider, model);
   }
 
+  public getConfiguredDefaultModel(): ModelSelection | undefined {
+    return this.modelSelector.getConfiguredDefaultModel();
+  }
+
+  public setConfiguredDefaultModel(provider: string, model: string, reasoningEffort?: any): void {
+    this.modelSelector.setConfiguredDefaultModel(provider, model, reasoningEffort);
+  }
+
+  public async checkModelExists(provider: string, model: string): Promise<boolean> {
+    return this.modelSelector.checkModelExists(provider, model);
+  }
+
   public getKujiraDefaultModel(): ModelSelection {
     return this.modelSelector.getKujiraDefaultModel();
   }
@@ -835,20 +847,23 @@ export class SessionManager {
     this.pendingClearedSessionId.set(peer, nextSessionId);
     this.peerCurrentSessionId.set(peer, nextSessionId);
 
-    // 继承前序会话的模型与思考深度
+    // 继承前序会话的思考深度（独立 Feature 保留，与模型选择解耦）
     const prevSel = currentSid ? this.modelSelector.getModelSelection(currentSid) : undefined;
     const dbPrev = this.persistence.getSessionState(peer);
     const defaultSel = this.getDefaultModelSelection();
-    const inheritedProvider = prevSel?.provider || dbPrev?.model_provider || defaultSel.provider;
-    const inheritedModel = prevSel?.model || dbPrev?.model_name || defaultSel.model;
-    const inheritedEffort =
-      prevSel?.reasoningEffort ?? dbPrev?.model_reasoning_effort ?? defaultSel.reasoningEffort;
+
+    // 新建会话模型选择：优先使用用户配置的默认模型，未配置则使用默认选择，不再盲目继承旧会话的临时切换模型
+    const configuredDefault = typeof this.getConfiguredDefaultModel === 'function' ? this.getConfiguredDefaultModel() : undefined;
+    const targetProvider = configuredDefault ? configuredDefault.provider : defaultSel.provider;
+    const targetModel = configuredDefault ? configuredDefault.model : defaultSel.model;
+    const targetEffort =
+      prevSel?.reasoningEffort ?? dbPrev?.model_reasoning_effort ?? configuredDefault?.reasoningEffort ?? defaultSel.reasoningEffort;
 
     this.modelSelector.setModelSelection(
       nextSessionId,
-      inheritedProvider,
-      inheritedModel,
-      inheritedEffort,
+      targetProvider,
+      targetModel,
+      targetEffort,
       peer,
       false
     );
@@ -859,10 +874,30 @@ export class SessionManager {
       cleared_round: round,
       cleared_version: nextVersion,
       updated_at: Date.now(),
-      model_provider: inheritedProvider,
-      model_name: inheritedModel,
-      model_reasoning_effort: inheritedEffort,
+      model_provider: targetProvider,
+      model_name: targetModel,
+      model_reasoning_effort: targetEffort,
     });
+
+    if (configuredDefault && typeof this.checkModelExists === 'function') {
+      void (async () => {
+        try {
+          const exists = await this.checkModelExists(
+            configuredDefault.provider,
+            configuredDefault.model
+          );
+          if (!exists) {
+            const bridge = this.agentRunner.getOutboundBridge();
+            if (bridge && typeof (bridge as any).sendTextReply === 'function') {
+              await (bridge as any).sendTextReply(
+                peer,
+                `选择的模型已删除或不存在（${configuredDefault.provider} / ${configuredDefault.model}），请使用 /模型 重新设置。`
+              );
+            }
+          }
+        } catch {}
+      })();
+    }
 
     this.agentRunner.getOutboundBridge()?.clearInboundContext?.(peer);
 

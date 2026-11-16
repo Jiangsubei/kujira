@@ -127,6 +127,15 @@ export async function handleThinkCommand(
   try {
     if (isGlobal) {
       context.sessionManager?.setKujiraDefaultModel(curProv, curMod, targetEffort);
+      context.sessionManager?.setModelSelection(
+        context.session.id,
+        curProv,
+        curMod,
+        targetEffort
+      );
+      if (agent && (agent as any).modelSelection?.current) {
+        (agent as any).modelSelection.current.reasoningEffort = targetEffort;
+      }
       const allSids = context.sessionManager?.getAllKujiraSessionIds() || [context.session.id];
       for (const sid of allSids) {
         try {

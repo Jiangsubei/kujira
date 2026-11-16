@@ -24,14 +24,14 @@ export async function handleModelCommand(
     reasoningEffort?: string
   ) => safeSyncSessionModel(context.ctx, sessionId, provider, model, reasoningEffort);
 
-  // 1. 参数拆解：分离 --global / -g / --全局 与目标模型参数
-  let isGlobal = false;
+  // 1. 参数拆解：分离 -默认 与目标模型参数
+  let isSetDefault = false;
   const rawArgs = (args || '').trim();
   const tokens = rawArgs.split(/\s+/).filter(Boolean);
   const filteredTokens: string[] = [];
   for (const tok of tokens) {
-    if (tok === '--global' || tok === '-g' || tok === '--全局') {
-      isGlobal = true;
+    if (tok === '-默认') {
+      isSetDefault = true;
     } else {
       filteredTokens.push(tok);
     }
@@ -44,16 +44,9 @@ export async function handleModelCommand(
   const curProv = curSel?.provider || (agent as any)?.options?.provider || 'deepseek-official';
   const curMod = curSel?.model || (agent as any)?.options?.model || 'deepseek-v4-flash';
   const curEffort = curSel?.reasoningEffort;
-  const kujiraDefault = context.sessionManager?.getKujiraDefaultModel() || {
-    provider: curProv,
-    model: curMod,
-  };
-  const hostDefault = context.sessionManager?.getHostDefaultModelSelection() || {
-    provider: 'deepseek-official',
-    model: 'deepseek-v4-flash',
-  };
+  const configuredDefault = context.sessionManager?.getConfiguredDefaultModel?.();
 
-  // 2. 空模型参数时：列出当前会话、全局默认及可用模型列表
+  // 2. 空模型参数时：列出当前会话模型、新建会话默认模型（若有）及可用模型列表
   if (!modelArg) {
     const groups = new Map<string, DiscoveredModelInfo[]>();
     for (const item of discovered) {
@@ -70,10 +63,19 @@ export async function handleModelCommand(
       listSections.push(`[${groupName}]\n${lines.join('\n')}`);
     }
 
+    const headerLines: string[] = [
+      `当前会话模型：${curProv} / ${curMod}${curEffort ? ` (思考: ${curEffort})` : ''}`,
+    ];
+    if (configuredDefault) {
+      headerLines.push(
+        `新建会话默认：${configuredDefault.provider} / ${configuredDefault.model}${
+          configuredDefault.reasoningEffort ? ` (思考: ${configuredDefault.reasoningEffort})` : ''
+        }`
+      );
+    }
+
     const reply = [
-      `当前会话模型：${curProv} / ${curMod}`,
-      `Kujira 全局默认：${kujiraDefault.provider} / ${kujiraDefault.model}`,
-      `宿主全局默认：${hostDefault.provider} / ${hostDefault.model}`,
+      ...headerLines,
       '',
       '可用模型列表：',
       listSections.join('\n\n'),
@@ -83,7 +85,7 @@ export async function handleModelCommand(
       '- 空格智能匹配：/模型 deepseek flash',
       '- 指定供应商：/模型 opencode-go deepseek-flash',
       '- 供应商斜杠语法：/模型 deepseek-official/deepseek-v4-pro',
-      '- 所有会话全局生效：在末尾追加 -g 或 --全局',
+      '- 设为新建会话默认：在末尾追加 -默认',
     ].join('\n');
 
     return {
@@ -122,7 +124,7 @@ export async function handleModelCommand(
       targetModel = exactModelHits[0].model;
     } else if (exactModelHits.length > 1) {
       const candidates = exactModelHits
-        .map((m) => `- /模型 ${m.provider} ${m.model}${isGlobal ? ' -g' : ''}`)
+        .map((m) => `- /模型 ${m.provider} ${m.model}${isSetDefault ? ' -默认' : ''}`)
         .join('\n');
       return {
         handled: true,
@@ -169,7 +171,7 @@ export async function handleModelCommand(
       targetModel = matches[0].model;
     } else if (matches.length > 1) {
       const candidates = matches
-        .map((m) => `- /模型 ${m.provider} ${m.model}${isGlobal ? ' -g' : ''}`)
+        .map((m) => `- /模型 ${m.provider} ${m.model}${isSetDefault ? ' -默认' : ''}`)
         .join('\n');
       return {
         handled: true,
@@ -223,50 +225,30 @@ export async function handleModelCommand(
   }
 
   try {
-    if (isGlobal) {
-      context.sessionManager?.setKujiraDefaultModel(
-        targetProvider,
-        targetModel,
-        targetEffort
-      );
+    // 无论是否带 -默认，均先切换当前单聊会话模型
+    context.sessionManager?.setModelSelection(
+      context.session.id,
+      targetProvider,
+      targetModel,
+      targetEffort
+    );
 
-      const allSids = context.sessionManager?.getAllKujiraSessionIds() || [context.session.id];
-      for (const sid of allSids) {
-        try {
-          await safeSyncApiProxy(sid, targetProvider, targetModel, targetEffort);
-        } catch (syncErr: any) {
-          context.ctx.logger?.('kujira')?.debug?.(
-            `[Command] 全局切换模型同步宿主会话 ${sid} 失败 (已跳过离线/失效会话):`,
-            syncErr?.message || syncErr
-          );
-        }
-      }
+    if (agent && (agent as any).modelSelection?.current) {
+      (agent as any).modelSelection.current.provider = targetProvider;
+      (agent as any).modelSelection.current.model = targetModel;
+      (agent as any).modelSelection.current.reasoningEffort = targetEffort;
+    }
 
-      return {
-        handled: true,
-        success: true,
-        reply: [
-          `Kujira 全局模型已切换为：${targetProvider} / ${targetModel}`,
-          effortDesc ? effortDesc.trim() : '',
-          '范围：已同步切换所有单聊会话，新建会话也将默认使用此模型。',
-        ].filter(Boolean).join('\n'),
-      };
-    } else {
-      context.sessionManager?.setModelSelection(
-        context.session.id,
-        targetProvider,
-        targetModel,
-        targetEffort
-      );
+    await safeSyncApiProxy(
+      context.session.id,
+      targetProvider,
+      targetModel,
+      targetEffort
+    );
 
-      if (agent && (agent as any).modelSelection?.current) {
-        (agent as any).modelSelection.current.provider = targetProvider;
-        (agent as any).modelSelection.current.model = targetModel;
-        (agent as any).modelSelection.current.reasoningEffort = targetEffort;
-      }
-
-      await safeSyncApiProxy(
-        context.session.id,
+    if (isSetDefault) {
+      // 设为新建会话默认模型：仅记录默认配置，绝不暴力改写全场其他会话
+      context.sessionManager?.setConfiguredDefaultModel?.(
         targetProvider,
         targetModel,
         targetEffort
@@ -278,7 +260,17 @@ export async function handleModelCommand(
         reply: [
           `当前会话模型已切换为：${targetProvider} / ${targetModel}`,
           effortDesc ? effortDesc.trim() : '',
-          '提示：仅对当前会话生效；全局切换请追加 -g 或 --全局。',
+          '已设为新建会话默认模型（下一次开启新会话将默认生效）。',
+        ].filter(Boolean).join('\n'),
+      };
+    } else {
+      return {
+        handled: true,
+        success: true,
+        reply: [
+          `当前会话模型已切换为：${targetProvider} / ${targetModel}`,
+          effortDesc ? effortDesc.trim() : '',
+          '提示：仅对当前会话生效；设为新建会话默认请追加 -默认。',
         ].filter(Boolean).join('\n'),
       };
     }

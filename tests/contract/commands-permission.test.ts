@@ -140,37 +140,31 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     }
   });
 
-  it('契约 3b: /模型 支持 -g 与 --全局 参数切换 Kujira 全局默认模型', async () => {
+  it('契约 3b: /模型 支持 -默认 参数切换当前会话并记录新建会话默认模型', async () => {
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
     const sessionA = booted.ctx.sessions.create('kujira-user-a1b2c3d4e5f60001' as any);
     const sessionB = booted.ctx.sessions.create('kujira-user-a1b2c3d4e5f60002' as any);
+    sessionManager.setModelSelection(sessionB.id, 'deepseek-official', 'deepseek-v4-flash');
 
-    const resGlobal = await handleSlashCommand('/模型 deepseek-v4-pro --全局', {
+    const resDefault = await handleSlashCommand('/模型 deepseek-v4-pro -默认', {
       userId: 'user_a1b2c3d4e5f60001',
       session: sessionA,
       ctx: booted.ctx,
       sessionManager,
     });
-    expect(resGlobal.handled).toBe(true);
-    expect(resGlobal.success).toBe(true);
-    expect(resGlobal.reply).toContain('Kujira 全局模型已切换为：deepseek-official / deepseek-v4-pro');
-    expect(resGlobal.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
+    expect(resDefault.handled).toBe(true);
+    expect(resDefault.success).toBe(true);
+    expect(resDefault.reply).toContain('当前会话模型已切换为：deepseek-official / deepseek-v4-pro');
+    expect(resDefault.reply).toContain('已设为新建会话默认模型');
+    expect(resDefault.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
 
     expect(sessionManager.getModelSelection(sessionA.id)?.model).toBe('deepseek-v4-pro');
-    expect(sessionManager.getModelSelection(sessionB.id)?.model).toBe('deepseek-v4-pro');
-
-    const resPrefix = await handleSlashCommand('/模型 -g deepseek-v4-flash', {
-      userId: 'user_a1b2c3d4e5f60001',
-      session: sessionA,
-      ctx: booted.ctx,
-      sessionManager,
-    });
-    expect(resPrefix.success).toBe(true);
-    expect(sessionManager.getModelSelection(sessionA.id)?.model).toBe('deepseek-v4-flash');
-    expect(sessionManager.getModelSelection(sessionB.id)?.model).toBe('deepseek-v4-flash');
+    expect(sessionManager.getConfiguredDefaultModel()?.model).toBe('deepseek-v4-pro');
+    // 单聊隔离：不暴力篡改其他会话
+    expect(sessionManager.getModelSelection(sessionB.id)?.model).not.toBe('deepseek-v4-pro');
   });
 
-  it('契约 3c: /模型 空参数查询呈现当前会话模型、Kujira 全局默认及帮助说明，无 emoji', async () => {
+  it('契约 3c: /模型 空参数查询呈现当前会话模型及帮助说明，无 emoji，不包含宿主全局信息', async () => {
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
     const sessionA = booted.ctx.sessions.create('kujira-user-a1b2c3d4e5f60001' as any);
 
@@ -184,9 +178,10 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     expect(res.handled).toBe(true);
     expect(res.success).toBe(true);
     expect(res.reply).toContain('当前会话模型：');
-    expect(res.reply).toContain('Kujira 全局默认：');
+    expect(res.reply).not.toContain('Kujira 全局默认：');
+    expect(res.reply).not.toContain('宿主全局默认：');
     expect(res.reply).toContain('可用模型列表：');
-    expect(res.reply).toContain('--全局');
+    expect(res.reply).toContain('-默认');
     expect(res.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
   });
 
@@ -766,7 +761,7 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
       expect(sessionManager.getKujiraDefaultModel().reasoningEffort).toBe('high');
       expect(sessionManager.getModelSelection(sessionActive.id)?.reasoningEffort).toBe('high');
 
-      const modelRes = await handleSlashCommand('/模型 deepseek-v4-flash -g', {
+      const modelRes = await handleSlashCommand('/模型 deepseek-v4-flash -默认', {
         userId: 'user_a1b2c3d4e5f60040',
         session: sessionActive,
         ctx: booted.ctx,
@@ -775,8 +770,9 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
 
       expect(modelRes.handled).toBe(true);
       expect(modelRes.success).toBe(true);
-      expect(modelRes.reply).toContain('Kujira 全局模型已切换为：deepseek-official / deepseek-v4-flash');
-      expect(sessionManager.getKujiraDefaultModel().model).toBe('deepseek-v4-flash');
+      expect(modelRes.reply).toContain('当前会话模型已切换为：deepseek-official / deepseek-v4-flash');
+      expect(modelRes.reply).toContain('已设为新建会话默认模型');
+      expect(sessionManager.getConfiguredDefaultModel()?.model).toBe('deepseek-v4-flash');
       expect(sessionManager.getModelSelection(sessionActive.id)?.model).toBe('deepseek-v4-flash');
     } finally {
       if (sessionController && originalSelectModel) {

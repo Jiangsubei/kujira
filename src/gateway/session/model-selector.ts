@@ -21,7 +21,7 @@ export interface KujiraModelSelectionRef {
 
 export class SessionModelSelector {
   private selectionMap = new Map<string, KujiraModelSelectionRef>();
-  private kujiraDefaultModel?: ModelSelection;
+  private configuredDefaultModel?: ModelSelection;
 
   constructor(
     private readonly ctx?: Context,
@@ -34,7 +34,7 @@ export class SessionModelSelector {
       const rawDefault = this.persistence.getPluginConfig(KUJIRA_DEFAULT_MODEL_KEY);
       if (rawDefault) {
         try {
-          this.kujiraDefaultModel = JSON.parse(rawDefault);
+          this.configuredDefaultModel = JSON.parse(rawDefault);
         } catch {}
       }
 
@@ -119,55 +119,92 @@ export class SessionModelSelector {
   }
 
   /**
-   * 获取 Kujira 插件全局默认模型 (优先使用插件配置，否则回退到宿主默认)
+   * 探测指定提供商与模型在当前 DSH 环境中是否真实存在且可用
    */
-  public getKujiraDefaultModel(): ModelSelection {
-    if (this.kujiraDefaultModel?.provider && this.kujiraDefaultModel?.model) {
-      return { ...this.kujiraDefaultModel };
+  public async checkModelExists(provider: string, model: string): Promise<boolean> {
+    const llm = this.ctx?.get?.('llm') || (this.ctx as any)?.llm;
+    if (!llm) return false;
+    try {
+      if (typeof llm.listProviders === 'function') {
+        const providers = llm.listProviders();
+        if (Array.isArray(providers) && providers.length > 0) {
+          const pHit = providers.some((p: any) => (p.id || p) === provider);
+          if (!pHit) return false;
+        }
+      }
+      if (typeof llm.listModels === 'function') {
+        const models = llm.listModels(provider);
+        if (Array.isArray(models) && models.length > 0) {
+          return models.some((m: any) => (m.id || m) === model);
+        }
+      }
+      if (typeof llm.resolveModelInfo === 'function') {
+        const info = await llm.resolveModelInfo(provider, model);
+        return Boolean(info);
+      }
+    } catch {
+      return false;
     }
-    return this.getHostDefaultModelSelection();
+    return false;
   }
 
   /**
-   * 设置 Kujira 插件全局默认模型，并批量联动同步已知的所有 Kujira 单聊会话
+   * 获取用户显式配置的新建会话默认模型（未配置则返回 undefined）
    */
-  public setKujiraDefaultModel(
+  public getConfiguredDefaultModel(): ModelSelection | undefined {
+    if (this.configuredDefaultModel?.provider && this.configuredDefaultModel?.model) {
+      return { ...this.configuredDefaultModel };
+    }
+    return undefined;
+  }
+
+  /**
+   * 设置新建会话默认模型，仅持久化记录配置，绝不暴力改写现有其他活跃会话
+   */
+  public setConfiguredDefaultModel(
     provider: string,
     model: string,
-    reasoningEffort?: any,
-    activeSessionIds?: string[]
+    reasoningEffort?: any
   ): void {
     const sel: ModelSelection = {
       provider,
       model,
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     };
-    this.kujiraDefaultModel = sel;
+    this.configuredDefaultModel = sel;
     if (this.persistence) {
       this.persistence.setPluginConfig(KUJIRA_DEFAULT_MODEL_KEY, JSON.stringify(sel));
     }
-
-    // 1. 同步内存中所有已记录的会话 selection
-    const sids = activeSessionIds || Array.from(this.selectionMap.keys());
-    for (const sid of sids) {
-      const ref = this.getOrCreateSelectionRef(sid);
-      ref.current = { ...sel };
-    }
-
-    // 2. 持久化至已知的所有 peer 数据库状态中
-    if (this.persistence) {
-      const allStates = this.persistence.getAllSessionStates();
-      for (const st of allStates) {
-        st.model_provider = provider;
-        st.model_name = model;
-        st.model_reasoning_effort = reasoningEffort ?? undefined;
-        this.persistence.saveSessionState(st);
-      }
-    }
   }
 
+  /**
+   * 获取新建会话生效的默认模型 (优先用户显式配置，否则回退到宿主全局默认)
+   */
   public getDefaultModelSelection(): ModelSelection {
-    return this.getKujiraDefaultModel();
+    const configured = this.getConfiguredDefaultModel();
+    if (configured) {
+      return configured;
+    }
+    return this.getHostDefaultModelSelection();
+  }
+
+  /**
+   * 兼容性别名：获取 Kujira 插件默认模型
+   */
+  public getKujiraDefaultModel(): ModelSelection {
+    return this.getDefaultModelSelection();
+  }
+
+  /**
+   * 兼容性别名：设置 Kujira 插件默认模型（已重构为纯配置记录，不再暴力批量改写全场会话）
+   */
+  public setKujiraDefaultModel(
+    provider: string,
+    model: string,
+    reasoningEffort?: any,
+    _activeSessionIds?: string[]
+  ): void {
+    this.setConfiguredDefaultModel(provider, model, reasoningEffort);
   }
 
   public getOrCreateSelectionRef(sessionId: string): KujiraModelSelectionRef {
