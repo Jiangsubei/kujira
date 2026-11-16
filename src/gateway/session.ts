@@ -864,6 +864,8 @@ export class SessionManager {
       model_reasoning_effort: inheritedEffort,
     });
 
+    this.agentRunner.getOutboundBridge()?.clearInboundContext?.(peer);
+
     return peer;
   }
 
@@ -999,6 +1001,8 @@ export class SessionManager {
       model_name: existing?.model_name,
       model_reasoning_effort: existing?.model_reasoning_effort,
     });
+
+    this.agentRunner.getOutboundBridge()?.clearInboundContext?.(peer);
 
     return true;
   }

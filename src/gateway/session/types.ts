@@ -50,6 +50,7 @@ export interface ParsedSessionId {
 export interface OutboundBridgeLike {
   trackInboundContext(peer: string, context: any): void;
   trackPendingMessage?(messageId: string, peer: string, context: any): void;
+  clearInboundContext?(peer: string): void;
 }
 
 export interface SessionManagerOptions {

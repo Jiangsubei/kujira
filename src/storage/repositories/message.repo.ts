@@ -703,6 +703,19 @@ export class MessageRepository {
   }
 
   /**
+   * 将指定 peer 的所有未失效入站回复槽位标记为失效（会话切换/新建时清空陈旧锚点）
+   */
+  invalidateInboundSlotsByPeer(peer: string): void {
+    const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
+    if (!cleanPeer) return;
+    const db = this.getDb();
+    db.prepare('UPDATE inbound_reply_slots SET invalidated = 1, updated_at = ? WHERE peer = ? AND invalidated = 0').run(
+      Date.now(),
+      cleanPeer
+    );
+  }
+
+  /**
    * 获取指定 peer 最近一条仍有效的入站被动回复槽位
    */
   getLatestValidInboundSlot(peer: string): InboundReplySlot | null {

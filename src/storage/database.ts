@@ -172,6 +172,10 @@ export class MessageDatabase {
     this.messageRepo.markInboundSlotInvalidated(msgId);
   }
 
+  invalidateInboundSlotsByPeer(peer: string): void {
+    this.messageRepo.invalidateInboundSlotsByPeer(peer);
+  }
+
   getLatestValidInboundSlot(peer: string): InboundReplySlot | null {
     return this.messageRepo.getLatestValidInboundSlot(peer);
   }

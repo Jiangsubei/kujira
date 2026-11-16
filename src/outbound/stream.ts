@@ -105,6 +105,7 @@ export interface OutboundSlotDb extends MediaUploadCacheStore {
   allocateNextMsgSeq?(msgId: string, seed?: { peer: string; openid: string }): number;
   advanceMsgSeq?(msgId: string, minNextSeq: number): number | void;
   markInboundSlotInvalidated?(msgId: string): void;
+  invalidateInboundSlotsByPeer?(peer: string): void;
   getMessage?(msgId: string): MessageRecord | null;
   getMessageByShortId?(peer: string, shortId: string): MessageRecord | null;
   getMessageByRefIdx?(refIdx: string): MessageRecord | null;
@@ -378,6 +379,24 @@ export class OutboundStreamBridge implements OutboundBridgeLike {
       return;
     }
     this.trackInboundContext(peer, context);
+  }
+
+  /**
+   * 清空指定 peer 的所有内存被动回复锚点与上下文，并同步使数据库中历史槽位失效。
+   * 用于会话切换（/会话 或 /新建）时，确保新会话不复用旧会话的陈旧入站 msg_id，自然降级走主动通道。
+   */
+  clearInboundContext(peer: string): void {
+    if (!peer) return;
+    const key = this.normalizePeerKey(peer);
+    if (!key) return;
+    this.latestInboundAnchors.delete(key);
+    this.inboundContexts.delete(key);
+    this.inboundContexts.delete(peer);
+    try {
+      this.options.db?.invalidateInboundSlotsByPeer?.(key);
+    } catch (err) {
+      this.options.logger?.warn?.('[KujiraOutbound] invalidateInboundSlotsByPeer 异常:', err);
+    }
   }
 
   getActiveTurnContext(peer: string): InboundReplyContextInput | undefined {
