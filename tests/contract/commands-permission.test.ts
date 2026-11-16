@@ -645,6 +645,59 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     expect(busyRes.reply).toContain('运行状态：正在运行（轮次 #3）');
   });
 
+  it('契约 11b: /状态 命令按运行时事实即时映射，只要 Agent 处于非空闲状态（无论何种操作）均映射为正在运行，无需外部持久化布尔值', async () => {
+    const sessionManager = new SessionManager(booted.ctx, tmpHome);
+    const session = booted.ctx.sessions.create('kujira-user-a1b2c3d4e5f60021' as any);
+
+    // 1. 当 agent.status 为 'running' 时，映射为「正在运行」
+    const runningRes = await handleSlashCommand('/状态', {
+      userId: 'user_a1b2c3d4e5f60021',
+      session,
+      agent: { status: 'running' },
+      ctx: booted.ctx,
+      sessionManager,
+    });
+    expect(runningRes.success).toBe(true);
+    expect(runningRes.reply).toContain('运行状态：正在运行');
+
+    // 2. 当 agent.status 为任意非 'idle' 状态（例如 'working'）时，同样统一映射为「正在运行」
+    const workingRes = await handleSlashCommand('/状态', {
+      userId: 'user_a1b2c3d4e5f60021',
+      session,
+      agent: { status: 'working' },
+      ctx: booted.ctx,
+      sessionManager,
+    });
+    expect(workingRes.success).toBe(true);
+    expect(workingRes.reply).toContain('运行状态：正在运行');
+
+    // 3. 当 agent.status 为 'idle' 时，映射为「空闲」
+    const idleRes = await handleSlashCommand('/状态', {
+      userId: 'user_a1b2c3d4e5f60021',
+      session,
+      agent: { status: 'idle' },
+      ctx: booted.ctx,
+      sessionManager,
+    });
+    expect(idleRes.success).toBe(true);
+    expect(idleRes.reply).toContain('运行状态：空闲');
+
+    // 4. 当未直接显式传 agent，但 sessionManager.isAgentRunning(peer) 为 true 时，映射为「正在运行」
+    const mockSmWithRunning = {
+      sessionIdToPeer: (id: string) => id,
+      isAgentRunning: vi.fn().mockReturnValue(true),
+      getModelSelection: () => null,
+    };
+    const smRunningRes = await handleSlashCommand('/状态', {
+      userId: 'user_a1b2c3d4e5f60021',
+      session,
+      ctx: booted.ctx,
+      sessionManager: mockSmWithRunning,
+    });
+    expect(smRunningRes.success).toBe(true);
+    expect(smRunningRes.reply).toContain('运行状态：正在运行');
+  });
+
   it('契约 12: /模型 优化：唯一模型 ID 智能匹配、空格多词匹配及供应商显式指定', async () => {
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
     const session = booted.ctx.sessions.create('kujira-user-a1b2c3d4e5f60030' as any);

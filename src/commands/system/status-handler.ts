@@ -16,12 +16,31 @@ export async function handleStatusCommand(
   const sm = context.sessionManager;
   const peer = sm ? sm.sessionIdToPeer(context.session.id) : context.session.id;
   const activeTurn = sm?.getActiveTurn?.(peer);
-  const isBusy = activeTurn !== undefined || sm?.isSessionBusy?.(context.session.id);
+
+  const agents = safeGetService(context.ctx, 'agents');
+  const agent =
+    context.agent ||
+    sm?.getAgent?.(peer) ||
+    sm?.getAgent?.(context.session.id) ||
+    agents?.get?.(context.session.id);
+
+  // 状态映射：只要 Agent 处于非空闲状态（无论内部进行什么操作），均映射为运行中
+  const rawAgentStatus = (agent as any)?.status;
+  const isAgentNonIdle =
+    rawAgentStatus !== undefined &&
+    typeof rawAgentStatus === 'string' &&
+    rawAgentStatus !== 'idle';
+
+  const isSmRunning = Boolean(
+    sm?.isAgentRunning?.(peer) || sm?.isAgentRunning?.(context.session.id)
+  );
+  const isLegacyBusy = Boolean(sm?.isSessionBusy?.(context.session.id));
+  const isRunning = isAgentNonIdle || isSmRunning || isLegacyBusy || activeTurn !== undefined;
 
   let statusStr = '空闲';
   if (activeTurn !== undefined) {
     statusStr = `正在运行（轮次 #${activeTurn}）`;
-  } else if (isBusy) {
+  } else if (isRunning) {
     statusStr = '正在运行';
   }
 
@@ -48,8 +67,6 @@ export async function handleStatusCommand(
     } catch {}
   }
 
-  const agents = safeGetService(context.ctx, 'agents');
-  const agent = agents?.get?.(context.session.id);
   const curSel = sm?.getModelSelection(context.session.id) || (agent as any)?.modelSelection?.current;
   const curProv = curSel?.provider || (agent as any)?.options?.provider || 'deepseek-official';
   const curMod = curSel?.model || (agent as any)?.options?.model || 'deepseek-v4-flash';
