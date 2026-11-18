@@ -95,7 +95,8 @@ const KUJIRA_CARD_CSS = `
 .kujira_segBtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary, #388bfd);outline-offset:1px}
 .kujira_segBtn:disabled{opacity:.4;cursor:not-allowed}
 .kujira_segBtnActive,.kujira_segBtn[aria-checked="true"]{border-color:var(--dsw-alias-brand-primary, #388bfd) !important;background:var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));color:var(--dsw-alias-label-primary, #ffffff);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.1)}
-.kujira_peerFilterBox{display:flex;flex-direction:column;gap:10px;padding:12px;margin:0 0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3)}
+.kujira_peerFilterBox{display:flex;flex-direction:column;padding:0 12px;margin:0 0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3)}
+.kujira_peerFilterBox+.kujira_field{border-top:1px solid var(--dsw-alias-border-l2)}
 .kujira_peerEditorRow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
 .kujira_peerSelect{flex:1;min-width:0;height:28px;font-size:12px;padding:0 8px}
 .kujira_peerEditorActions{display:inline-flex;align-items:center;gap:6px;flex:none}

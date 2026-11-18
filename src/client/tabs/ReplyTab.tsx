@@ -150,8 +150,11 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
   const listMode: IdleReplyListMode =
     draft.idle_reply_list_mode === 'whitelist' ? 'whitelist' : DEFAULT_IDLE_REPLY_LIST_MODE;
-  const selectedPeers: string[] = Array.isArray(draft.idle_reply_peers)
-    ? draft.idle_reply_peers.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+  const activeListKey: 'idle_reply_blacklist' | 'idle_reply_whitelist' =
+    listMode === 'whitelist' ? 'idle_reply_whitelist' : 'idle_reply_blacklist';
+  const rawSelectedPeers = draft[activeListKey];
+  const selectedPeers: string[] = Array.isArray(rawSelectedPeers)
+    ? rawSelectedPeers.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
     : [];
   const selectedSet = new Set(selectedPeers);
   const knownPeersById = new Map(knownPeers.map((item) => [item.peer, item]));
@@ -174,14 +177,14 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
   const handleSaveAddPeer = () => {
     if (!effectiveCandidate || selectedSet.has(effectiveCandidate)) return;
-    onFieldChange('idle_reply_peers', [...selectedPeers, effectiveCandidate]);
+    onFieldChange(activeListKey, [...selectedPeers, effectiveCandidate]);
     setIsAddingPeer(false);
     setCandidatePeer('');
   };
 
   const handleRemovePeer = (peerToRemove: string) => {
     onFieldChange(
-      'idle_reply_peers',
+      activeListKey,
       selectedPeers.filter((p) => p !== peerToRemove)
     );
   };
@@ -341,18 +344,43 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
             options={IDLE_REPLY_LIST_MODE_OPTIONS}
             disabled={saving}
             overridden={model.isOverridden('idle_reply_list_mode')}
-            onReset={() => onResetField('idle_reply_list_mode')}
-            onChange={(val) => onFieldChange('idle_reply_list_mode', val)}
+            onReset={() => {
+              setIsAddingPeer(false);
+              setCandidatePeer('');
+              onResetField('idle_reply_list_mode');
+            }}
+            onChange={(val) => {
+              setIsAddingPeer(false);
+              setCandidatePeer('');
+              onFieldChange('idle_reply_list_mode', val);
+            }}
           />
 
           <div className={fieldStyle.field}>
             <div className={fieldStyle.head}>
               <label htmlFor="kujira-idle-reply-peer-select" className={fieldStyle.label}>
                 {listMode === 'whitelist'
-                  ? '白名单用户 (idle_reply_peers)'
-                  : '黑名单用户 (idle_reply_peers)'}
+                  ? '白名单用户 (idle_reply_whitelist)'
+                  : '黑名单用户 (idle_reply_blacklist)'}
               </label>
               <div className={fieldStyle.badges}>
+                {model.isOverridden(activeListKey) && (
+                  <>
+                    <span className={fieldStyle.badge}>已自定义</span>
+                    <button
+                      type="button"
+                      className={fieldStyle.reset}
+                      disabled={saving}
+                      onClick={() => {
+                        setIsAddingPeer(false);
+                        setCandidatePeer('');
+                        onResetField(activeListKey);
+                      }}
+                    >
+                      重置
+                    </button>
+                  </>
+                )}
                 <button
                   id="kujira-idle-reply-peer-add"
                   type="button"
@@ -364,23 +392,6 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
                 >
                   <IconPlus size={12} />
                 </button>
-                {model.isOverridden('idle_reply_peers') && (
-                  <>
-                    <span className={fieldStyle.badge}>已自定义</span>
-                    <button
-                      type="button"
-                      className={fieldStyle.reset}
-                      disabled={saving}
-                      onClick={() => {
-                        setIsAddingPeer(false);
-                        setCandidatePeer('');
-                        onResetField('idle_reply_peers');
-                      }}
-                    >
-                      重置
-                    </button>
-                  </>
-                )}
               </div>
             </div>
 

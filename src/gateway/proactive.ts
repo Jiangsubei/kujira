@@ -152,17 +152,23 @@ export function shouldPoolInbound(params: {
 }
 
 /**
- * 判断指定单聊 peer 是否允许触发冷场主动搭话（黑白名单门控）。
- * - 默认（blacklist + 空列表）：全部放行；
- * - blacklist：命中列表拦截，其余放行；
- * - whitelist：仅命中列表放行（空列表时全员不触发）。
+ * 判断指定单聊 peer 是否允许触发冷场主动搭话（黑白名单互斥门控）。
+ * - 黑名单模式（默认）：仅读取 `idle_reply_blacklist`（命中拦截，其余放行；空列表全员放行），`idle_reply_whitelist` 不生效；
+ * - 白名单模式：仅读取 `idle_reply_whitelist`（仅命中放行；空列表全员不触发），`idle_reply_blacklist` 不生效。
  */
 export function isPeerAllowedForIdleReply(peer: string, cfg?: BridgePluginConfig): boolean {
   const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
   if (!cleanPeer) return false;
   const mode: IdleReplyListMode =
     cfg?.idle_reply_list_mode === 'whitelist' ? 'whitelist' : DEFAULT_IDLE_REPLY_LIST_MODE;
-  const rawPeers = Array.isArray(cfg?.idle_reply_peers) ? cfg!.idle_reply_peers : [];
+  const rawPeers =
+    mode === 'whitelist'
+      ? Array.isArray(cfg?.idle_reply_whitelist)
+        ? cfg!.idle_reply_whitelist
+        : []
+      : Array.isArray(cfg?.idle_reply_blacklist)
+        ? cfg!.idle_reply_blacklist
+        : [];
   const inList = rawPeers.some((p) => typeof p === 'string' && p.trim() === cleanPeer);
   return mode === 'whitelist' ? inList : !inList;
 }

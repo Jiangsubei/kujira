@@ -284,30 +284,56 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       proactive_attitude: 'balanced',
     };
 
-    it('纯函数 isPeerAllowedForIdleReply 完整覆盖默认/黑名单/白名单语义', () => {
+    it('纯函数 isPeerAllowedForIdleReply 完整覆盖黑白名单分表存储与互斥语义', () => {
       // 默认配置（blacklist + []）全部放行
       expect(isPeerAllowedForIdleReply(PEER_A, {})).toBe(true);
-      expect(isPeerAllowedForIdleReply(PEER_A, { idle_reply_list_mode: 'blacklist', idle_reply_peers: [] })).toBe(true);
-
-      // 黑名单：命中拦截，其余放行
       expect(
-        isPeerAllowedForIdleReply(PEER_A, { idle_reply_list_mode: 'blacklist', idle_reply_peers: [PEER_A] })
-      ).toBe(false);
-      expect(
-        isPeerAllowedForIdleReply(PEER_B, { idle_reply_list_mode: 'blacklist', idle_reply_peers: [PEER_A] })
+        isPeerAllowedForIdleReply(PEER_A, {
+          idle_reply_list_mode: 'blacklist',
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [],
+        })
       ).toBe(true);
 
-      // 白名单为空：全部拦截
+      // 黑名单模式：仅 idle_reply_blacklist 生效，idle_reply_whitelist 互斥不生效
       expect(
-        isPeerAllowedForIdleReply(PEER_A, { idle_reply_list_mode: 'whitelist', idle_reply_peers: [] })
+        isPeerAllowedForIdleReply(PEER_A, {
+          idle_reply_list_mode: 'blacklist',
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [PEER_A],
+        })
+      ).toBe(false);
+      expect(
+        isPeerAllowedForIdleReply(PEER_B, {
+          idle_reply_list_mode: 'blacklist',
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [PEER_A],
+        })
+      ).toBe(true);
+
+      // 白名单模式为空：全部拦截（即使黑名单为空也不放行）
+      expect(
+        isPeerAllowedForIdleReply(PEER_A, {
+          idle_reply_list_mode: 'whitelist',
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [],
+        })
       ).toBe(false);
 
-      // 白名单非空：仅命中放行
+      // 白名单模式非空：仅 idle_reply_whitelist 生效，idle_reply_blacklist 互斥不生效
       expect(
-        isPeerAllowedForIdleReply(PEER_A, { idle_reply_list_mode: 'whitelist', idle_reply_peers: [PEER_A] })
+        isPeerAllowedForIdleReply(PEER_A, {
+          idle_reply_list_mode: 'whitelist',
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [PEER_A],
+        })
       ).toBe(true);
       expect(
-        isPeerAllowedForIdleReply(PEER_B, { idle_reply_list_mode: 'whitelist', idle_reply_peers: [PEER_A] })
+        isPeerAllowedForIdleReply(PEER_B, {
+          idle_reply_list_mode: 'whitelist',
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [PEER_A],
+        })
       ).toBe(false);
     });
 
@@ -319,7 +345,14 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
 
       // 先给 PEER_A 采样出一个闹钟（在黑名单为空时），验证加入黑名单后闹钟被清空
       await mgr.checkProactive({
-        config: { ...baseCfg, idle_reply_min_mins: 30, idle_reply_max_mins: 60, idle_reply_list_mode: 'blacklist', idle_reply_peers: [] },
+        config: {
+          ...baseCfg,
+          idle_reply_min_mins: 30,
+          idle_reply_max_mins: 60,
+          idle_reply_list_mode: 'blacklist',
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [PEER_A],
+        },
         dispatch: (ev) => { dispatched.push(ev); },
         knownPeers: () => [PEER_A, PEER_B],
         lastHumanMessageAt: () => t0,
@@ -331,7 +364,14 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       // 热更新将 PEER_A 加入黑名单，推进到 61 分钟
       const t61m = t0 + 61 * 60_000;
       await mgr.checkProactive({
-        config: { ...baseCfg, idle_reply_min_mins: 30, idle_reply_max_mins: 60, idle_reply_list_mode: 'blacklist', idle_reply_peers: [PEER_A] },
+        config: {
+          ...baseCfg,
+          idle_reply_min_mins: 30,
+          idle_reply_max_mins: 60,
+          idle_reply_list_mode: 'blacklist',
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [PEER_A],
+        },
         dispatch: (ev) => { dispatched.push(ev); },
         knownPeers: () => [PEER_A, PEER_B],
         lastHumanMessageAt: () => t0,
@@ -353,7 +393,12 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
 
       // 1. 白名单为空 -> 任何人都不触发
       await mgr.checkProactive({
-        config: { ...baseCfg, idle_reply_list_mode: 'whitelist', idle_reply_peers: [] },
+        config: {
+          ...baseCfg,
+          idle_reply_list_mode: 'whitelist',
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [],
+        },
         dispatch: (ev) => { dispatched.push(ev); },
         knownPeers: () => [PEER_A, PEER_B],
         lastHumanMessageAt: () => t0,
@@ -362,9 +407,14 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       });
       expect(dispatched).toHaveLength(0);
 
-      // 2. 白名单仅包含 PEER_A -> PEER_A 触发，PEER_B 与新来的 PEER_C 均不触发
+      // 2. 白名单仅包含 PEER_A -> PEER_A 触发（即使 PEER_A 也在黑名单里），PEER_B 与新来的 PEER_C 均不触发
       await mgr.checkProactive({
-        config: { ...baseCfg, idle_reply_list_mode: 'whitelist', idle_reply_peers: [PEER_A] },
+        config: {
+          ...baseCfg,
+          idle_reply_list_mode: 'whitelist',
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [PEER_A],
+        },
         dispatch: (ev) => { dispatched.push(ev); },
         knownPeers: () => [PEER_A, PEER_B, PEER_C],
         lastHumanMessageAt: () => t0,
@@ -379,10 +429,14 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         PEER_B,
         { content: '好友发消息测试聚合', time: tMsg },
         OPENID_B,
-        { config: { ...baseCfg, idle_reply_list_mode: 'whitelist', idle_reply_peers: [PEER_A] }, now: tMsg, rng: () => 0.5 }
+        {
+          config: { ...baseCfg, idle_reply_list_mode: 'whitelist', idle_reply_whitelist: [PEER_A] },
+          now: tMsg,
+          rng: () => 0.5,
+        }
       );
       await mgr.checkProactive({
-        config: { ...baseCfg, idle_reply_list_mode: 'whitelist', idle_reply_peers: [PEER_A] },
+        config: { ...baseCfg, idle_reply_list_mode: 'whitelist', idle_reply_whitelist: [PEER_A] },
         dispatch: (ev) => { dispatched.push(ev); },
         knownPeers: () => [PEER_A, PEER_B, PEER_C],
         lastHumanMessageAt: () => tMsg,
@@ -396,22 +450,36 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
   });
 
   describe('4. KujiraFormModel 数组字段与 ReplyTab 布局/交互/5秒轮询契约', () => {
-    it('KujiraFormModel 正确判定 idle_reply_peers 的 isOverridden / isDirty / resetField', () => {
+    it('KujiraFormModel 正确判定 idle_reply_blacklist / idle_reply_whitelist 的 isOverridden / isDirty / resetField', () => {
       const model = new KujiraFormModel({
-        initialValues: { idle_reply_list_mode: 'blacklist', idle_reply_peers: [] },
+        initialValues: {
+          idle_reply_list_mode: 'blacklist',
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [],
+        },
         baseDefaults: DEFAULT_BASE_CONFIG,
       });
 
-      expect(model.isOverridden('idle_reply_peers')).toBe(false);
+      expect(model.isOverridden('idle_reply_blacklist')).toBe(false);
+      expect(model.isOverridden('idle_reply_whitelist')).toBe(false);
       expect(model.isDirty()).toBe(false);
 
-      model.setField('idle_reply_peers', [PEER_A]);
-      expect(model.isOverridden('idle_reply_peers')).toBe(true);
+      model.setField('idle_reply_blacklist', [PEER_A]);
+      expect(model.isOverridden('idle_reply_blacklist')).toBe(true);
+      expect(model.isOverridden('idle_reply_whitelist')).toBe(false);
       expect(model.isDirty()).toBe(true);
 
-      model.resetField('idle_reply_peers');
-      expect(model.getDraft().idle_reply_peers).toEqual([]);
-      expect(model.isOverridden('idle_reply_peers')).toBe(false);
+      model.setField('idle_reply_whitelist', [PEER_B]);
+      expect(model.isOverridden('idle_reply_whitelist')).toBe(true);
+
+      model.resetField('idle_reply_blacklist');
+      expect(model.getDraft().idle_reply_blacklist).toEqual([]);
+      expect(model.getDraft().idle_reply_whitelist).toEqual([PEER_B]);
+      expect(model.isOverridden('idle_reply_blacklist')).toBe(false);
+      expect(model.isOverridden('idle_reply_whitelist')).toBe(true);
+
+      model.resetField('idle_reply_whitelist');
+      expect(model.getDraft().idle_reply_whitelist).toEqual([]);
       expect(model.isDirty()).toBe(false);
     });
 
@@ -464,7 +532,8 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         initialValues: {
           idle_reply_enabled: true,
           idle_reply_list_mode: 'blacklist',
-          idle_reply_peers: [],
+          idle_reply_blacklist: [],
+          idle_reply_whitelist: [PEER_B],
         },
         baseDefaults: DEFAULT_BASE_CONFIG,
       });
@@ -483,20 +552,24 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
 
       expect(blacklistEmptyHtml).toContain('id="kujira-idle-reply-peer-filter"');
       expect(blacklistEmptyHtml).toContain('id="kujira-idle-reply-list-mode"');
+      expect(blacklistEmptyHtml).toContain('黑名单用户 (idle_reply_blacklist)');
       expect(blacklistEmptyHtml).toContain('黑名单模式');
       expect(blacklistEmptyHtml).toContain('白名单模式');
       expect(blacklistEmptyHtml).toContain('id="kujira-idle-reply-peer-add"');
       expect(blacklistEmptyHtml).not.toContain('id="kujira-idle-reply-peer-editor"');
       expect(blacklistEmptyHtml).not.toContain('id="kujira-idle-reply-peer-select"');
+      // 白名单有数据时黑名单依然独立显示为空态，互不串扰
       expect(blacklistEmptyHtml).toContain('暂未配置，所有用户都会触发冷场主动搭话。');
+      expect(blacklistEmptyHtml).not.toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_B}"`);
       expect(blacklistEmptyHtml).not.toContain('刷新');
 
-      // 2. 白名单空态默认非编辑态
+      // 2. 白名单空态默认非编辑态（即使黑名单已有 PEER_A，白名单仍独立为空）
       const modelWhitelistEmpty = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
           idle_reply_list_mode: 'whitelist',
-          idle_reply_peers: [],
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [],
         },
         baseDefaults: DEFAULT_BASE_CONFIG,
       });
@@ -513,15 +586,18 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         })
       );
 
+      expect(whitelistEmptyHtml).toContain('白名单用户 (idle_reply_whitelist)');
       expect(whitelistEmptyHtml).toContain('暂未配置，所有用户都不会触发冷场主动搭话。');
+      expect(whitelistEmptyHtml).not.toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_A}"`);
       expect(whitelistEmptyHtml).not.toContain('id="kujira-idle-reply-peer-select"');
 
-      // 3. 已添加 PEER_A 的非编辑态：+ 按钮位于「已自定义」徽标之前，展示已选用户行、不展示下拉框
+      // 3. 已添加 PEER_A 的非编辑态：+ 按钮位于「已自定义」和「重置」的最右侧，展示已选用户行、不展示下拉框
       const modelWithPeer = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
           idle_reply_list_mode: 'blacklist',
-          idle_reply_peers: [PEER_A],
+          idle_reply_blacklist: [PEER_A],
+          idle_reply_whitelist: [],
         },
         baseDefaults: DEFAULT_BASE_CONFIG,
       });
@@ -539,12 +615,14 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       );
 
       const peerFieldSection = withPeerDefaultHtml.slice(
-        withPeerDefaultHtml.indexOf('黑名单用户 (idle_reply_peers)')
+        withPeerDefaultHtml.indexOf('黑名单用户 (idle_reply_blacklist)')
       );
-      const posAddBtn = peerFieldSection.indexOf('id="kujira-idle-reply-peer-add"');
       const posOverriddenBadge = peerFieldSection.indexOf('已自定义');
-      expect(posAddBtn).toBeGreaterThan(-1);
-      expect(posOverriddenBadge).toBeGreaterThan(posAddBtn);
+      const posResetBtn = peerFieldSection.indexOf('重置');
+      const posAddBtn = peerFieldSection.indexOf('id="kujira-idle-reply-peer-add"');
+      expect(posOverriddenBadge).toBeGreaterThan(-1);
+      expect(posResetBtn).toBeGreaterThan(posOverriddenBadge);
+      expect(posAddBtn).toBeGreaterThan(posResetBtn);
       expect(withPeerDefaultHtml).not.toContain('id="kujira-idle-reply-peer-select"');
       expect(withPeerDefaultHtml).toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_A}"`);
       expect(withPeerDefaultHtml).toContain(`data-testid="kujira-idle-reply-peer-remove-${PEER_A}"`);
@@ -576,6 +654,13 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       expect(selectBlock).toContain(`value="${PEER_B}"`);
       expect(selectBlock).toContain('B2C3D4E5');
       expect(selectBlock).toContain('晚安');
+
+      // 5. 样式契约：冷场搭话名单容器下方紧邻配置项必须保留分隔线
+      const cardStylesSource = fs.readFileSync(
+        path.resolve('src/client/card-styles.ts'),
+        'utf-8'
+      );
+      expect(cardStylesSource).toContain('.kujira_peerFilterBox+.kujira_field{border-top:1px solid var(--dsw-alias-border-l2)}');
     });
 
     it('formatPeerDropdownLabel 清晰展示短 OpenID、最近发言时间与消息预览；5 秒轮询在启动时立即拉取且每 5 秒自动刷新，停止后清理定时器', () => {

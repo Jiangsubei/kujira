@@ -29,7 +29,8 @@ import {
   DEFAULT_IDLE_REPLY_MIN_MINS,
   DEFAULT_IDLE_REPLY_MAX_MINS,
   DEFAULT_IDLE_REPLY_LIST_MODE,
-  DEFAULT_IDLE_REPLY_PEERS,
+  DEFAULT_IDLE_REPLY_BLACKLIST,
+  DEFAULT_IDLE_REPLY_WHITELIST,
   DEFAULT_PROACTIVE_ATTITUDE,
   DEFAULT_INSTANT_REPLY_ENABLED,
 } from '../constants/index.js';
@@ -146,11 +147,16 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_IDLE_REPLY_LIST_MODE)
     .volatile()
     .description('冷场主动搭话名单过滤模式 (blacklist: 黑名单排除, whitelist: 白名单仅允许)'),
-  idle_reply_peers: z
+  idle_reply_blacklist: z
     .array(z.string())
-    .default(DEFAULT_IDLE_REPLY_PEERS)
+    .default(DEFAULT_IDLE_REPLY_BLACKLIST)
     .volatile()
-    .description('冷场主动搭话黑白名单用户 peer 列表 (仅存内部哈希 peer)'),
+    .description('冷场主动搭话黑名单用户 peer 列表 (仅黑名单模式生效，仅存内部哈希 peer)'),
+  idle_reply_whitelist: z
+    .array(z.string())
+    .default(DEFAULT_IDLE_REPLY_WHITELIST)
+    .volatile()
+    .description('冷场主动搭话白名单用户 peer 列表 (仅白名单模式生效，仅存内部哈希 peer)'),
   proactive_attitude: z
     .union([z.const('enthusiastic'), z.const('balanced'), z.const('aloof')])
     .default(DEFAULT_PROACTIVE_ATTITUDE)

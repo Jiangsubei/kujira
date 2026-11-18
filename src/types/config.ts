@@ -31,7 +31,7 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（25 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（26 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
@@ -77,8 +77,10 @@ export interface BridgePluginConfig {
   idle_reply_max_mins?: number;
   /** 冷场主动搭话名单过滤模式 ('blacklist' 黑名单排除 | 'whitelist' 白名单仅允许，默认 'blacklist') */
   idle_reply_list_mode?: IdleReplyListMode;
-  /** 冷场主动搭话黑白名单用户 peer 列表（存内部哈希 peer，不落盘原始 openid） */
-  idle_reply_peers?: string[];
+  /** 冷场主动搭话黑名单用户 peer 列表（仅黑名单模式生效，存内部哈希 peer，不落盘原始 openid） */
+  idle_reply_blacklist?: string[];
+  /** 冷场主动搭话白名单用户 peer 列表（仅白名单模式生效，存内部哈希 peer，不落盘原始 openid） */
+  idle_reply_whitelist?: string[];
   /** 互动偏好分段 ('enthusiastic' 热情 | 'balanced' 均衡 | 'aloof' 冷淡，默认 'balanced') */
   proactive_attitude?: ProactiveAttitude;
   /** 允许在连续热聊时概率秒回 (突破聚合下限，默认 false) */
