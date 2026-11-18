@@ -90,6 +90,8 @@ export interface ReplyTabProps {
   saving: boolean;
   /** 可选初始已互动用户列表（供 SSR 与契约测试注入） */
   initialKnownPeers?: KnownPeerSummary[];
+  /** 可选初始是否展开内联添加行（供 SSR 与契约测试验证编辑态） */
+  initialAddingPeer?: boolean;
   onFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
   onResetField: (key: keyof BridgePluginConfig) => void;
 }
@@ -101,11 +103,13 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
     model,
     saving,
     initialKnownPeers,
+    initialAddingPeer,
     onFieldChange,
     onResetField,
   } = props;
 
   const [knownPeers, setKnownPeers] = useState<KnownPeerSummary[]>(initialKnownPeers ?? []);
+  const [isAddingPeer, setIsAddingPeer] = useState<boolean>(Boolean(initialAddingPeer));
   const [candidatePeer, setCandidatePeer] = useState<string>('');
   const [nowTs, setNowTs] = useState<number>(() => Date.now());
   const mountedRef = useRef(true);
@@ -158,9 +162,20 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
       ? candidatePeer
       : (availablePeers[0]?.peer ?? '');
 
-  const handleAddPeer = () => {
+  const handleOpenAddPeer = () => {
+    setIsAddingPeer(true);
+    setCandidatePeer('');
+  };
+
+  const handleCancelAddPeer = () => {
+    setIsAddingPeer(false);
+    setCandidatePeer('');
+  };
+
+  const handleSaveAddPeer = () => {
     if (!effectiveCandidate || selectedSet.has(effectiveCandidate)) return;
     onFieldChange('idle_reply_peers', [...selectedPeers, effectiveCandidate]);
+    setIsAddingPeer(false);
     setCandidatePeer('');
   };
 
@@ -337,55 +352,87 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
                   ? '白名单用户 (idle_reply_peers)'
                   : '黑名单用户 (idle_reply_peers)'}
               </label>
-              {model.isOverridden('idle_reply_peers') && (
-                <div className={fieldStyle.badges}>
-                  <span className={fieldStyle.badge}>已自定义</span>
-                  <button
-                    type="button"
-                    className={fieldStyle.reset}
-                    disabled={saving}
-                    onClick={() => onResetField('idle_reply_peers')}
-                  >
-                    重置
-                  </button>
-                </div>
-              )}
+              <div className={fieldStyle.badges}>
+                <button
+                  id="kujira-idle-reply-peer-add"
+                  type="button"
+                  className={faceStyle.actionBtn}
+                  title={listMode === 'whitelist' ? '添加白名单用户' : '添加黑名单用户'}
+                  aria-label={listMode === 'whitelist' ? '添加白名单用户' : '添加黑名单用户'}
+                  disabled={saving || isAddingPeer}
+                  onClick={handleOpenAddPeer}
+                >
+                  <IconPlus size={12} />
+                </button>
+                {model.isOverridden('idle_reply_peers') && (
+                  <>
+                    <span className={fieldStyle.badge}>已自定义</span>
+                    <button
+                      type="button"
+                      className={fieldStyle.reset}
+                      disabled={saving}
+                      onClick={() => {
+                        setIsAddingPeer(false);
+                        setCandidatePeer('');
+                        onResetField('idle_reply_peers');
+                      }}
+                    >
+                      重置
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
 
-            <div className={fieldStyle.peerAddRow}>
-              <select
-                id="kujira-idle-reply-peer-select"
-                className={[fieldStyle.input, fieldStyle.peerSelect].join(' ')}
-                disabled={saving || availablePeers.length === 0}
-                value={effectiveCandidate}
-                onChange={(e) => setCandidatePeer(e.target.value)}
+            {isAddingPeer && (
+              <div
+                id="kujira-idle-reply-peer-editor"
+                data-testid="kujira-idle-reply-peer-editor"
+                className={fieldStyle.peerEditorRow}
               >
-                {availablePeers.length === 0 ? (
-                  <option value="">
-                    {knownPeers.length === 0
-                      ? '暂无已收到消息的用户'
-                      : '所有已互动用户均已加入名单'}
-                  </option>
-                ) : (
-                  availablePeers.map((item) => (
-                    <option key={item.peer} value={item.peer}>
-                      {formatPeerDropdownLabel(item, nowTs)}
+                <select
+                  id="kujira-idle-reply-peer-select"
+                  className={[fieldStyle.input, fieldStyle.peerSelect].join(' ')}
+                  disabled={saving || availablePeers.length === 0}
+                  value={effectiveCandidate}
+                  onChange={(e) => setCandidatePeer(e.target.value)}
+                >
+                  {availablePeers.length === 0 ? (
+                    <option value="">
+                      {knownPeers.length === 0
+                        ? '暂无已收到消息的用户'
+                        : '所有已互动用户均已加入名单'}
                     </option>
-                  ))
-                )}
-              </select>
-              <button
-                id="kujira-idle-reply-peer-add"
-                type="button"
-                className={fieldStyle.peerAddBtn}
-                title={listMode === 'whitelist' ? '添加到白名单' : '添加到黑名单'}
-                aria-label={listMode === 'whitelist' ? '添加到白名单' : '添加到黑名单'}
-                disabled={saving || !effectiveCandidate}
-                onClick={handleAddPeer}
-              >
-                <IconPlus size={14} />
-              </button>
-            </div>
+                  ) : (
+                    availablePeers.map((item) => (
+                      <option key={item.peer} value={item.peer}>
+                        {formatPeerDropdownLabel(item, nowTs)}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <div className={fieldStyle.peerEditorActions}>
+                  <button
+                    id="kujira-idle-reply-peer-cancel"
+                    type="button"
+                    className={[cardStyle.discard, fieldStyle.peerEditorBtn].join(' ')}
+                    disabled={saving}
+                    onClick={handleCancelAddPeer}
+                  >
+                    取消
+                  </button>
+                  <button
+                    id="kujira-idle-reply-peer-save"
+                    type="button"
+                    className={[cardStyle.save, fieldStyle.peerEditorBtn].join(' ')}
+                    disabled={saving || !effectiveCandidate}
+                    onClick={handleSaveAddPeer}
+                  >
+                    保存
+                  </button>
+                </div>
+              </div>
+            )}
 
             {selectedPeers.length > 0 ? (
               <div className={fieldStyle.peerList}>
@@ -423,13 +470,13 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
                   );
                 })}
               </div>
-            ) : (
+            ) : !isAddingPeer ? (
               <p className={fieldStyle.hint}>
                 {listMode === 'whitelist'
-                  ? '当前白名单为空，冷场主动搭话不会对任何用户生效。请从上方选择用户后点击 + 添加。'
-                  : '当前黑名单为空，冷场主动搭话默认对所有已互动用户生效。'}
+                  ? '暂未配置，所有用户都不会触发冷场主动搭话。'
+                  : '暂未配置，所有用户都会触发冷场主动搭话。'}
               </p>
-            )}
+            ) : null}
           </div>
         </div>
       )}
