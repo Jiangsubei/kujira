@@ -17,10 +17,13 @@ import type { FaceRecord, QQAttachment, QQC2CMessageCreateEvent } from '../types
 import type { AttachmentDescriptor, AttachmentFaceMeta, AttachmentKind } from '../attachment/types.js';
 import {
   classifyAttachment,
-  extractFaceXmlTexts,
+  extractAttachmentXmlDescriptionText,
+  extractSingleFaceXmlText,
+  hasAttachmentXmlTag,
+  hasFaceXmlTag,
   isImageFileExt,
   isPureStickerMessage,
-  stripFaceXmlTags,
+  parseAttachmentXmlIndex,
 } from '../attachment/classify.js';
 import {
   detectSavedFormat,
@@ -203,7 +206,12 @@ const FORWARD_NODE_HEADER_RE = /^\s*===\s*消息\s*(\d+)\s*===\s*$/;
 const FORWARD_ATTACHMENT_LINE_RE = /^\s*\[附件\d+\]\s*(.*)$/;
 const FORWARD_SENDER_LINE_RE = /^\s*\[发送者\]\s*(.*)$/;
 const FORWARD_CONTENT_LINE_RE = /^\s*\[消息内容\][ \t]?(.*)$/;
-const FORWARD_RELATED_LINE_RE = /^\s*\[关联消息\]/;
+const FORWARD_RELATED_LINE_RE = /^\s*\[关联消息\]\s*$/;
+const FORWARD_RELATED_ITEM_RE = /^\s*---\s*第\s*\d+\s*条\s*---\s*$/;
+const FORWARD_MSG_TYPE_LINE_RE = /^\s*\[消息类型\]\s*(.*)$/;
+const FORWARD_INLINE_XML_TAG_RE =
+  /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>|<attachmentType\s*=\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,\s>\r\n]+)(?:\s*,\s*[^>\r\n]*)?>/g;
+const FORWARD_FACE_TYPE_6_RE = /^<faceType=\s*6(?:\b|[\s,>])/;
 const EMBEDDED_URL_TOKEN_REGEX = /URL\s*:\s*(https?:\/\/[^\s"'<>)\]]+)/i;
 const FORWARD_TYPE_RE = /(?:^|\s)类型\s*:\s*([^\s]+)/;
 const FORWARD_NAME_RE =
@@ -381,11 +389,19 @@ function renderForwardAttachment(
   return `[${kindLabel}${namePart}${meta ? ` (${meta})` : ''}${error ? ` (下载失败: ${error})` : ''}${rawUrl ? ` 直链: ${rawUrl}` : ' 无下载地址'}]`;
 }
 
+interface ParsedForwardRelatedItem {
+  senderName?: string;
+  messageType?: string;
+  rawTextLines: string[];
+  attachments: ParsedForwardAttachment[];
+}
+
 interface ParsedForwardNode {
   index: number;
   senderName?: string;
   rawTextLines: string[];
   attachments: ParsedForwardAttachment[];
+  relatedMessages: ParsedForwardRelatedItem[];
 }
 
 interface ParsedForwardDocument {
@@ -410,11 +426,28 @@ function parseForwardDocument(content: string): ParsedForwardDocument {
   const headerLines: string[] = [];
   const nodes: ParsedForwardNode[] = [];
   let currentNode: ParsedForwardNode | null = null;
+  let currentRelated: ParsedForwardRelatedItem | null = null;
   let inRelated = false;
+
+  const flushRelated = (): void => {
+    if (currentNode && currentRelated) {
+      currentRelated.rawTextLines = trimBlankLines(currentRelated.rawTextLines);
+      if (
+        currentRelated.rawTextLines.length > 0 ||
+        currentRelated.attachments.length > 0 ||
+        currentRelated.senderName ||
+        currentRelated.messageType
+      ) {
+        currentNode.relatedMessages.push(currentRelated);
+      }
+    }
+    currentRelated = null;
+  };
 
   for (const line of lines) {
     const headerMatch = FORWARD_NODE_HEADER_RE.exec(line);
     if (headerMatch) {
+      flushRelated();
       if (currentNode) {
         currentNode.rawTextLines = trimBlankLines(currentNode.rawTextLines);
         nodes.push(currentNode);
@@ -423,6 +456,7 @@ function parseForwardDocument(content: string): ParsedForwardDocument {
         index: Number(headerMatch[1]),
         rawTextLines: [],
         attachments: [],
+        relatedMessages: [],
       };
       inRelated = false;
       continue;
@@ -435,19 +469,77 @@ function parseForwardDocument(content: string): ParsedForwardDocument {
 
     if (!inRelated && FORWARD_RELATED_LINE_RE.test(line)) {
       inRelated = true;
-      currentNode.rawTextLines.push(line);
+      currentRelated = null;
       continue;
     }
 
-    if (!inRelated) {
-      const senderMatch = FORWARD_SENDER_LINE_RE.exec(line);
-      if (senderMatch) {
-        const sender = nonEmpty(senderMatch[1]);
-        if (sender && !currentNode.senderName) {
-          currentNode.senderName = sender;
+    if (inRelated) {
+      if (FORWARD_RELATED_ITEM_RE.test(line)) {
+        flushRelated();
+        currentRelated = {
+          rawTextLines: [],
+          attachments: [],
+        };
+        continue;
+      }
+
+      if (line.trim() === '') {
+        continue;
+      }
+
+      if (!currentRelated) {
+        currentRelated = {
+          rawTextLines: [],
+          attachments: [],
+        };
+      }
+
+      const relMsgTypeMatch = FORWARD_MSG_TYPE_LINE_RE.exec(line);
+      if (relMsgTypeMatch) {
+        const msgType = nonEmpty(relMsgTypeMatch[1]);
+        if (msgType && !currentRelated.messageType) {
+          currentRelated.messageType = msgType;
         }
         continue;
       }
+
+      const relSenderMatch = FORWARD_SENDER_LINE_RE.exec(line);
+      if (relSenderMatch) {
+        const sender = nonEmpty(relSenderMatch[1]);
+        if (sender && !currentRelated.senderName) {
+          currentRelated.senderName = sender;
+        }
+        continue;
+      }
+
+      if (FORWARD_ATTACHMENT_LINE_RE.test(line)) {
+        const parsedAtt = parseForwardAttachmentLine(line);
+        if (parsedAtt) {
+          currentRelated.attachments.push(parsedAtt);
+        }
+        continue;
+      }
+
+      const relContentMatch = FORWARD_CONTENT_LINE_RE.exec(line);
+      if (relContentMatch) {
+        const part = (relContentMatch[1] ?? '').trim();
+        if (part !== '' || currentRelated.rawTextLines.length > 0) {
+          currentRelated.rawTextLines.push(part);
+        }
+        continue;
+      }
+
+      currentRelated.rawTextLines.push(line.trim());
+      continue;
+    }
+
+    const senderMatch = FORWARD_SENDER_LINE_RE.exec(line);
+    if (senderMatch) {
+      const sender = nonEmpty(senderMatch[1]);
+      if (sender && !currentNode.senderName) {
+        currentNode.senderName = sender;
+      }
+      continue;
     }
 
     if (FORWARD_ATTACHMENT_LINE_RE.test(line)) {
@@ -458,15 +550,13 @@ function parseForwardDocument(content: string): ParsedForwardDocument {
       continue;
     }
 
-    if (!inRelated) {
-      const contentMatch = FORWARD_CONTENT_LINE_RE.exec(line);
-      if (contentMatch) {
-        const firstPart = contentMatch[1] ?? '';
-        if (firstPart.trim() !== '' || currentNode.rawTextLines.length > 0) {
-          currentNode.rawTextLines.push(firstPart);
-        }
-        continue;
+    const contentMatch = FORWARD_CONTENT_LINE_RE.exec(line);
+    if (contentMatch) {
+      const firstPart = contentMatch[1] ?? '';
+      if (firstPart.trim() !== '' || currentNode.rawTextLines.length > 0) {
+        currentNode.rawTextLines.push(firstPart);
       }
+      continue;
     }
 
     if (line.trim() === '' && currentNode.rawTextLines.length === 0) {
@@ -475,6 +565,7 @@ function parseForwardDocument(content: string): ParsedForwardDocument {
     currentNode.rawTextLines.push(line);
   }
 
+  flushRelated();
   if (currentNode) {
     currentNode.rawTextLines = trimBlankLines(currentNode.rawTextLines);
     nodes.push(currentNode);
@@ -486,36 +577,216 @@ function parseForwardDocument(content: string): ParsedForwardDocument {
   };
 }
 
-function stripNodeFaceTags(rawTextLines: string[]): {
-  rawNodeText: string;
-  cleanText: string;
-  hadFaceTag: boolean;
-  faceTexts: string[];
-} {
-  const rawNodeText = rawTextLines.join('\n');
-  let hadFaceTag = false;
-  const cleanedLines: string[] = [];
+/**
+ * 规整合并转发中的卡片节点与嵌套合并转发折叠占位：
+ * - 嵌套合并转发（`[卡片消息] 合并转发消息` + `摘要: [聊天记录]` + 重复尾行）折叠为清晰单行占位；
+ * - 普通卡片节点去除 `[消息类型] 卡片消息` 元信息行与尾部重复的 `[卡片消息] <名称> 摘要:<摘要>` 摘要行；
+ * - 非卡片节点原样保留，不影响 `[消息类型] 引用消息` 单独出现时的既有行为。
+ */
+function normalizeForwardCardLines(lines: string[], hasAttachments: boolean): string[] {
+  if (lines.length === 0) return lines;
 
-  for (const line of rawTextLines) {
-    const res = stripFaceXmlTags(line);
-    if (res.hadFaceTag) {
-      hadFaceTag = true;
-      if (res.text !== '') {
-        cleanedLines.push(res.text);
+  const hasCardTypeLine = lines.some((l) => /^\s*\[消息类型\]\s*卡片消息\s*$/.test(l));
+  const hasNestedForwardCardLine = lines.some((l) =>
+    /^\s*\[卡片消息\]\s*合并转发消息(?:\s+摘要\s*:\s*\[聊天记录\])?\s*$/.test(l)
+  );
+  if (!hasCardTypeLine && !hasNestedForwardCardLine) {
+    return lines;
+  }
+
+  const withoutType = lines.filter((l) => !/^\s*\[消息类型\]\s*卡片消息\s*$/.test(l));
+  const nonEmptyLines = withoutType.map((l) => l.trim()).filter(Boolean);
+
+  if (
+    !hasAttachments &&
+    hasNestedForwardCardLine &&
+    nonEmptyLines.length > 0 &&
+    nonEmptyLines.every(
+      (l) =>
+        /^\[卡片消息\]\s*合并转发消息(?:\s+摘要\s*:\s*\[聊天记录\])?$/.test(l) ||
+        /^摘要\s*:\s*\[聊天记录\]$/.test(l)
+    )
+  ) {
+    return ['[嵌套合并转发（平台未展开，无法查看内容）]'];
+  }
+
+  // 去除普通卡片节点末尾重复的 `[卡片消息] <名称> 摘要:<摘要>` 汇总行
+  const cleaned = trimBlankLines(withoutType);
+  if (cleaned.length >= 2) {
+    const lastLine = cleaned[cleaned.length - 1]!.trim();
+    const dupMatch = /^\[卡片消息\]\s*(.+?)\s+摘要\s*:\s*(.+)$/.exec(lastLine);
+    if (dupMatch) {
+      const cardName = dupMatch[1]!.trim();
+      const summary = dupMatch[2]!.trim();
+      const earlier = cleaned.slice(0, -1).map((l) => l.trim());
+      const hasNameLine = earlier.some((l) => l === `[卡片消息] ${cardName}`);
+      const hasSummaryLine = earlier.some((l) => {
+        const m = /^摘要\s*:\s*(.+)$/.exec(l);
+        return Boolean(m && m[1]!.trim() === summary);
+      });
+      if (hasNameLine && hasSummaryLine) {
+        return trimBlankLines(cleaned.slice(0, -1));
       }
-    } else {
-      cleanedLines.push(line);
     }
   }
 
-  const trimmed = trimBlankLines(cleanedLines);
-  const cleanText = trimmed.join('\n');
-  const faceTexts = hadFaceTag ? extractFaceXmlTexts(rawNodeText) : [];
-  return { rawNodeText, cleanText, hadFaceTag, faceTexts };
+  return cleaned;
+}
+
+function collectNodeXmlContext(rawTextLines: string[]): {
+  hadFaceTag: boolean;
+  hadAttachmentTag: boolean;
+  hasStickerFaceTag: boolean;
+  referencedAttachmentIndices: Set<number>;
+  hasUnindexedAttachmentTag: boolean;
+} {
+  let hadFaceTag = false;
+  let hadAttachmentTag = false;
+  let hasStickerFaceTag = false;
+  const referencedAttachmentIndices = new Set<number>();
+  let hasUnindexedAttachmentTag = false;
+
+  for (const line of rawTextLines) {
+    if (!hasFaceXmlTag(line) && !hasAttachmentXmlTag(line)) continue;
+    FORWARD_INLINE_XML_TAG_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = FORWARD_INLINE_XML_TAG_RE.exec(line)) !== null) {
+      const tag = m[0];
+      if (tag.startsWith('<attachmentType')) {
+        hadAttachmentTag = true;
+        const idx = parseAttachmentXmlIndex(tag);
+        if (idx !== undefined) {
+          referencedAttachmentIndices.add(idx);
+        } else {
+          hasUnindexedAttachmentTag = true;
+        }
+      } else {
+        hadFaceTag = true;
+        if (FORWARD_FACE_TYPE_6_RE.test(tag) || !extractSingleFaceXmlText(tag)) {
+          hasStickerFaceTag = true;
+        }
+      }
+    }
+  }
+
+  return {
+    hadFaceTag,
+    hadAttachmentTag,
+    hasStickerFaceTag,
+    referencedAttachmentIndices,
+    hasUnindexedAttachmentTag,
+  };
 }
 
 /**
- * 解析并清洗重构 QQ 官方 `message_type=102` 合并转发文本（剥离冗余标签与 `<faceType=...>` 壳，
+ * 将节点正文与附件做单趟顺序就地转换：
+ * - `<attachmentType=...,attachmentIndex=N,...>` 就地替换为对应附件（无匹配附件时回退解码 `description.text`）；
+ * - `<faceType=...>` 就地替换为表情包附件或 `[表情: <ext.text>]`；
+ * - 未被就地消费的附件按原顺序追加在后。
+ */
+function renderForwardInlineContent(
+  rawTextLines: string[],
+  attachments: ParsedForwardAttachment[],
+  options?: FormatForwardMessageOptions
+): string[] {
+  const xmlCtx = collectNodeXmlContext(rawTextLines);
+
+  const renderedAttachments = attachments.map((att, idx) => {
+    const entry = att.rawUrl ? options?.resolvedEntries?.get(att.rawUrl) : undefined;
+    const replacement = att.rawUrl ? options?.replacements?.get(att.rawUrl) : undefined;
+    const isStickerFaceCtx =
+      xmlCtx.hasStickerFaceTag &&
+      !xmlCtx.referencedAttachmentIndices.has(idx) &&
+      !xmlCtx.hasUnindexedAttachmentTag;
+    return renderForwardAttachment(att, entry, {
+      hadFaceTag: isStickerFaceCtx,
+      getFaceByMd5: options?.getFaceByMd5,
+      replacement,
+    });
+  });
+
+  const consumedAttachments = new Set<number>();
+  const processedLines: string[] = [];
+
+  for (const line of rawTextLines) {
+    if (!hasFaceXmlTag(line) && !hasAttachmentXmlTag(line)) {
+      processedLines.push(line);
+      continue;
+    }
+
+    FORWARD_INLINE_XML_TAG_RE.lastIndex = 0;
+    const replaced = line.replace(FORWARD_INLINE_XML_TAG_RE, (match) => {
+      if (match.startsWith('<attachmentType')) {
+        const declaredIdx = parseAttachmentXmlIndex(match);
+        if (
+          declaredIdx !== undefined &&
+          declaredIdx < renderedAttachments.length &&
+          !consumedAttachments.has(declaredIdx)
+        ) {
+          consumedAttachments.add(declaredIdx);
+          return renderedAttachments[declaredIdx]!;
+        }
+        if (declaredIdx === undefined) {
+          const nextIdx = renderedAttachments.findIndex((_, idx) => !consumedAttachments.has(idx));
+          if (nextIdx >= 0) {
+            consumedAttachments.add(nextIdx);
+            return renderedAttachments[nextIdx]!;
+          }
+        }
+        return extractAttachmentXmlDescriptionText(match) ?? '';
+      }
+
+      const isFaceType6 = FORWARD_FACE_TYPE_6_RE.test(match);
+      const faceText = extractSingleFaceXmlText(match);
+      if (isFaceType6 || !faceText) {
+        const stickerAttIdx = attachments.findIndex(
+          (att, idx) =>
+            !consumedAttachments.has(idx) &&
+            !xmlCtx.referencedAttachmentIndices.has(idx) &&
+            (att.mediaType === 'image' || att.mediaType === 'sticker')
+        );
+        if (stickerAttIdx >= 0) {
+          consumedAttachments.add(stickerAttIdx);
+          return renderedAttachments[stickerAttIdx]!;
+        }
+      }
+
+      if (faceText) {
+        return `[表情: ${faceText}]`;
+      }
+      return '';
+    });
+
+    const normalized = replaced
+      .replace(/\]\s*\[/g, '] [')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim();
+    if (normalized !== '') {
+      processedLines.push(normalized);
+    }
+  }
+
+  const trimmedTextLines = trimBlankLines(processedLines);
+  const unconsumedAttachments = renderedAttachments.filter((_, idx) => !consumedAttachments.has(idx));
+
+  const contentLines: string[] = [];
+  if (trimmedTextLines.length > 0) {
+    if (trimmedTextLines.length === 1 && unconsumedAttachments.length > 0) {
+      contentLines.push(`${trimmedTextLines[0]} ${unconsumedAttachments.join(' ')}`);
+    } else {
+      contentLines.push(...trimmedTextLines, ...unconsumedAttachments);
+    }
+  } else if (unconsumedAttachments.length > 0) {
+    contentLines.push(...unconsumedAttachments);
+  } else if (xmlCtx.hadFaceTag) {
+    contentLines.push('[表情]');
+  }
+
+  return contentLines;
+}
+
+/**
+ * 解析并清洗重构 QQ 官方 `message_type=102` 合并转发文本（剥离冗余标签与 `<faceType=...>` / `<attachmentType=...>` 壳，
  * 按 `1. 发送者: 内容/附件` 重排；已落盘附件仅展示本地路径，未落盘/失败保留选项 A 真实直链）。
  */
 export function formatForwardMessageContent(
@@ -549,40 +820,40 @@ export function formatForwardMessageContent(
   const outLines: string[] = [...doc.headerLines];
 
   for (const node of doc.nodes) {
-    const { cleanText, hadFaceTag, faceTexts } = stripNodeFaceTags(node.rawTextLines);
-
-    const renderedAttachments = node.attachments.map((att) => {
-      const entry = att.rawUrl ? options?.resolvedEntries?.get(att.rawUrl) : undefined;
-      const replacement = att.rawUrl ? options?.replacements?.get(att.rawUrl) : undefined;
-      return renderForwardAttachment(att, entry, {
-        hadFaceTag,
-        getFaceByMd5: options?.getFaceByMd5,
-        replacement,
-      });
-    });
-
-    const contentLines: string[] = [];
-    if (cleanText !== '') {
-      const textLines = cleanText.split(/\r?\n/);
-      if (renderedAttachments.length === 0 && hadFaceTag && faceTexts.length > 0) {
-        const lastIdx = textLines.length - 1;
-        textLines[lastIdx] = `${textLines[lastIdx]} ${faceTexts.map((t) => `[表情: ${t}]`).join(' ')}`;
-      }
-      if (textLines.length === 1 && renderedAttachments.length === 1) {
-        contentLines.push(`${textLines[0]} ${renderedAttachments[0]}`);
-      } else {
-        contentLines.push(...textLines, ...renderedAttachments);
-      }
-    } else if (renderedAttachments.length > 0) {
-      contentLines.push(...renderedAttachments);
-    } else if (hadFaceTag) {
-      contentLines.push(
-        faceTexts.length > 0 ? faceTexts.map((t) => `[表情: ${t}]`).join(' ') : '[表情]'
+    let baseLines = normalizeForwardCardLines(node.rawTextLines, node.attachments.length > 0);
+    // 仅当存在结构化 `[关联消息]` 块并转为 `[引用回复: "..."]` 时，剥离节点顶层冗余的 `[消息类型] 引用消息`
+    if (node.relatedMessages.length > 0) {
+      baseLines = trimBlankLines(
+        baseLines.filter((l) => !/^\s*\[消息类型\]\s*引用消息\s*$/.test(l))
       );
     }
 
+    const contentLines = renderForwardInlineContent(baseLines, node.attachments, options);
+
+    if (node.relatedMessages.length > 0) {
+      const quoteTags = node.relatedMessages.map((rel) => {
+        const relLines = renderForwardInlineContent(rel.rawTextLines, rel.attachments, options);
+        const relBody = relLines.join(' ').trim();
+        const quoteInner =
+          rel.senderName && relBody
+            ? `${rel.senderName}: ${relBody}`
+            : relBody || rel.senderName || '';
+        return quoteInner ? `[引用回复: "${quoteInner}"]` : '[引用回复]';
+      });
+      const quotedPrefix = quoteTags.join(' ');
+      if (contentLines.length > 0) {
+        contentLines[0] = `${quotedPrefix} ${contentLines[0]}`;
+      } else {
+        contentLines.push(quotedPrefix);
+      }
+    }
+
     if (contentLines.length === 0) {
-      outLines.push(node.senderName ? `${node.index}. ${node.senderName}` : `${node.index}. [空消息]`);
+      outLines.push(
+        node.senderName
+          ? `${node.index}. ${node.senderName}: [未展开或不支持的消息内容]`
+          : `${node.index}. [空消息]`
+      );
       continue;
     }
 
@@ -762,10 +1033,26 @@ export async function resolveEmbeddedForwardMedia(
 
   if (doc.nodes.length > 0) {
     for (const node of doc.nodes) {
-      const { hadFaceTag } = stripNodeFaceTags(node.rawTextLines);
-      for (const att of node.attachments) {
+      const xmlCtx = collectNodeXmlContext(node.rawTextLines);
+      for (const [idx, att] of node.attachments.entries()) {
         if (att.rawUrl) {
-          workItems.push({ parsed: att, hadFaceTag });
+          const isStickerFaceCtx =
+            xmlCtx.hasStickerFaceTag &&
+            !xmlCtx.referencedAttachmentIndices.has(idx) &&
+            !xmlCtx.hasUnindexedAttachmentTag;
+          workItems.push({ parsed: att, hadFaceTag: isStickerFaceCtx });
+        }
+      }
+      for (const rel of node.relatedMessages) {
+        const relCtx = collectNodeXmlContext(rel.rawTextLines);
+        for (const [idx, att] of rel.attachments.entries()) {
+          if (att.rawUrl) {
+            const isStickerFaceCtx =
+              relCtx.hasStickerFaceTag &&
+              !relCtx.referencedAttachmentIndices.has(idx) &&
+              !relCtx.hasUnindexedAttachmentTag;
+            workItems.push({ parsed: att, hadFaceTag: isStickerFaceCtx });
+          }
         }
       }
     }

@@ -38,6 +38,12 @@ const AUDIO_FILE_EXTENSIONS = new Set(['wav', 'amr', 'ogg', 'm4a', 'mp3']);
 const FACE_XML_TAG_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/;
 const FACE_XML_TAG_GLOBAL_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/g;
 const FACE_XML_EXT_ATTR_RE = /(?:^|[\s,])ext\s*=\s*(?:"([^"]*)"|'([^']*)')/;
+const ATTACHMENT_XML_TAG_RE =
+  /<attachmentType\s*=\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,\s>\r\n]+)(?:\s*,\s*[^>\r\n]*)?>/;
+const ATTACHMENT_XML_TAG_GLOBAL_RE =
+  /<attachmentType\s*=\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,\s>\r\n]+)(?:\s*,\s*[^>\r\n]*)?>/g;
+const ATTACHMENT_XML_INDEX_ATTR_RE = /(?:^|[\s,])attachmentIndex\s*=\s*"?(\d+)"?/;
+const ATTACHMENT_XML_DESC_ATTR_RE = /(?:^|[\s,])description\s*=\s*(?:"([^"]*)"|'([^']*)')/;
 const BASE64_FORMAT_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const OUTER_BRACKETS_RE = /^\[([^\[\]\r\n]+)\]$/;
 
@@ -45,6 +51,12 @@ const OUTER_BRACKETS_RE = /^\[([^\[\]\r\n]+)\]$/;
 export function hasFaceXmlTag(content?: string): boolean {
   if (typeof content !== 'string' || content === '') return false;
   return FACE_XML_TAG_RE.test(content);
+}
+
+/** 判断文本中是否包含 QQ 网关入站 `<attachmentType=...>` 原始 XML 标签。 */
+export function hasAttachmentXmlTag(content?: string): boolean {
+  if (typeof content !== 'string' || content === '') return false;
+  return ATTACHMENT_XML_TAG_RE.test(content);
 }
 
 /** 剥离 QQ 网关入站 `<faceType=...>` 原始 XML 标签并保留其余文本（无标签时原样返回）。 */
@@ -66,26 +78,39 @@ export function stripFaceXmlTags(content?: string): { text: string; hadFaceTag: 
   };
 }
 
-/**
- * 严格判定「纯表情包消息」：正文去除全部 `<faceType=...>` 标签后为空，且整条消息恰好只有一个图片类附件。
- *
- * 之所以要求「无其他文字 + 单图片」，是为了避免「文字 + 系统表情 + 一张截图」这类消息被误判为表情包，
- * 从而错误地把普通图片落盘到 `sticker/` 并渲染成 `[表情包]`。
- *
- * @param content 原始 `event.content`
- * @param imageAttachmentCount 本条消息中按 `content_type` 判定为图片的附件数量
- */
-export function isPureStickerMessage(
-  content: string | undefined,
-  imageAttachmentCount: number
-): boolean {
-  if (!hasFaceXmlTag(content)) return false;
-  if (imageAttachmentCount !== 1) return false;
-  return stripFaceXmlTags(content).text === '';
+/** 剥离 QQ 网关入站 `<attachmentType=...>` 原始 XML 标签并保留其余文本（无标签时原样返回）。 */
+export function stripAttachmentXmlTags(content?: string): {
+  text: string;
+  hadAttachmentTag: boolean;
+} {
+  if (typeof content !== 'string' || content === '') {
+    return { text: '', hadAttachmentTag: false };
+  }
+  let hadAttachmentTag = false;
+  const stripped = content.replace(ATTACHMENT_XML_TAG_GLOBAL_RE, () => {
+    hadAttachmentTag = true;
+    return '';
+  });
+  if (!hadAttachmentTag) {
+    return { text: content, hadAttachmentTag: false };
+  }
+  return {
+    text: stripped.replace(/[ \t]{2,}/g, ' ').trim(),
+    hadAttachmentTag: true,
+  };
 }
 
-function decodeFaceExtText(rawExt: string): string | undefined {
-  const b64 = rawExt.trim();
+/** 提取单个 `<attachmentType=...,attachmentIndex=N,...>` 标签内的 0-based 附件下标。 */
+export function parseAttachmentXmlIndex(tag: string): number | undefined {
+  if (typeof tag !== 'string' || tag === '') return undefined;
+  const match = ATTACHMENT_XML_INDEX_ATTR_RE.exec(tag);
+  if (!match) return undefined;
+  const idx = Number(match[1]);
+  return Number.isInteger(idx) && idx >= 0 ? idx : undefined;
+}
+
+function decodeBase64JsonText(rawB64: string, unwrapOuterBrackets: boolean): string | undefined {
+  const b64 = rawB64.trim();
   if (b64 === '' || b64.length % 4 === 1 || !BASE64_FORMAT_RE.test(b64)) {
     return undefined;
   }
@@ -105,12 +130,46 @@ function decodeFaceExtText(rawExt: string): string | undefined {
 
     const trimmed = rawText.trim();
     if (trimmed === '') return undefined;
+    if (!unwrapOuterBrackets) return trimmed;
     const bracketMatch = OUTER_BRACKETS_RE.exec(trimmed);
     const unwrapped = (bracketMatch ? bracketMatch[1]! : trimmed).trim();
     return unwrapped === '' ? undefined : unwrapped;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * 提取单个 `<attachmentType=...,description="...">` 标签内的 Base64 JSON 语义文本（如 `[图片]`）。
+ */
+export function extractAttachmentXmlDescriptionText(tag: string): string | undefined {
+  if (typeof tag !== 'string' || tag === '') return undefined;
+  const descMatch = ATTACHMENT_XML_DESC_ATTR_RE.exec(tag);
+  if (!descMatch) return undefined;
+  const rawDesc = descMatch[1] ?? descMatch[2] ?? '';
+  return decodeBase64JsonText(rawDesc, false);
+}
+
+/**
+ * 严格判定「纯表情包消息」：正文去除全部 `<faceType=...>` 标签后为空，且整条消息恰好只有一个图片类附件。
+ *
+ * 之所以要求「无其他文字 + 单图片」，是为了避免「文字 + 系统表情 + 一张截图」这类消息被误判为表情包，
+ * 从而错误地把普通图片落盘到 `sticker/` 并渲染成 `[表情包]`。
+ *
+ * @param content 原始 `event.content`
+ * @param imageAttachmentCount 本条消息中按 `content_type` 判定为图片的附件数量
+ */
+export function isPureStickerMessage(
+  content: string | undefined,
+  imageAttachmentCount: number
+): boolean {
+  if (!hasFaceXmlTag(content)) return false;
+  if (imageAttachmentCount !== 1) return false;
+  return stripFaceXmlTags(content).text === '';
+}
+
+function decodeFaceExtText(rawExt: string): string | undefined {
+  return decodeBase64JsonText(rawExt, true);
 }
 
 /**

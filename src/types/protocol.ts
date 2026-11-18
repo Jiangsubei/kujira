@@ -53,8 +53,9 @@ export interface QQMsgElement {
   attachments?: QQAttachment[];
 }
 
-/** C2C 单聊事件发送者（实测 username 与 union_openid 在单聊常为空串） */
+/** C2C 单聊事件发送者（实测 username 可能为空或下发真实昵称；2026-11-18 实测已下发 username 与 avatar） */
 export interface QQC2CAuthor {
+  avatar?: string;
   bot?: boolean;
   id?: string;
   union_openid?: string;

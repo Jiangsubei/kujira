@@ -11,10 +11,14 @@
 import type { FaceRecord, QQC2CMessageCreateEvent } from '../types/index.js';
 import type { AttachmentDescriptor } from '../attachment/types.js';
 import {
+  extractAttachmentXmlDescriptionText,
   extractFaceXmlTexts,
   extractSingleFaceXmlText,
+  hasAttachmentXmlTag,
   hasFaceXmlTag,
   isPureStickerMessage,
+  parseAttachmentXmlIndex,
+  stripAttachmentXmlTags,
   stripFaceXmlTags,
 } from '../attachment/classify.js';
 import {
@@ -26,7 +30,14 @@ import { computeFileMd5 } from '../storage/media.js';
 import { extractArkDataContent } from './card-parser.js';
 import { formatForwardMessageContent } from './inbound-media.js';
 
-export { extractFaceXmlTexts, hasFaceXmlTag, stripFaceXmlTags };
+export {
+  extractAttachmentXmlDescriptionText,
+  extractFaceXmlTexts,
+  hasAttachmentXmlTag,
+  hasFaceXmlTag,
+  stripAttachmentXmlTags,
+  stripFaceXmlTags,
+};
 
 export interface MatchedFaceInfo {
   id: string;
@@ -284,12 +295,37 @@ export function parseNormalizedContent(
   }
 
   // 3. 普通文本 / 富媒体 / 引用回复（message_type === 0 / 103）
+  const hadAttachmentTag = hasAttachmentXmlTag(rawContent);
   let text = rawContent;
   const consumedAttachments = new Set<number>();
 
-  if (hadFaceTag) {
-    const FACE_TAG_RE = /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>/g;
-    text = text.replace(FACE_TAG_RE, (match) => {
+  if (hadFaceTag || hadAttachmentTag) {
+    const INLINE_XML_TAG_RE =
+      /<faceType=\s*\d+(?:\s*,\s*[^>\r\n]*)?>|<attachmentType\s*=\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,\s>\r\n]+)(?:\s*,\s*[^>\r\n]*)?>/g;
+    text = text.replace(INLINE_XML_TAG_RE, (match) => {
+      if (match.startsWith('<attachmentType')) {
+        const declaredIdx = parseAttachmentXmlIndex(match);
+        if (
+          declaredIdx !== undefined &&
+          declaredIdx < renderedAttachments.length &&
+          !consumedAttachments.has(declaredIdx) &&
+          renderedAttachments[declaredIdx]
+        ) {
+          consumedAttachments.add(declaredIdx);
+          return renderedAttachments[declaredIdx]!;
+        }
+        if (declaredIdx === undefined) {
+          const nextIdx = renderedAttachments.findIndex(
+            (rendered, idx) => Boolean(rendered) && !consumedAttachments.has(idx)
+          );
+          if (nextIdx >= 0) {
+            consumedAttachments.add(nextIdx);
+            return renderedAttachments[nextIdx]!;
+          }
+        }
+        return extractAttachmentXmlDescriptionText(match) ?? '';
+      }
+
       // 1. 若有待消费的表情包附件（kind === 'sticker' 且尚未消费），优先就地就位
       const stickerIdx = descriptors.findIndex(
         (d, idx) => d.kind === 'sticker' && !consumedAttachments.has(idx)
