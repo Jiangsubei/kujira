@@ -245,7 +245,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     registerAgentTools({ tools: mockTools } as any, {
       db,
       mediaManager: {} as any,
-      config: () => ({ face_enabled: true } as any),
+      config: () => ({} as any),
     } as any);
     const listTool = mockTools.register.mock.calls.map((c) => c[0]).find((t) => t.name === 'list_faces');
 
@@ -727,7 +727,7 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     expect(resNoImg.error).toMatch(/未找到图片/);
   });
 
-  it('契约 7: 门控装配契约 (face_enabled 为 false 时不注册表情工具)', () => {
+  it('契约 7: 表情工具常驻装配契约 (无需任何开关配置始终注册全部 4 个表情工具)', () => {
     const mockTools = {
       register: vi.fn(),
     };
@@ -738,27 +738,14 @@ describe('契约测试: Agent 表情工具集 (Face Tools Contract)', () => {
     registerAgentTools(mockCtx as any, {
       db,
       mediaManager: {} as any,
-      config: () => ({ face_enabled: false } as any),
+      config: () => ({} as any),
     } as any);
 
-    const registeredNamesFalse = mockTools.register.mock.calls.map((call) => call[0].name);
-    expect(registeredNamesFalse).not.toContain('list_faces');
-    expect(registeredNamesFalse).not.toContain('send_face');
-    expect(registeredNamesFalse).not.toContain('collect_face');
-    expect(registeredNamesFalse).not.toContain('manage_faces');
-
-    mockTools.register.mockClear();
-    registerAgentTools(mockCtx as any, {
-      db,
-      mediaManager: {} as any,
-      config: () => ({ face_enabled: true } as any),
-    } as any);
-
-    const registeredNamesTrue = mockTools.register.mock.calls.map((call) => call[0].name);
-    expect(registeredNamesTrue).toContain('list_faces');
-    expect(registeredNamesTrue).toContain('send_face');
-    expect(registeredNamesTrue).toContain('collect_face');
-    expect(registeredNamesTrue).toContain('manage_faces');
+    const registeredNames = mockTools.register.mock.calls.map((call) => call[0].name);
+    expect(registeredNames).toContain('list_faces');
+    expect(registeredNames).toContain('send_face');
+    expect(registeredNames).toContain('collect_face');
+    expect(registeredNames).toContain('manage_faces');
   });
 
   it('契约 8: manage_faces 支持传入 face_id 为已有表情补全/更新 tags 与 mood', async () => {

@@ -95,8 +95,6 @@ export const DEFAULT_USER_PROFILE_BUDGET_CHARS = 2200;
 /** 单个 Session 规则文件的写入上限 */
 export const DEFAULT_SESSION_MEMORY_BUDGET_CHARS = 2200;
 
-export const DEFAULT_FACE_ENABLED = false;
-
 export const DEFAULT_FACE_STORE_MAX = 100;
 
 export const DEFAULT_FACE_QUERY_LIMIT = 100;
@@ -104,8 +102,6 @@ export const DEFAULT_FACE_QUERY_LIMIT = 100;
 export const DEFAULT_FACE_EVICT_POLICY = 'reject' as const;
 
 export const DEFAULT_FACE_GRACE_PERIOD_DAYS = 7;
-
-export const DEFAULT_SLANG_ENABLED = true;
 
 export const DEFAULT_SLANG_MAX_ENTRIES = 300;
 
@@ -235,11 +231,9 @@ export const DEFAULT_BASE_CONFIG = {
   memory_storage_dir: DEFAULT_MEMORY_DIR,
   user_profile_budget_chars: DEFAULT_USER_PROFILE_BUDGET_CHARS,
   session_memory_budget_chars: DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
-  face_enabled: DEFAULT_FACE_ENABLED,
   face_store_max: DEFAULT_FACE_STORE_MAX,
   face_store_dir: DEFAULT_FACE_STORE_DIR,
   face_evict_policy: DEFAULT_FACE_EVICT_POLICY,
-  slang_enabled: DEFAULT_SLANG_ENABLED,
   slang_max_entries: DEFAULT_SLANG_MAX_ENTRIES,
   slang_evict_policy: DEFAULT_SLANG_EVICT_POLICY,
   slang_storage_path: DEFAULT_SLANG_STORAGE_PATH,

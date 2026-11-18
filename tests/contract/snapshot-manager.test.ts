@@ -303,8 +303,6 @@ describe('契约测试: Kujira 多通道独立运行时快照管理器 (Snapshot
           slangStorage: mockSlangStorage,
           getPersona: () => '自定义人格设定',
           getBehavior: () => '',
-          getFaceEnabled: () => true,
-          getSlangEnabled: () => true,
         });
 
         expect(hub.getProvider('kujira:persona')).toBeDefined();
@@ -366,7 +364,6 @@ describe('契约测试: Kujira 多通道独立运行时快照管理器 (Snapshot
       const hub = setupSnapshotHub({
         ctx: mockCtx,
         db: mockDb,
-        getFaceEnabled: () => true,
         getFaceStoreMax: () => 250,
       });
 

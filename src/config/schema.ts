@@ -14,11 +14,9 @@ import {
   DEFAULT_MEMORY_DIR,
   DEFAULT_USER_PROFILE_BUDGET_CHARS,
   DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
-  DEFAULT_FACE_ENABLED,
   DEFAULT_FACE_STORE_MAX,
   DEFAULT_FACE_STORE_DIR,
   DEFAULT_FACE_EVICT_POLICY,
-  DEFAULT_SLANG_ENABLED,
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
   DEFAULT_SLANG_STORAGE_PATH,
@@ -72,11 +70,6 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_SESSION_MEMORY_BUDGET_CHARS)
     .volatile()
     .description('Session 规则字符预算上限：单个会话规则文件的写入上限 (默认 2200)'),
-  face_enabled: z
-    .boolean()
-    .default(DEFAULT_FACE_ENABLED)
-    .volatile()
-    .description('控制新建会话是否装载表情包工具集，对后续新会话生效'),
   face_store_max: z
     .number()
     .default(DEFAULT_FACE_STORE_MAX)
@@ -92,11 +85,6 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_FACE_EVICT_POLICY)
     .volatile()
     .description('满额策略 (reject: 拒绝新增, evict_lru: 淘汰最久未用)'),
-  slang_enabled: z
-    .boolean()
-    .default(DEFAULT_SLANG_ENABLED)
-    .volatile()
-    .description('控制新建会话是否装载黑话工具集与注入黑话上下文，对后续新会话生效'),
   slang_max_entries: z
     .number()
     .default(DEFAULT_SLANG_MAX_ENTRIES)

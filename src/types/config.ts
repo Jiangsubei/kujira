@@ -31,7 +31,7 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（26 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（24 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
@@ -47,16 +47,12 @@ export interface BridgePluginConfig {
   user_profile_budget_chars?: number;
   /** Session 规则字符预算上限：单个会话规则文件的写入上限 (默认 2200) */
   session_memory_budget_chars?: number;
-  /** 控制新建会话是否装载表情包工具集，对后续新会话生效 */
-  face_enabled?: boolean;
   /** 本地表情库存储容量上限 (默认 100 张) */
   face_store_max?: number;
   /** 本地表情库文件存储目录 (默认 .dsh/kujira/faces) */
   face_store_dir?: string;
   /** 表情库满额淘汰策略 ('reject' 拒绝新增 / 'evict_lru' 淘汰最久未用) */
   face_evict_policy?: 'reject' | 'evict_lru';
-  /** 控制新建会话是否装载黑话工具集与注入黑话上下文，对后续新会话生效 */
-  slang_enabled?: boolean;
   /** 黑话知识库条数上限 (默认 300 条) */
   slang_max_entries?: number;
   /** 黑话库满额淘汰策略 ('reject' 拒绝新增 / 'evict_lru' 淘汰查阅最少词条) */

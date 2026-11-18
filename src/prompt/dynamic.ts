@@ -70,7 +70,6 @@ export function registerKujiraDynamicPrompt(
 export function registerFacePromptContext(
   ctx: Context,
   db: MessageDatabase,
-  getEnabled: () => boolean = () => true,
   getFaceStoreMax?: () => number,
   snapshotManager?: SnapshotManager
 ): () => void {
@@ -82,10 +81,6 @@ export function registerFacePromptContext(
     name: 'kujira:face_summary',
     order: 48,
     provide: () => {
-      if (!getEnabled()) {
-        return '';
-      }
-
       const limit = typeof getFaceStoreMax === 'function' ? getFaceStoreMax() : DEFAULT_FACE_STORE_MAX;
       const activeFacesRes = db.getActiveFacesForContext(limit);
       return formatFaceLibraryContext(activeFacesRes.faces, activeFacesRes.total);

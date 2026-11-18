@@ -110,7 +110,6 @@ describe('契约测试: 黑话系统装配与运行时接线闭环 (Slang Assemb
       ctx: mockCtx,
       db,
       slangStorage: service.storage,
-      getSlangEnabled: () => true,
     });
 
     const slangProvider = hub.getProvider('kujira:slang');
@@ -175,14 +174,14 @@ describe('契约测试: 黑话系统装配与运行时接线闭环 (Slang Assemb
     expect(hub.getProvider('kujira:slang')).toBeUndefined();
   });
 
-  it('契约 2: registerAgentTools 在 slang_enabled !== false 时装配 query_slang、record_slang 与 manage_slang 并可执行', async () => {
+  it('契约 2: registerAgentTools 无条件常驻装配 query_slang、record_slang 与 manage_slang 并可执行', async () => {
     const storage = new SlangStorage(db, 300, 'reject');
     const unregister = registerAgentTools(mockCtx, {
       db,
       mediaManager,
       dshHome: tmpDir,
       slangStorage: storage,
-      configGetter: () => ({ slang_enabled: true }),
+      configGetter: () => ({}),
     });
 
     const queryTool = registeredTools.get('query_slang');
@@ -227,22 +226,5 @@ describe('契约测试: 黑话系统装配与运行时接线闭环 (Slang Assemb
     expect(registeredTools.has('query_slang')).toBe(false);
     expect(registeredTools.has('record_slang')).toBe(false);
     expect(registeredTools.has('manage_slang')).toBe(false);
-  });
-
-  it('契约 3: registerAgentTools 在 slang_enabled === false 时跳过黑话工具装配', () => {
-    const storage = new SlangStorage(db, 300, 'reject');
-    const unregister = registerAgentTools(mockCtx, {
-      db,
-      mediaManager,
-      dshHome: tmpDir,
-      slangStorage: storage,
-      configGetter: () => ({ slang_enabled: false }),
-    });
-
-    expect(registeredTools.has('query_slang')).toBe(false);
-    expect(registeredTools.has('record_slang')).toBe(false);
-    expect(registeredTools.has('manage_slang')).toBe(false);
-
-    unregister();
   });
 });

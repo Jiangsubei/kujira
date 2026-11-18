@@ -73,8 +73,8 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     }
   });
 
-  it('装配 1: 默认状态 (face_enabled=false) 真实装配下绝不暴露 4 个表情工具，kujira:face_summary 保持静默', async () => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-off-'));
+  it('装配 1: 默认无配置开关下真实装配常驻暴露全部 4 个表情工具，空库时 kujira:face_summary 返回空字符串', async () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-default-'));
     booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: true,
@@ -83,7 +83,7 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     const provider = (booted.ctx.get('kujiraBridgeTools') || (booted.ctx as any).kujiraBridgeTools) as any;
     expect(provider).toBeDefined();
 
-    // 挂载 kujira-tools 插件（即使配置默认 face_enabled=false，常规单聊工具应注册，4 个表情工具绝不挂载）
+    // 挂载 kujira-tools 插件（无需任何开关配置，常规单聊工具与 4 个表情工具均常驻装配）
     await booted.ctx.plugin(KujiraToolsPlugin);
 
     const toolsService = (booted.ctx.get('tools') || (booted.ctx as any).tools) as any;
@@ -91,13 +91,14 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     expect(toolsService.get('send_qq_message')).toBeDefined();
 
     for (const name of FACE_TOOL_NAMES) {
-      expect(toolsService.get(name)).toBeUndefined();
+      expect(toolsService.get(name)).toBeDefined();
     }
 
     const snapshotManager = (booted.ctx as any).snapshotManager;
     expect(snapshotManager).toBeDefined();
     const faceProvider = snapshotManager.getProvider('kujira:face_summary');
     expect(faceProvider).toBeDefined();
+    // 空库时保持静默返回空字符串
     expect(
       faceProvider.provide(
         { peer: MOCK_PEER, userId: MOCK_HASH },
@@ -106,13 +107,12 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     ).toBe('');
   });
 
-  it('装配 2: 开启总开关 (face_enabled=true) 真实装配下完整挂载 4 个表情工具并可执行与遵循 Lossless JSON', async () => {
+  it('装配 2: 真实装配下完整挂载 4 个表情工具并可执行与遵循 Lossless JSON', async () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-face-on-'));
     booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: true,
       config: {
-        face_enabled: true,
         face_store_max: 50,
       },
     });
@@ -179,9 +179,7 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
       mountPlugin: false,
     });
 
-    await booted.ctx.plugin(KujiraPlugin, {
-      face_enabled: true,
-    });
+    await booted.ctx.plugin(KujiraPlugin, {});
     await waitForPreset(booted.ctx, 'kujira-session');
 
     const faceNameSet = new Set<string>(FACE_TOOL_NAMES);
@@ -238,9 +236,6 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
     booted = await bootDshKujira({
       dshHome: tmpHome,
       mountPlugin: true,
-      config: {
-        face_enabled: true,
-      },
     });
 
     await booted.ctx.plugin(KujiraToolsPlugin);
@@ -331,7 +326,6 @@ describe('契约测试: 表情包系统真实装配闭环 (Face Assembly Contrac
       dshHome: tmpHome,
       mountPlugin: true,
       config: {
-        face_enabled: true,
         face_store_max: 3,
       },
     });

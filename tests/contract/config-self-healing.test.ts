@@ -11,7 +11,7 @@ import {
 import { BridgeConfigSchema } from '../../src/config/schema.js';
 import { DEFAULT_BASE_CONFIG, PLUGIN_NAME, SETTINGS_NAMESPACE } from '../../src/constants/index.js';
 
-const EXPECTED_15_KEYS = [
+const EXPECTED_13_KEYS = [
   'image_ttl_days',
   'new_message_behavior',
   'persona',
@@ -19,11 +19,9 @@ const EXPECTED_15_KEYS = [
   'memory_storage_dir',
   'user_profile_budget_chars',
   'session_memory_budget_chars',
-  'face_enabled',
   'face_store_max',
   'face_store_dir',
   'face_evict_policy',
-  'slang_enabled',
   'slang_max_entries',
   'slang_evict_policy',
   'slang_storage_path',
@@ -44,9 +42,9 @@ const PROACTIVE_KEYS = [
   'instant_reply_enabled',
 ] as const;
 
-const EXPECTED_26_KEYS = [...EXPECTED_15_KEYS, ...PROACTIVE_KEYS] as const;
+const EXPECTED_24_KEYS = [...EXPECTED_13_KEYS, ...PROACTIVE_KEYS] as const;
 
-describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -57,23 +55,23 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 26 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 26 项合法键', () => {
+  describe('1. 单一真相源与 24 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 24 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(26);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_26_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_26_KEYS].sort());
+      expect(validKeys.size).toBe(24);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_24_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_24_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_26_KEYS) {
+      for (const field of EXPECTED_24_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_26_KEYS) {
+      for (const field of EXPECTED_24_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'
@@ -91,6 +89,8 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
         // 已固化为默认开启而废除的配置开关
         'markdown_enabled',
         'input_notify_enabled',
+        'face_enabled',
+        'slang_enabled',
         // 旧聚合与冷场固定分钟数配置（彻底清除，由仿生动态区间全面取代）
         'aggregation_interval_mins',
         'idle_reply_timeout_mins',
@@ -141,12 +141,14 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
   });
 
   describe('2. 纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
-    it('分离 23 项合法字段与 markdown_enabled / input_notify_enabled / 旧固定分钟数 / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
+    it('分离 24 项合法字段与 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled / 旧固定分钟数 / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
       const dirtyInput = {
         image_ttl_days: 14,
         new_message_behavior: 'queue',
         persona: '测试单聊人格',
-        // 以下均为已废除键，必须全部剔除（含 markdown_enabled 与 input_notify_enabled 及旧固定分钟数）
+        // 以下均为已废除键，必须全部剔除（含 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled 及旧固定分钟数）
+        face_enabled: true,
+        slang_enabled: false,
         markdown_enabled: false,
         input_notify_enabled: true,
         aggregation_interval_mins: 2,
@@ -174,6 +176,8 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
       });
       expect(result.removed.sort()).toEqual(
         [
+          'face_enabled',
+          'slang_enabled',
           'markdown_enabled',
           'input_notify_enabled',
           'aggregation_interval_mins',
@@ -199,7 +203,7 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
       const cleanInput = {
         image_ttl_days: 14,
         new_message_behavior: 'steer' as const,
-        face_enabled: true,
+        face_store_max: 120,
         slang_evict_policy: 'evict_lru' as const,
       };
       const cleanRes = sanitizeConfigPayload(cleanInput);
@@ -216,7 +220,9 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
       const { valid } = sanitizeConfigPayload({
         image_ttl_days: 7,
         new_message_behavior: 'steer',
+        face_store_max: 100,
         face_enabled: true,
+        slang_enabled: true,
         markdown_enabled: true,
         input_notify_enabled: false,
         ws_port: 8080,
@@ -227,7 +233,7 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
       expect(valid).toEqual({
         image_ttl_days: 7,
         new_message_behavior: 'steer',
-        face_enabled: true,
+        face_store_max: 100,
       });
 
       const ops = Object.entries(valid).map(([key, value]) => ({ op: 'set' as const, path: [key], value }));
@@ -257,6 +263,8 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
         '  name: kujira',
         '  config:',
         '    image_ttl_days: 7',
+        '    face_enabled: true',
+        '    slang_enabled: false',
         '    markdown_enabled: true',
         '    input_notify_enabled: false',
         '    aggregation_interval_mins: 2',
@@ -293,6 +301,8 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
       expect(healResult.filePath).toBe(patchPath);
       expect(healResult.removedKeys.sort()).toEqual(
         [
+          'face_enabled',
+          'slang_enabled',
           'markdown_enabled',
           'input_notify_enabled',
           'aggregation_interval_mins',
@@ -314,7 +324,9 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
       expect(updated).toContain('image_ttl_days: 7');
       expect(updated).toContain('persona: "保留的合法单聊人格"');
 
-      // 所有死键（含 markdown_enabled / input_notify_enabled 及旧固定分钟数）及其多行子块已物理删除
+      // 所有死键（含 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled 及旧固定分钟数）及其多行子块已物理删除
+      expect(updated).not.toContain('face_enabled');
+      expect(updated).not.toContain('slang_enabled');
       expect(updated).not.toContain('markdown_enabled');
       expect(updated).not.toContain('input_notify_enabled');
       expect(updated).not.toContain('aggregation_interval_mins');
@@ -347,7 +359,7 @@ describe('契约测试: Kujira 26 项配置 Schema 与物理自愈引擎 (Config
         '    image_ttl_days: 7',
         '    new_message_behavior: steer',
         '    face_evict_policy: evict_lru',
-        '    slang_enabled: true',
+        '    slang_max_entries: 300',
         '',
       ].join('\n');
       fs.writeFileSync(patchPath, cleanYaml, 'utf8');

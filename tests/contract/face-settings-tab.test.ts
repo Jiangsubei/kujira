@@ -45,29 +45,18 @@ describe('契约测试: Web UI 设置卡「表情包」Tab (Face Settings Tab Co
     expect(html).toContain('表情包');
   });
 
-  it('契约 2: 切换至 face Tab，默认渲染总开关 face_enabled (默认关闭)', () => {
-    const { html } = renderCard({ initialTab: 'face' });
-
-    expect(html).toContain('kujira-tabpanel-face');
-    expect(html).toContain('装载表情包工具集');
-    expect(html).toContain('id="kujira-face-enabled"');
-
-    expect(html).not.toContain('id="kujira-face-store-max"');
-    expect(html).not.toContain('kujira-face-gallery');
-    expect(html).not.toContain('face_sub_type');
-  });
-
-  it('契约 3: 总开关开启 (face_enabled=true) 时展示配额、淘汰策略、默认目录 .dsh/kujira/faces 与表情画廊', () => {
+  it('契约 2: 切换至 face Tab，不再渲染 face_enabled 总开关，直接展示配额、淘汰策略、默认目录 .dsh/kujira/faces 与表情画廊', () => {
     const { html } = renderCard({
       initialTab: 'face',
       initialConfig: {
-        face_enabled: true,
         face_store_max: 100,
         face_evict_policy: 'reject',
       },
     });
 
     expect(html).toContain('kujira-tabpanel-face');
+    expect(html).not.toContain('id="kujira-face-enabled"');
+    expect(html).not.toContain('装载表情包工具集');
     expect(html).toContain('id="kujira-face-store-max"');
     expect(html).toContain('id="kujira-face-evict-policy"');
     expect(html).toContain('id="kujira-face-store-dir"');

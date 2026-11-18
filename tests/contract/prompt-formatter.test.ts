@@ -40,11 +40,9 @@ describe('契约测试: 统一提示词与上下文格式化模块 (PromptFormat
   });
 
   describe('2. 表情包全量上下文注入 (formatFaceLibraryContext)', () => {
-    it('2.1 表情库为空时，返回标准二级标题与友好收录指引', () => {
+    it('2.1 表情库为空时，返回空字符串保持静默', () => {
       const res = formatFaceLibraryContext([], 0);
-      expect(res).toContain('## 本地表情包库存 (Sticker & Meme Library)');
-      expect(res).toContain('当前本地表情库为空');
-      expect(res).toContain('collect_face');
+      expect(res).toBe('');
     });
 
     it('2.2 表情库有数据时，按情绪分组列出各表情的 ID 与详细标签，且包含一步直发指引', () => {

@@ -380,8 +380,6 @@ export interface SetupSnapshotHubOptions {
   db: MessageDatabase;
   memoryStorage?: MemoryStorage;
   slangStorage?: SlangStorage;
-  getSlangEnabled?: () => boolean;
-  getFaceEnabled?: () => boolean;
   getFaceStoreMax?: () => number;
   getPersona?: () => string;
   getBehavior?: () => string;
@@ -454,9 +452,6 @@ export function setupSnapshotHub(options: SetupSnapshotHubOptions): SnapshotMana
       name: 'kujira:slang',
       order: 45,
       provide: () => {
-        if (options.getSlangEnabled && !options.getSlangEnabled()) {
-          return '';
-        }
         const rawMarkdown = sStorage.getRawMarkdownSync();
         if (!rawMarkdown || !rawMarkdown.trim()) {
           return '';
@@ -471,9 +466,6 @@ export function setupSnapshotHub(options: SetupSnapshotHubOptions): SnapshotMana
     name: 'kujira:face_summary',
     order: 48,
     provide: () => {
-      if (options.getFaceEnabled && !options.getFaceEnabled()) {
-        return '';
-      }
       const limit =
         typeof options.getFaceStoreMax === 'function'
           ? options.getFaceStoreMax()

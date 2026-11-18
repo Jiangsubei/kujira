@@ -27,8 +27,6 @@ export interface SlangServiceOptions {
   getMaxEntries?: () => number;
   evictPolicy?: 'reject' | 'evict_lru' | (() => 'reject' | 'evict_lru');
   getEvictPolicy?: () => 'reject' | 'evict_lru';
-  enabled?: boolean | (() => boolean);
-  getEnabled?: () => boolean;
   /** 是否向 root ctx.tools 注册全局 Slang 工具（默认 true） */
   registerGlobalTools?: boolean;
   /** 是否向 root ctx 注册动态提示词段（默认 true；在配合统一 SnapshotHub 装配时传入 false） */
@@ -56,11 +54,6 @@ export function setupSlangService(
     options.getEvictPolicy?.() ??
     (typeof options.evictPolicy === 'function' ? options.evictPolicy() : options.evictPolicy) ??
     DEFAULT_SLANG_EVICT_POLICY;
-
-  const getEnabled = () =>
-    options.getEnabled?.() ??
-    (typeof options.enabled === 'function' ? options.enabled() : options.enabled) ??
-    true;
 
   // 1. 初始化 Storage（基于 SQLite 全局共享）
   const storage = new SlangStorage(
@@ -109,9 +102,6 @@ export function setupSlangService(
       name: 'kujira:slang',
       order: 45,
       provide: () => {
-        if (!getEnabled()) {
-          return '';
-        }
         const rawMarkdown = storage.getRawMarkdownSync();
         if (!rawMarkdown || !rawMarkdown.trim()) {
           return '';

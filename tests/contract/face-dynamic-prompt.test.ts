@@ -39,7 +39,7 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
   });
 
   it('契约 1: registerFacePromptContext 正确注册 kujira:face_summary 且 order 为 48', () => {
-    const unregister = registerFacePromptContext(mockCtx, db, () => true);
+    const unregister = registerFacePromptContext(mockCtx, db);
 
     const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
     expect(promptObj).toBeDefined();
@@ -85,7 +85,7 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
       format: 'png',
     });
 
-    registerFacePromptContext(mockCtx, db, () => true);
+    registerFacePromptContext(mockCtx, db);
     const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {
@@ -105,8 +105,8 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     expect(text).toContain('send_face(face_id="..."');
   });
 
-  it('契约 3: Kujira 单聊会话且库为空时，注入友好收录引导文案', () => {
-    registerFacePromptContext(mockCtx, db, () => true);
+  it('契约 3: Kujira 单聊会话且库为空时，输出空字符串保持静默', () => {
+    registerFacePromptContext(mockCtx, db);
     const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {
@@ -116,38 +116,10 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     };
 
     const text = promptObj.text(assembleCtx);
-    expect(text).toContain('本地表情包库存 (Sticker & Meme Library)');
-    expect(text).toContain('当前本地表情库为空');
-    expect(text).toContain('collect_face');
-  });
-
-  it('契约 4: 当 face_enabled 为 false 时，始终输出空字符串', () => {
-    db.insertFace({
-      id: 'f1',
-      file_path: '/path/f1.png',
-      md5: 'md5_1',
-      source: 'manual',
-      tags: ['猫猫'],
-      mood: '卖萌',
-      enabled: true,
-      size: 1024,
-      format: 'png',
-    });
-
-    registerFacePromptContext(mockCtx, db, () => false);
-    const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
-
-    const assembleCtx = {
-      agent: {
-        session: { id: kujiraSessionId },
-      },
-    };
-
-    const text = promptObj.text(assembleCtx);
     expect(text).toBe('');
   });
 
-  it('契约 5: 非 Kujira 单聊会话（Web UI 及旧群聊格式）静默，输出为空字符串', () => {
+  it('契约 4: 非 Kujira 单聊会话（Web UI 及旧群聊格式）静默，输出为空字符串', () => {
     db.insertFace({
       id: 'f1',
       file_path: '/path/f1.png',
@@ -160,7 +132,7 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
       format: 'png',
     });
 
-    registerFacePromptContext(mockCtx, db, () => true);
+    registerFacePromptContext(mockCtx, db);
     const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     expect(promptObj.text({ agent: { session: { id: 'web-assistant-session-999' } } })).toBe('');
@@ -168,7 +140,7 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
     expect(promptObj.text({ agent: { session: { id: 'group_3000000014' } } })).toBe('');
   });
 
-  it('契约 6: 上下文注入上限动态遵循 getFaceStoreMax 配置', () => {
+  it('契约 5: 上下文注入上限动态遵循 getFaceStoreMax 配置', () => {
     for (let i = 1; i <= 5; i++) {
       db.insertFace({
         id: `face_${i}`,
@@ -183,7 +155,7 @@ describe('契约测试: 表情包动态情绪锚点 System Prompt 上下文注�
       });
     }
 
-    registerFacePromptContext(mockCtx, db, () => true, () => 2);
+    registerFacePromptContext(mockCtx, db, () => 2);
     const promptObj = mockCtx.snapshotManager.getProvider('kujira:face_summary');
 
     const assembleCtx = {

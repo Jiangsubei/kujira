@@ -119,13 +119,11 @@ export function registerAgentTools(
     // 5. recall_message
     unregisters.push(tools.register(createRecallMessageTool(options)));
 
-    // 6. 表情包能力 (由 face_enabled 总开关前置门控)
-    if (getConfig().face_enabled) {
-      unregisters.push(tools.register(createListFacesTool(options)));
-      unregisters.push(tools.register(createSendFaceTool(options)));
-      unregisters.push(tools.register(createCollectFaceTool(options)));
-      unregisters.push(tools.register(createManageFacesTool(options)));
-    }
+    // 6. 表情包能力 (常驻装配)
+    unregisters.push(tools.register(createListFacesTool(options)));
+    unregisters.push(tools.register(createSendFaceTool(options)));
+    unregisters.push(tools.register(createCollectFaceTool(options)));
+    unregisters.push(tools.register(createManageFacesTool(options)));
 
     // 7. schedule_task
     unregisters.push(
@@ -140,20 +138,18 @@ export function registerAgentTools(
       )
     );
 
-    // 8. 黑话学习工具集 (由 slang_enabled 总开关前置门控，默认开启)
-    if (getConfig().slang_enabled !== false) {
-      const storage =
-        options.slangStorage ||
-        new SlangStorage(
-          options.db || getConfig().slang_storage_path,
-          () => getConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
-          () => getConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
-          options.dshHome
-        );
-      const slangDefs = createSlangToolDefinitions(storage);
-      for (const def of slangDefs) {
-        unregisters.push(tools.register(def));
-      }
+    // 8. 黑话学习工具集 (常驻装配)
+    const storage =
+      options.slangStorage ||
+      new SlangStorage(
+        options.db || getConfig().slang_storage_path,
+        () => getConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
+        () => getConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
+        options.dshHome
+      );
+    const slangDefs = createSlangToolDefinitions(storage);
+    for (const def of slangDefs) {
+      unregisters.push(tools.register(def));
     }
 
     // 9. manage_scheduled_tasks

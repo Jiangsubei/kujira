@@ -49,7 +49,7 @@ DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到�
 - **单聊专属预设（`kujira-session`）**：构建期与运行时单一真相源（SSOT）自动同步，注入专属轻量化提示词与单聊工具集；屏蔽无关 Coding 冗余，彻底杜绝 QQ 专用工具泄露至 WebUI 常规会话。
 - **双层记忆体系**：单聊会话规则 + 用户专属画像，基于 Markdown 持久化存储；写入侧受独立字符预算硬拒绝约束，注入侧保持原子读取，单 Agent 轮次内“顺手提炼”。
 - **黑话学习系统**：基于 SQLite 存储的词库，全局常驻 L1 索引动态注入，支持查梗、收录新梗与满额拒绝/LRU淘汰策略。
-- **表情包资产闭环**：受 `face_enabled` 配置门控，提供查表情、发表情、收录好图与满额管控（默认拒绝新增，支持 LRU 淘汰）全生命周期工具链。
+- **表情包资产闭环**：默认常驻装配，提供查表情、发表情、收录好图与满额管控（默认拒绝新增，支持 LRU 淘汰）全生命周期工具链。
 - **纯两字中文斜杠命令**：开箱支持 `/状态`、`/模型`、`/思考`、`/停止`、`/新建`、`/会话`、`/用量`、`/压缩`、`/权限`、`/帮助` 10 大指令，单聊用户自主掌控，支持会话一键 Compaction 压缩。
 - **WebUI 6 大 Tab 设置面板**：集成于 DSH 设置界面，精炼至 23 项核心参数，全部支持 volatile 动态热更新，废弃字段全自动物理自愈过滤。
 
@@ -145,7 +145,6 @@ dsh plugin add kujira
 ### 5. 表情资产 (Face)
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `face_enabled` | `boolean` | `false` | 控制新建会话是否在预设中装载表情包工具集 |
 | `face_store_max` | `number` | `100` | 本地表情库存储容量上限（张） |
 | `face_store_dir` | `string` | `".dsh/kujira/faces"` | 本地表情库文件存储目录 |
 | `face_evict_policy` | `'reject' \| 'evict_lru'` | `'reject'` | 库容满额策略（`reject` 拒绝 / `evict_lru` 淘汰最久未用） |
@@ -153,7 +152,6 @@ dsh plugin add kujira
 ### 6. 黑话学习 (Slang)
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `slang_enabled` | `boolean` | `true` | 控制新建会话是否装载黑话工具集与注入黑话上下文 |
 | `slang_max_entries` | `number` | `300` | 黑话知识库条数上限 |
 | `slang_evict_policy` | `'reject' \| 'evict_lru'` | `'reject'` | 黑话满额策略（`reject` 拒绝 / `evict_lru` 淘汰查阅最少词条） |
 | `slang_storage_path` | `string` | `".dsh/kujira/slang/slang.md"` | 黑话 Markdown 文档参考保存路径 |

@@ -46,10 +46,7 @@ export function formatFaceLibraryContext(
   const total = typeof totalCount === 'number' ? totalCount : faces.length;
 
   if (total === 0 || faces.length === 0) {
-    return [
-      '## 本地表情包库存 (Sticker & Meme Library)',
-      '当前本地表情库为空。若聊天中出现有趣的表情包，可调用 `collect_face` 进行收录打标。',
-    ].join('\n\n');
+    return '';
   }
 
   // 1. 按情绪分组聚合

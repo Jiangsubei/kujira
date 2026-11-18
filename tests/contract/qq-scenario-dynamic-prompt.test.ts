@@ -53,8 +53,6 @@ describe('契约测试: Kujira 会话提示词干净度与通道隔离验证 (QQ
       slangStorage,
       getPersona: () => '默认测试人设',
       getBehavior: () => '',
-      getFaceEnabled: () => true,
-      getSlangEnabled: () => true,
     });
   });
 

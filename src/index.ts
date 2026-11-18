@@ -422,8 +422,6 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     getMaxEntries: () => currentConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
     evictPolicy: currentConfig().slang_evict_policy,
     getEvictPolicy: () => currentConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
-    enabled: currentConfig().slang_enabled,
-    getEnabled: () => currentConfig().slang_enabled ?? true,
   });
 
   let snapshotManager: SnapshotManager | null = setupSnapshotHub({
@@ -431,8 +429,6 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     db,
     memoryStorage: memoryService.storage,
     slangStorage: slangService.storage,
-    getSlangEnabled: () => currentConfig().slang_enabled ?? true,
-    getFaceEnabled: () => Boolean(currentConfig().face_enabled),
     getFaceStoreMax: () => currentConfig().face_store_max ?? DEFAULT_FACE_STORE_MAX,
     getPersona: () => currentConfig().persona || '',
     getBehavior: () => currentConfig().behavior || '',

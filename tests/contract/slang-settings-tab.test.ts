@@ -45,12 +45,12 @@ describe('契约测试: Web UI 设置卡「黑话学习」Tab (Slang Settings Ta
     expect(html).toContain('黑话学习');
   });
 
-  it('契约 2: 切换至 slang Tab，默认渲染总开关 slang_enabled (默认开启) 及条数上限、淘汰策略与默认导出路径', () => {
+  it('契约 2: 切换至 slang Tab，不再渲染 slang_enabled 总开关，直接展示条数上限、淘汰策略、默认导出路径与容量状态', () => {
     const { html } = renderCard({ initialTab: 'slang' });
 
     expect(html).toContain('kujira-tabpanel-slang');
-    expect(html).toContain('装载黑话学习套件');
-    expect(html).toContain('id="kujira-slang-enabled"');
+    expect(html).not.toContain('装载黑话学习套件');
+    expect(html).not.toContain('id="kujira-slang-enabled"');
 
     expect(html).toContain('id="kujira-slang-max-entries"');
     expect(html).toContain('id="kujira-slang-evict-policy"');
@@ -61,21 +61,7 @@ describe('契约测试: Web UI 设置卡「黑话学习」Tab (Slang Settings Ta
     expect(html).not.toContain('slang-budget-chars');
   });
 
-  it('契约 3: 当 slang_enabled 为 false 时，折叠下级配置与词条列表', () => {
-    const { html } = renderCard({
-      initialTab: 'slang',
-      initialConfig: { slang_enabled: false },
-    });
-
-    expect(html).toContain('kujira-tabpanel-slang');
-    expect(html).toContain('id="kujira-slang-enabled"');
-    expect(html).not.toContain('id="kujira-slang-max-entries"');
-    expect(html).not.toContain('id="kujira-slang-evict-policy"');
-    expect(html).not.toContain('id="kujira-slang-storage-path"');
-    expect(html).not.toContain('容量状态:');
-  });
-
-  it('契约 4: 渲染「+ 添加黑话」图标按钮且位于容量状态右侧', () => {
+  it('契约 3: 渲染「+ 添加黑话」图标按钮且位于容量状态右侧', () => {
     const { html } = renderCard({ initialTab: 'slang' });
 
     expect(html).toContain('kujira-slang-add-btn');

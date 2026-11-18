@@ -76,11 +76,10 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
 
 ### Tab 5: 表情资产 (Face)
 
-管理个性化表情包库的收录、发送与淘汰机制。
+管理个性化表情包库的收录、发送与淘汰机制（表情工具集 `list_faces`、`send_face`、`collect_face`、`manage_faces` 默认常驻装配，表情库为空时不注入上下文）。
 
 | 参数名 | 字段类型 | 默认值 | 作用域与机制说明 |
 | :--- | :--- | :--- | :--- |
-| **`face_enabled`** | `boolean` | `false` | **表情包工具总开关**。<br/>开启后，向 `kujira-session` 预设中注入表情工具集（`list_faces`、`send_face`、`collect_face`、`manage_faces`）。 |
 | **`face_store_max`** | `number` | `100` | **本地表情库存储容量上限（张）**。达到上限后将触发淘汰策略。 |
 | **`face_store_dir`** | `string` | `".dsh/kujira/faces"` | **本地表情库图片保存目录**。 |
 | **`face_evict_policy`** | `'reject' \| 'evict_lru'` | `'reject'` | **库容满额淘汰策略**：<br/>• `reject`：库容满时直接拒绝收录新表情；<br/>• `evict_lru`：自动淘汰模型最久未发送过的冷门表情。 |
@@ -89,11 +88,10 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
 
 ### Tab 6: 黑话学习 (Slang)
 
-管理流行梗、专属暗号与标志句式的学习知识库。
+管理流行梗、专属暗号与标志句式的学习知识库（黑话工具集 `query_slang`、`record_slang`、`manage_slang` 默认常驻装配，词库非空时自动在 System Prompt 中挂载 L1 索引，为空时不注入上下文）。
 
 | 参数名 | 字段类型 | 默认值 | 作用域与机制说明 |
 | :--- | :--- | :--- | :--- |
-| **`slang_enabled`** | `boolean` | `true` | **黑话系统总开关**。<br/>开启后注入黑话工具集，并在 System Prompt 中挂载常驻 L1 词条索引，模型命中暗号时自动查阅例句。 |
 | **`slang_max_entries`** | `number` | `300` | **黑话知识库条数上限（条）**。 |
 | **`slang_evict_policy`** | `'reject' \| 'evict_lru'` | `'reject'` | **黑话满额策略**：`reject`（满额拒绝）或 `evict_lru`（淘汰查阅频次最少的词条）。 |
 | **`slang_storage_path`** | `string` | `".dsh/kujira/slang/slang.md"` | **黑话 Markdown 参考导出路径**。用于将 SQLite 词库导出为人可读的 Markdown 文本供审阅。 |
@@ -113,9 +111,6 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
   - `proactive_attitude`: `'enthusiastic'`
   - `instant_reply_enabled`: `true`
   - `idle_reply_enabled`: `false`
-- **表情与黑话**：
-  - `face_enabled`: `false`
-  - `slang_enabled`: `false`
 
 ### 配方 B：“慢条斯理”型沉浸贴心伙伴
 > **场景**：日常闲聊、情感树洞、懂梗斗图、真实拟人体验。
@@ -126,9 +121,9 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
   - `proactive_attitude`: `'balanced'`
   - `instant_reply_enabled`: `true`（连续连聊时秒回，增加互动兴奋感）
   - `idle_reply_enabled`: `true`（`idle_reply_min_mins: 45`, `idle_reply_max_mins: 180`）
-- **表情与黑话**：
-  - `face_enabled`: `true`（`face_store_max: 150`, `face_evict_policy: 'evict_lru'`）
-  - `slang_enabled`: `true`
+- **表情资产**：
+  - `face_store_max`: `150`
+  - `face_evict_policy`: `'evict_lru'`
 
 ### 配方 C：“高冷独立”型冷系角色
 > **场景**：傲娇、独立自主、不主动迎合的角色设定。

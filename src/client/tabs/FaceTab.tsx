@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { SwitchField, ValueField } from '../fields.js';
+import { ValueField } from '../fields.js';
 import { cardStyle, fieldStyle, faceStyle } from '../card-styles.js';
 import { IconUpload, IconEdit, IconTrash, IconBan } from '../icons.js';
 import { parseStringToArray } from '../utils.js';
@@ -173,287 +173,272 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
       ].filter(Boolean).join(' ')}
       style={!active ? { display: 'none' } : undefined}
     >
-      <SwitchField
-        id="kujira-face-enabled"
-        label="装载表情包工具集 (face_enabled)"
-        hint="控制新建会话是否在预设中包含表情包工具集，保存后对后续新会话生效"
-        checked={Boolean(draft.face_enabled)}
+      <ValueField
+        id="kujira-face-store-max"
+        label="表情库容量上限 (face_store_max)"
+        hint={`本地表情库最多保存多少张可用表情（默认 ${DEFAULT_FACE_STORE_MAX} 张）`}
+        placeholder={String(DEFAULT_FACE_STORE_MAX)}
+        numeric
+        value={String(draft.face_store_max ?? DEFAULT_FACE_STORE_MAX)}
         disabled={saving}
-        overridden={model.isOverridden('face_enabled')}
-        onReset={() => onResetField('face_enabled')}
-        onChange={(checked) => onFieldChange('face_enabled', checked)}
+        overridden={model.isOverridden('face_store_max')}
+        onReset={() => onResetField('face_store_max')}
+        onChange={(val) =>
+          onFieldChange('face_store_max', parseInt(val, 10) || DEFAULT_FACE_STORE_MAX)
+        }
       />
 
-      {draft.face_enabled && (
-        <>
-          <ValueField
-            id="kujira-face-store-max"
-            label="表情库容量上限 (face_store_max)"
-            hint={`本地表情库最多保存多少张可用表情（默认 ${DEFAULT_FACE_STORE_MAX} 张）`}
-            placeholder={String(DEFAULT_FACE_STORE_MAX)}
-            numeric
-            value={String(draft.face_store_max ?? DEFAULT_FACE_STORE_MAX)}
-            disabled={saving}
-            overridden={model.isOverridden('face_store_max')}
-            onReset={() => onResetField('face_store_max')}
-            onChange={(val) =>
-              onFieldChange('face_store_max', parseInt(val, 10) || DEFAULT_FACE_STORE_MAX)
-            }
-          />
-
-          <div className={fieldStyle.field}>
-            <div className={fieldStyle.head}>
-              <label htmlFor="kujira-face-evict-policy" className={fieldStyle.label}>
-                满额淘汰策略 (face_evict_policy)
-              </label>
-              {model.isOverridden('face_evict_policy') && (
-                <div className={fieldStyle.badges}>
-                  <span className={fieldStyle.badge}>已自定义</span>
-                  <button
-                    type="button"
-                    className={fieldStyle.reset}
-                    onClick={() => onResetField('face_evict_policy')}
-                  >
-                    重置
-                  </button>
-                </div>
-              )}
-            </div>
-            <select
-              id="kujira-face-evict-policy"
-              className={fieldStyle.input}
-              disabled={saving}
-              value={draft.face_evict_policy || DEFAULT_FACE_EVICT_POLICY}
-              onChange={(e) => onFieldChange('face_evict_policy', e.target.value as any)}
-            >
-              <option value="reject">拒绝新增 (reject) - 满额后停止收录，不删旧表情</option>
-              <option value="evict_lru">淘汰最久未用 (evict_lru) - 满额后自动淘汰最久未使用的表情</option>
-            </select>
-            <p className={fieldStyle.hint}>达到容量上限后的行为策略。淘汰的表情在硬盘上保留 7 天后悔期。</p>
-          </div>
-
-          <ValueField
-            id="kujira-face-store-dir"
-            label="表情库存储目录 (face_store_dir)"
-            hint={`本地表情图片原图落盘存储目录 (默认 ${DEFAULT_FACE_STORE_DIR})`}
-            placeholder={DEFAULT_FACE_STORE_DIR}
-            value={draft.face_store_dir || DEFAULT_FACE_STORE_DIR}
-            disabled={saving}
-            overridden={model.isOverridden('face_store_dir')}
-            onReset={() => onResetField('face_store_dir')}
-            onChange={(val) => onFieldChange('face_store_dir', val)}
-          />
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            style={{ display: 'none' }}
-            onChange={handleFileSelect}
-          />
-          <div className={`kujira-face-upload-bar ${faceStyle.uploadBar}`}>
-            <button
-              type="button"
-              className={`kujira-face-upload-btn ${cardStyle.discard}`}
-              onClick={() => fileInputRef.current?.click()}
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
-            >
-              <IconUpload size={14} />
-              <span>上传表情</span>
-            </button>
-            <span className={fieldStyle.hint} style={{ margin: 0 }}>
-              支持 PNG / JPG / GIF / WEBP 格式（选择图片后弹出确认与打标弹窗，免强制打标）
-            </span>
-          </div>
-
-          <div className={`kujira-face-gallery ${faceStyle.gallery}`}>
-            <div className={faceStyle.galleryHead}>
-              <h4 className={faceStyle.galleryTitle}>已收录表情包资产 ({faces.length})</h4>
-              <p className={faceStyle.gallerySub}>
-                免人工审批 · 即偷即用 · 点击铅笔图标可直接二次编辑标签 · 淘汰表情保留 7 天后悔期
-              </p>
-            </div>
-
-            {faces.length === 0 ? (
-              <div className={`kujira-face-empty ${faceStyle.empty}`}>
-                <IconBan size={36} />
-                <p className={faceStyle.emptyText}>
-                  {facesLoading ? '正在加载表情库...' : '暂未收录表情包，点击上方「上传表情」即可添加'}
-                </p>
-              </div>
-            ) : (
-              <div className={`kujira-face-grid ${faceStyle.grid}`}>
-                {faces.map((f) => (
-                  <div key={f.id} className={faceStyle.card}>
-                    <div className={faceStyle.cardPreview}>
-                      <img src={f.preview_url} className={faceStyle.cardImg} alt={f.id} />
-                    </div>
-                    <div className={faceStyle.cardTitle} title={f.tags.join(', ') || f.id}>
-                      {f.tags.length > 0 ? f.tags.join(', ') : f.id}
-                    </div>
-
-                    <div className={faceStyle.cardActions}>
-                      <button
-                        type="button"
-                        className={`kujira-face-edit-btn ${faceStyle.actionBtn}`}
-                        title="编辑表情标签与情绪"
-                        onClick={() => {
-                          if (editingFaceId === f.id) {
-                            setEditingFaceId(null);
-                          } else {
-                            setEditingFaceId(f.id);
-                            setEditingTags(f.tags.join(', '));
-                            setEditingMood(f.mood || '');
-                          }
-                        }}
-                      >
-                        <IconEdit size={12} />
-                      </button>
-                      <button
-                        type="button"
-                        className={`kujira-face-delete-btn ${faceStyle.actionBtn} ${faceStyle.actionDelete}`}
-                        title="删除表情包 (保留 7 天后悔期)"
-                        onClick={() => handleDeleteFace(f.id)}
-                      >
-                        <IconTrash size={12} />
-                      </button>
-                    </div>
-
-                    {editingFaceId === f.id && (
-                      <div className={`kujira-face-inline-editor ${faceStyle.inlineEditor}`}>
-                        <input
-                          type="text"
-                          className={fieldStyle.input}
-                          value={editingTags}
-                          onChange={(e) => setEditingTags(e.target.value)}
-                          placeholder="新标签 (逗号分隔)"
-                          style={{
-                            height: '24px',
-                            fontSize: '11px',
-                            padding: '2px 6px',
-                            width: '100%',
-                            boxSizing: 'border-box',
-                          }}
-                        />
-                        <input
-                          type="text"
-                          className={fieldStyle.input}
-                          value={editingMood}
-                          onChange={(e) => setEditingMood(e.target.value)}
-                          placeholder="新情绪 (选填)"
-                          style={{
-                            height: '24px',
-                            fontSize: '11px',
-                            padding: '2px 6px',
-                            width: '100%',
-                            boxSizing: 'border-box',
-                          }}
-                        />
-                        <div style={{ display: 'flex', gap: '4px', marginTop: '2px' }}>
-                          <button
-                            type="button"
-                            className={`kujira-face-save-edit-btn ${cardStyle.save}`}
-                            onClick={() => handleSaveEditFace(f.id)}
-                            style={{
-                              flex: 1,
-                              height: '24px',
-                              padding: '0 4px',
-                              fontSize: '11px',
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                            }}
-                          >
-                            保存
-                          </button>
-                          <button
-                            type="button"
-                            className={cardStyle.discard}
-                            onClick={() => setEditingFaceId(null)}
-                            style={{
-                              height: '24px',
-                              padding: '0 6px',
-                              fontSize: '11px',
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                            }}
-                          >
-                            取消
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {pendingUpload && (
-            <div className={faceStyle.modalOverlay} onClick={() => setPendingUpload(null)}>
-              <div className={faceStyle.modalPanel} onClick={(e) => e.stopPropagation()}>
-                <div className={faceStyle.modalHead}>
-                  <h3 className={faceStyle.modalTitle}>上传新表情包</h3>
-                  <button
-                    type="button"
-                    className={faceStyle.modalClose}
-                    onClick={() => setPendingUpload(null)}
-                    title="关闭"
-                  >
-                    ✕
-                  </button>
-                </div>
-
-                <div className={faceStyle.modalBody}>
-                  <div className={faceStyle.modalPreviewBox}>
-                    <img
-                      src={pendingUpload.previewUrl}
-                      className={faceStyle.modalPreviewImg}
-                      alt="表情大图预览"
-                    />
-                  </div>
-                </div>
-
-                <div className={faceStyle.modalFooterRow}>
-                  <input
-                    type="text"
-                    className={fieldStyle.input}
-                    placeholder="标签 (选填，逗号分隔，如: 猫猫, 叹气)"
-                    value={uploadTags}
-                    onChange={(e) => setUploadTags(e.target.value)}
-                    style={{ flex: 1, minWidth: '120px', height: '32px', fontSize: '12px' }}
-                  />
-                  <input
-                    type="text"
-                    className={fieldStyle.input}
-                    placeholder="情绪 (选填)"
-                    value={uploadMood}
-                    onChange={(e) => setUploadMood(e.target.value)}
-                    style={{ width: '80px', flexShrink: 0, height: '32px', fontSize: '12px' }}
-                  />
-                  <button
-                    type="button"
-                    className={cardStyle.discard}
-                    onClick={() => setPendingUpload(null)}
-                    style={{ height: '32px', padding: '0 12px', fontSize: '12px', whiteSpace: 'nowrap', flexShrink: 0 }}
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="button"
-                    className={`kujira-face-modal-submit-btn ${cardStyle.save}`}
-                    onClick={submitPendingUpload}
-                    disabled={uploading}
-                    style={{ height: '32px', padding: '0 14px', fontSize: '12px', whiteSpace: 'nowrap', flexShrink: 0 }}
-                  >
-                    {uploading ? '上传中...' : '提交表情'}
-                  </button>
-                </div>
-              </div>
+      <div className={fieldStyle.field}>
+        <div className={fieldStyle.head}>
+          <label htmlFor="kujira-face-evict-policy" className={fieldStyle.label}>
+            满额淘汰策略 (face_evict_policy)
+          </label>
+          {model.isOverridden('face_evict_policy') && (
+            <div className={fieldStyle.badges}>
+              <span className={fieldStyle.badge}>已自定义</span>
+              <button
+                type="button"
+                className={fieldStyle.reset}
+                onClick={() => onResetField('face_evict_policy')}
+              >
+                重置
+              </button>
             </div>
           )}
-        </>
+        </div>
+        <select
+          id="kujira-face-evict-policy"
+          className={fieldStyle.input}
+          disabled={saving}
+          value={draft.face_evict_policy || DEFAULT_FACE_EVICT_POLICY}
+          onChange={(e) => onFieldChange('face_evict_policy', e.target.value as any)}
+        >
+          <option value="reject">拒绝新增 (reject) - 满额后停止收录，不删旧表情</option>
+          <option value="evict_lru">淘汰最久未用 (evict_lru) - 满额后自动淘汰最久未使用的表情</option>
+        </select>
+        <p className={fieldStyle.hint}>达到容量上限后的行为策略。淘汰的表情在硬盘上保留 7 天后悔期。</p>
+      </div>
+
+      <ValueField
+        id="kujira-face-store-dir"
+        label="表情库存储目录 (face_store_dir)"
+        hint={`本地表情图片原图落盘存储目录 (默认 ${DEFAULT_FACE_STORE_DIR})`}
+        placeholder={DEFAULT_FACE_STORE_DIR}
+        value={draft.face_store_dir || DEFAULT_FACE_STORE_DIR}
+        disabled={saving}
+        overridden={model.isOverridden('face_store_dir')}
+        onReset={() => onResetField('face_store_dir')}
+        onChange={(val) => onFieldChange('face_store_dir', val)}
+      />
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={handleFileSelect}
+      />
+      <div className={`kujira-face-upload-bar ${faceStyle.uploadBar}`}>
+        <button
+          type="button"
+          className={`kujira-face-upload-btn ${cardStyle.discard}`}
+          onClick={() => fileInputRef.current?.click()}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+        >
+          <IconUpload size={14} />
+          <span>上传表情</span>
+        </button>
+        <span className={fieldStyle.hint} style={{ margin: 0 }}>
+          支持 PNG / JPG / GIF / WEBP 格式（选择图片后弹出确认与打标弹窗，免强制打标）
+        </span>
+      </div>
+
+      <div className={`kujira-face-gallery ${faceStyle.gallery}`}>
+        <div className={faceStyle.galleryHead}>
+          <h4 className={faceStyle.galleryTitle}>已收录表情包资产 ({faces.length})</h4>
+          <p className={faceStyle.gallerySub}>
+            免人工审批 · 即偷即用 · 点击铅笔图标可直接二次编辑标签 · 淘汰表情保留 7 天后悔期
+          </p>
+        </div>
+
+        {faces.length === 0 ? (
+          <div className={`kujira-face-empty ${faceStyle.empty}`}>
+            <IconBan size={36} />
+            <p className={faceStyle.emptyText}>
+              {facesLoading ? '正在加载表情库...' : '暂未收录表情包，点击上方「上传表情」即可添加'}
+            </p>
+          </div>
+        ) : (
+          <div className={`kujira-face-grid ${faceStyle.grid}`}>
+            {faces.map((f) => (
+              <div key={f.id} className={faceStyle.card}>
+                <div className={faceStyle.cardPreview}>
+                  <img src={f.preview_url} className={faceStyle.cardImg} alt={f.id} />
+                </div>
+                <div className={faceStyle.cardTitle} title={f.tags.join(', ') || f.id}>
+                  {f.tags.length > 0 ? f.tags.join(', ') : f.id}
+                </div>
+
+                <div className={faceStyle.cardActions}>
+                  <button
+                    type="button"
+                    className={`kujira-face-edit-btn ${faceStyle.actionBtn}`}
+                    title="编辑表情标签与情绪"
+                    onClick={() => {
+                      if (editingFaceId === f.id) {
+                        setEditingFaceId(null);
+                      } else {
+                        setEditingFaceId(f.id);
+                        setEditingTags(f.tags.join(', '));
+                        setEditingMood(f.mood || '');
+                      }
+                    }}
+                  >
+                    <IconEdit size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    className={`kujira-face-delete-btn ${faceStyle.actionBtn} ${faceStyle.actionDelete}`}
+                    title="删除表情包 (保留 7 天后悔期)"
+                    onClick={() => handleDeleteFace(f.id)}
+                  >
+                    <IconTrash size={12} />
+                  </button>
+                </div>
+
+                {editingFaceId === f.id && (
+                  <div className={`kujira-face-inline-editor ${faceStyle.inlineEditor}`}>
+                    <input
+                      type="text"
+                      className={fieldStyle.input}
+                      value={editingTags}
+                      onChange={(e) => setEditingTags(e.target.value)}
+                      placeholder="新标签 (逗号分隔)"
+                      style={{
+                        height: '24px',
+                        fontSize: '11px',
+                        padding: '2px 6px',
+                        width: '100%',
+                        boxSizing: 'border-box',
+                      }}
+                    />
+                    <input
+                      type="text"
+                      className={fieldStyle.input}
+                      value={editingMood}
+                      onChange={(e) => setEditingMood(e.target.value)}
+                      placeholder="新情绪 (选填)"
+                      style={{
+                        height: '24px',
+                        fontSize: '11px',
+                        padding: '2px 6px',
+                        width: '100%',
+                        boxSizing: 'border-box',
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '4px', marginTop: '2px' }}>
+                      <button
+                        type="button"
+                        className={`kujira-face-save-edit-btn ${cardStyle.save}`}
+                        onClick={() => handleSaveEditFace(f.id)}
+                        style={{
+                          flex: 1,
+                          height: '24px',
+                          padding: '0 4px',
+                          fontSize: '11px',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                      >
+                        保存
+                      </button>
+                      <button
+                        type="button"
+                        className={cardStyle.discard}
+                        onClick={() => setEditingFaceId(null)}
+                        style={{
+                          height: '24px',
+                          padding: '0 6px',
+                          fontSize: '11px',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {pendingUpload && (
+        <div className={faceStyle.modalOverlay} onClick={() => setPendingUpload(null)}>
+          <div className={faceStyle.modalPanel} onClick={(e) => e.stopPropagation()}>
+            <div className={faceStyle.modalHead}>
+              <h3 className={faceStyle.modalTitle}>上传新表情包</h3>
+              <button
+                type="button"
+                className={faceStyle.modalClose}
+                onClick={() => setPendingUpload(null)}
+                title="关闭"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className={faceStyle.modalBody}>
+              <div className={faceStyle.modalPreviewBox}>
+                <img
+                  src={pendingUpload.previewUrl}
+                  className={faceStyle.modalPreviewImg}
+                  alt="表情大图预览"
+                />
+              </div>
+            </div>
+
+            <div className={faceStyle.modalFooterRow}>
+              <input
+                type="text"
+                className={fieldStyle.input}
+                placeholder="标签 (选填，逗号分隔，如: 猫猫, 叹气)"
+                value={uploadTags}
+                onChange={(e) => setUploadTags(e.target.value)}
+                style={{ flex: 1, minWidth: '120px', height: '32px', fontSize: '12px' }}
+              />
+              <input
+                type="text"
+                className={fieldStyle.input}
+                placeholder="情绪 (选填)"
+                value={uploadMood}
+                onChange={(e) => setUploadMood(e.target.value)}
+                style={{ width: '80px', flexShrink: 0, height: '32px', fontSize: '12px' }}
+              />
+              <button
+                type="button"
+                className={cardStyle.discard}
+                onClick={() => setPendingUpload(null)}
+                style={{ height: '32px', padding: '0 12px', fontSize: '12px', whiteSpace: 'nowrap', flexShrink: 0 }}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className={`kujira-face-modal-submit-btn ${cardStyle.save}`}
+                onClick={submitPendingUpload}
+                disabled={uploading}
+                style={{ height: '32px', padding: '0 14px', fontSize: '12px', whiteSpace: 'nowrap', flexShrink: 0 }}
+              >
+                {uploading ? '上传中...' : '提交表情'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

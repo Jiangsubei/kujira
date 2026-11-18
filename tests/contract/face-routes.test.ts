@@ -97,7 +97,7 @@ describe('契约测试: 表情包管理 HTTP REST 接口 (Face Routes Contract)'
     registerFacesRoutes({
       ctx: mockCtx,
       db,
-      getConfig: () => ({ face_enabled: true, face_store_max: 10, face_evict_policy: 'evict_lru' }),
+      getConfig: () => ({ face_store_max: 10, face_evict_policy: 'evict_lru' }),
       dshHome: tmpDir,
     });
 
@@ -143,7 +143,7 @@ describe('契约测试: 表情包管理 HTTP REST 接口 (Face Routes Contract)'
     registerFacesRoutes({
       ctx: mockCtx,
       db,
-      getConfig: () => ({ face_enabled: true, face_store_max: 10 }),
+      getConfig: () => ({ face_store_max: 10 }),
       dshHome: tmpDir,
     });
 
@@ -185,7 +185,7 @@ describe('契约测试: 表情包管理 HTTP REST 接口 (Face Routes Contract)'
     registerFacesRoutes({
       ctx: mockCtx,
       db,
-      getConfig: () => ({ face_enabled: true }),
+      getConfig: () => ({}),
       dshHome: tmpDir,
     });
 

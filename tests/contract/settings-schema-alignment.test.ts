@@ -12,19 +12,19 @@ import { BridgeConfigSchema } from '../../src/config/schema.js';
 import { DEFAULT_BASE_CONFIG as SERVER_DEFAULTS } from '../../src/server/routes.js';
 import { DEFAULT_BASE_CONFIG as CLIENT_DEFAULTS } from '../../src/client/card.js';
 
-describe('契约测试：设置系统与四方 26 键单一真相源一致性 (Settings Alignment Contract)', () => {
-  it('Schema、Constants、服务端默认值、客户端默认值四方键严格一致（精确 26 项核心单聊配置）', () => {
+describe('契约测试：设置系统与四方 24 键单一真相源一致性 (Settings Alignment Contract)', () => {
+  it('Schema、Constants、服务端默认值、客户端默认值四方键严格一致（精确 24 项核心单聊配置）', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const schemaKeys = Object.keys(schemaShape).sort();
     const constantsKeys = Object.keys(CONSTANTS_DEFAULTS).sort();
     const serverKeys = Object.keys(SERVER_DEFAULTS).sort();
     const clientKeys = Object.keys(CLIENT_DEFAULTS).sort();
 
-    // 1. 精确 26 键（15 项基础单聊配置 + 11 项仿生主动能力与黑白名单分表配置）
-    expect(schemaKeys).toHaveLength(26);
-    expect(constantsKeys).toHaveLength(26);
-    expect(serverKeys).toHaveLength(26);
-    expect(clientKeys).toHaveLength(26);
+    // 1. 精确 24 键（13 项基础单聊配置 + 11 项仿生主动能力与黑白名单分表配置）
+    expect(schemaKeys).toHaveLength(24);
+    expect(constantsKeys).toHaveLength(24);
+    expect(serverKeys).toHaveLength(24);
+    expect(clientKeys).toHaveLength(24);
 
     // 2. 四方键集合完全恒等，且服务端与客户端直接复用 Constants SSOT
     expect(schemaKeys).toEqual(constantsKeys);
@@ -33,8 +33,10 @@ describe('契约测试：设置系统与四方 26 键单一真相源一致性 (S
     expect(SERVER_DEFAULTS).toBe(CONSTANTS_DEFAULTS);
     expect(CLIENT_DEFAULTS).toBe(CONSTANTS_DEFAULTS);
 
-    // 3. 已下线字段与凭据字段（markdown_enabled, input_notify_enabled, ws_*, admins, 群聊, 主动回复, 安全矩阵, app_id/app_secret, 旧固定分钟数）绝不存在
+    // 3. 已下线字段与凭据字段（face_enabled, slang_enabled, markdown_enabled, input_notify_enabled, ws_*, admins, 群聊, 主动回复, 安全矩阵, app_id/app_secret, 旧固定分钟数）绝不存在
     const deadKeys = [
+      'face_enabled',
+      'slang_enabled',
       'markdown_enabled',
       'input_notify_enabled',
       'aggregation_interval_mins',
@@ -79,11 +81,11 @@ describe('契约测试：设置系统与四方 26 键单一真相源一致性 (S
     }
   });
 
-  it('全部 26 项运行时配置字段均标记为 .volatile()，以支持 DSH 设置面板保存与热更新', () => {
+  it('全部 24 项运行时配置字段均标记为 .volatile()，以支持 DSH 设置面板保存与热更新', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const schemaKeys = Object.keys(schemaShape);
 
-    expect(schemaKeys).toHaveLength(26);
+    expect(schemaKeys).toHaveLength(24);
     for (const field of schemaKeys) {
       expect(
         schemaShape[field]?.meta?.volatile,

@@ -43,9 +43,7 @@ describe('契约测试: DSH 默认 coding 预设环境下 QQ 会话预设持久�
       ],
     });
 
-    await booted.ctx.plugin(KujiraPlugin, {
-      face_enabled: true,
-    });
+    await booted.ctx.plugin(KujiraPlugin, {});
 
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
     const agent = await sessionManager.getOrCreateAgent(MOCK_PEER_1);
@@ -74,9 +72,7 @@ describe('契约测试: DSH 默认 coding 预设环境下 QQ 会话预设持久�
       ],
     });
 
-    await booted.ctx.plugin(KujiraPlugin, {
-      face_enabled: true,
-    });
+    await booted.ctx.plugin(KujiraPlugin, {});
 
     const sessionManager1 = new SessionManager(booted.ctx, tmpHome);
     const agent1 = await sessionManager1.getOrCreateAgent(MOCK_PEER_2);
@@ -101,9 +97,7 @@ describe('契约测试: DSH 默认 coding 预设环境下 QQ 会话预设持久�
       ],
     });
 
-    await booted.ctx.plugin(KujiraPlugin, {
-      face_enabled: true,
-    });
+    await booted.ctx.plugin(KujiraPlugin, {});
 
     const sessionManager2 = new SessionManager(booted.ctx, tmpHome);
     const resumedAgent = await sessionManager2.getOrCreateAgent(MOCK_PEER_2);

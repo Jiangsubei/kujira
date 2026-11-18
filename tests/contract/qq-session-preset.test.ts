@@ -34,10 +34,7 @@ describe('契约测试: Kujira 单聊会话专属预设装配与工具隔离 (QQ
       ],
     });
 
-    await booted.ctx.plugin(KujiraPlugin, {
-      face_enabled: true,
-      slang_enabled: true,
-    });
+    await booted.ctx.plugin(KujiraPlugin, {});
   });
 
   afterEach(async () => {
@@ -243,10 +240,7 @@ describe('契约测试: Kujira 单聊会话专属预设装配与工具隔离 (QQ
         }
       });
 
-      await freshBoot.ctx.plugin(KujiraPlugin, {
-        face_enabled: false,
-        slang_enabled: false,
-      });
+      await freshBoot.ctx.plugin(KujiraPlugin, {});
 
       // 等待异步 inject 与事件循环
       await new Promise((resolve) => setTimeout(resolve, 100));

@@ -181,6 +181,8 @@ describe('阶段 1 契约测试：生命周期与 P0 装配契约 (Lifecycle & A
         '        ws_port: 8080',
         "        ws_token: 'legacy-token'",
         '        face_enabled: true',
+        '        slang_enabled: false',
+        '        face_store_max: 120',
         '',
       ].join('\n');
 
@@ -208,7 +210,9 @@ describe('阶段 1 契约测试：生命周期与 P0 装配契约 (Lifecycle & A
       const healedContent1 = fs.readFileSync(patchFile, 'utf8');
       expect(healedContent1).not.toContain('ws_port');
       expect(healedContent1).not.toContain('ws_token');
-      expect(healedContent1).toContain('face_enabled: true');
+      expect(healedContent1).not.toContain('face_enabled');
+      expect(healedContent1).not.toContain('slang_enabled');
+      expect(healedContent1).toContain('face_store_max: 120');
 
       await fork1.dispose();
 
@@ -221,7 +225,9 @@ describe('阶段 1 契约测试：生命周期与 P0 装配契约 (Lifecycle & A
       const healedContent2 = fs.readFileSync(patchFile, 'utf8');
       expect(healedContent2).not.toContain('ws_port');
       expect(healedContent2).not.toContain('ws_token');
-      expect(healedContent2).toContain('face_enabled: true');
+      expect(healedContent2).not.toContain('face_enabled');
+      expect(healedContent2).not.toContain('slang_enabled');
+      expect(healedContent2).toContain('face_store_max: 120');
 
       await fork2.dispose();
     });
