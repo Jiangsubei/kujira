@@ -192,10 +192,13 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   const dshHome = resolvePluginDshHome();
   let isDisposed = false;
 
+  let runtimeConfigOverrides: BridgePluginConfig = {};
+
   const currentConfig = (): BridgePluginConfig => {
     const fromSettings = readHostSettingsConfig(ctx);
     const fromArgs = extractConfigValues(config);
-    const merged = sanitizeConfigPayload(mergeBridgeConfigs(fromArgs, fromSettings)).valid;
+    const withRuntime = mergeBridgeConfigs(fromArgs, runtimeConfigOverrides);
+    const merged = sanitizeConfigPayload(mergeBridgeConfigs(withRuntime, fromSettings)).valid;
     if (typeof merged.persona === 'string' && merged.persona.trim() === '') {
       merged.persona = DEFAULT_BASE_CONFIG.persona;
     }
@@ -523,7 +526,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     }
   });
 
-  // 7. 接入单聊提问 & 审批 waterfall（单聊好友均开放；scheduled_task 无发起人保留 Fail-Closed）
+  // 7. 接入单聊提问 & 审批 waterfall（admins 为空时 1 对 1 开放，非空时仅管理员可审批；无人值守保留 Fail-Closed）
   const approvalResponder = new KujiraApprovalResponder({
     outboundBridge,
     gateway,
@@ -531,6 +534,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     db,
     sender: serialSender,
     turnInitiatorTracker,
+    getConfig: currentConfig,
     logger,
   });
 
@@ -622,6 +626,10 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
 
   const reconcile = async (forcedConfig?: BridgePluginConfig): Promise<void> => {
     if (isDisposed) return;
+    if (forcedConfig) {
+      const cleanedForced = sanitizeConfigPayload(extractConfigValues(forcedConfig)).valid;
+      runtimeConfigOverrides = mergeBridgeConfigs(runtimeConfigOverrides, cleanedForced);
+    }
     const active = forcedConfig
       ? sanitizeConfigPayload({ ...currentConfig(), ...extractConfigValues(forcedConfig) }).valid
       : currentConfig();
@@ -631,6 +639,12 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       if (memoryService.storage.getBaseDir() !== updatedMemoryDir) {
         memoryService.storage.setBaseDir(updatedMemoryDir, dshHome);
       }
+    }
+
+    try {
+      sessionManager.syncPrivacyToolsForActiveSessions(active);
+    } catch (err) {
+      logger.warn?.('[Plugin] 热同步活跃会话隐私工具组隔离状态失败:', err);
     }
 
     try {
@@ -873,6 +887,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
           agent,
           ctx,
           sessionManager,
+          config: currentConfig(),
         });
         const replyText = result.reply || result.error;
         if (replyText) {

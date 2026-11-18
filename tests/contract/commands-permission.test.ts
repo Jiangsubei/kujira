@@ -577,14 +577,16 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     expect(setRes.reply).toContain('当前会话思考深度已切换为：max (Max)');
     expect(setRes.reply).not.toMatch(/[\u{1F300}-\u{1F9FF}]/u);
 
-    const globalRes = await handleSlashCommand('/思考 low --全局', {
+    const defaultRes = await handleSlashCommand('/思考 low -默认', {
       userId: 'user_a1b2c3d4e5f60010',
       session,
       ctx: booted.ctx,
       sessionManager,
     });
-    expect(globalRes.success).toBe(true);
-    expect(globalRes.reply).toContain('Kujira 全局思考深度已切换为：low (Low)');
+    expect(defaultRes.success).toBe(true);
+    expect(defaultRes.reply).toContain('当前会话思考深度已切换为：low (Low)');
+    expect(defaultRes.reply).toContain('已设为新建会话默认思考深度');
+    expect(sessionManager.getConfiguredDefaultModel()?.reasoningEffort).toBe('low');
   });
 
   it('契约 11: /状态 命令汇总网关连接状态、模型、思考等级、权限模式、上下文用量及运行状态', async () => {
@@ -726,12 +728,12 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     expect(sessionManager.getModelSelection(session.id)?.model).toBe('deepseek-v4-pro');
   });
 
-  it('契约 13: /思考 -g 与 /模型 -g 在存在离线或失效会话 (session not found) 时容错隔离，确保全局切换成功', async () => {
+  it('契约 13: /思考 -默认 与 /模型 -默认 仅切换当前会话并记录新建会话默认，绝不批量改写其他离线或已有会话', async () => {
     const sessionManager = new SessionManager(booted.ctx, tmpHome);
     const sessionActive = booted.ctx.sessions.create('kujira-user-a1b2c3d4e5f60040' as any);
 
     const staleSid = 'kujira-user-deadbeefdeadbeef';
-    sessionManager.getOrCreateSelectionRef(staleSid);
+    sessionManager.setModelSelection(staleSid, 'deepseek-official', 'deepseek-v4-flash', 'low');
 
     const selectModelMock = vi.fn(async (req: any) => {
       if (req.sessionId === staleSid) {
@@ -748,7 +750,7 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
     }
 
     try {
-      const thinkRes = await handleSlashCommand('/思考 high -g', {
+      const thinkRes = await handleSlashCommand('/思考 high -默认', {
         userId: 'user_a1b2c3d4e5f60040',
         session: sessionActive,
         ctx: booted.ctx,
@@ -757,9 +759,14 @@ describe('契约测试: Kujira 单聊两字中文斜杠命令与无 admins 开�
 
       expect(thinkRes.handled).toBe(true);
       expect(thinkRes.success).toBe(true);
-      expect(thinkRes.reply).toContain('Kujira 全局思考深度已切换为：high (High)');
-      expect(sessionManager.getKujiraDefaultModel().reasoningEffort).toBe('high');
+      expect(thinkRes.reply).toContain('当前会话思考深度已切换为：high (High)');
+      expect(thinkRes.reply).toContain('已设为新建会话默认思考深度');
+      expect(sessionManager.getConfiguredDefaultModel()?.reasoningEffort).toBe('high');
       expect(sessionManager.getModelSelection(sessionActive.id)?.reasoningEffort).toBe('high');
+      expect(sessionManager.getModelSelection(staleSid)?.reasoningEffort).toBe('low');
+      expect(selectModelMock).not.toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: staleSid })
+      );
 
       const modelRes = await handleSlashCommand('/模型 deepseek-v4-flash -默认', {
         userId: 'user_a1b2c3d4e5f60040',

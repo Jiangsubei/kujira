@@ -31,6 +31,10 @@ import {
   DEFAULT_IDLE_REPLY_WHITELIST,
   DEFAULT_PROACTIVE_ATTITUDE,
   DEFAULT_INSTANT_REPLY_ENABLED,
+  DEFAULT_ADMINS,
+  DEFAULT_PRIVACY_TOOLS_LIST_MODE,
+  DEFAULT_PRIVACY_TOOLS_BLACKLIST,
+  DEFAULT_PRIVACY_TOOLS_WHITELIST,
 } from '../constants/index.js';
 import type { BridgePluginConfig } from '../types/index.js';
 
@@ -155,6 +159,26 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_INSTANT_REPLY_ENABLED)
     .volatile()
     .description('允许在连续热聊时概率秒回 (突破聚合下限，默认 false)'),
+  admins: z
+    .array(z.string())
+    .default(DEFAULT_ADMINS)
+    .volatile()
+    .description('管理员用户 peer 列表 (空列表表示 1 对 1 模式全员具备管理员权限，仅存内部哈希 peer)'),
+  privacy_tools_list_mode: z
+    .union([z.const('blacklist'), z.const('whitelist')])
+    .default(DEFAULT_PRIVACY_TOOLS_LIST_MODE)
+    .volatile()
+    .description('隔离可能泄露隐私的工具名单过滤模式 (blacklist: 黑名单隔离, whitelist: 白名单仅允许)'),
+  privacy_tools_blacklist: z
+    .array(z.string())
+    .default(DEFAULT_PRIVACY_TOOLS_BLACKLIST)
+    .volatile()
+    .description('隔离可能泄露隐私的工具黑名单用户 peer 列表 (仅黑名单模式生效，空数组表示无人被隔离)'),
+  privacy_tools_whitelist: z
+    .array(z.string())
+    .default(DEFAULT_PRIVACY_TOOLS_WHITELIST)
+    .volatile()
+    .description('隔离可能泄露隐私的工具白名单用户 peer 列表 (仅白名单模式生效，空数组表示所有用户均被隔离)'),
 });
 
 export type { BridgePluginConfig };

@@ -16,6 +16,10 @@ import { DEFAULT_NEW_MESSAGE_BEHAVIOR, PLUGIN_NAME } from '../../constants/index
 import type { WakeupPayload } from '../../types/index.js';
 import { TurnInitiatorTracker, resolveWakeupInitiator } from '../../approval/turn-initiator.js';
 import {
+  isPrivacyToolsRestricted,
+  resolvePrivacyIsolatedTools,
+} from '../../utils/access-control.js';
+import {
   RemoteError,
   SessionAlreadyOwnedError,
   type OutboundBridgeLike,
@@ -50,6 +54,25 @@ export function safeGetService(ctx: any, name: string): any {
   return undefined;
 }
 
+/**
+ * 仅从当前 Agent 作用域上下文解析 `tools` 服务（绝不回退到 root/unscoped ctx，
+ * 因为 `ToolsService.restrict()` 强制要求绑定到具体的 scoped `agentCtx`）。
+ */
+function getScopedToolsService(agentCtx: any): any {
+  if (!agentCtx) return undefined;
+  try {
+    if (typeof agentCtx.get === 'function') {
+      const val = agentCtx.get('tools');
+      if (val !== undefined) return val;
+    }
+  } catch {}
+  try {
+    return agentCtx.tools;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface AgentRunnerDelegate {
   peerToSessionId(peer: string): string;
   sessionIdToPeer(sessionId: string): string;
@@ -63,6 +86,10 @@ export class SessionAgentRunner {
   private busySessions = new Set<string>();
   private persistedSessions = new Set<string>();
   private pendingFirstTurnSessions = new Set<string>();
+  /** `sessionId -> tools.restrict disposer`（用于会话隐私工具组的幂等施加与热解除） */
+  private privacyToolDisposers = new Map<string, () => void>();
+  /** `sessionId -> agentCtx`（用于兜底访问 `agent.ctx` 进行热同步） */
+  private agentContexts = new Map<string, any>();
   private outboundBridge?: OutboundBridgeLike;
   /** 审批「本轮唤醒者」追踪器（由插件根 Context 注入并订阅 session/event） */
   private turnInitiatorTracker?: TurnInitiatorTracker;
@@ -205,12 +232,161 @@ export class SessionAgentRunner {
   public async releaseActiveHandle(sessionId: string): Promise<void> {
     this.clearPendingFirstTurn(sessionId);
     this.persistedSessions.delete(sessionId);
+    this.clearPrivacyToolsForSession(sessionId);
+    this.agentContexts.delete(sessionId);
     const handle = this.activeHandles.get(sessionId);
     if (handle) {
       this.activeHandles.delete(sessionId);
       if (typeof handle.dispose === 'function') {
         await Promise.resolve(handle.dispose()).catch(() => {});
       }
+    }
+  }
+
+  private clearPrivacyToolsForSession(sessionId: string): void {
+    const disposer = this.privacyToolDisposers.get(sessionId);
+    if (!disposer) {
+      return;
+    }
+    this.privacyToolDisposers.delete(sessionId);
+    try {
+      disposer();
+    } catch (err: any) {
+      this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
+        `[SessionAgentRunner] 解除会话 ${sessionId} 隐私工具隔离异常:`,
+        err?.message
+      );
+    }
+  }
+
+  private resolveDenyToolsForContext(agentCtx: any, agent?: any): string[] {
+    const toolsSvc = getScopedToolsService(agentCtx);
+    if (!toolsSvc) {
+      return resolvePrivacyIsolatedTools();
+    }
+
+    let knownNames: string[] | undefined;
+
+    if (typeof toolsSvc.definitions === 'function') {
+      try {
+        const defs = agent !== undefined ? toolsSvc.definitions(agent) : toolsSvc.definitions();
+        if (Array.isArray(defs)) {
+          if (defs.length > 0) {
+            knownNames = defs
+              .map((d: any) => (typeof d?.name === 'string' ? d.name : ''))
+              .filter(Boolean);
+          } else if (agent !== undefined && !(Array.isArray(toolsSvc.names) && toolsSvc.names.length > 0)) {
+            return [];
+          }
+        }
+      } catch {}
+    }
+
+    if (!knownNames && Array.isArray(toolsSvc.names) && toolsSvc.names.length > 0) {
+      knownNames = toolsSvc.names.filter(
+        (n: any): n is string => typeof n === 'string' && n.length > 0
+      );
+    }
+
+    if (knownNames && knownNames.length > 0) {
+      return resolvePrivacyIsolatedTools(knownNames);
+    }
+
+    return resolvePrivacyIsolatedTools();
+  }
+
+  private applyPrivacyToolsRestriction(agentCtx: any, agent?: any): (() => void) | undefined {
+    const toolsSvc = getScopedToolsService(agentCtx);
+    if (!toolsSvc || typeof toolsSvc.restrict !== 'function') {
+      return undefined;
+    }
+
+    const deny = this.resolveDenyToolsForContext(agentCtx, agent);
+    if (deny.length === 0) {
+      return undefined;
+    }
+
+    try {
+      const disposer = toolsSvc.restrict({ deny });
+      return typeof disposer === 'function' ? disposer : () => {};
+    } catch (err: any) {
+      this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
+        `[SessionAgentRunner] tools.restrict 批量隔离失败，降级逐项隔离 (${deny.join(', ')}):`,
+        err?.message
+      );
+      const disposers: Array<() => void> = [];
+      let appliedCount = 0;
+      for (const toolName of deny) {
+        try {
+          const singleDisposer = toolsSvc.restrict({ deny: [toolName] });
+          appliedCount++;
+          if (typeof singleDisposer === 'function') {
+            disposers.push(singleDisposer);
+          }
+        } catch {
+          // 忽略当前作用域不可限制的单个工具（如未注册或挂载于 own layer 的工具）
+        }
+      }
+      if (appliedCount === 0) {
+        return undefined;
+      }
+      return () => {
+        for (const disposeSingle of disposers) {
+          try {
+            disposeSingle();
+          } catch {}
+        }
+      };
+    }
+  }
+
+  /**
+   * 幂等同步单个会话的隐私工具组隔离状态（支持热施加与热解除，无需重建会话）。
+   */
+  public syncPrivacyToolsForSession(
+    sessionId: string,
+    peer: string,
+    agentCtx?: any,
+    agent?: any,
+    configOverride?: any
+  ): void {
+    if (!sessionId) return;
+    const targetCtx = agentCtx || (agent as any)?.ctx || this.agentContexts.get(sessionId);
+    if (targetCtx) {
+      this.agentContexts.set(sessionId, targetCtx);
+    }
+
+    const shouldRestrict = isPrivacyToolsRestricted(peer, configOverride ?? this.getConfig());
+    if (shouldRestrict) {
+      if (this.privacyToolDisposers.has(sessionId)) {
+        return;
+      }
+      if (!targetCtx) {
+        return;
+      }
+      const disposer = this.applyPrivacyToolsRestriction(targetCtx, agent);
+      if (disposer) {
+        this.privacyToolDisposers.set(sessionId, disposer);
+      }
+      return;
+    }
+
+    this.clearPrivacyToolsForSession(sessionId);
+  }
+
+  /**
+   * 遍历所有活跃会话并按当前最新配置热同步隐私工具组隔离状态。
+   */
+  public syncPrivacyToolsForActiveSessions(configOverride?: any): void {
+    for (const [sessionId, handle] of this.activeHandles.entries()) {
+      const peer = this.delegate.sessionIdToPeer(sessionId);
+      this.syncPrivacyToolsForSession(
+        sessionId,
+        peer,
+        (handle.agent as any)?.ctx,
+        handle.agent,
+        configOverride
+      );
     }
   }
 
@@ -317,12 +493,10 @@ export class SessionAgentRunner {
 
       if (isHandleValid) {
         (handle.agent as any).modelSelection = selectionRef;
+        this.syncPrivacyToolsForSession(sessionId, peer, (handle.agent as any)?.ctx, handle.agent);
         return handle.agent;
       }
-      this.activeHandles.delete(sessionId);
-      if (typeof handle.dispose === 'function') {
-        await Promise.resolve(handle.dispose()).catch(() => {});
-      }
+      await this.releaseActiveHandle(sessionId);
       this.delegate.onSessionReassigned?.(peer, '');
       sessionId = this.delegate.peerToSessionId(peer);
     }
@@ -337,6 +511,9 @@ export class SessionAgentRunner {
 
       if (!isExistingZombie) {
         (existingAgent as any).modelSelection = selectionRef;
+        if ((existingAgent as any)?.ctx) {
+          this.syncPrivacyToolsForSession(sessionId, peer, (existingAgent as any).ctx, existingAgent);
+        }
         return existingAgent;
       }
       this.delegate.onSessionReassigned?.(peer, '');
@@ -378,36 +555,66 @@ export class SessionAgentRunner {
       }
     }
 
-    const setupFn = (agentCtx: any) => {
-      if (typeof agentCtx?.on === 'function') {
-        installModelSelection(agentCtx);
+    interface SetupAttemptCapture {
+      agentCtx?: any;
+      disposer?: () => void;
+    }
+
+    const createAttemptSetup = () => {
+      const captured: SetupAttemptCapture = {};
+      const setup = (agentCtx: any, agent?: any) => {
+        captured.agentCtx = agentCtx;
+        if (typeof agentCtx?.on === 'function') {
+          installModelSelection(agentCtx);
+        }
+        const applyInitialPrivacyRestriction = () => {
+          if (isPrivacyToolsRestricted(peer, this.getConfig())) {
+            const disposer = this.applyPrivacyToolsRestriction(agentCtx, agent);
+            if (disposer) {
+              captured.disposer = disposer;
+            }
+          }
+          return undefined;
+        };
+        const presets: any =
+          agentCtx?.get?.('agentPresets') || (this.ctx as any).agentPresets;
+        if (presets?.mount) {
+          return presets
+            .mount(agentCtx, QQ_PRESET_ID)
+            .then(() => applyInitialPrivacyRestriction())
+            .catch((err: any) => {
+              this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
+                `[SessionAgentRunner] mount preset ${QQ_PRESET_ID} failed, falling back:`,
+                err?.message
+              );
+              const toolsProvider =
+                (this.ctx as any).kujiraBridgeTools ||
+                (this.ctx.root as any)?.kujiraBridgeTools;
+              toolsProvider?.registerTools?.(agentCtx);
+              return applyInitialPrivacyRestriction();
+            });
+        }
+        const toolsProvider =
+          (this.ctx as any).kujiraBridgeTools ||
+          (this.ctx.root as any)?.kujiraBridgeTools;
+        toolsProvider?.registerTools?.(agentCtx);
+        return applyInitialPrivacyRestriction();
+      };
+      return { setup, captured };
+    };
+
+    const rollbackCapturedDisposer = (captured?: SetupAttemptCapture) => {
+      if (captured?.disposer) {
+        const disposer = captured.disposer;
+        captured.disposer = undefined;
+        try {
+          disposer();
+        } catch {}
       }
-      const presets: any =
-        agentCtx?.get?.('agentPresets') || (this.ctx as any).agentPresets;
-      if (presets?.mount) {
-        return presets
-          .mount(agentCtx, QQ_PRESET_ID)
-          .then(() => undefined)
-          .catch((err: any) => {
-            this.ctx.logger?.(PLUGIN_NAME)?.debug?.(
-              `[SessionAgentRunner] mount preset ${QQ_PRESET_ID} failed, falling back:`,
-              err?.message
-            );
-            const toolsProvider =
-              (this.ctx as any).kujiraBridgeTools ||
-              (this.ctx.root as any)?.kujiraBridgeTools;
-            toolsProvider?.registerTools?.(agentCtx);
-            return undefined;
-          });
-      }
-      const toolsProvider =
-        (this.ctx as any).kujiraBridgeTools ||
-        (this.ctx.root as any)?.kujiraBridgeTools;
-      toolsProvider?.registerTools?.(agentCtx);
-      return undefined;
     };
 
     let handle: AgentHandle | undefined;
+    let winningCapture: SetupAttemptCapture | undefined;
     let isSessionLocked = false;
     let isResumed = false;
 
@@ -416,6 +623,7 @@ export class SessionAgentRunner {
       const delays = this.options?.retryDelays || [300, 600, 900];
       const maxRetries = delays.length;
       for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const resumeSetup = createAttemptSetup();
         try {
           const resumedHandle = await agents.resume({
             resumeSessionId: sessionId as any,
@@ -424,14 +632,18 @@ export class SessionAgentRunner {
               model,
               ...(effort !== undefined ? { reasoningEffort: effort } : {}),
             },
-            setup: setupFn,
+            setup: resumeSetup.setup,
           });
           if (resumedHandle) {
             handle = resumedHandle;
+            winningCapture = resumeSetup.captured;
             isResumed = true;
+          } else {
+            rollbackCapturedDisposer(resumeSetup.captured);
           }
           break;
         } catch (err: any) {
+          rollbackCapturedDisposer(resumeSetup.captured);
           const isOwnedError =
             err?.name === 'SessionAlreadyOwnedError' ||
             err?.constructor?.name === 'SessionAlreadyOwnedError' ||
@@ -471,6 +683,7 @@ export class SessionAgentRunner {
       if (typeof agents?.create !== 'function') {
         throw new Error('agents.create is not available');
       }
+      const createSetup = createAttemptSetup();
       try {
         handle = await agents.create({
           sessionId: sessionId as any,
@@ -480,9 +693,15 @@ export class SessionAgentRunner {
             ...(effort !== undefined ? { reasoningEffort: effort } : {}),
           },
           meta: { cwd, agentPreset: QQ_PRESET_ID },
-          setup: setupFn,
+          setup: createSetup.setup,
         });
+        if (handle) {
+          winningCapture = createSetup.captured;
+        } else {
+          rollbackCapturedDisposer(createSetup.captured);
+        }
       } catch (createErr: any) {
+        rollbackCapturedDisposer(createSetup.captured);
         if (
           typeof createErr?.message === 'string' &&
           (createErr.message.includes('already exists') || createErr.message.includes('already attached'))
@@ -504,16 +723,27 @@ export class SessionAgentRunner {
           this.delegate.onSessionReassigned?.(peer, sessionId);
           cwd = this.workspace.resolveCwd(sessionId);
           await fsp.mkdir(cwd, { recursive: true });
-          handle = await agents.create({
-            sessionId: sessionId as any,
-            agentOptions: {
-              provider,
-              model,
-              ...(effort !== undefined ? { reasoningEffort: effort } : {}),
-            },
-            meta: { cwd, agentPreset: QQ_PRESET_ID },
-            setup: setupFn,
-          });
+          const fallbackSetup = createAttemptSetup();
+          try {
+            handle = await agents.create({
+              sessionId: sessionId as any,
+              agentOptions: {
+                provider,
+                model,
+                ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+              },
+              meta: { cwd, agentPreset: QQ_PRESET_ID },
+              setup: fallbackSetup.setup,
+            });
+            if (handle) {
+              winningCapture = fallbackSetup.captured;
+            } else {
+              rollbackCapturedDisposer(fallbackSetup.captured);
+            }
+          } catch (fallbackErr: any) {
+            rollbackCapturedDisposer(fallbackSetup.captured);
+            throw fallbackErr;
+          }
         } else {
           throw createErr;
         }
@@ -525,6 +755,14 @@ export class SessionAgentRunner {
     }
 
     this.activeHandles.set(sessionId, handle);
+    const resolvedAgentCtx = winningCapture?.agentCtx || (handle.agent as any)?.ctx;
+    if (resolvedAgentCtx) {
+      this.agentContexts.set(sessionId, resolvedAgentCtx);
+    }
+    if (winningCapture?.disposer) {
+      this.clearPrivacyToolsForSession(sessionId);
+      this.privacyToolDisposers.set(sessionId, winningCapture.disposer);
+    }
 
     // 单聊新会话统一默认装配 workspace-write 权限，不限制 Preset 内置工作区与 Shell 工具
     if (!isResumed) {
@@ -577,6 +815,9 @@ export class SessionAgentRunner {
         } catch {}
       }
     }
+
+    // 最终幂等对齐一次隐私工具组状态，防范 setupFn 与 reconcile 并发竞态或 presets.select 补齐场景
+    this.syncPrivacyToolsForSession(sessionId, peer, resolvedAgentCtx, handle.agent);
 
     (handle.agent as any).modelSelection = selectionRef;
     this.delegate.onClearPendingCleared?.(peer, sessionId);
@@ -663,6 +904,13 @@ export class SessionAgentRunner {
     if (sc && (sc.prompt as any)?.__dsh_kujira_guarded) {
       sc.prompt = (sc.prompt as any).__originalPrompt;
     }
+    for (const disposer of this.privacyToolDisposers.values()) {
+      try {
+        disposer();
+      } catch {}
+    }
+    this.privacyToolDisposers.clear();
+    this.agentContexts.clear();
     for (const [id, handle] of this.activeHandles.entries()) {
       try {
         await handle.dispose();

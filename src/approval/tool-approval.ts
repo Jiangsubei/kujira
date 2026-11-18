@@ -3,10 +3,13 @@
  * 接入 Cordis `approval/request` waterfall。
  *
  * 契约规范：
- * - 单聊好友均具备审批权限（彻底移除 admins 白名单与群聊分支）；
+ * - 管理员权限分层（基于 `admins` 实时热读取）：
+ *   - `admins` 为空（1 对 1 模式）：所有通过本轮唤醒者校验的单聊好友均具备审批权限；
+ *   - `admins` 非空：仅名单内管理员允许下发审批弹窗与 `y/n` 放行，非管理员直接 Fail-Closed 拒绝且不下发提示；
+ *   - 入站回复二次防竞态校验：审批挂起期间被移出 `admins` 的用户即使回复 `y` 也会立即转为 `'rejected'`；
  * - 严格保留无人值守定时任务 (`scheduled_task`) Fail-Closed 门控：
- *   当 `applicantId === null || ''`，或通过 `turnInitiatorTracker.getInitiator(sessionId)` 查得 `undefined` 时，
- *   立即返回 `'rejected'` 且绝不下发审批提示；
+ *   当 `applicantId === null || ''` 或系统伪身份，或通过 `turnInitiatorTracker.getInitiator(sessionId)` 查得 `undefined` 时，
+ *   立即返回 `'rejected'` 且绝不下发审批提示（即使 `admins` 为空也如此）；
  * - 出站统一通过 `OutboundStreamBridge.sendTextReply` 下发（共享 `msg_seq` 槽位与被动/主动降级）。
  */
 
@@ -16,7 +19,8 @@ import {
   type OutboundSlotDb,
   type SessionManagerLike,
 } from '../outbound/stream.js';
-import type { SerialSender } from '../types/index.js';
+import type { BridgePluginConfig, SerialSender } from '../types/index.js';
+import { hasConfiguredAdmins, isAdminIdentity } from '../utils/access-control.js';
 import type { TurnInitiatorTracker } from './turn-initiator.js';
 
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
@@ -46,6 +50,10 @@ export interface ApprovalResponderOptions {
   turnInitiatorTracker?: TurnInitiatorTracker;
   /** 可选默认关联的 DSH SessionId */
   sessionId?: string;
+  /** 实时读取当前插件配置（优先于静态 `admins`，支持热更新立即生效） */
+  getConfig?: () => Pick<BridgePluginConfig, 'admins'> | undefined;
+  /** 静态管理员 peer 列表（兼容直传场景；若同时提供 `getConfig` 则优先读取 `getConfig()`） */
+  admins?: string[];
   /** 审批超时时间 (ms)，默认 300_000ms (5 分钟) */
   timeoutMs?: number;
   logger?: {
@@ -86,6 +94,19 @@ export class KujiraApprovalResponder {
 
   private getActiveBridge(): OutboundStreamBridge | undefined {
     return this.options?.outboundBridge ?? this.fallbackBridge;
+  }
+
+  private resolveAdminConfig(): Pick<BridgePluginConfig, 'admins'> | undefined {
+    if (typeof this.options?.getConfig === 'function') {
+      const cfg = this.options.getConfig();
+      if (cfg !== undefined) {
+        return cfg;
+      }
+    }
+    if (this.options?.admins !== undefined) {
+      return { admins: this.options.admins };
+    }
+    return undefined;
   }
 
   private async sendPrompt(peer: string, text: string): Promise<void> {
@@ -154,6 +175,20 @@ export class KujiraApprovalResponder {
         `[KujiraApprovalResponder] 无人值守或无本轮真实发起人触发审批请求 ${req.toolName} (peer: ${peer})，已 Fail-Closed 拒绝且不下发`
       );
       return 'rejected';
+    }
+
+    // 管理员权限实时校验：admins 为空时（1 对 1 模式）放行单聊好友；非空时严格要求 peer 与非空 applicantId 均命中管理员名单
+    const activeConfig = this.resolveAdminConfig();
+    if (hasConfiguredAdmins(activeConfig)) {
+      const peerAllowed = isAdminIdentity(peer, activeConfig);
+      const trimmedApplicant = typeof req.applicantId === 'string' ? req.applicantId.trim() : '';
+      const applicantAllowed = trimmedApplicant ? isAdminIdentity(trimmedApplicant, activeConfig) : true;
+      if (!peerAllowed || !applicantAllowed) {
+        this.options?.logger?.warn?.(
+          `[KujiraApprovalResponder] 非管理员触发审批请求 ${req.toolName} (peer: ${peer})，已 Fail-Closed 拒绝且不下发`
+        );
+        return 'rejected';
+      }
     }
 
     // 顶替机制：同一 peer 发起新审批请求时，前序挂起请求被顶替收敛为 cancelled
@@ -281,6 +316,16 @@ export class KujiraApprovalResponder {
 
     if (!isApprove && !isReject) {
       return false;
+    }
+
+    // 二次防竞态校验：挂起审批期间被移出 admins 的用户绝不允许放行，直接转为 rejected 并消费该回复
+    const activeConfig = this.resolveAdminConfig();
+    if (hasConfiguredAdmins(activeConfig) && !isAdminIdentity(key, activeConfig)) {
+      this.options?.logger?.warn?.(
+        `[KujiraApprovalResponder] 用户 ${key} 在审批挂起期间已不再具备管理员权限，强制拒绝审批请求 ${pending.req.toolName}`
+      );
+      pending.resolve('rejected');
+      return true;
     }
 
     if (isApprove) {

@@ -5,6 +5,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Session } from '@deepseek-ai/dsh-session';
 import type { SessionManager } from '../gateway/session.js';
+import type { BridgePluginConfig } from '../types/index.js';
 
 export interface CommandContext {
   userId: string;
@@ -14,6 +15,10 @@ export interface CommandContext {
   agent?: any;
   /** 可选：per-session 模型选择落位 (Spec §8.1 /model 为 Per-Session 语义) */
   sessionManager?: SessionManager;
+  /** 可选：当前生效插件配置（含 admins 等访问控制字段） */
+  config?: BridgePluginConfig;
+  /** 可选：显式传入的管理员列表（便于测试与直调，优先级高于 config.admins） */
+  admins?: string[];
 }
 
 export interface CommandResult {

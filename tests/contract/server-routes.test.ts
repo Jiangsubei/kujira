@@ -101,7 +101,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
 
       expect(CONFIG_ROUTE_PATH).toBe('/plugins/kujira/config');
       expect(DEFAULT_BASE_CONFIG).toBe(CONSTANTS_BASE_CONFIG);
-      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(24);
+      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(28);
 
       registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
         dshHome: tmpHome,
@@ -239,10 +239,10 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
       expect(result.body.config.new_message_behavior).toBe('steer');
       expect(result.body.config.image_ttl_days).toBe(7);
       expect(result.body.config.persona).toBe('测试人格设定');
+      expect(result.body.config.admins).toEqual(['1000000001']);
       expect(result.body.config.markdown_enabled).toBeUndefined();
       expect(result.body.config.input_notify_enabled).toBeUndefined();
       expect(result.body.config.ws_port).toBeUndefined();
-      expect(result.body.config.admins).toBeUndefined();
       expect(result.body.config.app_id).toBeUndefined();
       expect(result.body.baseDefaults).toEqual(DEFAULT_BASE_CONFIG);
     });
@@ -349,7 +349,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
         app_secret: 'mock-secret-new-55',
         markdown_enabled: false,
         input_notify_enabled: true,
-        admins: ['1000000001'],
+        ws_port: 8080,
       });
       const { res, getResult } = createMockRes();
 
@@ -363,7 +363,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
         appSecret: { configured: true, source: 'file', writable: true },
         ready: true,
       });
-      expect(result.body.healedKeys).toEqual(['markdown_enabled', 'input_notify_enabled', 'admins']);
+      expect(result.body.healedKeys).toEqual(['markdown_enabled', 'input_notify_enabled', 'ws_port']);
       expect(result.body.config).toEqual({
         new_message_behavior: 'queue',
         image_ttl_days: 14,

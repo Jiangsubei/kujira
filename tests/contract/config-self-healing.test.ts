@@ -42,9 +42,17 @@ const PROACTIVE_KEYS = [
   'instant_reply_enabled',
 ] as const;
 
-const EXPECTED_24_KEYS = [...EXPECTED_13_KEYS, ...PROACTIVE_KEYS] as const;
+/** 新增的管理员与隐私工具隔离配置键，共 4 项 */
+const ACCESS_CONTROL_KEYS = [
+  'admins',
+  'privacy_tools_list_mode',
+  'privacy_tools_blacklist',
+  'privacy_tools_whitelist',
+] as const;
 
-describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+const EXPECTED_28_KEYS = [...EXPECTED_13_KEYS, ...PROACTIVE_KEYS, ...ACCESS_CONTROL_KEYS] as const;
+
+describe('契约测试: Kujira 28 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -55,23 +63,23 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 24 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 24 项合法键', () => {
+  describe('1. 单一真相源与 28 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 28 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(24);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_24_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_24_KEYS].sort());
+      expect(validKeys.size).toBe(28);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_28_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_28_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_24_KEYS) {
+      for (const field of EXPECTED_28_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_24_KEYS) {
+      for (const field of EXPECTED_28_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'
@@ -100,7 +108,6 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
         'bot_qq',
         'app_id',
         'app_secret',
-        'admins',
         'aliases',
         // 旧群聊 & 主动回复 & 免打扰键
         'proactive_reply_enabled',
@@ -141,11 +148,12 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
   });
 
   describe('2. 纯函数自愈清洗契约 (sanitizeConfigPayload)', () => {
-    it('分离 24 项合法字段与 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled / 旧固定分钟数 / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
+    it('分离 28 项合法字段（含 admins）与 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled / 旧固定分钟数 / 旧 NapCat / 群聊 / 凭据死键，且不再执行 0.1.5 历史键搬运', () => {
       const dirtyInput = {
         image_ttl_days: 14,
         new_message_behavior: 'queue',
         persona: '测试单聊人格',
+        admins: ['user_1000000002'],
         // 以下均为已废除键，必须全部剔除（含 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled 及旧固定分钟数）
         face_enabled: true,
         slang_enabled: false,
@@ -158,7 +166,6 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
         bot_qq: '1000000021',
         app_id: '1000000001',
         app_secret: 'mock-secret-never-persist-in-config',
-        admins: ['1000000002'],
         proactive_reply_enabled: true,
         proactive_night_dnd: true,
         group_memory_total_budget_chars: 8000,
@@ -173,6 +180,7 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
         image_ttl_days: 14,
         new_message_behavior: 'queue',
         persona: '测试单聊人格',
+        admins: ['user_1000000002'],
       });
       expect(result.removed.sort()).toEqual(
         [
@@ -187,7 +195,6 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
           'bot_qq',
           'app_id',
           'app_secret',
-          'admins',
           'proactive_reply_enabled',
           'proactive_night_dnd',
           'group_memory_total_budget_chars',
@@ -275,6 +282,8 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
         '    app_id: "1000000001"',
         '    app_secret: "mock-secret-remove"',
         '    admins:',
+        '      - "user_1000000002"',
+        '    aliases:',
         '      - "1000000002"',
         '    proactive_reply_enabled: true',
         '    proactive_night_dnd: true',
@@ -312,7 +321,7 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
           'bot_qq',
           'app_id',
           'app_secret',
-          'admins',
+          'aliases',
           'proactive_reply_enabled',
           'proactive_night_dnd',
           'group_memory_total_budget_chars',
@@ -323,6 +332,8 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
       const updated = fs.readFileSync(patchPath, 'utf8');
       expect(updated).toContain('image_ttl_days: 7');
       expect(updated).toContain('persona: "保留的合法单聊人格"');
+      expect(updated).toContain('admins:');
+      expect(updated).toContain('user_1000000002');
 
       // 所有死键（含 face_enabled / slang_enabled / markdown_enabled / input_notify_enabled 及旧固定分钟数）及其多行子块已物理删除
       expect(updated).not.toContain('face_enabled');
@@ -335,7 +346,7 @@ describe('契约测试: Kujira 24 项配置 Schema 与物理自愈引擎 (Config
       expect(updated).not.toContain('ws_token');
       expect(updated).not.toContain('bot_qq');
       expect(updated).not.toContain('app_secret');
-      expect(updated).not.toContain('1000000002');
+      expect(updated).not.toContain('aliases:');
       expect(updated).not.toContain('8000000001');
       expect(updated).not.toContain('proactive_reply_enabled');
       expect(updated).not.toContain('group_memory_total_budget_chars');

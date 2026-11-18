@@ -154,6 +154,35 @@ export const DEFAULT_INSTANT_REPLY_ENABLED = false;
 export const PROACTIVE_CHECK_INTERVAL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
+// 管理员权限与隐私工具隔离默认值及工具清单
+// ---------------------------------------------------------------------------
+
+/** 管理员用户 peer 列表 (默认空数组，表示 1 对 1 模式，所有单聊好友均视为具备管理员权限) */
+export const DEFAULT_ADMINS: string[] = [];
+
+/** 隔离可能泄露隐私的工具名单过滤模式 ('blacklist' 黑名单隔离 | 'whitelist' 白名单仅允许，默认 'blacklist') */
+export const DEFAULT_PRIVACY_TOOLS_LIST_MODE = 'blacklist' as const;
+
+/** 隔离可能泄露隐私的工具黑名单用户 peer 列表 (仅黑名单模式生效；空数组表示无人被隔离) */
+export const DEFAULT_PRIVACY_TOOLS_BLACKLIST: string[] = [];
+
+/** 隔离可能泄露隐私的工具白名单用户 peer 列表 (仅白名单模式生效；空数组表示所有用户均被隔离) */
+export const DEFAULT_PRIVACY_TOOLS_WHITELIST: string[] = [];
+
+/** 可能泄露隐私的隔离工具清单（9 个，明确不含 send_file 与 read_image） */
+export const PRIVACY_ISOLATED_TOOL_NAMES = [
+  'bash',
+  'pwsh',
+  'read',
+  'write',
+  'edit',
+  'apply_patch',
+  'working_directory',
+  'load_workspace_dependencies',
+  'skill',
+] as const;
+
+// ---------------------------------------------------------------------------
 // 人格、记忆与单聊交互规范文案
 // ---------------------------------------------------------------------------
 
@@ -248,6 +277,10 @@ export const DEFAULT_BASE_CONFIG = {
   idle_reply_whitelist: DEFAULT_IDLE_REPLY_WHITELIST,
   proactive_attitude: DEFAULT_PROACTIVE_ATTITUDE,
   instant_reply_enabled: DEFAULT_INSTANT_REPLY_ENABLED,
+  admins: DEFAULT_ADMINS,
+  privacy_tools_list_mode: DEFAULT_PRIVACY_TOOLS_LIST_MODE,
+  privacy_tools_blacklist: DEFAULT_PRIVACY_TOOLS_BLACKLIST,
+  privacy_tools_whitelist: DEFAULT_PRIVACY_TOOLS_WHITELIST,
 };
 
 /** 插件默认核心配置 (与 DEFAULT_BASE_CONFIG 恒等) */

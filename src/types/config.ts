@@ -10,6 +10,9 @@ export type ProactiveAttitude = 'enthusiastic' | 'balanced' | 'aloof';
 /** 冷场主动搭话黑白名单模式 ('blacklist' 黑名单排除 | 'whitelist' 白名单仅允许) */
 export type IdleReplyListMode = 'blacklist' | 'whitelist';
 
+/** 隔离可能泄露隐私的工具名单模式 ('blacklist' 黑名单隔离 | 'whitelist' 白名单仅允许) */
+export type PrivacyToolsListMode = 'blacklist' | 'whitelist';
+
 /** QQ 官方 Bot 开放平台凭据（仅通过 DSH ctx.credentials 安全存储，不写入配置文件） */
 export interface QqCredential {
   appId: string;
@@ -31,7 +34,7 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（24 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（28 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
@@ -81,6 +84,14 @@ export interface BridgePluginConfig {
   proactive_attitude?: ProactiveAttitude;
   /** 允许在连续热聊时概率秒回 (突破聚合下限，默认 false) */
   instant_reply_enabled?: boolean;
+  /** 管理员用户 peer 列表（空列表表示 1 对 1 模式，所有单聊好友均视为具备管理员权限；非空时仅名单内用户具备管理员权限；仅存内部哈希 peer） */
+  admins?: string[];
+  /** 隔离可能泄露隐私的工具名单过滤模式 ('blacklist' 黑名单隔离 | 'whitelist' 白名单仅允许，默认 'blacklist') */
+  privacy_tools_list_mode?: PrivacyToolsListMode;
+  /** 隔离可能泄露隐私的工具黑名单用户 peer 列表（仅黑名单模式生效；空数组表示无人被隔离） */
+  privacy_tools_blacklist?: string[];
+  /** 隔离可能泄露隐私的工具白名单用户 peer 列表（仅白名单模式生效；空数组表示所有用户均被隔离） */
+  privacy_tools_whitelist?: string[];
   /** @deprecated 旧版过渡期类型兼容占位（已从 Schema、默认值与有效配置彻底清除） */
   aggregation_interval_mins?: number;
   /** @deprecated 旧版过渡期类型兼容占位（已从 Schema、默认值与有效配置彻底清除） */

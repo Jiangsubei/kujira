@@ -575,6 +575,10 @@ export class SessionManager {
     return this.agentRunner.getOrCreateAgent(peerOrSessionId);
   }
 
+  public syncPrivacyToolsForActiveSessions(configOverride?: any): void {
+    this.agentRunner.syncPrivacyToolsForActiveSessions(configOverride);
+  }
+
   public formatWakeupPrompt(payload: WakeupPayload): string {
     return formatWakeupPrompt(payload);
   }

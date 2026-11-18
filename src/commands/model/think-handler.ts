@@ -11,13 +11,13 @@ export async function handleThinkCommand(
   args: string,
   context: CommandContext
 ): Promise<CommandResult> {
-  let isGlobal = false;
+  let isSetDefault = false;
   const rawArgs = (args || '').trim();
   const tokens = rawArgs.split(/\s+/).filter(Boolean);
   const filteredTokens: string[] = [];
   for (const tok of tokens) {
-    if (tok === '--global' || tok === '-g' || tok === '--全局') {
-      isGlobal = true;
+    if (tok === '-默认') {
+      isSetDefault = true;
     } else {
       filteredTokens.push(tok);
     }
@@ -45,6 +45,7 @@ export async function handleThinkCommand(
   const curProv = curSel?.provider || (agent as any)?.options?.provider || 'deepseek-official';
   const curMod = curSel?.model || (agent as any)?.options?.model || 'deepseek-v4-flash';
   const explicitEffort = curSel?.reasoningEffort;
+  const configuredDefault = context.sessionManager?.getConfiguredDefaultModel?.();
 
   const reasoningInfo = await getModelReasoningInfo(context.ctx, curProv, curMod, explicitEffort);
 
@@ -64,6 +65,15 @@ export async function handleThinkCommand(
       curName && curName !== reasoningInfo.currentEffort ? ` (${curName})` : ''
     }${reasoningInfo.isDefault ? ' [默认]' : ''}`;
 
+    const headerLines: string[] = [`当前模型：${curProv} / ${curMod}`, currentLine];
+    if (configuredDefault) {
+      headerLines.push(
+        `新建会话默认：${configuredDefault.provider} / ${configuredDefault.model} (思考: ${
+          configuredDefault.reasoningEffort || '模型默认'
+        })`
+      );
+    }
+
     const listLines = reasoningInfo.efforts.map((e) => {
       const isDef = e.id === reasoningInfo.defaultEffort ? ' [默认]' : '';
       const isCur = e.id === reasoningInfo.currentEffort ? ' (当前)' : '';
@@ -72,8 +82,7 @@ export async function handleThinkCommand(
     });
 
     const reply = [
-      `当前模型：${curProv} / ${curMod}`,
-      currentLine,
+      ...headerLines,
       '',
       '支持的思考档位：',
       listLines.join('\n'),
@@ -81,7 +90,7 @@ export async function handleThinkCommand(
       '切换说明：',
       '- 仅当前会话：/思考 <档位>（例如：/思考 low 或 /思考 max）',
       '- 恢复模型默认：/思考 default',
-      '- 所有会话全局生效：/思考 <档位> -g（或 --全局）',
+      '- 设为新建会话默认：在末尾追加 -默认',
     ].join('\n');
 
     return {
@@ -124,63 +133,103 @@ export async function handleThinkCommand(
     targetName = `${matched.id} (${matched.name})`;
   }
 
-  try {
-    if (isGlobal) {
-      context.sessionManager?.setKujiraDefaultModel(curProv, curMod, targetEffort);
-      context.sessionManager?.setModelSelection(
-        context.session.id,
-        curProv,
-        curMod,
-        targetEffort
-      );
-      if (agent && (agent as any).modelSelection?.current) {
-        (agent as any).modelSelection.current.reasoningEffort = targetEffort;
-      }
-      const allSids = context.sessionManager?.getAllKujiraSessionIds() || [context.session.id];
-      for (const sid of allSids) {
-        try {
-          await safeSyncSessionModel(context.ctx, sid, curProv, curMod, targetEffort);
-        } catch (syncErr: any) {
-          context.ctx.logger?.('kujira')?.debug?.(
-            `[Command] 全局切换思考深度同步宿主会话 ${sid} 失败 (已跳过离线/失效会话):`,
-            syncErr?.message || syncErr
-          );
-        }
-      }
+  // 当带 -默认 且已配置不同的新建会话默认模型时，先校验默认模型兼容性，绝不偷偷覆盖默认模型
+  let targetDefaultProv = configuredDefault?.provider || curProv;
+  let targetDefaultMod = configuredDefault?.model || curMod;
+  let preservedDifferentDefault = false;
+
+  if (
+    isSetDefault &&
+    configuredDefault &&
+    (configuredDefault.provider !== curProv || configuredDefault.model !== curMod)
+  ) {
+    const defaultReasoning = await getModelReasoningInfo(
+      context.ctx,
+      configuredDefault.provider,
+      configuredDefault.model,
+      configuredDefault.reasoningEffort
+    );
+
+    if (!defaultReasoning.supported) {
       return {
         handled: true,
-        success: true,
-        reply: [
-          `Kujira 全局思考深度已切换为：${targetName}`,
-          '范围：已同步切换所有单聊会话，新建会话也将默认使用此思考深度。',
-        ].join('\n'),
-      };
-    } else {
-      context.sessionManager?.setModelSelection(
-        context.session.id,
-        curProv,
-        curMod,
-        targetEffort
-      );
-      if (agent && (agent as any).modelSelection?.current) {
-        (agent as any).modelSelection.current.reasoningEffort = targetEffort;
-      }
-      await safeSyncSessionModel(
-        context.ctx,
-        context.session.id,
-        curProv,
-        curMod,
-        targetEffort
-      );
-      return {
-        handled: true,
-        success: true,
-        reply: [
-          `当前会话思考深度已切换为：${targetName}`,
-          '提示：仅对当前会话生效；全局切换请追加 -g 或 --全局。',
-        ].filter(Boolean).join('\n'),
+        success: false,
+        error: `设置默认思考深度失败：当前新建会话默认模型 [${configuredDefault.provider} / ${configuredDefault.model}] 不支持深度思考（可先执行 /模型 <模型> -默认 更换默认模型，或去掉 -默认 仅切换当前会话）`,
       };
     }
+
+    if (
+      targetEffort !== undefined &&
+      !defaultReasoning.efforts.some((e) => e.id === targetEffort)
+    ) {
+      const validDefaultList = defaultReasoning.efforts
+        .map((e) => `${e.id} (${e.name})`)
+        .join(', ');
+      return {
+        handled: true,
+        success: false,
+        error: `设置默认思考深度失败：当前新建会话默认模型 [${configuredDefault.provider} / ${configuredDefault.model}] 不支持思考档位 [${targetEffort}]（支持档位：${validDefaultList}；可先执行 /模型 <模型> -默认 更换默认模型，或去掉 -默认 仅切换当前会话）`,
+      };
+    }
+
+    targetDefaultProv = configuredDefault.provider;
+    targetDefaultMod = configuredDefault.model;
+    preservedDifferentDefault = true;
+  }
+
+  try {
+    // 无论是否带 -默认，先切换当前会话的思考深度并仅同步当前会话
+    context.sessionManager?.setModelSelection(
+      context.session.id,
+      curProv,
+      curMod,
+      targetEffort
+    );
+    if (agent && (agent as any).modelSelection?.current) {
+      (agent as any).modelSelection.current.reasoningEffort = targetEffort;
+    }
+    await safeSyncSessionModel(
+      context.ctx,
+      context.session.id,
+      curProv,
+      curMod,
+      targetEffort
+    );
+
+    if (isSetDefault) {
+      if (typeof context.sessionManager?.setConfiguredDefaultModel === 'function') {
+        context.sessionManager.setConfiguredDefaultModel(
+          targetDefaultProv,
+          targetDefaultMod,
+          targetEffort
+        );
+      } else if (typeof context.sessionManager?.setKujiraDefaultModel === 'function') {
+        context.sessionManager.setKujiraDefaultModel(
+          targetDefaultProv,
+          targetDefaultMod,
+          targetEffort
+        );
+      }
+
+      const defaultHint = preservedDifferentDefault
+        ? `已设为新建会话默认思考深度（作用于默认模型 ${targetDefaultProv} / ${targetDefaultMod}，下一次开启新会话将默认生效）。`
+        : '已设为新建会话默认思考深度（下一次开启新会话将默认生效）。';
+
+      return {
+        handled: true,
+        success: true,
+        reply: [`当前会话思考深度已切换为：${targetName}`, defaultHint].join('\n'),
+      };
+    }
+
+    return {
+      handled: true,
+      success: true,
+      reply: [
+        `当前会话思考深度已切换为：${targetName}`,
+        '提示：仅对当前会话生效；设为新建会话默认请追加 -默认。',
+      ].join('\n'),
+    };
   } catch (err: any) {
     return {
       handled: true,
