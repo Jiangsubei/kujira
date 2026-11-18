@@ -1,7 +1,13 @@
-import React from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ValueField, SwitchField, SegmentedField } from '../fields.js';
-import { cardStyle, fieldStyle } from '../card-styles.js';
-import type { BridgePluginConfig, ProactiveAttitude } from '../../types/index.js';
+import { cardStyle, fieldStyle, faceStyle } from '../card-styles.js';
+import { IconPlus, IconTrash } from '../icons.js';
+import type {
+  BridgePluginConfig,
+  IdleReplyListMode,
+  KnownPeerSummaryRecord,
+  ProactiveAttitude,
+} from '../../types/index.js';
 import {
   DEFAULT_NEW_MESSAGE_BEHAVIOR,
   DEFAULT_AGGREGATION_ENABLED,
@@ -10,10 +16,16 @@ import {
   DEFAULT_IDLE_REPLY_ENABLED,
   DEFAULT_IDLE_REPLY_MIN_MINS,
   DEFAULT_IDLE_REPLY_MAX_MINS,
+  DEFAULT_IDLE_REPLY_LIST_MODE,
   DEFAULT_PROACTIVE_ATTITUDE,
   DEFAULT_INSTANT_REPLY_ENABLED,
 } from '../../constants/index.js';
 import type { KujiraFormModel } from '../model.js';
+
+export const PEERS_ENDPOINT = '/plugins/kujira/peers';
+export const IDLE_REPLY_PEERS_POLL_MS = 5_000;
+
+export type KnownPeerSummary = KnownPeerSummaryRecord;
 
 const PROACTIVE_ATTITUDE_OPTIONS: Array<{ value: ProactiveAttitude; label: string }> = [
   { value: 'enthusiastic', label: '热情' },
@@ -21,11 +33,63 @@ const PROACTIVE_ATTITUDE_OPTIONS: Array<{ value: ProactiveAttitude; label: strin
   { value: 'aloof', label: '冷淡' },
 ];
 
+const IDLE_REPLY_LIST_MODE_OPTIONS: Array<{ value: IdleReplyListMode; label: string }> = [
+  { value: 'blacklist', label: '黑名单模式' },
+  { value: 'whitelist', label: '白名单模式' },
+];
+
+export function formatRelativeSpeakTime(timestamp: number | null, now = Date.now()): string {
+  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
+    return '暂无发言';
+  }
+  const diffMs = Math.max(0, now - timestamp);
+  if (diffMs < 60_000) return '刚刚';
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 60) return `${mins}分钟前`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}天前`;
+
+  const d = new Date(timestamp);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+export function formatPeerDropdownLabel(peer: KnownPeerSummary, now = Date.now()): string {
+  const shortId = peer.short_openid ? `${peer.short_openid}…` : peer.peer;
+  const timeText = formatRelativeSpeakTime(peer.last_message_time, now);
+  const preview = peer.last_message_preview?.trim();
+  if (preview) {
+    return `${shortId} · ${timeText} · “${preview}”`;
+  }
+  return `${shortId} · ${timeText}`;
+}
+
+/**
+ * 启动已互动用户列表自动轮询：启动时立即拉取一次，随后每隔 intervalMs 自动刷新。
+ * 返回清理函数，切换 Tab、关闭总开关或卸载组件时停止轮询。
+ */
+export function startPeerListPolling(
+  fetcher: () => void | Promise<void>,
+  intervalMs = IDLE_REPLY_PEERS_POLL_MS
+): () => void {
+  void fetcher();
+  const timer = setInterval(() => {
+    void fetcher();
+  }, intervalMs);
+  return () => {
+    clearInterval(timer);
+  };
+}
+
 export interface ReplyTabProps {
   active: boolean;
   draft: Partial<BridgePluginConfig>;
   model: KujiraFormModel;
   saving: boolean;
+  /** 可选初始已互动用户列表（供 SSR 与契约测试注入） */
+  initialKnownPeers?: KnownPeerSummary[];
   onFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
   onResetField: (key: keyof BridgePluginConfig) => void;
 }
@@ -36,9 +100,76 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
     draft,
     model,
     saving,
+    initialKnownPeers,
     onFieldChange,
     onResetField,
   } = props;
+
+  const [knownPeers, setKnownPeers] = useState<KnownPeerSummary[]>(initialKnownPeers ?? []);
+  const [candidatePeer, setCandidatePeer] = useState<string>('');
+  const [nowTs, setNowTs] = useState<number>(() => Date.now());
+  const mountedRef = useRef(true);
+  const inFlightRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const loadKnownPeers = useCallback(async () => {
+    if (typeof fetch !== 'function' || inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      const res = await fetch(PEERS_ENDPOINT);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (mountedRef.current && data?.ok && Array.isArray(data.peers)) {
+        setKnownPeers(data.peers);
+        setNowTs(Date.now());
+      }
+    } catch {
+      // 离线或接口暂不可用时静默容错
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, []);
+
+  const idleReplyEnabled = Boolean(draft.idle_reply_enabled ?? DEFAULT_IDLE_REPLY_ENABLED);
+
+  // 打开设置/切入本 Tab 或开启冷场搭话时自动刷新，并在停留期间每 5 秒轮询一次
+  useEffect(() => {
+    if (!active || !idleReplyEnabled) return;
+    return startPeerListPolling(loadKnownPeers, IDLE_REPLY_PEERS_POLL_MS);
+  }, [active, idleReplyEnabled, loadKnownPeers]);
+
+  const listMode: IdleReplyListMode =
+    draft.idle_reply_list_mode === 'whitelist' ? 'whitelist' : DEFAULT_IDLE_REPLY_LIST_MODE;
+  const selectedPeers: string[] = Array.isArray(draft.idle_reply_peers)
+    ? draft.idle_reply_peers.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+    : [];
+  const selectedSet = new Set(selectedPeers);
+  const knownPeersById = new Map(knownPeers.map((item) => [item.peer, item]));
+  const availablePeers = knownPeers.filter((item) => !selectedSet.has(item.peer));
+
+  const effectiveCandidate =
+    candidatePeer && availablePeers.some((p) => p.peer === candidatePeer)
+      ? candidatePeer
+      : (availablePeers[0]?.peer ?? '');
+
+  const handleAddPeer = () => {
+    if (!effectiveCandidate || selectedSet.has(effectiveCandidate)) return;
+    onFieldChange('idle_reply_peers', [...selectedPeers, effectiveCandidate]);
+    setCandidatePeer('');
+  };
+
+  const handleRemovePeer = (peerToRemove: string) => {
+    onFieldChange(
+      'idle_reply_peers',
+      selectedPeers.filter((p) => p !== peerToRemove)
+    );
+  };
 
   return (
     <div
@@ -85,6 +216,18 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
           一轮 Agent 循环正在进行时收到单聊新消息的处理行为。即时对话场景推荐「及时插话」。
         </p>
       </div>
+
+      <SegmentedField
+        id="kujira-proactive-attitude"
+        label="互动偏好 (proactive_attitude)"
+        hint="全局仿生节奏偏置，同时作用于下方的连续消息聚合与冷场主动搭话：热情（偏向最小时长，反应迅速、潜水间隔短）；均衡（均匀随机分布）；冷淡（偏向最大时长，节奏沉着、留白多）"
+        value={draft.proactive_attitude ?? DEFAULT_PROACTIVE_ATTITUDE}
+        options={PROACTIVE_ATTITUDE_OPTIONS}
+        disabled={saving}
+        overridden={model.isOverridden('proactive_attitude')}
+        onReset={() => onResetField('proactive_attitude')}
+        onChange={(val) => onFieldChange('proactive_attitude', val)}
+      />
 
       <SwitchField
         id="kujira-aggregation-enabled"
@@ -154,16 +297,142 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
         id="kujira-idle-reply-enabled"
         label="冷场主动搭话 (idle_reply_enabled)"
         hint={
-          draft.idle_reply_enabled
+          idleReplyEnabled
             ? '长时间没有新消息时，由模型自主判断是否主动发起话题；等待用户答题或审批期间同样跳过'
             : '开启后，单聊长时间无新消息时模型会主动找话题；需存在可用的被动回复锚点才会发信'
         }
-        checked={draft.idle_reply_enabled ?? DEFAULT_IDLE_REPLY_ENABLED}
+        checked={idleReplyEnabled}
         disabled={saving}
         overridden={model.isOverridden('idle_reply_enabled')}
         onReset={() => onResetField('idle_reply_enabled')}
         onChange={(checked) => onFieldChange('idle_reply_enabled', checked)}
       />
+
+      {idleReplyEnabled && (
+        <div
+          id="kujira-idle-reply-peer-filter"
+          data-testid="kujira-idle-reply-peer-filter"
+          className={fieldStyle.peerFilterBox}
+        >
+          <SegmentedField
+            id="kujira-idle-reply-list-mode"
+            label="搭话名单模式 (idle_reply_list_mode)"
+            hint={
+              listMode === 'whitelist'
+                ? '白名单模式：仅下方名单内的用户会触发冷场主动搭话，其余好友均不受打扰'
+                : '黑名单模式：排除下方名单内的用户，其余已互动用户正常触发冷场主动搭话'
+            }
+            value={listMode}
+            options={IDLE_REPLY_LIST_MODE_OPTIONS}
+            disabled={saving}
+            overridden={model.isOverridden('idle_reply_list_mode')}
+            onReset={() => onResetField('idle_reply_list_mode')}
+            onChange={(val) => onFieldChange('idle_reply_list_mode', val)}
+          />
+
+          <div className={fieldStyle.field}>
+            <div className={fieldStyle.head}>
+              <label htmlFor="kujira-idle-reply-peer-select" className={fieldStyle.label}>
+                {listMode === 'whitelist'
+                  ? '白名单用户 (idle_reply_peers)'
+                  : '黑名单用户 (idle_reply_peers)'}
+              </label>
+              {model.isOverridden('idle_reply_peers') && (
+                <div className={fieldStyle.badges}>
+                  <span className={fieldStyle.badge}>已自定义</span>
+                  <button
+                    type="button"
+                    className={fieldStyle.reset}
+                    disabled={saving}
+                    onClick={() => onResetField('idle_reply_peers')}
+                  >
+                    重置
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className={fieldStyle.peerAddRow}>
+              <select
+                id="kujira-idle-reply-peer-select"
+                className={[fieldStyle.input, fieldStyle.peerSelect].join(' ')}
+                disabled={saving || availablePeers.length === 0}
+                value={effectiveCandidate}
+                onChange={(e) => setCandidatePeer(e.target.value)}
+              >
+                {availablePeers.length === 0 ? (
+                  <option value="">
+                    {knownPeers.length === 0
+                      ? '暂无已收到消息的用户'
+                      : '所有已互动用户均已加入名单'}
+                  </option>
+                ) : (
+                  availablePeers.map((item) => (
+                    <option key={item.peer} value={item.peer}>
+                      {formatPeerDropdownLabel(item, nowTs)}
+                    </option>
+                  ))
+                )}
+              </select>
+              <button
+                id="kujira-idle-reply-peer-add"
+                type="button"
+                className={fieldStyle.peerAddBtn}
+                title={listMode === 'whitelist' ? '添加到白名单' : '添加到黑名单'}
+                aria-label={listMode === 'whitelist' ? '添加到白名单' : '添加到黑名单'}
+                disabled={saving || !effectiveCandidate}
+                onClick={handleAddPeer}
+              >
+                <IconPlus size={14} />
+              </button>
+            </div>
+
+            {selectedPeers.length > 0 ? (
+              <div className={fieldStyle.peerList}>
+                {selectedPeers.map((peerId) => {
+                  const info = knownPeersById.get(peerId);
+                  const shortCode = info?.short_openid ? `${info.short_openid}…` : peerId;
+                  const timeText = info ? formatRelativeSpeakTime(info.last_message_time, nowTs) : '';
+                  const preview = info?.last_message_preview?.trim() || '';
+                  const subText = [timeText, preview ? `“${preview}”` : '']
+                    .filter(Boolean)
+                    .join(' · ');
+
+                  return (
+                    <div
+                      key={peerId}
+                      data-testid={`kujira-idle-reply-peer-item-${peerId}`}
+                      className={fieldStyle.peerRow}
+                    >
+                      <div className={fieldStyle.peerMeta}>
+                        <span className={fieldStyle.peerCode}>{shortCode}</span>
+                        {subText && <span className={fieldStyle.peerSub}>{subText}</span>}
+                      </div>
+                      <button
+                        type="button"
+                        data-testid={`kujira-idle-reply-peer-remove-${peerId}`}
+                        className={[faceStyle.actionBtn, faceStyle.actionDelete].join(' ')}
+                        title="移出名单"
+                        aria-label={`移出 ${shortCode}`}
+                        disabled={saving}
+                        onClick={() => handleRemovePeer(peerId)}
+                      >
+                        <IconTrash size={13} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className={fieldStyle.hint}>
+                {listMode === 'whitelist'
+                  ? '当前白名单为空，冷场主动搭话不会对任何用户生效。请从上方选择用户后点击 + 添加。'
+                  : '当前黑名单为空，冷场主动搭话默认对所有已互动用户生效。'}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       <ValueField
         id="kujira-idle-reply-min-mins"
@@ -172,7 +441,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
         placeholder={String(DEFAULT_IDLE_REPLY_MIN_MINS)}
         numeric
         value={String(draft.idle_reply_min_mins ?? DEFAULT_IDLE_REPLY_MIN_MINS)}
-        disabled={saving || !draft.idle_reply_enabled}
+        disabled={saving || !idleReplyEnabled}
         overridden={model.isOverridden('idle_reply_min_mins')}
         onReset={() => onResetField('idle_reply_min_mins')}
         onChange={(val) => {
@@ -191,7 +460,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
         placeholder={String(DEFAULT_IDLE_REPLY_MAX_MINS)}
         numeric
         value={String(draft.idle_reply_max_mins ?? DEFAULT_IDLE_REPLY_MAX_MINS)}
-        disabled={saving || !draft.idle_reply_enabled}
+        disabled={saving || !idleReplyEnabled}
         overridden={model.isOverridden('idle_reply_max_mins')}
         onReset={() => onResetField('idle_reply_max_mins')}
         onChange={(val) => {
@@ -201,18 +470,6 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
             Number.isNaN(parsed) ? DEFAULT_IDLE_REPLY_MAX_MINS : parsed
           );
         }}
-      />
-
-      <SegmentedField
-        id="kujira-proactive-attitude"
-        label="互动偏好 (proactive_attitude)"
-        hint="调节仿生动态时钟的随机采样偏置：热情（偏向最小时长，反应迅速、潜水间隔短）；均衡（均匀随机分布）；冷淡（偏向最大时长，节奏沉着、留白多）"
-        value={draft.proactive_attitude ?? DEFAULT_PROACTIVE_ATTITUDE}
-        options={PROACTIVE_ATTITUDE_OPTIONS}
-        disabled={saving}
-        overridden={model.isOverridden('proactive_attitude')}
-        onReset={() => onResetField('proactive_attitude')}
-        onChange={(val) => onFieldChange('proactive_attitude', val)}
       />
     </div>
   );

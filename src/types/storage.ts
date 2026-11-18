@@ -38,6 +38,17 @@ export interface PeerOpenidMapping {
   updated_at: number; // 毫秒时间戳
 }
 
+/** 脱敏后的已互动单聊用户摘要（供 WebUI 冷场搭话黑白名单下拉选择，绝不含完整明文 openid） */
+export interface KnownPeerSummaryRecord {
+  peer: string;
+  /** 原始 openid 截断前 8 位，仅作短标识展示 */
+  short_openid: string;
+  /** 最近一条入站消息（self = 0）时间戳（毫秒），无消息时为 null */
+  last_message_time: number | null;
+  /** 最近一条入站消息摘要（折叠空白并截断），无消息时为空串 */
+  last_message_preview: string;
+}
+
 /** 入站被动回复锚点与 `msg_seq` 槽位持久化表 */
 export interface InboundReplySlot {
   msg_id: string;

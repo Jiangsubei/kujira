@@ -7,6 +7,9 @@ export type DshPermissionPreset = 'read-only' | 'workspace-write' | 'danger-full
 /** 仿生主动互动偏好分段 ('enthusiastic' 热情 | 'balanced' 均衡 | 'aloof' 冷淡) */
 export type ProactiveAttitude = 'enthusiastic' | 'balanced' | 'aloof';
 
+/** 冷场主动搭话黑白名单模式 ('blacklist' 黑名单排除 | 'whitelist' 白名单仅允许) */
+export type IdleReplyListMode = 'blacklist' | 'whitelist';
+
 /** QQ 官方 Bot 开放平台凭据（仅通过 DSH ctx.credentials 安全存储，不写入配置文件） */
 export interface QqCredential {
   appId: string;
@@ -28,7 +31,7 @@ export interface CredentialStatusSummary {
   reason?: string;
 }
 
-/** kujira 单聊插件核心配置（23 项，不含 AppID/AppSecret 凭据） */
+/** kujira 单聊插件核心配置（25 项，不含 AppID/AppSecret 凭据） */
 export interface BridgePluginConfig {
   /** 外来图片/媒体资源本地缓存保留天数 */
   image_ttl_days?: number;
@@ -72,6 +75,10 @@ export interface BridgePluginConfig {
   idle_reply_min_mins?: number;
   /** 潜水主动搭话最大沉默时长 (单位: 分钟，默认 120 分钟) */
   idle_reply_max_mins?: number;
+  /** 冷场主动搭话名单过滤模式 ('blacklist' 黑名单排除 | 'whitelist' 白名单仅允许，默认 'blacklist') */
+  idle_reply_list_mode?: IdleReplyListMode;
+  /** 冷场主动搭话黑白名单用户 peer 列表（存内部哈希 peer，不落盘原始 openid） */
+  idle_reply_peers?: string[];
   /** 互动偏好分段 ('enthusiastic' 热情 | 'balanced' 均衡 | 'aloof' 冷淡，默认 'balanced') */
   proactive_attitude?: ProactiveAttitude;
   /** 允许在连续热聊时概率秒回 (突破聚合下限，默认 false) */

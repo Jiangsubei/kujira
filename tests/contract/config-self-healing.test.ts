@@ -29,7 +29,7 @@ const EXPECTED_15_KEYS = [
   'slang_storage_path',
 ] as const;
 
-/** 新增的单聊仿生主动能力配置键（消息聚合回复 + 冷场主动搭话），共 8 项 */
+/** 新增的单聊仿生主动能力配置键（消息聚合回复 + 冷场主动搭话 + 黑白名单过滤），共 10 项 */
 const PROACTIVE_KEYS = [
   'aggregation_enabled',
   'aggregation_min_seconds',
@@ -37,13 +37,15 @@ const PROACTIVE_KEYS = [
   'idle_reply_enabled',
   'idle_reply_min_mins',
   'idle_reply_max_mins',
+  'idle_reply_list_mode',
+  'idle_reply_peers',
   'proactive_attitude',
   'instant_reply_enabled',
 ] as const;
 
-const EXPECTED_23_KEYS = [...EXPECTED_15_KEYS, ...PROACTIVE_KEYS] as const;
+const EXPECTED_25_KEYS = [...EXPECTED_15_KEYS, ...PROACTIVE_KEYS] as const;
 
-describe('契约测试: Kujira 23 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+describe('契约测试: Kujira 25 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -54,23 +56,23 @@ describe('契约测试: Kujira 23 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 23 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 23 项合法键', () => {
+  describe('1. 单一真相源与 25 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 25 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(23);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_23_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_23_KEYS].sort());
+      expect(validKeys.size).toBe(25);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_25_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_25_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_23_KEYS) {
+      for (const field of EXPECTED_25_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_23_KEYS) {
+      for (const field of EXPECTED_25_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'

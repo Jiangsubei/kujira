@@ -16,7 +16,12 @@
  *   - **等待用户输入时暂停**：提问/审批挂起期间跳过 tick 与 flush，池与时序完整保留。
  */
 
-import type { AggregatedMessage, BridgePluginConfig, ProactiveAttitude } from '../types/index.js';
+import type {
+  AggregatedMessage,
+  BridgePluginConfig,
+  IdleReplyListMode,
+  ProactiveAttitude,
+} from '../types/index.js';
 import type { SystemWakeupEvent, AggregatedMessagesEvent } from '../types/system-event.js';
 import {
   DEFAULT_AGGREGATION_ENABLED,
@@ -25,6 +30,7 @@ import {
   DEFAULT_IDLE_REPLY_ENABLED,
   DEFAULT_IDLE_REPLY_MIN_MINS,
   DEFAULT_IDLE_REPLY_MAX_MINS,
+  DEFAULT_IDLE_REPLY_LIST_MODE,
   DEFAULT_PROACTIVE_ATTITUDE,
   DEFAULT_INSTANT_REPLY_ENABLED,
 } from '../constants/index.js';
@@ -143,6 +149,22 @@ export function shouldPoolInbound(params: {
   if (!params.aggregationEnabled) return false;
   if (!params.isAgentRunning) return true;
   return params.behavior === 'queue';
+}
+
+/**
+ * 判断指定单聊 peer 是否允许触发冷场主动搭话（黑白名单门控）。
+ * - 默认（blacklist + 空列表）：全部放行；
+ * - blacklist：命中列表拦截，其余放行；
+ * - whitelist：仅命中列表放行（空列表时全员不触发）。
+ */
+export function isPeerAllowedForIdleReply(peer: string, cfg?: BridgePluginConfig): boolean {
+  const cleanPeer = typeof peer === 'string' ? peer.trim() : '';
+  if (!cleanPeer) return false;
+  const mode: IdleReplyListMode =
+    cfg?.idle_reply_list_mode === 'whitelist' ? 'whitelist' : DEFAULT_IDLE_REPLY_LIST_MODE;
+  const rawPeers = Array.isArray(cfg?.idle_reply_peers) ? cfg!.idle_reply_peers : [];
+  const inList = rawPeers.some((p) => typeof p === 'string' && p.trim() === cleanPeer);
+  return mode === 'whitelist' ? inList : !inList;
 }
 
 function cloneMessage(message: AggregatedMessage): AggregatedMessage {
@@ -567,6 +589,16 @@ export class ProactiveManager {
     }
 
     for (const peer of candidates) {
+      // 黑白名单门控：不在冷场主动搭话允许范围内时直接跳过，并清除历史残留的潜水闹钟
+      if (!isPeerAllowedForIdleReply(peer, options.config)) {
+        const existing = this.states.get(peer);
+        if (existing) {
+          existing.idleTargetWakeupAt = null;
+          existing.lastSampledBaseTime = null;
+        }
+        continue;
+      }
+
       const st = this.stateOf(peer);
 
       // 本轮刚投递过聚合：绝不在同一轮叠加搭话

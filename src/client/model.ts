@@ -91,7 +91,11 @@ export class KujiraFormModel {
 
   resetField<K extends keyof BridgePluginConfig>(key: K) {
     if (this.baseDefaults[key] !== undefined) {
-      this.draft = { ...this.draft, [key]: this.baseDefaults[key] };
+      const defVal = this.baseDefaults[key];
+      this.draft = {
+        ...this.draft,
+        [key]: Array.isArray(defVal) ? ([...defVal] as BridgePluginConfig[K]) : defVal,
+      };
     } else {
       const next = { ...this.draft };
       delete next[key];
@@ -106,6 +110,9 @@ export class KujiraFormModel {
       return false;
     }
     const defaultVal = this.baseDefaults[key];
+    if (Array.isArray(draftVal) || Array.isArray(defaultVal)) {
+      return JSON.stringify(draftVal || []) !== JSON.stringify(defaultVal || []);
+    }
     return draftVal !== defaultVal;
   }
 

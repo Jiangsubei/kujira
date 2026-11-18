@@ -91,6 +91,7 @@ import { isSlashCommand, handleSlashCommand } from './commands/index.js';
 import { registerConfigRoute } from './server/routes.js';
 import { registerFacesRoutes } from './server/face-routes.js';
 import { registerSlangRoutes } from './server/slang-routes.js';
+import { registerPeerRoutes } from './server/peer-routes.js';
 
 export * from './memory/index.js';
 export * from './slang/index.js';
@@ -667,6 +668,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
   const unregisterConfigRoute = registerConfigRoute(ctx, currentConfig, queueReconcile, { dshHome });
   const unregisterFacesRoutes = registerFacesRoutes({ ctx, db, getConfig: currentConfig, dshHome });
   const unregisterSlangRoutes = registerSlangRoutes({ ctx, storage: slangService.storage });
+  const unregisterPeerRoutes = registerPeerRoutes({ ctx, db });
 
   const unregVolatile = (ctx as any).on?.('loader/volatile-update', () => {
     if (!isDisposed) void queueReconcile();
@@ -1092,6 +1094,7 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
     safeCall(unregisterConfigRoute);
     safeCall(unregisterFacesRoutes);
     safeCall(unregisterSlangRoutes);
+    safeCall(unregisterPeerRoutes);
     safeCall(unregVolatile);
     safeCall(unregSettingsDoc);
     safeCall(unregCredUpdate);

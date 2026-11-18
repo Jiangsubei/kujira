@@ -95,6 +95,17 @@ const KUJIRA_CARD_CSS = `
 .kujira_segBtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary, #388bfd);outline-offset:1px}
 .kujira_segBtn:disabled{opacity:.4;cursor:not-allowed}
 .kujira_segBtnActive,.kujira_segBtn[aria-checked="true"]{border-color:var(--dsw-alias-brand-primary, #388bfd) !important;background:var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));color:var(--dsw-alias-label-primary, #ffffff);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.1)}
+.kujira_peerFilterBox{display:flex;flex-direction:column;gap:10px;padding:12px;margin:0 0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3)}
+.kujira_peerAddRow{display:flex;align-items:center;gap:8px}
+.kujira_peerSelect{flex:1;min-width:0}
+.kujira_peerAddBtn{appearance:none;height:34px;width:34px;flex:none;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);cursor:pointer;padding:0;transition:border-color .16s,background .16s,color .16s}
+.kujira_peerAddBtn:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
+.kujira_peerAddBtn:disabled{opacity:.4;cursor:not-allowed}
+.kujira_peerList{display:flex;flex-direction:column;gap:6px}
+.kujira_peerRow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);font-size:12px;line-height:1.4}
+.kujira_peerMeta{display:flex;align-items:center;gap:6px;min-width:0;flex:1;overflow:hidden}
+.kujira_peerCode{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary);flex:none}
+.kujira_peerSub{color:var(--dsw-alias-label-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 `;
 
 export function injectCardStyles(): void {
@@ -130,6 +141,15 @@ export const cardStyle = {
   segContainer: 'kujira_segContainer',
   segBtn: 'kujira_segBtn',
   segBtnActive: 'kujira_segBtnActive',
+  peerFilterBox: 'kujira_peerFilterBox',
+  peerAddRow: 'kujira_peerAddRow',
+  peerSelect: 'kujira_peerSelect',
+  peerAddBtn: 'kujira_peerAddBtn',
+  peerList: 'kujira_peerList',
+  peerRow: 'kujira_peerRow',
+  peerMeta: 'kujira_peerMeta',
+  peerCode: 'kujira_peerCode',
+  peerSub: 'kujira_peerSub',
 };
 
 export const sectionStyle = {
@@ -169,6 +189,15 @@ export const fieldStyle = {
   segContainer: 'kujira_segContainer',
   segBtn: 'kujira_segBtn',
   segBtnActive: 'kujira_segBtnActive',
+  peerFilterBox: 'kujira_peerFilterBox',
+  peerAddRow: 'kujira_peerAddRow',
+  peerSelect: 'kujira_peerSelect',
+  peerAddBtn: 'kujira_peerAddBtn',
+  peerList: 'kujira_peerList',
+  peerRow: 'kujira_peerRow',
+  peerMeta: 'kujira_peerMeta',
+  peerCode: 'kujira_peerCode',
+  peerSub: 'kujira_peerSub',
 };
 
 export const faceStyle = {

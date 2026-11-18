@@ -133,6 +133,12 @@ export const DEFAULT_IDLE_REPLY_MIN_MINS = 30;
 /** 潜水主动搭话最大沉默时长 (单位: 分钟，默认 120 分钟) */
 export const DEFAULT_IDLE_REPLY_MAX_MINS = 120;
 
+/** 冷场主动搭话名单过滤模式 ('blacklist' 黑名单排除 | 'whitelist' 白名单仅允许，默认 'blacklist') */
+export const DEFAULT_IDLE_REPLY_LIST_MODE = 'blacklist' as const;
+
+/** 冷场主动搭话黑白名单用户 peer 列表 (默认空数组；黑名单空数组等价于对所有已互动用户生效) */
+export const DEFAULT_IDLE_REPLY_PEERS: string[] = [];
+
 /** @deprecated 旧版过渡期常量（不在有效配置 DEFAULT_BASE_CONFIG 中，仅供未迁移模块引用） */
 export const DEFAULT_AGGREGATION_INTERVAL_MINS = 2;
 
@@ -240,6 +246,8 @@ export const DEFAULT_BASE_CONFIG = {
   idle_reply_enabled: DEFAULT_IDLE_REPLY_ENABLED,
   idle_reply_min_mins: DEFAULT_IDLE_REPLY_MIN_MINS,
   idle_reply_max_mins: DEFAULT_IDLE_REPLY_MAX_MINS,
+  idle_reply_list_mode: DEFAULT_IDLE_REPLY_LIST_MODE,
+  idle_reply_peers: DEFAULT_IDLE_REPLY_PEERS,
   proactive_attitude: DEFAULT_PROACTIVE_ATTITUDE,
   instant_reply_enabled: DEFAULT_INSTANT_REPLY_ENABLED,
 };

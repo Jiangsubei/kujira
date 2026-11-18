@@ -101,7 +101,7 @@ describe('契约测试: 服务端配置 REST API 路由 (/plugins/kujira/config)
 
       expect(CONFIG_ROUTE_PATH).toBe('/plugins/kujira/config');
       expect(DEFAULT_BASE_CONFIG).toBe(CONSTANTS_BASE_CONFIG);
-      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(23);
+      expect(Object.keys(DEFAULT_BASE_CONFIG)).toHaveLength(25);
 
       registerConfigRoute(mockCtx, () => ({} as BridgePluginConfig), async () => {}, {
         dshHome: tmpHome,

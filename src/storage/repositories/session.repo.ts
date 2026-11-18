@@ -3,9 +3,23 @@
  * (session_states, peer_openid_map)
  */
 
-import type { SessionStateRecord } from '../../types/index.js';
+import type { KnownPeerSummaryRecord, SessionStateRecord } from '../../types/index.js';
 
-export type { SessionStateRecord };
+export type { KnownPeerSummaryRecord, SessionStateRecord };
+
+const PEER_PREVIEW_MAX_CHARS = 16;
+const SHORT_OPENID_LEN = 8;
+
+function formatLastMessagePreview(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const compact = raw.replace(/\s+/g, ' ').trim();
+  if (!compact) return '';
+  const chars = Array.from(compact);
+  if (chars.length <= PEER_PREVIEW_MAX_CHARS) {
+    return compact;
+  }
+  return `${chars.slice(0, PEER_PREVIEW_MAX_CHARS).join('')}…`;
+}
 
 export class SessionRepository {
   constructor(private getDb: () => any) {}
@@ -132,6 +146,61 @@ export class SessionRepository {
     for (const row of rows) {
       const peer = typeof row?.peer === 'string' ? row.peer.trim() : '';
       if (peer) out.push(peer);
+    }
+    return out;
+  }
+
+  /**
+   * 枚举所有曾经互动过的单聊用户脱敏摘要（按最近入站消息时间倒序）。
+   * 仅统计用户入站消息（self = 0），绝不返回完整明文 openid。
+   */
+  listKnownPeersWithLastMessage(): KnownPeerSummaryRecord[] {
+    const db = this.getDb();
+    const rows = db
+      .prepare(`
+        SELECT
+          p.peer AS peer,
+          p.openid AS openid,
+          p.updated_at AS updated_at,
+          m.time AS last_message_time,
+          m.content AS last_message_content
+        FROM peer_openid_map p
+        LEFT JOIN messages m
+          ON m.rowid = (
+            SELECT m2.rowid
+            FROM messages m2
+            WHERE m2.peer = p.peer AND m2.self = 0
+            ORDER BY m2.time DESC, m2.rowid DESC
+            LIMIT 1
+          )
+        ORDER BY
+          CASE WHEN m.time IS NULL THEN 1 ELSE 0 END ASC,
+          m.time DESC,
+          p.updated_at DESC,
+          p.peer ASC
+      `)
+      .all() as Array<{
+      peer?: unknown;
+      openid?: unknown;
+      last_message_time?: unknown;
+      last_message_content?: unknown;
+    }>;
+
+    const out: KnownPeerSummaryRecord[] = [];
+    for (const row of rows) {
+      const peer = typeof row?.peer === 'string' ? row.peer.trim() : '';
+      const openid = typeof row?.openid === 'string' ? row.openid.trim() : '';
+      if (!peer) continue;
+      const lastTime =
+        typeof row?.last_message_time === 'number' && Number.isFinite(row.last_message_time)
+          ? row.last_message_time
+          : null;
+      out.push({
+        peer,
+        short_openid: openid ? openid.slice(0, SHORT_OPENID_LEN) : peer.slice(0, SHORT_OPENID_LEN),
+        last_message_time: lastTime,
+        last_message_preview: formatLastMessagePreview(row?.last_message_content),
+      });
     }
     return out;
   }

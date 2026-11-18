@@ -12,6 +12,7 @@ import type {
   SlangQueryOptions,
   MessageRecord,
   InboundReplySlot,
+  KnownPeerSummaryRecord,
   MediaUploadCacheRecord,
   ReadChatHistoryParams,
   ReadChatHistoryResult,
@@ -222,6 +223,11 @@ export class MessageDatabase {
   /** 全量列举「曾经真实互动过」的 peer（peer_openid_map 中已登记的） */
   getAllPeers(): string[] {
     return this.sessionRepo.getAllPeers();
+  }
+
+  /** 列举已互动单聊用户脱敏摘要（短 OpenID + 最近入站发言时间与预览），按最近发言倒序 */
+  listKnownPeersWithLastMessage(): KnownPeerSummaryRecord[] {
+    return this.sessionRepo.listKnownPeersWithLastMessage();
   }
 
   // ==================== 插件键值配置 ====================

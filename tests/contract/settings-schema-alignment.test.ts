@@ -12,19 +12,19 @@ import { BridgeConfigSchema } from '../../src/config/schema.js';
 import { DEFAULT_BASE_CONFIG as SERVER_DEFAULTS } from '../../src/server/routes.js';
 import { DEFAULT_BASE_CONFIG as CLIENT_DEFAULTS } from '../../src/client/card.js';
 
-describe('契约测试：设置系统与四方 23 键单一真相源一致性 (Settings Alignment Contract)', () => {
-  it('Schema、Constants、服务端默认值、客户端默认值四方键严格一致（精确 23 项核心单聊配置）', () => {
+describe('契约测试：设置系统与四方 25 键单一真相源一致性 (Settings Alignment Contract)', () => {
+  it('Schema、Constants、服务端默认值、客户端默认值四方键严格一致（精确 25 项核心单聊配置）', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const schemaKeys = Object.keys(schemaShape).sort();
     const constantsKeys = Object.keys(CONSTANTS_DEFAULTS).sort();
     const serverKeys = Object.keys(SERVER_DEFAULTS).sort();
     const clientKeys = Object.keys(CLIENT_DEFAULTS).sort();
 
-    // 1. 精确 23 键（15 项基础单聊配置 + 8 项仿生主动能力配置）
-    expect(schemaKeys).toHaveLength(23);
-    expect(constantsKeys).toHaveLength(23);
-    expect(serverKeys).toHaveLength(23);
-    expect(clientKeys).toHaveLength(23);
+    // 1. 精确 25 键（15 项基础单聊配置 + 10 项仿生主动能力与黑白名单配置）
+    expect(schemaKeys).toHaveLength(25);
+    expect(constantsKeys).toHaveLength(25);
+    expect(serverKeys).toHaveLength(25);
+    expect(clientKeys).toHaveLength(25);
 
     // 2. 四方键集合完全恒等，且服务端与客户端直接复用 Constants SSOT
     expect(schemaKeys).toEqual(constantsKeys);
@@ -79,11 +79,11 @@ describe('契约测试：设置系统与四方 23 键单一真相源一致性 (S
     }
   });
 
-  it('全部 23 项运行时配置字段均标记为 .volatile()，以支持 DSH 设置面板保存与热更新', () => {
+  it('全部 25 项运行时配置字段均标记为 .volatile()，以支持 DSH 设置面板保存与热更新', () => {
     const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
     const schemaKeys = Object.keys(schemaShape);
 
-    expect(schemaKeys).toHaveLength(23);
+    expect(schemaKeys).toHaveLength(25);
     for (const field of schemaKeys) {
       expect(
         schemaShape[field]?.meta?.volatile,
