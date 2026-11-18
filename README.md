@@ -16,7 +16,7 @@
   <a href="https://github.com/deepseek-ai/dsh"><img src="https://img.shields.io/badge/DeepSeek%20Harness-%3E%3D0.2.2-4f46e5" alt="DeepSeek Harness" /></a>
   <a href="https://q.qq.com/"><img src="https://img.shields.io/badge/QQ%20Bot%20API-v2%20Compliant-00CAFC" alt="QQ Bot API" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.12.0-339933" alt="Node.js" /></a>
-  <img src="https://img.shields.io/badge/Tests-760%2B%20Passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/Tests-830%2B%20Passing-brightgreen" alt="Tests" />
 </p>
 
 DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到的专业助手，也是能记事实、懂梗玩词、具备仿生动态呼吸节奏的贴心伙伴。让 DSH Agent 在 QQ 官方单聊（C2C）中合规开箱即用。
@@ -26,10 +26,12 @@ DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到�
 > 本项目全面基于腾讯 **QQ 开放平台官方 Bot API v2** 规范构建，采用正向 WebSocket 长连接与 OpenAPI 直连通信。告别第三方协议端封号风控，零外部逆向服务依赖，提供长期稳定的生产级接入能力。
 
 > [!CAUTION]
-> **安全警示与权限模型（重中之重）**
-> - **默认 1 对 1 独占**：在 QQ 开放平台创建机器人的开发者，默认即为机器人管理员且**默认可以直接添加机器人为好友**，无需在后台额外配置测试白名单；
-> - **好友即主人，指令全开放**：添加了机器人好友的用户，默认拥有 **10 大两字中文斜杠命令（包括 `/权限` 切换完全访问、`/模型`、`/思考`、`/新建` 等）的全部控制权**；
-> - **高危操作提醒**：若您在开放平台「开发设置」中将其他好友添加为“可添加机器人为好友的开发体验用户”，该好友亦将获得完整的系统操作权限。**本项目强烈且仅推荐 1 对 1 私人专属场景，切勿随意扩列未信任的用户！**
+> **安全模型与多好友权限隔离**
+> - **默认 1 对 1 开箱即用**：在 QQ 开放平台创建机器人的开发者默认可直接添加机器人为好友。未配置管理员名单与隐私隔离时，默认按 1 对 1 私人助手场景开放完整工具、审批与全部斜杠命令；
+> - **多好友防隐私泄露控制**：若在开放平台将其他好友加入体验名单，强烈建议在 WebUI **「常规」** 设置中配置：
+>   1. **管理员名单 (`admins`)**：配置后仅名单内用户可审批敏感工具，以及执行 `/权限`、`/模型 ... -默认`、`/思考 ... -默认`（其余日常指令与本会话内切换模型/思考仍对好友开放）；
+>   2. **隔离可能泄露隐私的工具 (`privacy_tools_enabled`)**：勾选开启后默认对所有单聊隔离 Shell、文件读写、目录、环境依赖与技能加载（保留 `send_file`、`read_image` 与聊天工具），并可在「更多选项」中配置白名单豁免或黑名单精准隔离；
+> - **首次自举与热生效**：配置名单前先向机器人发任意消息，即可在 WebUI 脱敏下拉列表中识别并添加自己；保存后对所有存活会话**立即热生效**，无需重启或新建会话。
 
 ---
 
@@ -50,14 +52,14 @@ DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到�
 - **双层记忆体系**：单聊会话规则 + 用户专属画像，基于 Markdown 持久化存储；写入侧受独立字符预算硬拒绝约束，注入侧保持原子读取，单 Agent 轮次内“顺手提炼”。
 - **黑话学习系统**：基于 SQLite 存储的词库，全局常驻 L1 索引动态注入，支持查梗、收录新梗与满额拒绝/LRU淘汰策略。
 - **表情包资产闭环**：默认常驻装配，提供查表情、发表情、收录好图与满额管控（默认拒绝新增，支持 LRU 淘汰）全生命周期工具链。
-- **纯两字中文斜杠命令**：开箱支持 `/状态`、`/模型`、`/思考`、`/停止`、`/新建`、`/会话`、`/用量`、`/压缩`、`/权限`、`/帮助` 10 大指令，单聊用户自主掌控，支持会话一键 Compaction 压缩。
-- **WebUI 6 大 Tab 设置面板**：集成于 DSH 设置界面，精炼至 23 项核心参数，全部支持 volatile 动态热更新，废弃字段全自动物理自愈过滤。
+- **纯两字中文斜杠命令与权限分层**：开箱支持 `/状态`、`/模型`、`/思考`、`/停止`、`/新建`、`/会话`、`/用量`、`/压缩`、`/权限`、`/帮助` 10 大指令；`/模型` 与 `/思考` 统一支持 `-默认` 设定新建会话默认值；配置 `admins` 后自动对 `/权限` 及 `-默认` 全局配置启用管理员门控。
+- **WebUI 6 大 Tab 设置面板**：集成于 DSH 设置界面，涵盖 29 项核心参数，全部支持 volatile 动态热更新（含管理员审批、隐私工具热隔离与冷场搭话黑白名单），废弃字段全自动物理自愈过滤。
 
 ---
 
 ## ⚡ 极速上手
 
-整个部署流程仅需 **“装插件 → 官方后台拿凭据 → 填入即连”** 3 步，其余 21 项高级配置开箱即具备精心调校的默认值。
+整个部署流程仅需 **“装插件 → 官方后台拿凭据 → 填入即连”** 3 步，其余 29 项运行参数开箱即具备精心调校的默认值。
 
 ### 步骤 1：安装插件（双端二选一）
 
@@ -98,51 +100,59 @@ dsh plugin add kujira
 1. 打开 DSH 设置面板中的 **kujira** 插件卡片：
    - **桌面端**：直接在客户端「插件设置」中找到 `kujira`；
    - **Web 端**：启动 `dsh --profile web` 后，浏览器访问 `http://127.0.0.1:3080/`；
-2. 切换至 **「连接设置 (Connection)」** 分区：
+2. 切换至 **「常规 (Connection)」** 分区：
    - 填入上一步获取的 **AppID** 与 **密钥**；
    - 点击 **保存**（凭据受 DSH `ctx.credentials` 只写保护，明文安全持久化且前端不回显）；
 3. 用手机 QQ 扫描机器人的测试二维码或添加机器人好友，发送任意文本，机器人即刻以拟人化节奏回复！
 
 ---
 
-## ⚙️ 运行时配置全景 (23 项)
+## ⚙️ 运行时配置全景 (29 项)
 
 配置面板在 WebUI 中分为 6 个 Tab 分区，所有参数均支持动态热生效：
 
-### 1. 连接设置 (Connection)
+### 1. 常规 (Connection)
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `AppID` | `string` | *(必填)* | QQ 开放平台机器人 AppID（只写保护） |
-| `密钥 (AppSecret)` | `string` | *(必填)* | QQ 开放平台机器人密钥（只写保护） |
+| `AppID` | `string` | *(必填)* | QQ 开放平台机器人 AppID（只写保护，不入配置文件） |
+| `密钥 (AppSecret)` | `string` | *(必填)* | QQ 开放平台机器人密钥（只写保护，不入配置文件） |
 | `image_ttl_days` | `number` | `7` | 外来图片与媒体资源本地缓存保留天数 |
+| `admins` | `string[]` | `[]` | 管理员名单（存内部脱敏 `peer`）；为空按 1 对 1 开放，非空时仅管理员可审批与执行 `/权限`、`/模型 -默认`、`/思考 -默认` |
+| `privacy_tools_enabled` | `boolean` | `false` | 隔离可能泄露隐私的工具总开关（Shell/文件/目录/环境/技能，保留发文件与识图），保存即对存活会话热生效 |
+| `privacy_tools_list_mode` | `'whitelist' \| 'blacklist'` | `'whitelist'` | 隐私工具隔离名单模式（开启后展开「更多选项」可见：`whitelist` 白名单豁免 / `blacklist` 黑名单精准隔离） |
+| `privacy_tools_whitelist` | `string[]` | `[]` | 隐私工具白名单用户 `peer` 列表（白名单模式下放行；空表时开启开关即全员隔离） |
+| `privacy_tools_blacklist` | `string[]` | `[]` | 隐私工具黑名单用户 `peer` 列表（黑名单模式下仅隔离名单内用户） |
 
-### 2. 人格与准则 (Persona & Behavior)
+### 2. 回复节奏 (Reply)
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `new_message_behavior` | `'steer' \| 'queue'` | `'steer'` | 运行中收到新消息的行为模式（`steer` 及时插话 vs `queue` 加入队列） |
+| `proactive_attitude` | `'enthusiastic' \| 'balanced' \| 'aloof'` | `'balanced'` | 互动偏好分段（`enthusiastic` 热情 / `balanced` 均衡 / `aloof` 冷淡） |
+| `aggregation_enabled` | `boolean` | `false` | 消息聚合回复总开关（连续消息按周期窗口合并回复，需手动开启） |
+| `aggregation_min_seconds` | `number` | `10` | 聚合等待最小时长（秒，硬底线） |
+| `aggregation_max_seconds` | `number` | `60` | 聚合等待最大时长（秒） |
+| `instant_reply_enabled` | `boolean` | `false` | 允许在连续热聊时概率秒回（突破聚合下限） |
+| `idle_reply_enabled` | `boolean` | `false` | 冷场主动搭话总开关（长时间无新消息时主动发起话题） |
+| `idle_reply_list_mode` | `'blacklist' \| 'whitelist'` | `'blacklist'` | 冷场主动搭话名单过滤模式（开启后展开「更多选项」可见） |
+| `idle_reply_blacklist` | `string[]` | `[]` | 冷场主动搭话黑名单用户 `peer` 列表（黑名单模式排除） |
+| `idle_reply_whitelist` | `string[]` | `[]` | 冷场主动搭话白名单用户 `peer` 列表（白名单模式仅允许） |
+| `idle_reply_min_mins` | `number` | `30` | 潜水主动搭话最小沉默时长（分钟） |
+| `idle_reply_max_mins` | `number` | `120` | 潜水主动搭话最大沉默时长（分钟） |
+
+### 3. 人格与准则 (Persona & Behavior)
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `persona` | `string` | *(内置)* | 助手的人格设定（注入 System Prompt 动态段） |
 | `behavior` | `string` | *(内置)* | 行为约束准则（注入 System Prompt 动态段） |
 
-### 3. 回复节奏 (Reply)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `new_message_behavior` | `'steer' \| 'queue'` | `'steer'` | 运行中收到新消息的行为模式（`steer` 及时插话 vs `queue` 加入队列） |
-| `aggregation_enabled` | `boolean` | `false` | 消息聚合回复总开关（连续消息按周期窗口合并回复，需手动开启） |
-| `aggregation_min_seconds` | `number` | `10` | 聚合等待最小时长（秒，硬底线） |
-| `aggregation_max_seconds` | `number` | `60` | 聚合等待最大时长（秒） |
-| `idle_reply_enabled` | `boolean` | `false` | 冷场主动搭话总开关（长时间无新消息时主动发起话题） |
-| `idle_reply_min_mins` | `number` | `30` | 潜水主动搭话最小沉默时长（分钟） |
-| `idle_reply_max_mins` | `number` | `120` | 潜水主动搭话最大沉默时长（分钟） |
-| `proactive_attitude` | `'enthusiastic' \| 'balanced' \| 'aloof'` | `'balanced'` | 互动偏好分段（`enthusiastic` 热情 / `balanced` 均衡 / `aloof` 冷淡） |
-| `instant_reply_enabled` | `boolean` | `false` | 允许在连续热聊时概率秒回（突破聚合下限） |
-
-### 4. 记忆系统 (Memory)
+### 4. 记忆 (Memory)
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `memory_storage_dir` | `string` | `".dsh/kujira/memory"` | 双层记忆 Markdown 文件存储根目录 |
 | `user_profile_budget_chars` | `number` | `2200` | 单个用户画像文件的写入字符上限 |
 | `session_memory_budget_chars` | `number` | `2200` | 单个会话规则文件的写入字符上限 |
 
-### 5. 表情资产 (Face)
+### 5. 表情包 (Face)
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `face_store_max` | `number` | `100` | 本地表情库存储容量上限（张） |
@@ -160,20 +170,20 @@ dsh plugin add kujira
 
 ## 💬 10 大纯两字中文斜杠命令
 
-在 QQ 单聊中发送带有 `/` 前缀的中文指令，可直接操控当前 Agent 运行时状态：
+在 QQ 单聊中发送带有 `/` 前缀的中文指令，可直接操控当前 Agent 运行时状态（配置 `admins` 后，高危/默认配置项自动受管理员门控）：
 
-| 指令 | 说明 | 示例 |
-|---|---|---|
-| `/状态` | 查看当前会话状态、模型版本、思考档位与运行时指标 | `/状态` |
-| `/模型` | 探查可用模型列表并切换当前会话模型 | `/模型 deepseek-reasoner` |
-| `/思考` | 切换模型推理思考档位（开 / 关 / 指定预算） | `/思考 8192` |
-| `/新建` | 结束当前会话轮次，就地开启新会话（记忆跨轮次保留） | `/新建` |
-| `/会话` | 浏览历史会话列表并按序号无损切回 | `/会话` |
-| `/用量` | 查询当前会话 Token 消耗明细与表面上下文占比 | `/用量` |
-| `/压缩` | 立即对当前会话历史进行结构化摘要压缩，释放上下文空间 | `/压缩` |
-| `/停止` | 紧急中断正在运行中的 Agent 思考与生成回合 | `/停止` |
-| `/权限` | 切换会话运行权限模式（只读 / 工作区写入 / 完全访问） | `/权限 完全` |
-| `/帮助` | 显示所有可用指令与使用简要指南 | `/帮助` |
+| 指令 | 权限级别 | 说明 | 示例 |
+|---|---|---|---|
+| `/状态` | 全员 | 查看当前会话状态、模型版本、思考档位与运行时指标 | `/状态` |
+| `/模型` | 全员（`-默认` 仅管理员） | 查看或切换当前会话模型；追加 `-默认` 设为新建会话默认模型 | `/模型 deepseek-v4-flash -默认` |
+| `/思考` | 全员（`-默认` 仅管理员） | 查看或切换当前会话思考深度；追加 `-默认` 设为新建会话默认思考深度 | `/思考 high -默认` 或 `/思考 关` |
+| `/新建` | 全员 | 结束当前会话轮次，就地开启新会话（记忆跨轮次保留） | `/新建` |
+| `/会话` | 全员 | 浏览历史会话列表并按序号或标题无损切回 | `/会话` 或 `/会话 2` |
+| `/用量` | 全员 | 查询当前会话 Token 消耗明细与上下文占比 | `/用量` |
+| `/压缩` | 全员 | 立即对当前会话历史进行结构化摘要压缩，释放上下文空间 | `/压缩` |
+| `/停止` | 全员 | 紧急中断正在运行中的 Agent 思考与生成回合 | `/停止` |
+| `/权限` | 仅管理员（配置 `admins` 后） | 查看或切换会话运行权限模式（`只读` / `编辑` / `完全`） | `/权限 编辑` |
+| `/帮助` | 全员 | 显示所有可用指令与使用简要指南 | `/帮助` |
 
 ---
 
@@ -203,7 +213,7 @@ pnpm test          # 完整构建测试（pnpm build + vitest run）
 - [文档中心索引 (docs/README.md)](docs/README.md)：专题文档总览与快速导航入口。
 - [快速上手指南 (docs/getting-started.md)](docs/getting-started.md)：详细环境准备、QQ 开放平台操作图解、双端安装与验证排查。
 - [系统架构与设计哲学 (docs/architecture.md)](docs/architecture.md)：仿生动态时序引擎数学模型、正向网关、静默出站体系深度解析。
-- [运行时配置全景参考 (docs/configuration.md)](docs/configuration.md)：23 项核心配置详尽字典、调优配方与自愈机制。
+- [运行时配置全景参考 (docs/configuration.md)](docs/configuration.md)：29 项核心配置详尽字典、管理员权限与隐私工具热隔离、调优配方与自愈机制。
 - [Agent 工具集与斜杠命令手册 (docs/tools-and-commands.md)](docs/tools-and-commands.md)：16 大专属工具 Lossless JSON 契约与 10 大命令。
 - [常见问题排查与实测手册 (docs/troubleshooting.md)](docs/troubleshooting.md)：实测避坑（40054005 跨天去重、40034024 ID混淆、流式 50015001、2 分钟撤回）、探针使用指南。
 
