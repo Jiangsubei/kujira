@@ -32,6 +32,7 @@ import {
   DEFAULT_PROACTIVE_ATTITUDE,
   DEFAULT_INSTANT_REPLY_ENABLED,
   DEFAULT_ADMINS,
+  DEFAULT_PRIVACY_TOOLS_ENABLED,
   DEFAULT_PRIVACY_TOOLS_LIST_MODE,
   DEFAULT_PRIVACY_TOOLS_BLACKLIST,
   DEFAULT_PRIVACY_TOOLS_WHITELIST,
@@ -164,11 +165,16 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_ADMINS)
     .volatile()
     .description('管理员用户 peer 列表 (空列表表示 1 对 1 模式全员具备管理员权限，仅存内部哈希 peer)'),
+  privacy_tools_enabled: z
+    .boolean()
+    .default(DEFAULT_PRIVACY_TOOLS_ENABLED)
+    .volatile()
+    .description('隔离可能泄露隐私的工具总开关 (默认 false，开启后按名单规则实时热隔离)'),
   privacy_tools_list_mode: z
     .union([z.const('blacklist'), z.const('whitelist')])
     .default(DEFAULT_PRIVACY_TOOLS_LIST_MODE)
     .volatile()
-    .description('隔离可能泄露隐私的工具名单过滤模式 (blacklist: 黑名单隔离, whitelist: 白名单仅允许)'),
+    .description('隔离可能泄露隐私的工具名单过滤模式 (whitelist: 白名单豁免仅允许, blacklist: 黑名单精准隔离，默认 whitelist)'),
   privacy_tools_blacklist: z
     .array(z.string())
     .default(DEFAULT_PRIVACY_TOOLS_BLACKLIST)
@@ -178,7 +184,7 @@ export const BridgeConfigSchema: z<any> = z.object({
     .array(z.string())
     .default(DEFAULT_PRIVACY_TOOLS_WHITELIST)
     .volatile()
-    .description('隔离可能泄露隐私的工具白名单用户 peer 列表 (仅白名单模式生效，空数组表示所有用户均被隔离)'),
+    .description('隔离可能泄露隐私的工具白名单用户 peer 列表 (仅白名单模式生效，开启总开关且空数组表示所有用户均被隔离)'),
 });
 
 export type { BridgePluginConfig };

@@ -278,7 +278,7 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
     }
   });
 
-  it('契约 1: 默认配置（blacklist + []）下，会话不限制隐私工具，所有平台隐私工具与 send_file/read_image 均可见', async () => {
+  it('契约 1: 默认配置（privacy_tools_enabled=false）下，会话不限制隐私工具，所有平台隐私工具与 send_file/read_image 均可见', async () => {
     const agent = await sessionManager.getOrCreateAgent(GUEST_PEER);
     const visible = getVisibleToolNames(agent);
 
@@ -290,8 +290,9 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
     expect(visible.has('send_qq_message')).toBe(true);
   });
 
-  it('契约 2: 黑名单模式下，命中 peer 隔离全部隐私工具，未命中 peer 完整保留，且 send_file 与 read_image 始终不被隔离', async () => {
+  it('契约 2: 开启总开关且黑名单模式下，命中 peer 隔离全部隐私工具，未命中 peer 完整保留，且 send_file 与 read_image 始终不被隔离', async () => {
     liveConfig = {
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'blacklist',
       privacy_tools_blacklist: [GUEST_PEER],
       privacy_tools_whitelist: [],
@@ -320,12 +321,10 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
     expect(adminVisible.has('read_image')).toBe(true);
   });
 
-  it('契约 3: 白名单模式下，空白名单全员隔离；加入白名单的 peer 放行，其余 peer 隔离', async () => {
-    // 空白名单 → 全员隔离
+  it('契约 3: 开启总开关后默认白名单空表全员隔离；加入白名单的 peer 豁免放行，其余 peer 隔离', async () => {
+    // 仅勾选总开关（默认白名单空表）→ 立刻全员隔离
     liveConfig = {
-      privacy_tools_list_mode: 'whitelist',
-      privacy_tools_blacklist: [],
-      privacy_tools_whitelist: [],
+      privacy_tools_enabled: true,
     };
 
     const guestAgent = await sessionManager.getOrCreateAgent(GUEST_PEER);
@@ -338,6 +337,7 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
 
     // 将 ADMIN_PEER_1 加入白名单：ADMIN_PEER_1 放行，GUEST_PEER 仍被隔离
     liveConfig = {
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'whitelist',
       privacy_tools_blacklist: [],
       privacy_tools_whitelist: [ADMIN_PEER_1],
@@ -358,8 +358,8 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
     expect(guestVisibleStill.has('read_image')).toBe(true);
   });
 
-  it('契约 4 (核心热切换): 存活会话无需重建，配置拉黑/切白名单与放行后调用 syncPrivacyToolsForActiveSessions 立即双向热生效', async () => {
-    // 1. 初始默认（未隔离）创建存活会话
+  it('契约 4 (核心热切换): 存活会话无需重建，总开关与黑白名单变更后调用 syncPrivacyToolsForActiveSessions 立即双向热生效', async () => {
+    // 1. 初始默认（未开启隔离）创建存活会话
     const agent = await sessionManager.getOrCreateAgent(GUEST_PEER);
     const initialSessionId = (agent as any).session?.id;
     let visible = getVisibleToolNames(agent);
@@ -367,8 +367,9 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
       expect(visible.has(name)).toBe(true);
     }
 
-    // 2. 会话存活中途拉黑并热同步 → 隐私工具立即从 agent.ctx.tools.definitions(agent) 消失
+    // 2. 会话存活中途开启总开关并拉黑热同步 → 隐私工具立即从 agent.ctx.tools.definitions(agent) 消失
     liveConfig = {
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'blacklist',
       privacy_tools_blacklist: [GUEST_PEER],
       privacy_tools_whitelist: [],
@@ -387,10 +388,11 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
     expect(visible.has('send_file')).toBe(true);
     expect(visible.has('read_image')).toBe(true);
 
-    // 3. 修改配置移出黑名单并热同步 → 隐私工具立即热恢复可见
+    // 3. 关闭总开关并热同步（即使保留黑名单）→ 隐私工具立即热恢复可见
     liveConfig = {
+      privacy_tools_enabled: false,
       privacy_tools_list_mode: 'blacklist',
-      privacy_tools_blacklist: [],
+      privacy_tools_blacklist: [GUEST_PEER],
       privacy_tools_whitelist: [],
     };
     sessionManager.syncPrivacyToolsForActiveSessions();
@@ -400,8 +402,9 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
       expect(visible.has(name)).toBe(true);
     }
 
-    // 4. 切换至空白名单并热同步 → 再次立即隔离
+    // 4. 开启总开关（默认空白名单）并热同步 → 再次立即隔离
     liveConfig = {
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'whitelist',
       privacy_tools_blacklist: [],
       privacy_tools_whitelist: [],
@@ -417,6 +420,7 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
 
     // 5. 加入白名单并热同步 → 再次热恢复可见，且始终是同一个存活 Agent 实例
     liveConfig = {
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'whitelist',
       privacy_tools_blacklist: [],
       privacy_tools_whitelist: [GUEST_PEER],
@@ -455,6 +459,7 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
     const scopedCtx = { get: (k: string) => (k === 'tools' ? toolsSvc : undefined) };
     const fakeAgent: any = { session: { id: 'kujira-user-fallbacktest' }, ctx: scopedCtx };
     let cfg: BridgePluginConfig = {
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'blacklist',
       privacy_tools_blacklist: [GUEST_PEER],
       privacy_tools_whitelist: [],
@@ -487,10 +492,11 @@ describe('契约测试: 真实 DSH SessionManager 会话隐私工具热隔离 (P
       expect(restricted.has('send_file')).toBe(false);
       expect(restricted.has('read_image')).toBe(false);
 
-      // 移出黑名单并热同步 → 降级组合 disposer 正确释放全部已隔离项
+      // 关闭总开关并热同步 → 降级组合 disposer 正确释放全部已隔离项
       cfg = {
+        privacy_tools_enabled: false,
         privacy_tools_list_mode: 'blacklist',
-        privacy_tools_blacklist: [],
+        privacy_tools_blacklist: [GUEST_PEER],
         privacy_tools_whitelist: [],
       };
       isolatedMgr.syncPrivacyToolsForActiveSessions();

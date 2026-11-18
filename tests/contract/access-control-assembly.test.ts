@@ -130,9 +130,10 @@ describe('契约测试: 权限分层与隐私工具热隔离生产装配端到�
     expect(guestInitialTools.has('read')).toBe(true);
     expect(guestInitialTools.has('send_file')).toBe(true);
 
-    // 2. 通过真实配置路由切为白名单模式（仅放行 ADMIN_PEER）→ 触发 reconcile 热同步
+    // 2. 通过真实配置路由开启隔离总开关（默认白名单仅放行 ADMIN_PEER）→ 触发 reconcile 热同步
     await postConfig({
       admins: [ADMIN_PEER],
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'whitelist',
       privacy_tools_whitelist: [ADMIN_PEER],
     });
@@ -154,6 +155,7 @@ describe('契约测试: 权限分层与隐私工具热隔离生产装配端到�
 
     // 3. 中途将 GUEST_PEER 加入白名单 → 同一个存活会话立即热恢复隐私工具（无需新建/重启）
     await postConfig({
+      privacy_tools_enabled: true,
       privacy_tools_list_mode: 'whitelist',
       privacy_tools_whitelist: [ADMIN_PEER, GUEST_PEER],
     });
@@ -165,6 +167,20 @@ describe('契约测试: 权限分层与隐私工具热隔离生产装配端到�
     expect(guestAfterRestore.has('edit')).toBe(true);
     expect(guestAfterRestore.has('working_directory')).toBe(true);
     expect(guestAfterRestore.has('skill')).toBe(true);
+
+    // 4. 切回仅 ADMIN_PEER 白名单再次隔离，再关闭总开关 → 即使名单仍在，所有会话立即热恢复
+    await postConfig({
+      privacy_tools_enabled: true,
+      privacy_tools_list_mode: 'whitelist',
+      privacy_tools_whitelist: [ADMIN_PEER],
+    });
+    expect(getVisibleToolNames(guestAgent).has('read')).toBe(false);
+
+    await postConfig({
+      privacy_tools_enabled: false,
+    });
+    expect(getVisibleToolNames(guestAgent).has('read')).toBe(true);
+    expect(getVisibleToolNames(guestAgent).has(expectedShell)).toBe(true);
   });
 
   it('装配闭环 2: 生产 approval/request waterfall 接入热更新 admins，非管理员静默 Fail-Closed、管理员正常弹窗', async () => {

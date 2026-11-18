@@ -141,9 +141,13 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).toMatch(/id="kujira-cred-app-secret"[^>]*value=""/);
       expect(connectionHtml).toContain('未配置');
 
-      // 3. image_ttl_days
+      // 3. image_ttl_days 与直接平铺的管理员名单 / 隔离可能泄露隐私的工具总开关
       expect(connectionHtml).toContain('id="kujira-image-ttl"');
       expect(connectionHtml).toContain('image_ttl_days');
+      expect(connectionHtml).toContain('管理员名单 (admins)');
+      expect(connectionHtml).toContain('id="kujira-privacy-tools-enabled"');
+      expect(connectionHtml).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
+      expect(connectionHtml).not.toContain('kujira-privacy-tools-more-section');
 
       // 4. 已迁入 Tab 2 的 new_message_behavior 与仿生回复配置项不在 Tab 1
       expect(connectionHtml).not.toContain('kujira-new-message-behavior');
@@ -161,7 +165,6 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).not.toContain('ws_port');
       expect(connectionHtml).not.toContain('ws_token');
       expect(connectionHtml).not.toContain('bot_qq');
-      expect(connectionHtml).not.toContain('admins');
       expect(connectionHtml).not.toContain('aliases');
     });
 

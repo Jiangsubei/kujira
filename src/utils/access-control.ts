@@ -106,29 +106,37 @@ export function isAdminIdentity(
 
 /**
  * 判断给定身份是否命中「隔离可能泄露隐私的工具」策略：
- * - `blacklist` 模式（默认）：仅当归一化后命中黑名单时返回 `true`（无效身份返回 `false`）；
- * - `whitelist` 模式：Fail-Closed，无效身份或未命中白名单均返回 `true`（空白名单全员隔离）。
+ * - `privacy_tools_enabled` 未开启（默认 `false`）：不隔离任何会话，返回 `false`；
+ * - 开启后：
+ *   - `whitelist` 模式（默认）：Fail-Closed，无效身份或未命中白名单均返回 `true`（空白名单全员隔离，命中白名单豁免放行）；
+ *   - `blacklist` 模式：仅当归一化后命中黑名单时返回 `true`（无效身份返回 `false`）。
  */
 export function isPrivacyToolsRestricted(
   identity: string | undefined | null,
   config?: Pick<
     BridgePluginConfig,
-    'privacy_tools_list_mode' | 'privacy_tools_blacklist' | 'privacy_tools_whitelist'
+    | 'privacy_tools_enabled'
+    | 'privacy_tools_list_mode'
+    | 'privacy_tools_blacklist'
+    | 'privacy_tools_whitelist'
   > | null
 ): boolean {
-  const mode = config?.privacy_tools_list_mode === 'whitelist' ? 'whitelist' : 'blacklist';
+  if (!config?.privacy_tools_enabled) {
+    return false;
+  }
+  const mode = config.privacy_tools_list_mode === 'blacklist' ? 'blacklist' : 'whitelist';
   const peer = normalizeIdentityToPeer(identity);
   if (mode === 'whitelist') {
     if (!peer) {
       return true;
     }
-    const whitelist = normalizePeerList(config?.privacy_tools_whitelist);
+    const whitelist = normalizePeerList(config.privacy_tools_whitelist);
     return !whitelist.includes(peer);
   }
   if (!peer) {
     return false;
   }
-  const blacklist = normalizePeerList(config?.privacy_tools_blacklist);
+  const blacklist = normalizePeerList(config.privacy_tools_blacklist);
   return blacklist.includes(peer);
 }
 

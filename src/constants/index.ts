@@ -160,13 +160,16 @@ export const PROACTIVE_CHECK_INTERVAL_MS = 60 * 1000;
 /** 管理员用户 peer 列表 (默认空数组，表示 1 对 1 模式，所有单聊好友均视为具备管理员权限) */
 export const DEFAULT_ADMINS: string[] = [];
 
-/** 隔离可能泄露隐私的工具名单过滤模式 ('blacklist' 黑名单隔离 | 'whitelist' 白名单仅允许，默认 'blacklist') */
-export const DEFAULT_PRIVACY_TOOLS_LIST_MODE = 'blacklist' as const;
+/** 隔离可能泄露隐私的工具总开关 (默认 false，不隔离任何会话；开启后默认白名单空表即全员隔离) */
+export const DEFAULT_PRIVACY_TOOLS_ENABLED = false;
+
+/** 隔离可能泄露隐私的工具名单过滤模式 ('whitelist' 白名单豁免 | 'blacklist' 黑名单精准隔离，默认 'whitelist') */
+export const DEFAULT_PRIVACY_TOOLS_LIST_MODE = 'whitelist' as const;
 
 /** 隔离可能泄露隐私的工具黑名单用户 peer 列表 (仅黑名单模式生效；空数组表示无人被隔离) */
 export const DEFAULT_PRIVACY_TOOLS_BLACKLIST: string[] = [];
 
-/** 隔离可能泄露隐私的工具白名单用户 peer 列表 (仅白名单模式生效；空数组表示所有用户均被隔离) */
+/** 隔离可能泄露隐私的工具白名单用户 peer 列表 (仅白名单模式生效；开启总开关且白名单空数组表示所有用户均被隔离) */
 export const DEFAULT_PRIVACY_TOOLS_WHITELIST: string[] = [];
 
 /** 可能泄露隐私的隔离工具清单（9 个，明确不含 send_file 与 read_image） */
@@ -278,6 +281,7 @@ export const DEFAULT_BASE_CONFIG = {
   proactive_attitude: DEFAULT_PROACTIVE_ATTITUDE,
   instant_reply_enabled: DEFAULT_INSTANT_REPLY_ENABLED,
   admins: DEFAULT_ADMINS,
+  privacy_tools_enabled: DEFAULT_PRIVACY_TOOLS_ENABLED,
   privacy_tools_list_mode: DEFAULT_PRIVACY_TOOLS_LIST_MODE,
   privacy_tools_blacklist: DEFAULT_PRIVACY_TOOLS_BLACKLIST,
   privacy_tools_whitelist: DEFAULT_PRIVACY_TOOLS_WHITELIST,
