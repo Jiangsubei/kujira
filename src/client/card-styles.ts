@@ -95,8 +95,12 @@ const KUJIRA_CARD_CSS = `
 .kujira_segBtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary, #388bfd);outline-offset:1px}
 .kujira_segBtn:disabled{opacity:.4;cursor:not-allowed}
 .kujira_segBtnActive,.kujira_segBtn[aria-checked="true"]{border-color:var(--dsw-alias-brand-primary, #388bfd) !important;background:var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));color:var(--dsw-alias-label-primary, #ffffff);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.1)}
-.kujira_peerFilterBox{display:flex;flex-direction:column;padding:0 12px;margin:0 0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3)}
-.kujira_peerFilterBox+.kujira_field{border-top:1px solid var(--dsw-alias-border-l2)}
+.kujira_peerFilterSection{display:flex;flex-direction:column;gap:8px;padding:0 0 12px}
+.kujira_peerFilterSection+.kujira_field,.kujira_peerFilterBox+.kujira_field{border-top:1px solid var(--dsw-alias-border-l2)}
+.kujira_moreToggle{appearance:none;background:0 0;border:none;padding:2px 0;margin:0;display:inline-flex;align-items:center;gap:4px;width:fit-content;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);cursor:pointer;transition:color .16s}
+.kujira_moreToggle:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
+.kujira_moreToggle:disabled{opacity:.4;cursor:default}
+.kujira_peerFilterBox{display:flex;flex-direction:column;padding:0 12px;margin:0;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3)}
 .kujira_peerEditorRow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
 .kujira_peerSelect{flex:1;min-width:0;height:28px;font-size:12px;padding:0 8px}
 .kujira_peerEditorActions{display:inline-flex;align-items:center;gap:6px;flex:none}
@@ -141,6 +145,8 @@ export const cardStyle = {
   segContainer: 'kujira_segContainer',
   segBtn: 'kujira_segBtn',
   segBtnActive: 'kujira_segBtnActive',
+  peerFilterSection: 'kujira_peerFilterSection',
+  moreToggle: 'kujira_moreToggle',
   peerFilterBox: 'kujira_peerFilterBox',
   peerEditorRow: 'kujira_peerEditorRow',
   peerSelect: 'kujira_peerSelect',
@@ -190,6 +196,8 @@ export const fieldStyle = {
   segContainer: 'kujira_segContainer',
   segBtn: 'kujira_segBtn',
   segBtnActive: 'kujira_segBtnActive',
+  peerFilterSection: 'kujira_peerFilterSection',
+  moreToggle: 'kujira_moreToggle',
   peerFilterBox: 'kujira_peerFilterBox',
   peerEditorRow: 'kujira_peerEditorRow',
   peerSelect: 'kujira_peerSelect',
