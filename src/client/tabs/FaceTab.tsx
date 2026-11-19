@@ -175,7 +175,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
     >
       <ValueField
         id="kujira-face-store-max"
-        label="表情库容量上限 (face_store_max)"
+        label="表情库容量上限"
         hint={`本地表情库最多保存多少张可用表情（默认 ${DEFAULT_FACE_STORE_MAX} 张）`}
         placeholder={String(DEFAULT_FACE_STORE_MAX)}
         numeric
@@ -191,7 +191,7 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
       <div className={fieldStyle.field}>
         <div className={fieldStyle.head}>
           <label htmlFor="kujira-face-evict-policy" className={fieldStyle.label}>
-            满额淘汰策略 (face_evict_policy)
+            满额时行为
           </label>
           {model.isOverridden('face_evict_policy') && (
             <div className={fieldStyle.badges}>
@@ -213,15 +213,15 @@ export function FaceTab(props: FaceTabProps): React.JSX.Element {
           value={draft.face_evict_policy || DEFAULT_FACE_EVICT_POLICY}
           onChange={(e) => onFieldChange('face_evict_policy', e.target.value as any)}
         >
-          <option value="reject">拒绝新增 (reject) - 满额后停止收录，不删旧表情</option>
-          <option value="evict_lru">淘汰最久未用 (evict_lru) - 满额后自动淘汰最久未使用的表情</option>
+          <option value="reject">拒绝新增 - 满额后停止收录，不删旧表情</option>
+          <option value="evict_lru">淘汰最久未用 - 满额后自动淘汰最久未使用的表情</option>
         </select>
         <p className={fieldStyle.hint}>达到容量上限后的行为策略。淘汰的表情在硬盘上保留 7 天后悔期。</p>
       </div>
 
       <ValueField
         id="kujira-face-store-dir"
-        label="表情库存储目录 (face_store_dir)"
+        label="表情库存储目录"
         hint={`本地表情图片原图落盘存储目录 (默认 ${DEFAULT_FACE_STORE_DIR})`}
         placeholder={DEFAULT_FACE_STORE_DIR}
         value={draft.face_store_dir || DEFAULT_FACE_STORE_DIR}

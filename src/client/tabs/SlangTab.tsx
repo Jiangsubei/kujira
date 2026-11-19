@@ -166,7 +166,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
     >
       <ValueField
         id="kujira-slang-max-entries"
-        label="黑话条数容量上限 (slang_max_entries)"
+        label="黑话条数容量上限"
         hint={`黑话知识库最大允许收录条数 (默认 ${DEFAULT_SLANG_MAX_ENTRIES} 条)`}
         placeholder={String(DEFAULT_SLANG_MAX_ENTRIES)}
         numeric
@@ -182,7 +182,7 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
       <div className={fieldStyle.field}>
         <div className={fieldStyle.head}>
           <label htmlFor="kujira-slang-evict-policy" className={fieldStyle.label}>
-            满额淘汰策略 (slang_evict_policy)
+            满额时行为
           </label>
           {model.isOverridden('slang_evict_policy') && (
             <div className={fieldStyle.badges}>
@@ -204,15 +204,15 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
           value={draft.slang_evict_policy || DEFAULT_SLANG_EVICT_POLICY}
           onChange={(e) => onFieldChange('slang_evict_policy', e.target.value as any)}
         >
-          <option value="reject">拒绝新增 (reject) - 满额后停止收录，提示手动清理</option>
-          <option value="evict_lru">淘汰查阅最少词条 (evict_lru) - 满额后根据模型查询次数自动淘汰最冷门词条</option>
+          <option value="reject">拒绝新增 - 满额后停止收录，提示手动清理</option>
+          <option value="evict_lru">淘汰最少查阅 - 满额后根据模型查询次数自动淘汰冷门词条</option>
         </select>
         <p className={fieldStyle.hint}>达到条数上限后的行为策略。淘汰依据为模型调用工具查询黑话的次数与活跃度。</p>
       </div>
 
       <ValueField
         id="kujira-slang-storage-path"
-        label="黑话文档参考路径 (slang_storage_path)"
+        label="黑话库存储路径"
         hint={`黑话知识库参考 Markdown 导出路径 (默认 ${DEFAULT_SLANG_STORAGE_PATH})`}
         placeholder={DEFAULT_SLANG_STORAGE_PATH}
         value={draft.slang_storage_path || DEFAULT_SLANG_STORAGE_PATH}

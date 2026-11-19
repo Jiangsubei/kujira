@@ -31,7 +31,7 @@ export function PersonaTab(props: PersonaTabProps): React.JSX.Element {
     >
       <TextAreaField
         id="kujira-persona"
-        label="助手人格设定 (persona)"
+        label="助手人设"
         hint="注入 Agent 动态 System Prompt 的角色设定 (保护静态 KV 缓存)"
         placeholder="例如: 你是一个得力的 QQ 单聊智能助手..."
         value={draft.persona || ''}
@@ -43,7 +43,7 @@ export function PersonaTab(props: PersonaTabProps): React.JSX.Element {
 
       <TextAreaField
         id="kujira-behavior"
-        label="行为准则 (behavior)"
+        label="行为准则"
         hint="注入 Agent 动态 System Prompt 的行为准则与回答风格要求"
         placeholder="例如: 回答请清晰精炼，必要时调用 read_chat_history 查询近期单聊上下文..."
         value={draft.behavior || ''}

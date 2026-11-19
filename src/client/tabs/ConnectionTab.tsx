@@ -61,7 +61,7 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
     >
       <ValueField
         id="kujira-cred-app-id"
-        label="Bot AppID (QQ_BOT_APP_ID)"
+        label="Bot AppID"
         hint={
           credentialsStatus.appId.configured
             ? '当前已配置 AppID；采用只写保护（绝不回显明文），留空将保留现有凭据，输入新值将持久化至 DSH 凭据库并触发重连'
@@ -82,7 +82,7 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-cred-app-secret"
-        label="Bot AppSecret (QQ_BOT_SECRET)"
+        label="Bot AppSecret"
         hint={
           credentialsStatus.appSecret.configured
             ? '当前已配置 AppSecret；采用只写保护（绝不回显明文），留空将保留现有密钥，输入新值将覆盖更新并触发重连'
@@ -103,7 +103,7 @@ export function ConnectionTab(props: ConnectionTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-image-ttl"
-        label="多媒体文件缓存 TTL 天数 (image_ttl_days)"
+        label="多媒体文件缓存天数"
         hint="接收与生成的图片/音视频/文件在本地的保留天数，过期定时自动清理 (默认 7)"
         placeholder={String(DEFAULT_IMAGE_TTL_DAYS)}
         numeric

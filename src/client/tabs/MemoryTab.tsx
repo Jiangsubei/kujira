@@ -36,7 +36,7 @@ export function MemoryTab(props: MemoryTabProps): React.JSX.Element {
     >
       <ValueField
         id="kujira-memory-storage-dir"
-        label="记忆存储目录 (memory_storage_dir)"
+        label="记忆存储目录"
         hint={`Session 记忆与用户画像 Markdown 存储根目录 (默认 ${DEFAULT_MEMORY_DIR})`}
         placeholder={DEFAULT_MEMORY_DIR}
         value={draft.memory_storage_dir || DEFAULT_MEMORY_DIR}
@@ -48,7 +48,7 @@ export function MemoryTab(props: MemoryTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-user-profile-budget-chars"
-        label="用户画像字符预算上限 (user_profile_budget_chars)"
+        label="用户画像字符预算上限"
         hint={`单个用户画像文件的写入上限，仅在当前单聊会话内隔离生效 (默认 ${DEFAULT_USER_PROFILE_BUDGET_CHARS})`}
         placeholder={String(DEFAULT_USER_PROFILE_BUDGET_CHARS)}
         numeric
@@ -63,7 +63,7 @@ export function MemoryTab(props: MemoryTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-session-memory-budget-chars"
-        label="Session 规则字符预算上限 (session_memory_budget_chars)"
+        label="会话规则字符预算上限"
         hint={`单个单聊会话规则文件的写入上限 (默认 ${DEFAULT_SESSION_MEMORY_BUDGET_CHARS})`}
         placeholder={String(DEFAULT_SESSION_MEMORY_BUDGET_CHARS)}
         numeric

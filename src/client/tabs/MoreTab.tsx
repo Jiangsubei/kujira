@@ -162,7 +162,7 @@ export function MoreTab(props: MoreTabProps): React.JSX.Element {
     >
       <PeerListEditor
         idPrefix="kujira-admins"
-        label="管理员名单 (admins)"
+        label="管理员名单"
         addButtonTitle="添加管理员"
         hint={
           selectedAdmins.length > 0
@@ -189,7 +189,7 @@ export function MoreTab(props: MoreTabProps): React.JSX.Element {
 
       <SwitchField
         id="kujira-privacy-tools-enabled"
-        label="隔离可能泄露隐私的工具 (privacy_tools_enabled)"
+        label="隔离可能泄露隐私的工具"
         hint={
           privacyToolsEnabled
             ? '已开启，按下方名单规则隔离 Shell、文件读写、目录、环境依赖与技能加载等可能泄露隐私的工具（保留发文件与识图等聊天工具）；保存后对已有会话热生效'
@@ -210,7 +210,7 @@ export function MoreTab(props: MoreTabProps): React.JSX.Element {
         >
           <SegmentedField
             id="kujira-privacy-tools-list-mode"
-            label="隔离名单模式 (privacy_tools_list_mode)"
+            label="隔离名单模式"
             hint={
               privacyListMode === 'blacklist'
                 ? '黑名单模式：仅对下方名单内的用户隔离上述工具，其余用户正常使用'
@@ -234,8 +234,8 @@ export function MoreTab(props: MoreTabProps): React.JSX.Element {
             idPrefix="kujira-privacy-tools-peer"
             label={
               privacyListMode === 'blacklist'
-                ? '黑名单用户 (privacy_tools_blacklist)'
-                : '白名单用户 (privacy_tools_whitelist)'
+                ? '黑名单用户'
+                : '白名单用户'
             }
             addButtonTitle={
               privacyListMode === 'blacklist' ? '添加黑名单用户' : '添加白名单用户'
@@ -307,7 +307,7 @@ export function MoreTab(props: MoreTabProps): React.JSX.Element {
         >
           <SegmentedField
             id="kujira-idle-reply-list-mode"
-            label="搭话名单模式 (idle_reply_list_mode)"
+            label="搭话名单模式"
             hint={
               idleListMode === 'whitelist'
                 ? '白名单模式：仅下方名单内的用户会触发冷场主动搭话，其余好友均不受打扰'
@@ -331,8 +331,8 @@ export function MoreTab(props: MoreTabProps): React.JSX.Element {
             idPrefix="kujira-idle-reply-peer"
             label={
               idleListMode === 'whitelist'
-                ? '白名单用户 (idle_reply_whitelist)'
-                : '黑名单用户 (idle_reply_blacklist)'
+                ? '白名单用户'
+                : '黑名单用户'
             }
             addButtonTitle={idleListMode === 'whitelist' ? '添加白名单用户' : '添加黑名单用户'}
             emptyHint={

@@ -61,7 +61,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
       <div className={fieldStyle.field}>
         <div className={fieldStyle.head}>
           <label htmlFor="kujira-new-message-behavior" className={fieldStyle.label}>
-            新消息行为 (new_message_behavior)
+            新消息行为
           </label>
           {model.isOverridden('new_message_behavior') && (
             <div className={fieldStyle.badges}>
@@ -83,8 +83,8 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
           value={draft.new_message_behavior || DEFAULT_NEW_MESSAGE_BEHAVIOR}
           onChange={(e) => onFieldChange('new_message_behavior', e.target.value as any)}
         >
-          <option value="steer">及时插话 (steer) - 等待当前 Step 完成后立即接纳新消息并调整行动</option>
-          <option value="queue">加入队列 (queue) - 等待当前轮次（Turn）完全结束后依次排队执行</option>
+          <option value="steer">及时插话 - 等待当前 Step 完成后立即接纳新消息并调整行动</option>
+          <option value="queue">加入队列 - 等待当前轮次完全结束后依次排队执行</option>
         </select>
         <p className={fieldStyle.hint}>
           一轮 Agent 循环正在进行时收到单聊新消息的处理行为。即时对话场景推荐「及时插话」。
@@ -93,7 +93,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <SegmentedField
         id="kujira-proactive-attitude"
-        label="互动偏好 (proactive_attitude)"
+        label="互动偏好"
         hint="全局仿生节奏偏置，同时作用于下方的连续消息聚合与冷场主动搭话：热情（偏向最小时长，反应迅速、潜水间隔短）；均衡（均匀随机分布）；冷淡（偏向最大时长，节奏沉着、留白多）"
         value={draft.proactive_attitude ?? DEFAULT_PROACTIVE_ATTITUDE}
         options={PROACTIVE_ATTITUDE_OPTIONS}
@@ -105,7 +105,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <SwitchField
         id="kujira-aggregation-enabled"
-        label="连续消息聚合回复 (aggregation_enabled)"
+        label="连续消息聚合"
         hint={
           draft.aggregation_enabled
             ? '按事件驱动与仿生动态节奏聚合新消息，到点后由模型统一回复；不逐条即时应答，等待用户答题或审批期间自动跳过'
@@ -120,7 +120,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-aggregation-min-seconds"
-        label="聚合最小时长 (aggregation_min_seconds)"
+        label="聚合最小时长"
         hint={`连续消息聚合等待的下限硬底线，即使多条消息快速折减也不会低于此时长 (单位秒，默认 ${DEFAULT_AGGREGATION_MIN_SECONDS})`}
         placeholder={String(DEFAULT_AGGREGATION_MIN_SECONDS)}
         numeric
@@ -139,7 +139,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-aggregation-max-seconds"
-        label="聚合最大时长 (aggregation_max_seconds)"
+        label="聚合最大时长"
         hint={`连续消息聚合等待的上限，初始随机采样的最长等待时间 (单位秒，默认 ${DEFAULT_AGGREGATION_MAX_SECONDS})`}
         placeholder={String(DEFAULT_AGGREGATION_MAX_SECONDS)}
         numeric
@@ -158,7 +158,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <SwitchField
         id="kujira-instant-reply-enabled"
-        label="允许在连续热聊时概率秒回 (instant_reply_enabled)"
+        label="概率秒回"
         hint="开启后，在会话处于高热度时允许突破聚合等待下限，在 0~2 秒内极速响应"
         checked={draft.instant_reply_enabled ?? DEFAULT_INSTANT_REPLY_ENABLED}
         disabled={saving || !draft.aggregation_enabled}
@@ -169,7 +169,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <SwitchField
         id="kujira-idle-reply-enabled"
-        label="冷场主动搭话 (idle_reply_enabled)"
+        label="冷场主动搭话"
         hint={
           idleReplyEnabled
             ? '长时间没有新消息时，由模型自主判断是否主动发起话题；可在「更多配置」Tab 配置名单过滤；等待用户答题或审批期间同样跳过'
@@ -184,7 +184,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-idle-reply-min-mins"
-        label="潜水搭话最小沉默时长 (idle_reply_min_mins)"
+        label="冷场最小时长"
         hint={`单聊无新消息后主动搭话的最早尝试时间 (单位分钟，默认 ${DEFAULT_IDLE_REPLY_MIN_MINS})`}
         placeholder={String(DEFAULT_IDLE_REPLY_MIN_MINS)}
         numeric
@@ -203,7 +203,7 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
 
       <ValueField
         id="kujira-idle-reply-max-mins"
-        label="潜水搭话最大沉默时长 (idle_reply_max_mins)"
+        label="冷场最大时长"
         hint={`单聊无新消息后主动搭话的最迟尝试时间 (单位分钟，默认 ${DEFAULT_IDLE_REPLY_MAX_MINS})`}
         placeholder={String(DEFAULT_IDLE_REPLY_MAX_MINS)}
         numeric

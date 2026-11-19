@@ -589,9 +589,9 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       );
 
       expect(whitelistEmptyHtml).toContain('id="kujira-idle-reply-peer-filter"');
-      expect(whitelistEmptyHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(whitelistEmptyHtml).toContain('搭话名单模式');
       expect(whitelistEmptyHtml).toContain('白名单模式');
-      expect(whitelistEmptyHtml).toContain('白名单用户 (idle_reply_whitelist)');
+      expect(whitelistEmptyHtml).toContain('白名单用户');
       expect(whitelistEmptyHtml).toContain('暂未配置，所有用户都不会触发冷场主动搭话。');
       expect(whitelistEmptyHtml).not.toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_A}"`);
 

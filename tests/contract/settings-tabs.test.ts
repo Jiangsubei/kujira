@@ -136,20 +136,20 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
 
       // 1. AppID 只写输入框 + 已配置来源徽章
       expect(connectionHtml).toContain('id="kujira-cred-app-id"');
-      expect(connectionHtml).toContain('Bot AppID (QQ_BOT_APP_ID)');
+      expect(connectionHtml).toContain('Bot AppID');
       expect(connectionHtml).toContain('已配置 (来源: file)');
       expect(connectionHtml).toMatch(/id="kujira-cred-app-id"[^>]*value=""/);
 
       // 2. AppSecret 只写 password 输入框 + 未配置徽章
       expect(connectionHtml).toContain('id="kujira-cred-app-secret"');
-      expect(connectionHtml).toContain('Bot AppSecret (QQ_BOT_SECRET)');
+      expect(connectionHtml).toContain('Bot AppSecret');
       expect(connectionHtml).toMatch(/id="kujira-cred-app-secret"[^>]*type="password"/);
       expect(connectionHtml).toMatch(/id="kujira-cred-app-secret"[^>]*value=""/);
       expect(connectionHtml).toContain('未配置');
 
       // 3. image_ttl_days 保留在 Tab 1，但管理员名单与隐私工具隔离已迁至 Tab 7
       expect(connectionHtml).toContain('id="kujira-image-ttl"');
-      expect(connectionHtml).toContain('image_ttl_days');
+      expect(connectionHtml).toContain('多媒体文件缓存天数');
       expect(connectionHtml).not.toContain('admins');
       expect(connectionHtml).not.toContain('kujira-admins');
       expect(connectionHtml).not.toContain('kujira-privacy-tools-enabled');
@@ -252,9 +252,9 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       );
       const personaHtml = panelMatch![0];
       expect(personaHtml).toContain('id="kujira-persona"');
-      expect(personaHtml).toContain('助手人格设定 (persona)');
+      expect(personaHtml).toContain('助手人设');
       expect(personaHtml).toContain('id="kujira-behavior"');
-      expect(personaHtml).toContain('行为准则 (behavior)');
+      expect(personaHtml).toContain('行为准则');
     });
 
     it('切换到 Tab 4 (记忆) 时仅展示 3 个单聊核心记忆配置项，绝不包含群聊预算', () => {
@@ -290,11 +290,11 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       const moreHtml = panelMatch![0];
 
       // 1. 管理员名单
-      expect(moreHtml).toContain('管理员名单 (admins)');
+      expect(moreHtml).toContain('管理员名单');
       expect(moreHtml).toContain('id="kujira-admins-add"');
 
       // 2. 隔离可能泄露隐私的工具总开关
-      expect(moreHtml).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
+      expect(moreHtml).toContain('隔离可能泄露隐私的工具');
       expect(moreHtml).toContain('id="kujira-privacy-tools-enabled"');
 
       // 3. 冷场主动搭话名单总开关
@@ -306,7 +306,7 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
         initialTab: 'more',
         initialConfig: { idle_reply_list_mode: 'whitelist' },
       });
-      expect(enabledCardHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(enabledCardHtml).toContain('搭话名单模式');
       expect(enabledCardHtml).toContain('id="kujira-idle-reply-list-mode"');
       expect(enabledCardHtml).toContain('id="kujira-idle-reply-peer-add"');
     });

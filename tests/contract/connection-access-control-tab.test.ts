@@ -142,14 +142,14 @@ describe('契约测试: 更多配置 Tab 管理员名单、隐私工具隔离与
       )![0];
 
       // 管理员名单直接可见
-      expect(morePanel).toContain('管理员名单 (admins)');
+      expect(morePanel).toContain('管理员名单');
       expect(morePanel).toContain('暂未配置，默认按 1 对 1 场景对所有单聊用户开放完整权限。');
       expect(morePanel).toContain('/权限');
       expect(morePanel).toContain('/模型 -默认');
       expect(morePanel).toContain('/思考 -默认');
 
       // 隔离可能泄露隐私的工具总开关（默认关闭）
-      expect(morePanel).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
+      expect(morePanel).toContain('隔离可能泄露隐私的工具');
       expect(morePanel).toMatch(/id="kujira-privacy-tools-enabled"[^>]*type="checkbox"/);
       expect(morePanel).not.toMatch(/id="kujira-privacy-tools-enabled"[^>]*checked/);
 
@@ -182,7 +182,7 @@ describe('契约测试: 更多配置 Tab 管理员名单、隐私工具隔离与
       expect(html).toContain('id="kujira-privacy-tools-list-mode"');
       expect(html).toContain('白名单模式');
       expect(html).toContain('黑名单模式');
-      expect(html).toContain('白名单用户 (privacy_tools_whitelist)');
+      expect(html).toContain('白名单用户');
       expect(html).toContain('暂未配置，所有单聊会话都会隔离可能泄露隐私的工具。');
     });
   });
@@ -252,7 +252,7 @@ describe('契约测试: 更多配置 Tab 管理员名单、隐私工具隔离与
       expect(emptyBlacklistHtml).toMatch(
         /id="kujira-privacy-tools-list-mode-option-blacklist"[^>]*aria-checked="true"/
       );
-      expect(emptyBlacklistHtml).toContain('黑名单用户 (privacy_tools_blacklist)');
+      expect(emptyBlacklistHtml).toContain('黑名单用户');
       expect(emptyBlacklistHtml).toContain('暂未配置，所有单聊会话均保留完整工具。');
       expect(emptyBlacklistHtml).not.toContain(`data-testid="kujira-privacy-tools-peer-item-${PEER_A}"`);
     });
