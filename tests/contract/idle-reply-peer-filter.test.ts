@@ -20,12 +20,16 @@ import { KujiraFormModel } from '../../src/client/model.js';
 import { KujiraSettingsCard, DEFAULT_BASE_CONFIG } from '../../src/client/card.js';
 import {
   ReplyTab,
-  IDLE_REPLY_PEERS_POLL_MS,
+} from '../../src/client/tabs/ReplyTab.js';
+import {
+  MoreTab,
+} from '../../src/client/tabs/MoreTab.js';
+import {
+  PEERS_POLL_MS as IDLE_REPLY_PEERS_POLL_MS,
   formatPeerDropdownLabel,
-  hasCustomIdleReplyFilterConfig,
   startPeerListPolling,
   type KnownPeerSummary,
-} from '../../src/client/tabs/ReplyTab.js';
+} from '../../src/client/components/PeerListEditor.js';
 import type { BridgePluginConfig } from '../../src/types/index.js';
 import * as KujiraPlugin from '../../src/index.js';
 
@@ -484,7 +488,7 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       expect(model.isDirty()).toBe(false);
     });
 
-    it('ReplyTab 顺序调整为「新消息行为 → 互动偏好 → 连续消息聚合 → 冷场主动搭话」，关闭搭话时隐藏黑白名单，开启时展示且无刷新按钮', () => {
+    it('ReplyTab 顺序为「新消息行为 → 互动偏好 → 连续消息聚合 → 冷场主动搭话 → 潜水搭话时长」，黑白名单迁至更多配置 Tab 且平铺展示', () => {
       // 默认 idle_reply_enabled = false
       const closedHtml = renderToStaticMarkup(
         React.createElement(KujiraSettingsCard, {
@@ -497,34 +501,25 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         /id="kujira-tabpanel-reply"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-persona")/
       )![0];
 
-      // 严格验证顺序：新消息行为 < 互动偏好 < 连续消息聚合 < 冷场主动搭话
+      // 严格验证顺序：新消息行为 < 互动偏好 < 连续消息聚合 < 冷场主动搭话 < 潜水搭话最小沉默时长 < 潜水搭话最大沉默时长
       const posNewMsg = replyPanel.indexOf('id="kujira-new-message-behavior"');
       const posAttitude = replyPanel.indexOf('id="kujira-proactive-attitude"');
       const posAgg = replyPanel.indexOf('id="kujira-aggregation-enabled"');
       const posIdle = replyPanel.indexOf('id="kujira-idle-reply-enabled"');
+      const posMinMins = replyPanel.indexOf('id="kujira-idle-reply-min-mins"');
+      const posMaxMins = replyPanel.indexOf('id="kujira-idle-reply-max-mins"');
       expect(posNewMsg).toBeGreaterThan(-1);
       expect(posAttitude).toBeGreaterThan(posNewMsg);
       expect(posAgg).toBeGreaterThan(posAttitude);
       expect(posIdle).toBeGreaterThan(posAgg);
+      expect(posMinMins).toBeGreaterThan(posIdle);
+      expect(posMaxMins).toBeGreaterThan(posMinMins);
 
-      // 总开关关闭时，「更多选项」入口与黑白名单内联块全部隐藏（不渲染）
+      // ReplyTab 纯净化：不再包含名单过滤或折叠按钮
       expect(replyPanel).not.toContain('id="kujira-idle-reply-more-toggle"');
       expect(replyPanel).not.toContain('id="kujira-idle-reply-peer-filter"');
       expect(replyPanel).not.toContain('id="kujira-idle-reply-list-mode"');
       expect(replyPanel).not.toContain('id="kujira-idle-reply-peer-select"');
-
-      // hasCustomIdleReplyFilterConfig 契约：仅默认黑名单+双空表为 false，其余任一自定义配置均为 true
-      expect(hasCustomIdleReplyFilterConfig({})).toBe(false);
-      expect(
-        hasCustomIdleReplyFilterConfig({
-          idle_reply_list_mode: 'blacklist',
-          idle_reply_blacklist: [],
-          idle_reply_whitelist: [],
-        })
-      ).toBe(false);
-      expect(hasCustomIdleReplyFilterConfig({ idle_reply_list_mode: 'whitelist' })).toBe(true);
-      expect(hasCustomIdleReplyFilterConfig({ idle_reply_blacklist: [PEER_A] })).toBe(true);
-      expect(hasCustomIdleReplyFilterConfig({ idle_reply_whitelist: [PEER_B] })).toBe(true);
 
       const knownPeers: KnownPeerSummary[] = [
         {
@@ -541,7 +536,7 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         },
       ];
 
-      // 0. 默认未配置任何名单（黑名单+双空表），即使已有多个真实用户，初始也默认折叠仅显示「更多选项」入口
+      // MoreTab 中冷场名单过滤直接平铺展示（无折叠按钮）
       const modelUnconfigured = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
@@ -552,8 +547,8 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         baseDefaults: DEFAULT_BASE_CONFIG,
       });
 
-      const collapsedDefaultHtml = renderToStaticMarkup(
-        React.createElement(ReplyTab, {
+      const moreTabDefaultHtml = renderToStaticMarkup(
+        React.createElement(MoreTab, {
           active: true,
           draft: modelUnconfigured.getDraft(),
           model: modelUnconfigured,
@@ -564,49 +559,15 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         })
       );
 
-      expect(collapsedDefaultHtml).toContain('id="kujira-idle-reply-more-toggle"');
-      expect(collapsedDefaultHtml).toContain('更多选项');
-      expect(collapsedDefaultHtml).toMatch(/id="kujira-idle-reply-more-toggle"[^>]*aria-expanded="false"/);
-      expect(collapsedDefaultHtml).not.toContain('id="kujira-idle-reply-peer-filter"');
+      // 无折叠按钮，直接平铺展示搭话名单模式与黑名单空态
+      expect(moreTabDefaultHtml).not.toContain('id="kujira-idle-reply-more-toggle"');
+      expect(moreTabDefaultHtml).toContain('id="kujira-idle-reply-peer-filter"');
+      expect(moreTabDefaultHtml).toContain('id="kujira-idle-reply-list-mode"');
+      expect(moreTabDefaultHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(moreTabDefaultHtml).toContain('黑名单用户 (idle_reply_blacklist)');
+      expect(moreTabDefaultHtml).toContain('暂未配置，所有用户都会触发冷场主动搭话。');
 
-      // 1. 点击「更多选项」展开后的黑名单空态（以及白名单非空时自动默认展开且互不串扰）
-      const modelBlacklistEmptyWithWhitelist = new KujiraFormModel({
-        initialValues: {
-          idle_reply_enabled: true,
-          idle_reply_list_mode: 'blacklist',
-          idle_reply_blacklist: [],
-          idle_reply_whitelist: [PEER_B],
-        },
-        baseDefaults: DEFAULT_BASE_CONFIG,
-      });
-
-      const blacklistEmptyHtml = renderToStaticMarkup(
-        React.createElement(ReplyTab, {
-          active: true,
-          draft: modelBlacklistEmptyWithWhitelist.getDraft(),
-          model: modelBlacklistEmptyWithWhitelist,
-          saving: false,
-          initialKnownPeers: knownPeers,
-          onFieldChange: vi.fn(),
-          onResetField: vi.fn(),
-        })
-      );
-
-      // 白名单有数据时打开设置默认自动展开，且黑名单依然独立显示为空态、互不串扰
-      expect(blacklistEmptyHtml).toMatch(/id="kujira-idle-reply-more-toggle"[^>]*aria-expanded="true"/);
-      expect(blacklistEmptyHtml).toContain('id="kujira-idle-reply-peer-filter"');
-      expect(blacklistEmptyHtml).toContain('id="kujira-idle-reply-list-mode"');
-      expect(blacklistEmptyHtml).toContain('黑名单用户 (idle_reply_blacklist)');
-      expect(blacklistEmptyHtml).toContain('黑名单模式');
-      expect(blacklistEmptyHtml).toContain('白名单模式');
-      expect(blacklistEmptyHtml).toContain('id="kujira-idle-reply-peer-add"');
-      expect(blacklistEmptyHtml).not.toContain('id="kujira-idle-reply-peer-editor"');
-      expect(blacklistEmptyHtml).not.toContain('id="kujira-idle-reply-peer-select"');
-      expect(blacklistEmptyHtml).toContain('暂未配置，所有用户都会触发冷场主动搭话。');
-      expect(blacklistEmptyHtml).not.toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_B}"`);
-      expect(blacklistEmptyHtml).not.toContain('刷新');
-
-      // 2. 切到白名单模式时（即使名单仍空）视为已配置，打开设置自动展开并显示白名单空态
+      // 切换为白名单模式直接展示白名单空态
       const modelWhitelistEmpty = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
@@ -618,7 +579,7 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       });
 
       const whitelistEmptyHtml = renderToStaticMarkup(
-        React.createElement(ReplyTab, {
+        React.createElement(MoreTab, {
           active: true,
           draft: modelWhitelistEmpty.getDraft(),
           model: modelWhitelistEmpty,
@@ -629,13 +590,11 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         })
       );
 
-      expect(whitelistEmptyHtml).toMatch(/id="kujira-idle-reply-more-toggle"[^>]*aria-expanded="true"/);
       expect(whitelistEmptyHtml).toContain('白名单用户 (idle_reply_whitelist)');
       expect(whitelistEmptyHtml).toContain('暂未配置，所有用户都不会触发冷场主动搭话。');
       expect(whitelistEmptyHtml).not.toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_A}"`);
-      expect(whitelistEmptyHtml).not.toContain('id="kujira-idle-reply-peer-select"');
 
-      // 3. 已添加 PEER_A 的非编辑态：自动默认展开，+ 按钮位于「已自定义」和「重置」的最右侧，展示已选用户行、不展示下拉框
+      // 已添加 PEER_A 的展示与内联编辑态
       const modelWithPeer = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
@@ -647,7 +606,7 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       });
 
       const withPeerDefaultHtml = renderToStaticMarkup(
-        React.createElement(ReplyTab, {
+        React.createElement(MoreTab, {
           active: true,
           draft: modelWithPeer.getDraft(),
           model: modelWithPeer,
@@ -658,28 +617,18 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         })
       );
 
-      const peerFieldSection = withPeerDefaultHtml.slice(
-        withPeerDefaultHtml.indexOf('黑名单用户 (idle_reply_blacklist)')
-      );
-      const posOverriddenBadge = peerFieldSection.indexOf('已自定义');
-      const posResetBtn = peerFieldSection.indexOf('重置');
-      const posAddBtn = peerFieldSection.indexOf('id="kujira-idle-reply-peer-add"');
-      expect(posOverriddenBadge).toBeGreaterThan(-1);
-      expect(posResetBtn).toBeGreaterThan(posOverriddenBadge);
-      expect(posAddBtn).toBeGreaterThan(posResetBtn);
-      expect(withPeerDefaultHtml).not.toContain('id="kujira-idle-reply-peer-select"');
       expect(withPeerDefaultHtml).toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_A}"`);
       expect(withPeerDefaultHtml).toContain(`data-testid="kujira-idle-reply-peer-remove-${PEER_A}"`);
 
-      // 4. 点击 + 进入内联添加态：展示下拉框 + 右侧「取消」「保存」按钮，+ 按钮禁用，下拉框自动排除已添加的 PEER_A
+      // 内联添加态：下拉框排除已添加的 PEER_A
       const withPeerEditingHtml = renderToStaticMarkup(
-        React.createElement(ReplyTab, {
+        React.createElement(MoreTab, {
           active: true,
           draft: modelWithPeer.getDraft(),
           model: modelWithPeer,
           saving: false,
           initialKnownPeers: knownPeers,
-          initialAddingPeer: true,
+          initialAddingIdlePeer: true,
           onFieldChange: vi.fn(),
           onResetField: vi.fn(),
         })
@@ -687,10 +636,6 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
 
       expect(withPeerEditingHtml).toMatch(/id="kujira-idle-reply-peer-add"[^>]*disabled/);
       expect(withPeerEditingHtml).toContain('id="kujira-idle-reply-peer-editor"');
-      expect(withPeerEditingHtml).toContain('id="kujira-idle-reply-peer-cancel"');
-      expect(withPeerEditingHtml).toContain('取消');
-      expect(withPeerEditingHtml).toContain('id="kujira-idle-reply-peer-save"');
-      expect(withPeerEditingHtml).toContain('保存');
       const selectBlock = withPeerEditingHtml.match(
         /<select[^>]*id="kujira-idle-reply-peer-select"[\s\S]*?<\/select>/
       )![0];
@@ -698,15 +643,6 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
       expect(selectBlock).toContain(`value="${PEER_B}"`);
       expect(selectBlock).toContain('B2C3D4E5');
       expect(selectBlock).toContain('晚安');
-
-      // 5. 样式契约：无论折叠还是展开，更多选项区下方紧邻配置项必须保留分隔线
-      const cardStylesSource = fs.readFileSync(
-        path.resolve('src/client/card-styles.ts'),
-        'utf-8'
-      );
-      expect(cardStylesSource).toContain(
-        '.kujira_peerFilterSection+.kujira_field,.kujira_peerFilterBox+.kujira_field{border-top:1px solid var(--dsw-alias-border-l2)}'
-      );
     });
 
     it('formatPeerDropdownLabel 清晰展示短 OpenID、最近发言时间与消息预览；5 秒轮询在启动时立即拉取且每 5 秒自动刷新，停止后清理定时器', () => {

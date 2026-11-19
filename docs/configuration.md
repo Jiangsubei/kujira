@@ -19,28 +19,23 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
 
 ---
 
-## 2. WebUI 6 大 Tab 参数权威字典
+## 2. WebUI 7 大 Tab 参数权威字典
 
 ### Tab 1: 常规 (Connection)
 
-聚焦于网络直连、凭据管理、本地静态资源缓存、管理员权限与隐私工具热隔离。
+聚焦于网络直连、凭据管理与本地静态资源缓存。
 
 | 参数名 | 字段类型 | 默认值 | 作用域与机制说明 |
 | :--- | :--- | :--- | :--- |
 | **AppID** | `string` | *(必填)* | QQ 开放平台分配的机器人唯一身份标识。凭据安全托管，前端只写。 |
 | **密钥 (AppSecret)** | `string` | *(必填)* | QQ 开放平台分配的机器人通信密钥。凭据安全托管，前端只写。 |
 | **`image_ttl_days`** | `number` | `7` | **外来图片与媒体资源缓存保留天数**。<br/>入站附件（图片、语音、文档）下载至 `files/<peer>/` 后的生存周期。定时清理任务会扫描并安全清理超出天数的历史媒体文件。 |
-| **`admins`** | `string[]` | `[]` | **管理员名单（支持多选，仅存脱敏内部 `peer`）**。<br/>• 为空时按 1 对 1 场景对所有单聊好友开放审批与全部斜杠命令；<br/>• 非空时仅名单内用户可审批敏感工具（无人值守定时任务/冷场搭话始终 Fail-Closed），以及使用 `/权限`、`/模型 ... -默认`、`/思考 ... -默认`；<br/>• 首次配置请先向机器人发送一条消息，即可在脱敏下拉列表（短 OpenID + 相对时间 + 消息摘要）中识别并添加自己，保存后热生效。 |
-| **`privacy_tools_enabled`** | `boolean` | `false` | **隔离可能泄露隐私的工具总开关**。<br/>• 关闭（默认）：不隔离任何会话，1 对 1 开箱即用；<br/>• 开启：按下方名单规则对会话热隔离 9 个可能访问宿主机文件与环境的工具（`bash`、`pwsh`、`read`、`write`、`edit`、`apply_patch`、`working_directory`、`load_workspace_dependencies`、`skill`），始终保留 `send_file`、`read_image`、`web_search`/`web_fetch`、`ask_user_question` 及全部 QQ 单聊专属工具；保存后对存活会话即时热生效。 |
-| **`privacy_tools_list_mode`** | `'whitelist' \| 'blacklist'` | `'whitelist'` | **隐私工具隔离名单模式**（开启总开关后位于「更多选项」内，默认折叠；修改为黑名单或任一名单非空时打开设置自动展开）：<br/>• `whitelist`（白名单模式，默认）：仅白名单内用户豁免隔离可使用上述工具，其余用户一律隔离（空白名单 = 勾选总开关即全员隔离）；<br/>• `blacklist`（黑名单模式）：仅隔离黑名单内用户，其余用户正常使用。 |
-| **`privacy_tools_whitelist`** | `string[]` | `[]` | **隐私工具白名单用户列表**（仅白名单模式生效，存内部脱敏 `peer`）。 |
-| **`privacy_tools_blacklist`** | `string[]` | `[]` | **隐私工具黑名单用户列表**（仅黑名单模式生效，存内部脱敏 `peer`）。 |
 
 ---
 
 ### Tab 2: 回复节奏 (Reply)
 
-控制消息聚合状态机、动态时钟、防饥饿模型与冷场主动搭话行为。
+控制消息聚合状态机、动态时钟、防饥饿模型与冷场主动搭话节奏（名单过滤见「更多配置」Tab）。
 
 | 参数名 | 字段类型 | 默认值 | 作用域与机制说明 |
 | :--- | :--- | :--- | :--- |
@@ -50,10 +45,7 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
 | **`aggregation_min_seconds`** | `number` | `10` | **聚合等待最小时长（秒，硬底线）**。<br/>收到首条消息后，系统预设的绝对最早回复底线时刻（`FloorTime`）。即便连续收到多条消息触发折减，倒计时也绝不早于此底线。 |
 | **`aggregation_max_seconds`** | `number` | `60` | **聚合等待最大时长（秒）**。<br/>首条消息到达后随机采样的初始等待上限。取值建议在 30~90 秒之间。 |
 | **`instant_reply_enabled`** | `boolean` | `false` | **概率秒回开关**。<br/>开启后，当模型检测到会话处于极高活跃度（例如用户在 15 秒内接话）时，有 $40\% \sim 70\%$ 的概率突破聚合底线，在 0~2 秒内极速秒回。 |
-| **`idle_reply_enabled`** | `boolean` | `false` | **冷场主动搭话总开关**。<br/>当双方结束对话且经过长时间沉默后，机器人自主发起话题（冷场破冰）。 |
-| **`idle_reply_list_mode`** | `'blacklist' \| 'whitelist'` | `'blacklist'` | **冷场主动搭话名单过滤模式**（开启冷场搭话后位于「更多选项」内，默认折叠；切白名单或任一名单非空时自动展开）：<br/>• `blacklist`（黑名单模式，默认）：排除黑名单用户，其余已互动用户正常触发；<br/>• `whitelist`（白名单模式）：仅白名单用户触发，其余好友不受打扰。 |
-| **`idle_reply_blacklist`** | `string[]` | `[]` | **冷场主动搭话黑名单用户列表**（仅黑名单模式生效，存内部脱敏 `peer`）。 |
-| **`idle_reply_whitelist`** | `string[]` | `[]` | **冷场主动搭话白名单用户列表**（仅白名单模式生效，存内部脱敏 `peer`）。 |
+| **`idle_reply_enabled`** | `boolean` | `false` | **冷场主动搭话总开关**。<br/>当双方结束对话且经过长时间沉默后，机器人自主发起话题（冷场破冰；可在「更多配置」Tab 配置精准名单过滤）。 |
 | **`idle_reply_min_mins`** | `number` | `30` | **潜水主动搭话最小沉默时长（分钟）**。 |
 | **`idle_reply_max_mins`** | `number` | `120` | **潜水主动搭话最大沉默时长（分钟）**。 |
 
@@ -102,7 +94,24 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
 | :--- | :--- | :--- | :--- |
 | **`slang_max_entries`** | `number` | `300` | **黑话知识库条数上限（条）**。 |
 | **`slang_evict_policy`** | `'reject' \| 'evict_lru'` | `'reject'` | **黑话满额策略**：`reject`（满额拒绝）或 `evict_lru`（淘汰查阅频次最少的词条）。 |
-| **`slang_storage_path`** | `string` | `".dsh/kujira/slang/slang.md"` | **黑话 Markdown 参考导出路径**。用于将 SQLite 词库导出为人可读的 Markdown 文本供审阅。 |
+| **`slang_storage_path`** | `string` | `".dsh/kujira/slang/slang.md"` | **黑话 Markdown 参考导出路径**。用于将 SQLite 词库导出为人可读的 Markdown文本供审阅。 |
+
+---
+
+### Tab 7: 更多配置 (More)
+
+收纳 1 对 1 基础场景下通常不需要关注的进阶管理配置，包含管理员名单鉴权、隐私工具热隔离与冷场主动搭话名单过滤。面板内各项直接平铺展开，免除冗余折叠操作。
+
+| 参数名 | 字段类型 | 默认值 | 作用域与机制说明 |
+| :--- | :--- | :--- | :--- |
+| **`admins`** | `string[]` | `[]` | **管理员名单（支持多选，仅存脱敏内部 `peer`）**。<br/>• 为空时按 1 对 1 场景对所有单聊好友开放审批与全部斜杠命令；<br/>• 非空时仅名单内用户可审批敏感工具（无人值守定时任务/冷场搭话始终 Fail-Closed），以及使用 `/权限`、`/模型 ... -默认`、`/思考 ... -默认`；<br/>• 首次配置请先向机器人发送一条消息，即可在脱敏下拉列表（短 OpenID + 相对时间 + 消息摘要）中识别并添加自己，保存后热生效。 |
+| **`privacy_tools_enabled`** | `boolean` | `false` | **隔离可能泄露隐私的工具总开关**。<br/>• 关闭（默认）：不隔离任何会话，1 对 1 开箱即用；<br/>• 开启：按下方名单规则对会话热隔离 9 个可能访问宿主机文件与环境的工具（`bash`、`pwsh`、`read`、`write`、`edit`、`apply_patch`、`working_directory`、`load_workspace_dependencies`、`skill`），始终保留 `send_file`、`read_image`、`web_search`/`web_fetch`、`ask_user_question` 及全部 QQ 单聊专属工具；保存后对存活会话即时热生效。 |
+| **`privacy_tools_list_mode`** | `'whitelist' \| 'blacklist'` | `'whitelist'` | **隐私工具隔离名单模式**（平铺展开）：<br/>• `whitelist`（白名单模式，默认）：仅白名单内用户豁免隔离可使用上述工具，其余用户一律隔离（空白名单 = 勾选总开关即全员隔离）；<br/>• `blacklist`（黑名单模式）：仅隔离黑名单内用户，其余用户正常使用。 |
+| **`privacy_tools_whitelist`** | `string[]` | `[]` | **隐私工具白名单用户列表**（仅白名单模式生效，存内部脱敏 `peer`）。 |
+| **`privacy_tools_blacklist`** | `string[]` | `[]` | **隐私工具黑名单用户列表**（仅黑名单模式生效，存内部脱敏 `peer`）。 |
+| **`idle_reply_list_mode`** | `'blacklist' \| 'whitelist'` | `'blacklist'` | **冷场主动搭话名单过滤模式**（平铺展开）：<br/>• `blacklist`（黑名单模式，默认）：排除黑名单用户，其余已互动用户正常触发；<br/>• `whitelist`（白名单模式）：仅白名单用户触发，其余好友不受打扰。 |
+| **`idle_reply_blacklist`** | `string[]` | `[]` | **冷场主动搭话黑名单用户列表**（仅黑名单模式生效，存内部脱敏 `peer`）。 |
+| **`idle_reply_whitelist`** | `string[]` | `[]` | **冷场主动搭话白名单用户列表**（仅白名单模式生效，存内部脱敏 `peer`）。 |
 
 ---
 

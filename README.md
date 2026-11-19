@@ -28,9 +28,9 @@ DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到�
 > [!CAUTION]
 > **安全模型与多好友权限隔离**
 > - **默认 1 对 1 开箱即用**：在 QQ 开放平台创建机器人的开发者默认可直接添加机器人为好友。未配置管理员名单与隐私隔离时，默认按 1 对 1 私人助手场景开放完整工具、审批与全部斜杠命令；
-> - **多好友防隐私泄露控制**：若在开放平台将其他好友加入体验名单，强烈建议在 WebUI **「常规」** 设置中配置：
+> - **多好友防隐私泄露控制**：若在开放平台将其他好友加入体验名单，强烈建议在 WebUI **「更多配置」** 设置中配置：
 >   1. **管理员名单 (`admins`)**：配置后仅名单内用户可审批敏感工具，以及执行 `/权限`、`/模型 ... -默认`、`/思考 ... -默认`（其余日常指令与本会话内切换模型/思考仍对好友开放）；
->   2. **隔离可能泄露隐私的工具 (`privacy_tools_enabled`)**：勾选开启后默认对所有单聊隔离 Shell、文件读写、目录、环境依赖与技能加载（保留 `send_file`、`read_image` 与聊天工具），并可在「更多选项」中配置白名单豁免或黑名单精准隔离；
+>   2. **隔离可能泄露隐私的工具 (`privacy_tools_enabled`)**：勾选开启后默认对所有单聊隔离 Shell、文件读写、目录、环境依赖与技能加载（保留 `send_file`、`read_image` 与聊天工具），可在下方配置白名单豁免或黑名单精准隔离；
 > - **首次自举与热生效**：配置名单前先向机器人发任意消息，即可在 WebUI 脱敏下拉列表中识别并添加自己；保存后对所有存活会话**立即热生效**，无需重启或新建会话。
 
 ---
@@ -53,7 +53,7 @@ DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到�
 - **黑话学习系统**：基于 SQLite 存储的词库，全局常驻 L1 索引动态注入，支持查梗、收录新梗与满额拒绝/LRU淘汰策略。
 - **表情包资产闭环**：默认常驻装配，提供查表情、发表情、收录好图与满额管控（默认拒绝新增，支持 LRU 淘汰）全生命周期工具链。
 - **纯两字中文斜杠命令与权限分层**：开箱支持 `/状态`、`/模型`、`/思考`、`/停止`、`/新建`、`/会话`、`/用量`、`/压缩`、`/权限`、`/帮助` 10 大指令；`/模型` 与 `/思考` 统一支持 `-默认` 设定新建会话默认值；配置 `admins` 后自动对 `/权限` 及 `-默认` 全局配置启用管理员门控。
-- **WebUI 6 大 Tab 设置面板**：集成于 DSH 设置界面，涵盖 29 项核心参数，全部支持 volatile 动态热更新（含管理员审批、隐私工具热隔离与冷场搭话黑白名单），废弃字段全自动物理自愈过滤。
+- **WebUI 7 大 Tab 设置面板**：集成于 DSH 设置界面，涵盖 29 项核心参数，全部支持 volatile 动态热更新（含管理员审批、隐私工具热隔离与冷场搭话黑白名单），废弃字段全自动物理自愈过滤。
 
 ---
 
@@ -109,7 +109,7 @@ dsh plugin add kujira
 
 ## ⚙️ 运行时配置全景 (29 项)
 
-配置面板在 WebUI 中分为 6 个 Tab 分区，所有参数均支持动态热生效：
+配置面板在 WebUI 中分为 7 个 Tab 分区，所有参数均支持动态热生效：
 
 ### 1. 常规 (Connection)
 | 参数 | 类型 | 默认值 | 说明 |
@@ -117,11 +117,6 @@ dsh plugin add kujira
 | `AppID` | `string` | *(必填)* | QQ 开放平台机器人 AppID（只写保护，不入配置文件） |
 | `密钥 (AppSecret)` | `string` | *(必填)* | QQ 开放平台机器人密钥（只写保护，不入配置文件） |
 | `image_ttl_days` | `number` | `7` | 外来图片与媒体资源本地缓存保留天数 |
-| `admins` | `string[]` | `[]` | 管理员名单（存内部脱敏 `peer`）；为空按 1 对 1 开放，非空时仅管理员可审批与执行 `/权限`、`/模型 -默认`、`/思考 -默认` |
-| `privacy_tools_enabled` | `boolean` | `false` | 隔离可能泄露隐私的工具总开关（Shell/文件/目录/环境/技能，保留发文件与识图），保存即对存活会话热生效 |
-| `privacy_tools_list_mode` | `'whitelist' \| 'blacklist'` | `'whitelist'` | 隐私工具隔离名单模式（开启后展开「更多选项」可见：`whitelist` 白名单豁免 / `blacklist` 黑名单精准隔离） |
-| `privacy_tools_whitelist` | `string[]` | `[]` | 隐私工具白名单用户 `peer` 列表（白名单模式下放行；空表时开启开关即全员隔离） |
-| `privacy_tools_blacklist` | `string[]` | `[]` | 隐私工具黑名单用户 `peer` 列表（黑名单模式下仅隔离名单内用户） |
 
 ### 2. 回复节奏 (Reply)
 | 参数 | 类型 | 默认值 | 说明 |
@@ -132,10 +127,7 @@ dsh plugin add kujira
 | `aggregation_min_seconds` | `number` | `10` | 聚合等待最小时长（秒，硬底线） |
 | `aggregation_max_seconds` | `number` | `60` | 聚合等待最大时长（秒） |
 | `instant_reply_enabled` | `boolean` | `false` | 允许在连续热聊时概率秒回（突破聚合下限） |
-| `idle_reply_enabled` | `boolean` | `false` | 冷场主动搭话总开关（长时间无新消息时主动发起话题） |
-| `idle_reply_list_mode` | `'blacklist' \| 'whitelist'` | `'blacklist'` | 冷场主动搭话名单过滤模式（开启后展开「更多选项」可见） |
-| `idle_reply_blacklist` | `string[]` | `[]` | 冷场主动搭话黑名单用户 `peer` 列表（黑名单模式排除） |
-| `idle_reply_whitelist` | `string[]` | `[]` | 冷场主动搭话白名单用户 `peer` 列表（白名单模式仅允许） |
+| `idle_reply_enabled` | `boolean` | `false` | 冷场主动搭话总开关（长时间无新消息时主动发起话题，名单过滤见「更多配置」） |
 | `idle_reply_min_mins` | `number` | `30` | 潜水主动搭话最小沉默时长（分钟） |
 | `idle_reply_max_mins` | `number` | `120` | 潜水主动搭话最大沉默时长（分钟） |
 
@@ -165,6 +157,18 @@ dsh plugin add kujira
 | `slang_max_entries` | `number` | `300` | 黑话知识库条数上限 |
 | `slang_evict_policy` | `'reject' \| 'evict_lru'` | `'reject'` | 黑话满额策略（`reject` 拒绝 / `evict_lru` 淘汰查阅最少词条） |
 | `slang_storage_path` | `string` | `".dsh/kujira/slang/slang.md"` | 黑话 Markdown 文档参考保存路径 |
+
+### 7. 更多配置 (More)
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `admins` | `string[]` | `[]` | 管理员名单（存内部脱敏 `peer`）；为空按 1 对 1 开放，非空时仅管理员可审批与执行 `/权限`、`/模型 -默认`、`/思考 -默认` |
+| `privacy_tools_enabled` | `boolean` | `false` | 隔离可能泄露隐私的工具总开关（Shell/文件/目录/环境/技能，保留发文件与识图），保存即对存活会话热生效 |
+| `privacy_tools_list_mode` | `'whitelist' \| 'blacklist'` | `'whitelist'` | 隐私工具隔离名单模式（`whitelist` 白名单豁免 / `blacklist` 黑名单精准隔离） |
+| `privacy_tools_whitelist` | `string[]` | `[]` | 隐私工具白名单用户 `peer` 列表（白名单模式下放行；空表时开启开关即全员隔离） |
+| `privacy_tools_blacklist` | `string[]` | `[]` | 隐私工具黑名单用户 `peer` 列表（黑名单模式下仅隔离名单内用户） |
+| `idle_reply_list_mode` | `'blacklist' \| 'whitelist'` | `'blacklist'` | 冷场主动搭话名单过滤模式（`blacklist` 黑名单排除 / `whitelist` 白名单仅允许） |
+| `idle_reply_blacklist` | `string[]` | `[]` | 冷场主动搭话黑名单用户 `peer` 列表（黑名单模式排除） |
+| `idle_reply_whitelist` | `string[]` | `[]` | 冷场主动搭话白名单用户 `peer` 列表（白名单模式仅允许） |
 
 ---
 

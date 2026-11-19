@@ -42,8 +42,8 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
     return html;
   }
 
-  describe('1. 6 分区 Tab 渲染与已下线 Tab 排他契约', () => {
-    it('卡片展开后必须渲染且仅渲染 6 个官方 Tab，彻底移除主动回复与权限安全 Tab', () => {
+  describe('1. 7 分区 Tab 渲染与已下线 Tab 排他契约', () => {
+    it('卡片展开后必须渲染且仅渲染 7 个官方 Tab，包含更多配置 Tab，彻底移除已废弃 Tab', () => {
       const html = renderCard();
 
       expect(html).toContain('role="tablist"');
@@ -67,6 +67,9 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(html).toContain('id="kujira-tab-slang"');
       expect(html).toContain('黑话学习');
 
+      expect(html).toContain('id="kujira-tab-more"');
+      expect(html).toContain('更多配置');
+
       expect(SETTINGS_TABS.map((t) => t.id)).toEqual([
         'connection',
         'reply',
@@ -74,8 +77,9 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
         'memory',
         'face',
         'slang',
+        'more',
       ]);
-      expect(SETTINGS_TABS).toHaveLength(6);
+      expect(SETTINGS_TABS).toHaveLength(7);
 
       expect(html).not.toContain('kujira-tab-proactive');
       expect(html).not.toContain('security');
@@ -103,6 +107,7 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(html).toMatch(/id="kujira-tab-memory"[^>]*aria-selected="false"/);
       expect(html).toMatch(/id="kujira-tab-face"[^>]*aria-selected="false"/);
       expect(html).toMatch(/id="kujira-tab-slang"[^>]*aria-selected="false"/);
+      expect(html).toMatch(/id="kujira-tab-more"[^>]*aria-selected="false"/);
 
       expect(html).toMatch(/id="kujira-tabpanel-connection"[^>]*role="tabpanel"/);
       expect(html).not.toMatch(/id="kujira-tabpanel-connection"[^>]*hidden/);
@@ -112,9 +117,10 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(html).toMatch(/id="kujira-tabpanel-memory"[^>]*hidden/);
       expect(html).toMatch(/id="kujira-tabpanel-face"[^>]*hidden/);
       expect(html).toMatch(/id="kujira-tabpanel-slang"[^>]*hidden/);
+      expect(html).toMatch(/id="kujira-tabpanel-more"[^>]*hidden/);
     });
 
-    it('Tab 1 包含 2 个只写凭据框（不回显明文）与 1 个媒体保留天数配置项，不再包含 new_message_behavior 或主动聚合/搭话', () => {
+    it('Tab 1 包含 2 个只写凭据框（不回显明文）与 1 个媒体保留天数配置项，管理员与隐私隔离已迁至更多配置 Tab', () => {
       const credStatus: CredentialStatusSummary = {
         appId: { configured: true, source: 'file', writable: true },
         appSecret: { configured: false, writable: true },
@@ -141,13 +147,13 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(connectionHtml).toMatch(/id="kujira-cred-app-secret"[^>]*value=""/);
       expect(connectionHtml).toContain('未配置');
 
-      // 3. image_ttl_days 与直接平铺的管理员名单 / 隔离可能泄露隐私的工具总开关
+      // 3. image_ttl_days 保留在 Tab 1，但管理员名单与隐私工具隔离已迁至 Tab 7
       expect(connectionHtml).toContain('id="kujira-image-ttl"');
       expect(connectionHtml).toContain('image_ttl_days');
-      expect(connectionHtml).toContain('管理员名单 (admins)');
-      expect(connectionHtml).toContain('id="kujira-privacy-tools-enabled"');
-      expect(connectionHtml).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
-      expect(connectionHtml).not.toContain('kujira-privacy-tools-more-section');
+      expect(connectionHtml).not.toContain('admins');
+      expect(connectionHtml).not.toContain('kujira-admins');
+      expect(connectionHtml).not.toContain('kujira-privacy-tools-enabled');
+      expect(connectionHtml).not.toContain('privacy_tools_enabled');
 
       // 4. 已迁入 Tab 2 的 new_message_behavior 与仿生回复配置项不在 Tab 1
       expect(connectionHtml).not.toContain('kujira-new-message-behavior');
@@ -269,6 +275,32 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
 
       expect(memoryHtml).not.toContain('group_memory_total_budget_chars');
       expect(memoryHtml).not.toContain('群聊');
+    });
+
+    it('切换到 Tab 7 (更多配置) 时平铺展示管理员名单、隐私工具隔离与冷场主动搭话名单过滤', () => {
+      const html = renderCard({ initialTab: 'more' });
+
+      expect(html).toMatch(/id="kujira-tab-more"[^>]*aria-selected="true"/);
+      expect(html).not.toMatch(/id="kujira-tabpanel-more"[^>]*hidden/);
+
+      const panelMatch = html.match(
+        /id="kujira-tabpanel-more"[\s\S]*?(?=<div class="[^"]*footer)/
+      );
+      expect(panelMatch).not.toBeNull();
+      const moreHtml = panelMatch![0];
+
+      // 1. 管理员名单
+      expect(moreHtml).toContain('管理员名单 (admins)');
+      expect(moreHtml).toContain('id="kujira-admins-add"');
+
+      // 2. 隔离可能泄露隐私的工具总开关
+      expect(moreHtml).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
+      expect(moreHtml).toContain('id="kujira-privacy-tools-enabled"');
+
+      // 3. 冷场主动搭话名单过滤
+      expect(moreHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(moreHtml).toContain('id="kujira-idle-reply-list-mode"');
+      expect(moreHtml).toContain('id="kujira-idle-reply-peer-add"');
     });
 
     it('setActiveTab 正确触发 onTabChange 回调通知', () => {

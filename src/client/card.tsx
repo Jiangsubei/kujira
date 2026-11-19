@@ -3,7 +3,7 @@ import { cardStyle, sectionStyle, injectCardStyles } from './card-styles.js';
 import { SafeIconChevronDown } from './icons.js';
 import { useCardState } from './use-card-state.js';
 import { SectionErrorBoundary } from './error-boundary.js';
-import { ConnectionTab, ReplyTab, PersonaTab, MemoryTab, FaceTab, SlangTab } from './tabs/index.js';
+import { ConnectionTab, ReplyTab, PersonaTab, MemoryTab, FaceTab, SlangTab, MoreTab } from './tabs/index.js';
 import { DEFAULT_BASE_CONFIG } from '../constants/index.js';
 import {
   SETTINGS_TABS,
@@ -74,6 +74,7 @@ export function KujiraSettingsCard(props: CardProps): React.JSX.Element {
       <MemoryTab {...commonTabProps} active={state.activeTab === 'memory'} />
       <FaceTab {...commonTabProps} active={state.activeTab === 'face'} onError={state.updateError} />
       <SlangTab {...commonTabProps} active={state.activeTab === 'slang'} onError={state.updateError} />
+      <MoreTab {...commonTabProps} active={state.activeTab === 'more'} />
 
       <div className={cardStyle.footer}>
         {state.errorMessage && <p className={cardStyle.failed} role="alert">{state.errorMessage}</p>}

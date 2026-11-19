@@ -11,7 +11,7 @@
 - **工具强隔离**：单聊专属工具（如 `send_qq_message`、`recall_message`、`list_faces` 等）仅对装配了 `kujira-session` 预设的 QQ 单聊会话可见，**绝不向 DSH WebUI 常规会话或审查会话泄露**；
 - **轻量化提示词注入**：预设配置 `complete: true`，在会话创建期彻底覆盖 DSH 默认庞杂的 Coding 提示词，仅注入专注 C2C 单聊的拟人化 Prompt；
 - **全要素工具集拼装**：自动装配文件系统（`tool-fs`）、跨平台 Shell（Windows 激活 `tool-pwsh` / Linux 激活 `tool-bash`）、官方 Web 搜索（`tool-web`）、技能发现（`tool-skill`）、交互提问（`tool-ask-user`）与会话压缩能力组（`compaction`）；
-- **隐私敏感工具动态热隔离**：当在「常规」设置开启 `privacy_tools_enabled` 且会话命中隔离策略时，基于 DSH `agent.ctx.tools.restrict({ deny })` 对该会话热屏蔽 `bash`、`pwsh`、`read`、`write`、`edit`、`apply_patch`、`working_directory`、`load_workspace_dependencies`、`skill` 共 9 个可能暴露本机文件与环境的工具（始终保留 `send_file`、`read_image`、`web_search`/`web_fetch`、`ask_user_question` 及全部 QQ 单聊专属工具）；修改开关或黑白名单后对存活会话**立即热生效**，下一条消息自动重注工具集且不丢失上下文。
+- **隐私敏感工具动态热隔离**：当在「更多配置」设置开启 `privacy_tools_enabled` 且会话命中隔离策略时，基于 DSH `agent.ctx.tools.restrict({ deny })` 对该会话热屏蔽 `bash`、`pwsh`、`read`、`write`、`edit`、`apply_patch`、`working_directory`、`load_workspace_dependencies`、`skill` 共 9 个可能暴露本机文件与环境的工具（始终保留 `send_file`、`read_image`、`web_search`/`web_fetch`、`ask_user_question` 及全部 QQ 单聊专属工具）；修改开关或黑白名单后对存活会话**立即热生效**，下一条消息自动重注工具集且不丢失上下文。
 
 ---
 

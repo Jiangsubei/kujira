@@ -1,19 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React from 'react';
 import { ValueField, SwitchField, SegmentedField } from '../fields.js';
 import { cardStyle, fieldStyle } from '../card-styles.js';
-import {
-  PEERS_ENDPOINT,
-  PEERS_POLL_MS,
-  PeerListEditor,
-  formatRelativeSpeakTime,
-  formatPeerDropdownLabel,
-  startPeerListPolling,
-  useKnownPeersPolling,
-  type KnownPeerSummary,
-} from '../components/PeerListEditor.js';
 import type {
   BridgePluginConfig,
-  IdleReplyListMode,
   ProactiveAttitude,
 } from '../../types/index.js';
 import {
@@ -24,20 +13,10 @@ import {
   DEFAULT_IDLE_REPLY_ENABLED,
   DEFAULT_IDLE_REPLY_MIN_MINS,
   DEFAULT_IDLE_REPLY_MAX_MINS,
-  DEFAULT_IDLE_REPLY_LIST_MODE,
   DEFAULT_PROACTIVE_ATTITUDE,
   DEFAULT_INSTANT_REPLY_ENABLED,
 } from '../../constants/index.js';
 import type { KujiraFormModel } from '../model.js';
-
-export {
-  PEERS_ENDPOINT,
-  formatRelativeSpeakTime,
-  formatPeerDropdownLabel,
-  startPeerListPolling,
-  type KnownPeerSummary,
-};
-export const IDLE_REPLY_PEERS_POLL_MS = PEERS_POLL_MS;
 
 const PROACTIVE_ATTITUDE_OPTIONS: Array<{ value: ProactiveAttitude; label: string }> = [
   { value: 'enthusiastic', label: '热情' },
@@ -45,38 +24,11 @@ const PROACTIVE_ATTITUDE_OPTIONS: Array<{ value: ProactiveAttitude; label: strin
   { value: 'aloof', label: '冷淡' },
 ];
 
-const IDLE_REPLY_LIST_MODE_OPTIONS: Array<{ value: IdleReplyListMode; label: string }> = [
-  { value: 'blacklist', label: '黑名单模式' },
-  { value: 'whitelist', label: '白名单模式' },
-];
-
-/**
- * 判断草稿中是否已配置了非默认的冷场搭话黑白名单规则。
- * 只要切换为白名单模式或任一名单非空即返回 true（打开设置时默认展开，避免隐形生效）。
- */
-export function hasCustomIdleReplyFilterConfig(draft: Partial<BridgePluginConfig>): boolean {
-  if (draft.idle_reply_list_mode === 'whitelist') return true;
-  const blacklist = Array.isArray(draft.idle_reply_blacklist)
-    ? draft.idle_reply_blacklist.filter((p) => typeof p === 'string' && p.trim().length > 0)
-    : [];
-  if (blacklist.length > 0) return true;
-  const whitelist = Array.isArray(draft.idle_reply_whitelist)
-    ? draft.idle_reply_whitelist.filter((p) => typeof p === 'string' && p.trim().length > 0)
-    : [];
-  return whitelist.length > 0;
-}
-
 export interface ReplyTabProps {
   active: boolean;
   draft: Partial<BridgePluginConfig>;
   model: KujiraFormModel;
   saving: boolean;
-  /** 可选初始已互动用户列表（供 SSR 与契约测试注入） */
-  initialKnownPeers?: KnownPeerSummary[];
-  /** 可选初始是否展开「更多选项」黑白名单面板（供 SSR 与契约测试验证展开态） */
-  initialPeerFilterExpanded?: boolean;
-  /** 可选初始是否展开内联添加行（供 SSR 与契约测试验证编辑态） */
-  initialAddingPeer?: boolean;
   onFieldChange: (key: keyof BridgePluginConfig, val: any) => void;
   onResetField: (key: keyof BridgePluginConfig) => void;
 }
@@ -87,43 +39,11 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
     draft,
     model,
     saving,
-    initialKnownPeers,
-    initialPeerFilterExpanded,
-    initialAddingPeer,
     onFieldChange,
     onResetField,
   } = props;
 
-  const hasCustomFilter = hasCustomIdleReplyFilterConfig(draft);
-  const [peerFilterExpanded, setPeerFilterExpanded] = useState<boolean>(
-    () => initialPeerFilterExpanded ?? hasCustomFilter
-  );
-  const userToggledPeerFilterRef = useRef<boolean>(initialPeerFilterExpanded !== undefined);
-  const [isAddingPeer, setIsAddingPeer] = useState<boolean>(Boolean(initialAddingPeer));
-
-  // 异步远程配置加载完成后，若检测到已配置非默认名单且用户尚未手动折叠，自动展开
-  useEffect(() => {
-    if (!userToggledPeerFilterRef.current && hasCustomFilter) {
-      setPeerFilterExpanded(true);
-    }
-  }, [hasCustomFilter]);
-
   const idleReplyEnabled = Boolean(draft.idle_reply_enabled ?? DEFAULT_IDLE_REPLY_ENABLED);
-
-  // 打开设置/切入本 Tab 且展开「更多选项」时自动刷新，并在停留期间每 5 秒轮询一次
-  const { knownPeers, nowTs } = useKnownPeersPolling(
-    active && idleReplyEnabled && peerFilterExpanded,
-    initialKnownPeers
-  );
-
-  const listMode: IdleReplyListMode =
-    draft.idle_reply_list_mode === 'whitelist' ? 'whitelist' : DEFAULT_IDLE_REPLY_LIST_MODE;
-  const activeListKey: 'idle_reply_blacklist' | 'idle_reply_whitelist' =
-    listMode === 'whitelist' ? 'idle_reply_whitelist' : 'idle_reply_blacklist';
-  const rawSelectedPeers = draft[activeListKey];
-  const selectedPeers: string[] = Array.isArray(rawSelectedPeers)
-    ? rawSelectedPeers.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
-    : [];
 
   return (
     <div
@@ -252,8 +172,8 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
         label="冷场主动搭话 (idle_reply_enabled)"
         hint={
           idleReplyEnabled
-            ? '长时间没有新消息时，由模型自主判断是否主动发起话题；等待用户答题或审批期间同样跳过'
-            : '开启后，单聊长时间无新消息时模型会主动找话题；需存在可用的被动回复锚点才会发信'
+            ? '长时间没有新消息时，由模型自主判断是否主动发起话题；可在「更多配置」Tab 配置名单过滤；等待用户答题或审批期间同样跳过'
+            : '开启后，单聊长时间无新消息时模型会主动找话题；可在「更多配置」Tab 配置名单过滤；需存在可用的被动回复锚点才会发信'
         }
         checked={idleReplyEnabled}
         disabled={saving}
@@ -261,96 +181,6 @@ export function ReplyTab(props: ReplyTabProps): React.JSX.Element {
         onReset={() => onResetField('idle_reply_enabled')}
         onChange={(checked) => onFieldChange('idle_reply_enabled', checked)}
       />
-
-      {idleReplyEnabled && (
-        <div
-          id="kujira-idle-reply-more-section"
-          data-testid="kujira-idle-reply-more-section"
-          className={fieldStyle.peerFilterSection}
-        >
-          <button
-            id="kujira-idle-reply-more-toggle"
-            type="button"
-            className={fieldStyle.moreToggle}
-            aria-expanded={peerFilterExpanded}
-            aria-controls="kujira-idle-reply-peer-filter"
-            disabled={saving}
-            onClick={() => {
-              userToggledPeerFilterRef.current = true;
-              setPeerFilterExpanded((prev) => {
-                const next = !prev;
-                if (!next) {
-                  setIsAddingPeer(false);
-                }
-                return next;
-              });
-            }}
-          >
-            <span aria-hidden="true">{peerFilterExpanded ? '▾' : '▸'}</span>
-            <span>更多选项</span>
-          </button>
-
-          {peerFilterExpanded && (
-            <div
-              id="kujira-idle-reply-peer-filter"
-              data-testid="kujira-idle-reply-peer-filter"
-              className={fieldStyle.peerFilterBox}
-            >
-              <SegmentedField
-                id="kujira-idle-reply-list-mode"
-                label="搭话名单模式 (idle_reply_list_mode)"
-                hint={
-                  listMode === 'whitelist'
-                    ? '白名单模式：仅下方名单内的用户会触发冷场主动搭话，其余好友均不受打扰'
-                    : '黑名单模式：排除下方名单内的用户，其余已互动用户正常触发冷场主动搭话'
-                }
-                value={listMode}
-                options={IDLE_REPLY_LIST_MODE_OPTIONS}
-                disabled={saving}
-                overridden={model.isOverridden('idle_reply_list_mode')}
-                onReset={() => {
-                  setIsAddingPeer(false);
-                  onResetField('idle_reply_list_mode');
-                }}
-                onChange={(val) => {
-                  setIsAddingPeer(false);
-                  onFieldChange('idle_reply_list_mode', val);
-                }}
-              />
-
-              <PeerListEditor
-                idPrefix="kujira-idle-reply-peer"
-                label={
-                  listMode === 'whitelist'
-                    ? '白名单用户 (idle_reply_whitelist)'
-                    : '黑名单用户 (idle_reply_blacklist)'
-                }
-                addButtonTitle={listMode === 'whitelist' ? '添加白名单用户' : '添加黑名单用户'}
-                emptyHint={
-                  listMode === 'whitelist'
-                    ? '暂未配置，所有用户都不会触发冷场主动搭话。'
-                    : '暂未配置，所有用户都会触发冷场主动搭话。'
-                }
-                selectedPeers={selectedPeers}
-                knownPeers={knownPeers}
-                nowTs={nowTs}
-                saving={saving}
-                overridden={model.isOverridden(activeListKey)}
-                adding={isAddingPeer}
-                onAddingChange={setIsAddingPeer}
-                onAdd={(peer) => onFieldChange(activeListKey, [...selectedPeers, peer])}
-                onRemove={(peer) =>
-                  onFieldChange(
-                    activeListKey,
-                    selectedPeers.filter((p) => p !== peer)
-                  )
-                }
-                onReset={() => onResetField(activeListKey)}
-              />
-            </div>
-          )}
-        </div>
-      )}
 
       <ValueField
         id="kujira-idle-reply-min-mins"

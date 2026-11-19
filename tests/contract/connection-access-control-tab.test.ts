@@ -10,11 +10,8 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
 import { openidToPeer } from '../../src/utils/peer.js';
 import { KujiraFormModel } from '../../src/client/model.js';
 import { KujiraSettingsCard, DEFAULT_BASE_CONFIG } from '../../src/client/card.js';
-import {
-  ConnectionTab,
-  hasCustomPrivacyToolsFilterConfig,
-  type ConnectionTabProps,
-} from '../../src/client/tabs/ConnectionTab.js';
+import { ConnectionTab, type ConnectionTabProps } from '../../src/client/tabs/ConnectionTab.js';
+import { MoreTab, type MoreTabProps } from '../../src/client/tabs/MoreTab.js';
 import {
   PEERS_ENDPOINT,
   PEERS_POLL_MS,
@@ -65,7 +62,28 @@ function renderConnectionTab(overrides: Partial<ConnectionTabProps> = {}): strin
   );
 }
 
-describe('契约测试: 常规 Tab 管理员名单与隐私工具隔离开关配置区 (ConnectionTab Access Control)', () => {
+function renderMoreTab(overrides: Partial<MoreTabProps> = {}): string {
+  const model =
+    overrides.model ??
+    new KujiraFormModel({
+      initialValues: overrides.draft ?? {},
+      baseDefaults: DEFAULT_BASE_CONFIG,
+    });
+
+  return renderToStaticMarkup(
+    React.createElement(MoreTab, {
+      active: true,
+      draft: model.getDraft(),
+      model,
+      saving: false,
+      onFieldChange: vi.fn(),
+      onResetField: vi.fn(),
+      ...overrides,
+    })
+  );
+}
+
+describe('契约测试: 更多配置 Tab 管理员名单、隐私工具隔离与常规 Tab 纯净性 (MoreTab Access Control & ConnectionTab Purity)', () => {
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -91,12 +109,27 @@ describe('契约测试: 常规 Tab 管理员名单与隐私工具隔离开关配
     },
   ];
 
-  describe('1. 顶层平铺布局（不折叠）与总开关未勾选态契约', () => {
-    it('默认配置下，「常规」Tab 直接平铺展示管理员名单与隐私工具隔离总开关（不折叠），未勾选总开关时不显示更多选项，且整个 HTML 不含 security', () => {
+  describe('1. 常规 Tab 纯净化契约：不再包含管理员名单与隐私工具隔离', () => {
+    it('ConnectionTab 仅保留 AppID, AppSecret, image_ttl_days，绝不渲染 admins 与 privacy_tools_*', () => {
+      const html = renderConnectionTab();
+      expect(html).toContain('id="kujira-cred-app-id"');
+      expect(html).toContain('id="kujira-cred-app-secret"');
+      expect(html).toContain('id="kujira-image-ttl"');
+
+      expect(html).not.toContain('admins');
+      expect(html).not.toContain('kujira-admins');
+      expect(html).not.toContain('privacy_tools_enabled');
+      expect(html).not.toContain('kujira-privacy-tools-enabled');
+      expect(html).not.toContain('security');
+    });
+  });
+
+  describe('2. 更多配置 Tab 顶层平铺布局与总开关未勾选态契约', () => {
+    it('默认配置下，「更多配置」Tab 平铺展示管理员名单与隐私工具隔离总开关，总开关关闭时不展示隐私名单区', () => {
       const cardHtml = renderToStaticMarkup(
         React.createElement(KujiraSettingsCard, {
           initialExpanded: true,
-          initialTab: 'connection',
+          initialTab: 'more',
           credentialsStatus: DEFAULT_CRED_STATUS,
           onSaveSettings: vi.fn(),
         })
@@ -104,117 +137,56 @@ describe('契约测试: 常规 Tab 管理员名单与隐私工具隔离开关配
 
       expect(cardHtml.toLowerCase()).not.toContain('security');
 
-      const connectionPanel = cardHtml.match(
-        /id="kujira-tabpanel-connection"[\s\S]*?(?=<div[^>]*id="kujira-tabpanel-reply")/
+      const morePanel = cardHtml.match(
+        /id="kujira-tabpanel-more"[\s\S]*?(?=<div class="[^"]*footer)/
       )![0];
 
-      // 排序：多媒体缓存 TTL → 管理员名单 → 隔离可能泄露隐私的工具总开关
-      const posTtl = connectionPanel.indexOf('id="kujira-image-ttl"');
-      const posAdmins = connectionPanel.indexOf('id="kujira-admins-add"');
-      const posPrivacySwitch = connectionPanel.indexOf('id="kujira-privacy-tools-enabled"');
-      expect(posTtl).toBeGreaterThan(-1);
-      expect(posAdmins).toBeGreaterThan(posTtl);
-      expect(posPrivacySwitch).toBeGreaterThan(posAdmins);
-
       // 管理员名单直接可见
-      expect(connectionPanel).toContain('管理员名单 (admins)');
-      expect(connectionPanel).toContain('暂未配置，默认按 1 对 1 场景对所有单聊用户开放完整权限。');
-      expect(connectionPanel).toContain('/权限');
-      expect(connectionPanel).toContain('/模型 -默认');
-      expect(connectionPanel).toContain('/思考 -默认');
+      expect(morePanel).toContain('管理员名单 (admins)');
+      expect(morePanel).toContain('暂未配置，默认按 1 对 1 场景对所有单聊用户开放完整权限。');
+      expect(morePanel).toContain('/权限');
+      expect(morePanel).toContain('/模型 -默认');
+      expect(morePanel).toContain('/思考 -默认');
 
       // 隔离可能泄露隐私的工具总开关（默认关闭）
-      expect(connectionPanel).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
-      expect(connectionPanel).toMatch(/id="kujira-privacy-tools-enabled"[^>]*type="checkbox"/);
-      expect(connectionPanel).not.toMatch(/id="kujira-privacy-tools-enabled"[^>]*checked/);
+      expect(morePanel).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
+      expect(morePanel).toMatch(/id="kujira-privacy-tools-enabled"[^>]*type="checkbox"/);
+      expect(morePanel).not.toMatch(/id="kujira-privacy-tools-enabled"[^>]*checked/);
 
-      // 总开关关闭时，不渲染「更多选项」和黑白名单区
-      expect(connectionPanel).not.toContain('kujira-privacy-tools-more-section');
-      expect(connectionPanel).not.toContain('kujira-privacy-tools-peer-filter');
-      expect(connectionPanel).not.toContain('privacy_tools_list_mode');
+      // 总开关关闭时，不渲染隐私名单过滤区
+      expect(morePanel).not.toContain('id="kujira-privacy-tools-peer-filter"');
+      expect(morePanel).not.toContain('privacy_tools_list_mode');
+
+      // 冷场主动搭话名单过滤也是平铺渲染（无折叠按钮）
+      expect(morePanel).toContain('id="kujira-idle-reply-peer-filter"');
+      expect(morePanel).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(morePanel).not.toContain('kujira-idle-reply-more-toggle');
     });
   });
 
-  describe('2. 勾选总开关后的默认折叠「更多选项」与 hasCustomPrivacyToolsFilterConfig 自动展开契约', () => {
-    it('勾选 privacy_tools_enabled 但未自定义名单时，显示默认折叠的「更多选项」按钮', () => {
-      const html = renderConnectionTab({
+  describe('3. 勾选 privacy_tools_enabled 后直接平铺展示黑白名单（无更多选项折叠按钮）', () => {
+    it('勾选 privacy_tools_enabled 时直接展示隔离名单模式与黑白名单编辑器，彻底摒弃折叠按钮', () => {
+      const html = renderMoreTab({
         draft: { privacy_tools_enabled: true },
         initialKnownPeers: knownPeers,
       });
 
       expect(html.toLowerCase()).not.toContain('security');
       expect(html).toMatch(/id="kujira-privacy-tools-enabled"[^>]*checked/);
-      expect(html).toContain('id="kujira-privacy-tools-more-section"');
-      expect(html).toContain('id="kujira-privacy-tools-more-toggle"');
-      expect(html).toContain('更多选项');
-      expect(html).toMatch(
-        /id="kujira-privacy-tools-more-toggle"[^>]*aria-expanded="false"/
-      );
-      expect(html).toMatch(
-        /id="kujira-privacy-tools-more-toggle"[^>]*aria-controls="kujira-privacy-tools-peer-filter"/
-      );
-      expect(html).not.toContain('id="kujira-privacy-tools-peer-filter"');
-    });
+      expect(html).not.toContain('id="kujira-privacy-tools-more-toggle"');
+      expect(html).not.toContain('更多选项');
 
-    it('仅默认空配置（白名单空表）返回 false，切黑名单或配置任一名单返回 true 且打开设置自动展开', () => {
-      expect(hasCustomPrivacyToolsFilterConfig({})).toBe(false);
-      expect(
-        hasCustomPrivacyToolsFilterConfig({
-          privacy_tools_list_mode: 'whitelist',
-          privacy_tools_blacklist: [],
-          privacy_tools_whitelist: [],
-        })
-      ).toBe(false);
-      expect(
-        hasCustomPrivacyToolsFilterConfig({
-          privacy_tools_blacklist: [''],
-          privacy_tools_whitelist: ['  '],
-        })
-      ).toBe(false);
-
-      expect(hasCustomPrivacyToolsFilterConfig({ privacy_tools_list_mode: 'blacklist' })).toBe(true);
-      expect(hasCustomPrivacyToolsFilterConfig({ privacy_tools_blacklist: [PEER_A] })).toBe(true);
-      expect(hasCustomPrivacyToolsFilterConfig({ privacy_tools_whitelist: [PEER_B] })).toBe(true);
-
-      const cases = [
-        { privacy_tools_enabled: true, privacy_tools_list_mode: 'blacklist' as const },
-        { privacy_tools_enabled: true, privacy_tools_blacklist: [PEER_A] },
-        { privacy_tools_enabled: true, privacy_tools_whitelist: [PEER_B] },
-      ];
-
-      for (const draft of cases) {
-        const html = renderConnectionTab({
-          draft,
-          initialKnownPeers: knownPeers,
-        });
-        expect(html).toMatch(/id="kujira-privacy-tools-more-toggle"[^>]*aria-expanded="true"/);
-        expect(html).toContain('id="kujira-privacy-tools-peer-filter"');
-        expect(html.toLowerCase()).not.toContain('security');
-      }
+      // 直接平铺展开
+      expect(html).toContain('id="kujira-privacy-tools-peer-filter"');
+      expect(html).toContain('id="kujira-privacy-tools-list-mode"');
+      expect(html).toContain('白名单模式');
+      expect(html).toContain('黑名单模式');
+      expect(html).toContain('白名单用户 (privacy_tools_whitelist)');
+      expect(html).toContain('暂未配置，所有单聊会话都会隔离可能泄露隐私的工具。');
     });
   });
 
-  describe('3. 展开态脱敏用户选择器、内联添加态与黑白名单独立互斥契约', () => {
-    it('开启总开关并展开「更多选项」后，默认展示白名单模式与空态提示', () => {
-      const html = renderConnectionTab({
-        draft: { privacy_tools_enabled: true },
-        initialPrivacyFilterExpanded: true,
-        initialKnownPeers: knownPeers,
-      });
-
-      expect(html.toLowerCase()).not.toContain('security');
-      expect(html).toContain('id="kujira-privacy-tools-list-mode"');
-      expect(html).toContain('隔离名单模式 (privacy_tools_list_mode)');
-      expect(html).toContain('白名单模式');
-      expect(html).toContain('黑名单模式');
-      expect(html).toMatch(
-        /id="kujira-privacy-tools-list-mode-option-whitelist"[^>]*aria-checked="true"/
-      );
-      expect(html).toContain('白名单用户 (privacy_tools_whitelist)');
-      expect(html).toContain('暂未配置，所有单聊会话都会隔离可能泄露隐私的工具。');
-      expect(html).not.toContain('id="kujira-privacy-tools-peer-editor"');
-    });
-
+  describe('4. 脱敏用户选择器、内联添加态与黑白名单独立互斥契约', () => {
     it('已选管理员与隐私名单内联添加态：展示短 OpenID + 相对时间 + 消息摘要与删除按钮，下拉框排除已选且绝不泄漏完整 OpenID', () => {
       const model = new KujiraFormModel({
         initialValues: {
@@ -227,7 +199,7 @@ describe('契约测试: 常规 Tab 管理员名单与隐私工具隔离开关配
         baseDefaults: DEFAULT_BASE_CONFIG,
       });
 
-      const html = renderConnectionTab({
+      const html = renderMoreTab({
         model,
         draft: model.getDraft(),
         initialKnownPeers: knownPeers,
@@ -266,7 +238,7 @@ describe('契约测试: 常规 Tab 管理员名单与隐私工具隔离开关配
     });
 
     it('黑名单模式独立读取 privacy_tools_blacklist，空态提示清晰区分', () => {
-      const emptyBlacklistHtml = renderConnectionTab({
+      const emptyBlacklistHtml = renderMoreTab({
         draft: {
           privacy_tools_enabled: true,
           privacy_tools_list_mode: 'blacklist',
@@ -285,7 +257,7 @@ describe('契约测试: 常规 Tab 管理员名单与隐私工具隔离开关配
     });
   });
 
-  describe('4. KujiraFormModel 脏态与脱敏用户轮询契约', () => {
+  describe('5. KujiraFormModel 脏态与脱敏用户轮询契约', () => {
     it('KujiraFormModel 正确追踪 privacy_tools_enabled 等 5 项配置的 overridden / isDirty 与重置', () => {
       const model = new KujiraFormModel({
         initialValues: { ...DEFAULT_BASE_CONFIG },

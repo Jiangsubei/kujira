@@ -4,3 +4,4 @@ export { PersonaTab, type PersonaTabProps } from './PersonaTab.js';
 export { MemoryTab, type MemoryTabProps } from './MemoryTab.js';
 export { FaceTab, type FaceTabProps } from './FaceTab.js';
 export { SlangTab, type SlangTabProps } from './SlangTab.js';
+export { MoreTab, type MoreTabProps } from './MoreTab.js';

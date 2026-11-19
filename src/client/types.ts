@@ -2,7 +2,14 @@ import type React from 'react';
 import type { BridgePluginConfig, CredentialStatusSummary } from '../types/index.js';
 import type { KujiraFormModel } from './model.js';
 
-export type SettingsTabId = 'connection' | 'reply' | 'persona' | 'memory' | 'face' | 'slang';
+export type SettingsTabId =
+  | 'connection'
+  | 'reply'
+  | 'persona'
+  | 'memory'
+  | 'face'
+  | 'slang'
+  | 'more';
 
 export interface TabItem {
   id: SettingsTabId;
@@ -16,6 +23,7 @@ export const SETTINGS_TABS: readonly TabItem[] = [
   { id: 'memory', label: '记忆' },
   { id: 'face', label: '表情包' },
   { id: 'slang', label: '黑话学习' },
+  { id: 'more', label: '更多配置' },
 ] as const;
 
 export interface CredentialsInputPayload {
