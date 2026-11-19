@@ -536,7 +536,7 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         },
       ];
 
-      // MoreTab 中冷场名单过滤直接平铺展示（无折叠按钮）
+      // MoreTab 中冷场名单外层平铺展示 Switch 开关（未开启时不渲染黑白名单框）
       const modelUnconfigured = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
@@ -559,15 +559,13 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         })
       );
 
-      // 无折叠按钮，直接平铺展示搭话名单模式与黑名单空态
+      // 外层平铺展示 Switch 开关，无折叠按钮且未勾选时不展开黑白名单框
+      expect(moreTabDefaultHtml).toContain('id="kujira-idle-reply-filter-enabled"');
+      expect(moreTabDefaultHtml).toContain('冷场主动搭话名单');
       expect(moreTabDefaultHtml).not.toContain('id="kujira-idle-reply-more-toggle"');
-      expect(moreTabDefaultHtml).toContain('id="kujira-idle-reply-peer-filter"');
-      expect(moreTabDefaultHtml).toContain('id="kujira-idle-reply-list-mode"');
-      expect(moreTabDefaultHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
-      expect(moreTabDefaultHtml).toContain('黑名单用户 (idle_reply_blacklist)');
-      expect(moreTabDefaultHtml).toContain('暂未配置，所有用户都会触发冷场主动搭话。');
+      expect(moreTabDefaultHtml).not.toContain('id="kujira-idle-reply-peer-filter"');
 
-      // 切换为白名单模式直接展示白名单空态
+      // 切换为白名单模式（视为已开启过滤）直接展开展示白名单空态
       const modelWhitelistEmpty = new KujiraFormModel({
         initialValues: {
           idle_reply_enabled: true,
@@ -590,6 +588,9 @@ describe('契约测试: 冷场主动搭话黑白名单过滤、脱敏用户摘�
         })
       );
 
+      expect(whitelistEmptyHtml).toContain('id="kujira-idle-reply-peer-filter"');
+      expect(whitelistEmptyHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(whitelistEmptyHtml).toContain('白名单模式');
       expect(whitelistEmptyHtml).toContain('白名单用户 (idle_reply_whitelist)');
       expect(whitelistEmptyHtml).toContain('暂未配置，所有用户都不会触发冷场主动搭话。');
       expect(whitelistEmptyHtml).not.toContain(`data-testid="kujira-idle-reply-peer-item-${PEER_A}"`);

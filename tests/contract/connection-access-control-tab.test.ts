@@ -157,9 +157,10 @@ describe('契约测试: 更多配置 Tab 管理员名单、隐私工具隔离与
       expect(morePanel).not.toContain('id="kujira-privacy-tools-peer-filter"');
       expect(morePanel).not.toContain('privacy_tools_list_mode');
 
-      // 冷场主动搭话名单过滤也是平铺渲染（无折叠按钮）
-      expect(morePanel).toContain('id="kujira-idle-reply-peer-filter"');
-      expect(morePanel).toContain('搭话名单模式 (idle_reply_list_mode)');
+      // 冷场主动搭话名单外层平铺展示 Switch 开关（未开启时不渲染黑白名单框）
+      expect(morePanel).toContain('冷场主动搭话名单');
+      expect(morePanel).toContain('id="kujira-idle-reply-filter-enabled"');
+      expect(morePanel).not.toContain('id="kujira-idle-reply-peer-filter"');
       expect(morePanel).not.toContain('kujira-idle-reply-more-toggle');
     });
   });

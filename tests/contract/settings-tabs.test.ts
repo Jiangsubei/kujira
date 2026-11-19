@@ -277,7 +277,7 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(memoryHtml).not.toContain('群聊');
     });
 
-    it('切换到 Tab 7 (更多配置) 时平铺展示管理员名单、隐私工具隔离与冷场主动搭话名单过滤', () => {
+    it('切换到 Tab 7 (更多配置) 时平铺展示管理员名单、隐私工具隔离与冷场主动搭话名单开关', () => {
       const html = renderCard({ initialTab: 'more' });
 
       expect(html).toMatch(/id="kujira-tab-more"[^>]*aria-selected="true"/);
@@ -297,10 +297,18 @@ describe('契约测试: Web UI 设置卡 6 分区 Tab、只写凭据表单与跨
       expect(moreHtml).toContain('隔离可能泄露隐私的工具 (privacy_tools_enabled)');
       expect(moreHtml).toContain('id="kujira-privacy-tools-enabled"');
 
-      // 3. 冷场主动搭话名单过滤
-      expect(moreHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
-      expect(moreHtml).toContain('id="kujira-idle-reply-list-mode"');
-      expect(moreHtml).toContain('id="kujira-idle-reply-peer-add"');
+      // 3. 冷场主动搭话名单总开关
+      expect(moreHtml).toContain('冷场主动搭话名单');
+      expect(moreHtml).toContain('id="kujira-idle-reply-filter-enabled"');
+
+      // 4. 勾选冷场搭话名单或有数据时展示模式与添加按钮
+      const enabledCardHtml = renderCard({
+        initialTab: 'more',
+        initialConfig: { idle_reply_list_mode: 'whitelist' },
+      });
+      expect(enabledCardHtml).toContain('搭话名单模式 (idle_reply_list_mode)');
+      expect(enabledCardHtml).toContain('id="kujira-idle-reply-list-mode"');
+      expect(enabledCardHtml).toContain('id="kujira-idle-reply-peer-add"');
     });
 
     it('setActiveTab 正确触发 onTabChange 回调通知', () => {
