@@ -6,7 +6,6 @@ import type { BridgePluginConfig } from '../../types/index.js';
 import {
   DEFAULT_SLANG_EVICT_POLICY,
   DEFAULT_SLANG_MAX_ENTRIES,
-  DEFAULT_SLANG_STORAGE_PATH,
 } from '../../constants/index.js';
 import type { KujiraFormModel } from '../model.js';
 
@@ -209,18 +208,6 @@ export function SlangTab(props: SlangTabProps): React.JSX.Element {
         </select>
         <p className={fieldStyle.hint}>达到条数上限后的行为策略。淘汰依据为模型调用工具查询黑话的次数与活跃度。</p>
       </div>
-
-      <ValueField
-        id="kujira-slang-storage-path"
-        label="黑话库存储路径"
-        hint={`黑话知识库参考 Markdown 导出路径 (默认 ${DEFAULT_SLANG_STORAGE_PATH})`}
-        placeholder={DEFAULT_SLANG_STORAGE_PATH}
-        value={draft.slang_storage_path || DEFAULT_SLANG_STORAGE_PATH}
-        disabled={saving}
-        overridden={model.isOverridden('slang_storage_path')}
-        onReset={() => onResetField('slang_storage_path')}
-        onChange={(val) => onFieldChange('slang_storage_path', val)}
-      />
 
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0 8px', borderTop: '1px solid var(--dsw-alias-border-l2)', fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' }}>
         <div>

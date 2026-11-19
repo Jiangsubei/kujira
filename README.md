@@ -156,7 +156,6 @@ dsh plugin add kujira
 |---|---|---|---|
 | `slang_max_entries` | `number` | `300` | 黑话知识库条数上限 |
 | `slang_evict_policy` | `'reject' \| 'evict_lru'` | `'reject'` | 黑话满额策略（`reject` 拒绝 / `evict_lru` 淘汰查阅最少词条） |
-| `slang_storage_path` | `string` | `".dsh/kujira/slang/slang.md"` | 黑话 Markdown 文档参考保存路径 |
 
 ### 7. 更多配置 (More)
 | 参数 | 类型 | 默认值 | 说明 |

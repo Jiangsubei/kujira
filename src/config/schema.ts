@@ -19,7 +19,6 @@ import {
   DEFAULT_FACE_EVICT_POLICY,
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
-  DEFAULT_SLANG_STORAGE_PATH,
   DEFAULT_AGGREGATION_ENABLED,
   DEFAULT_AGGREGATION_MIN_SECONDS,
   DEFAULT_AGGREGATION_MAX_SECONDS,
@@ -100,11 +99,6 @@ export const BridgeConfigSchema: z<any> = z.object({
     .default(DEFAULT_SLANG_EVICT_POLICY)
     .volatile()
     .description('黑话满额策略 (reject: 拒绝新增, evict_lru: 淘汰查阅最少词条)'),
-  slang_storage_path: z
-    .string()
-    .default(DEFAULT_SLANG_STORAGE_PATH)
-    .volatile()
-    .description('黑话 Markdown 文档保存路径 (默认 .dsh/kujira/slang/slang.md)'),
   aggregation_enabled: z
     .boolean()
     .default(DEFAULT_AGGREGATION_ENABLED)

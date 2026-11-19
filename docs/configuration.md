@@ -94,7 +94,6 @@ Kujira 内置自愈清理机制。当读取到旧版本遗留的废弃配置项�
 | :--- | :--- | :--- | :--- |
 | **`slang_max_entries`** | `number` | `300` | **黑话知识库条数上限（条）**。 |
 | **`slang_evict_policy`** | `'reject' \| 'evict_lru'` | `'reject'` | **黑话满额策略**：`reject`（满额拒绝）或 `evict_lru`（淘汰查阅频次最少的词条）。 |
-| **`slang_storage_path`** | `string` | `".dsh/kujira/slang/slang.md"` | **黑话 Markdown 参考导出路径**。用于将 SQLite 词库导出为人可读的 Markdown文本供审阅。 |
 
 ---
 

@@ -21,7 +21,6 @@ export * from '../tools/slang/index.js';
 
 export interface SlangServiceOptions {
   db?: MessageDatabase;
-  storagePath?: string;
   dshHome?: string;
   maxEntries?: number | (() => number);
   getMaxEntries?: () => number;
@@ -57,7 +56,7 @@ export function setupSlangService(
 
   // 1. 初始化 Storage（基于 SQLite 全局共享）
   const storage = new SlangStorage(
-    options.db || options.storagePath || DEFAULT_DATABASE_PATH,
+    options.db || DEFAULT_DATABASE_PATH,
     getMaxEntries,
     getEvictPolicy,
     effectiveDshHome

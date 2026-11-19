@@ -15,7 +15,6 @@ import {
   DEFAULT_DATABASE_PATH,
   DEFAULT_FACE_STORE_MAX,
   DEFAULT_IMAGE_TTL_DAYS,
-  DEFAULT_SLANG_STORAGE_PATH,
   DEFAULT_SLANG_MAX_ENTRIES,
   DEFAULT_SLANG_EVICT_POLICY,
   PROACTIVE_CHECK_INTERVAL_MS,
@@ -414,10 +413,8 @@ export function apply(ctx: Context, config: BridgePluginConfig = {}) {
       currentConfig().session_memory_budget_chars ?? DEFAULT_SESSION_MEMORY_BUDGET_CHARS,
   });
 
-  const rawSlangPath = currentConfig().slang_storage_path;
   const slangService = setupSlangService(ctx, {
     db,
-    storagePath: resolveDshPath(dshHome, rawSlangPath, DEFAULT_SLANG_STORAGE_PATH),
     dshHome,
     registerGlobalTools: false,
     registerPromptContext: false,

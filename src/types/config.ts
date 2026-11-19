@@ -60,8 +60,6 @@ export interface BridgePluginConfig {
   slang_max_entries?: number;
   /** 黑话库满额淘汰策略 ('reject' 拒绝新增 / 'evict_lru' 淘汰查阅最少词条) */
   slang_evict_policy?: 'reject' | 'evict_lru';
-  /** 黑话 Markdown 文档参考导出路径 (默认 .dsh/kujira/slang/slang.md) */
-  slang_storage_path?: string;
   /** 消息聚合回复总开关：开启后用户连续发送的消息按周期窗口聚合，一次性交给模型回复 */
   aggregation_enabled?: boolean;
   /** 聚合等待最小时长 (单位: 秒，默认 10 秒，硬底线) */

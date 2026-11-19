@@ -3,8 +3,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import {
-  parseSlangMarkdown,
-  formatSlangMarkdown,
   formatSlangContextIndex,
   SlangStorage,
 } from '../../src/slang/storage.js';
@@ -34,56 +32,7 @@ describe('SlangStorage Contract Tests', () => {
     } catch {}
   });
 
-  describe('Markdown Parser & Formatter', () => {
-    it('should parse empty or whitespace markdown into empty array', () => {
-      expect(parseSlangMarkdown('')).toEqual([]);
-      expect(parseSlangMarkdown('   \n\n  ')).toEqual([]);
-    });
-
-    it('should parse standard slang entries correctly', () => {
-      const md = [
-        '- **牢大**：指科比·布莱恩特，现多用于戏谑调侃。（例：想你了，牢大！）',
-        '- **开香槟**：提前庆祝或半场开香槟导致翻车。（例：优势很大，但先别开香槟。）',
-      ].join('\n');
-
-      const entries = parseSlangMarkdown(md);
-      expect(entries).toHaveLength(2);
-      expect(entries[0]).toEqual({
-        term: '牢大',
-        definition: '指科比·布莱恩特，现多用于戏谑调侃。',
-        example: '想你了，牢大！',
-      });
-      expect(entries[1]).toEqual({
-        term: '开香槟',
-        definition: '提前庆祝或半场开香槟导致翻车。',
-        example: '优势很大，但先别开香槟。',
-      });
-    });
-
-    it('should gracefully skip malformed lines or comment lines', () => {
-      const md = [
-        '# 黑话知识库',
-        '一些说明文字',
-        '- **有效词条**：释义内容。（例：例句内容）',
-        '- 无效行没有冒号和粗体',
-        '',
-      ].join('\n');
-
-      const entries = parseSlangMarkdown(md);
-      expect(entries).toHaveLength(1);
-      expect(entries[0]!.term).toBe('有效词条');
-      expect(entries[0]!.definition).toBe('释义内容。');
-      expect(entries[0]!.example).toBe('例句内容');
-    });
-
-    it('should format entries into standard compact markdown lines', () => {
-      const entries: SlangEntry[] = [
-        { term: '电子阳痿', definition: '买了游戏却不想玩的状态。', example: '下了一堆 Steam 游戏，结果电子阳痿了。' },
-      ];
-      const md = formatSlangMarkdown(entries);
-      expect(md).toBe('- **电子阳痿**：买了游戏却不想玩的状态。（例：下了一堆 Steam 游戏，结果电子阳痿了。）\n');
-    });
-
+  describe('L1 Prompt Context Formatter', () => {
     it('should format L1 context index with terms and tags', () => {
       const indexText = formatSlangContextIndex([
         { term: '开香槟', tags: '提前庆祝、反转被打脸' },

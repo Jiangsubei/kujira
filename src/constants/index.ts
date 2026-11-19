@@ -28,8 +28,6 @@ export const DEFAULT_FACE_OUTBOUND_MAX_SIZE = 240;
 
 export const DEFAULT_FACE_THUMB_DIRNAME = 'thumb';
 
-export const DEFAULT_SLANG_STORAGE_PATH = '.dsh/kujira/slang/slang.md';
-
 // ---------------------------------------------------------------------------
 // QQ 官方 Bot API v2 协议与实测硬边界常量
 // ---------------------------------------------------------------------------
@@ -268,7 +266,6 @@ export const DEFAULT_BASE_CONFIG = {
   face_evict_policy: DEFAULT_FACE_EVICT_POLICY,
   slang_max_entries: DEFAULT_SLANG_MAX_ENTRIES,
   slang_evict_policy: DEFAULT_SLANG_EVICT_POLICY,
-  slang_storage_path: DEFAULT_SLANG_STORAGE_PATH,
   aggregation_enabled: DEFAULT_AGGREGATION_ENABLED,
   aggregation_min_seconds: DEFAULT_AGGREGATION_MIN_SECONDS,
   aggregation_max_seconds: DEFAULT_AGGREGATION_MAX_SECONDS,

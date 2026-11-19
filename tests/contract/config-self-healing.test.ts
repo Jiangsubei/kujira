@@ -11,7 +11,7 @@ import {
 import { BridgeConfigSchema } from '../../src/config/schema.js';
 import { DEFAULT_BASE_CONFIG, PLUGIN_NAME, SETTINGS_NAMESPACE } from '../../src/constants/index.js';
 
-const EXPECTED_13_KEYS = [
+const EXPECTED_12_KEYS = [
   'image_ttl_days',
   'new_message_behavior',
   'persona',
@@ -24,7 +24,6 @@ const EXPECTED_13_KEYS = [
   'face_evict_policy',
   'slang_max_entries',
   'slang_evict_policy',
-  'slang_storage_path',
 ] as const;
 
 /** 新增的单聊仿生主动能力配置键（消息聚合回复 + 冷场主动搭话 + 黑白名单分表），共 11 项 */
@@ -51,9 +50,9 @@ const ACCESS_CONTROL_KEYS = [
   'privacy_tools_whitelist',
 ] as const;
 
-const EXPECTED_29_KEYS = [...EXPECTED_13_KEYS, ...PROACTIVE_KEYS, ...ACCESS_CONTROL_KEYS] as const;
+const EXPECTED_28_KEYS = [...EXPECTED_12_KEYS, ...PROACTIVE_KEYS, ...ACCESS_CONTROL_KEYS] as const;
 
-describe('契约测试: Kujira 29 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
+describe('契约测试: Kujira 28 项配置 Schema 与物理自愈引擎 (Config Self-Healing Contract)', () => {
   let testTmpDir: string;
 
   beforeEach(() => {
@@ -64,23 +63,23 @@ describe('契约测试: Kujira 29 项配置 Schema 与物理自愈引擎 (Config
     fs.rmSync(testTmpDir, { recursive: true, force: true });
   });
 
-  describe('1. 单一真相源与 29 项 Schema 契约', () => {
-    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 29 项合法键', () => {
+  describe('1. 单一真相源与 28 项 Schema 契约', () => {
+    it('插件标识统一为 kujira，且 getValidConfigKeys 返回严格收敛的 28 项合法键', () => {
       expect(PLUGIN_NAME).toBe('kujira');
       expect(SETTINGS_NAMESPACE).toBe('kujira');
 
       const validKeys = getValidConfigKeys();
-      expect(validKeys.size).toBe(29);
-      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_29_KEYS].sort());
-      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_29_KEYS].sort());
+      expect(validKeys.size).toBe(28);
+      expect(Array.from(validKeys).sort()).toEqual([...EXPECTED_28_KEYS].sort());
+      expect(Object.keys(DEFAULT_BASE_CONFIG).sort()).toEqual([...EXPECTED_28_KEYS].sort());
 
       const schemaShape = (BridgeConfigSchema as any).dict || (BridgeConfigSchema as any).shape || {};
-      for (const field of EXPECTED_29_KEYS) {
+      for (const field of EXPECTED_28_KEYS) {
         expect(schemaShape[field]?.meta?.volatile, `field ${field} must be .volatile()`).toBe(true);
       }
 
       const resolvedDefaults = (BridgeConfigSchema as any)({});
-      for (const field of EXPECTED_29_KEYS) {
+      for (const field of EXPECTED_28_KEYS) {
         const rawDefault = schemaShape[field]?.meta?.default;
         const volatileVal =
           typeof resolvedDefaults[field]?.get === 'function'
@@ -95,11 +94,12 @@ describe('契约测试: Kujira 29 项配置 Schema 与物理自愈引擎 (Config
     it('已废弃的 NapCat / 群聊 / 主动插话 / 安全权限 / 凭据 / 历史迁移键严禁存在于 Schema 中', () => {
       const validKeys = getValidConfigKeys();
       const deadKeys = [
-        // 已固化为默认开启而废除的配置开关
+        // 已固化为默认开启或已废除的配置项
         'markdown_enabled',
         'input_notify_enabled',
         'face_enabled',
         'slang_enabled',
+        'slang_storage_path',
         // 旧聚合与冷场固定分钟数配置（彻底清除，由仿生动态区间全面取代）
         'aggregation_interval_mins',
         'idle_reply_timeout_mins',

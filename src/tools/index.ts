@@ -142,7 +142,7 @@ export function registerAgentTools(
     const storage =
       options.slangStorage ||
       new SlangStorage(
-        options.db || getConfig().slang_storage_path,
+        options.db,
         () => getConfig().slang_max_entries ?? DEFAULT_SLANG_MAX_ENTRIES,
         () => getConfig().slang_evict_policy ?? DEFAULT_SLANG_EVICT_POLICY,
         options.dshHome

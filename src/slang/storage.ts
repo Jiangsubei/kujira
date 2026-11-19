@@ -10,46 +10,6 @@ import { resolveDshPath } from '../utils/path.js';
 import type { SlangEntry } from '../types/index.js';
 
 /**
- * 解析紧凑 Markdown 中的黑话词条
- * 标准格式: - **{term}**：{definition}（例：{example}）
- */
-export function parseSlangMarkdown(content: string): SlangEntry[] {
-  if (!content || !content.trim()) return [];
-  const lines = content.split('\n');
-  const entries: SlangEntry[] = [];
-  const regex = /^\s*-\s*\*\*(.+?)\*\*\s*[:：]\s*(.+?)(?:[（(]例[:：]?\s*(.+?)[)）])?\s*$/;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const match = trimmed.match(regex);
-    if (match) {
-      entries.push({
-        term: match[1].trim(),
-        definition: match[2].trim(),
-        example: match[3]?.trim() || '',
-      });
-    }
-  }
-  return entries;
-}
-
-/**
- * 将黑话结构化数组格式化为紧凑 Markdown 单行列表（供黑话知识库导出与展示）
- */
-export function formatSlangMarkdown(entries: SlangEntry[]): string {
-  if (!entries || entries.length === 0) return '';
-  return (
-    entries
-      .map((e) => {
-        const examplePart = e.example ? `（例：${e.example}）` : '';
-        return `- **${e.term}**：${e.definition}${examplePart}`;
-      })
-      .join('\n') + '\n'
-  );
-}
-
-/**
  * 将轻量条目数组格式化为 L1 常驻 Prompt 紧凑索引
  * 格式: - 主标题：标签（简要概述）
  */
@@ -84,9 +44,7 @@ export class SlangStorage {
       this.db = dbOrPath as MessageDatabase;
     } else {
       const dbPath = typeof dbOrPath === 'string' && dbOrPath
-        ? (dbOrPath.endsWith('.sqlite') || dbOrPath.endsWith('.db')
-            ? resolveDshPath(dshHome, dbOrPath)
-            : resolveDshPath(dshHome, undefined, DEFAULT_DATABASE_PATH))
+        ? resolveDshPath(dshHome, dbOrPath)
         : resolveDshPath(dshHome, undefined, DEFAULT_DATABASE_PATH);
       this.db = new MessageDatabase(dbPath);
       this.ownDb = true;

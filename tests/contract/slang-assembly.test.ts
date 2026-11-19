@@ -40,7 +40,6 @@ function expectLosslessJson(value: unknown, trail = 'root'): void {
 
 describe('契约测试: 黑话系统装配与运行时接线闭环 (Slang Assembly Contract)', () => {
   let tmpDir: string;
-  let testFilePath: string;
   let db: MessageDatabase;
   let mediaManager: MediaStorageManager;
   let registeredTools: Map<string, any>;
@@ -51,7 +50,6 @@ describe('契约测试: 黑话系统装配与运行时接线闭环 (Slang Assemb
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kujira-slang-assembly-'));
-    testFilePath = path.join(tmpDir, 'slang.md');
     db = new MessageDatabase(path.join(tmpDir, 'test.db'));
     db.init();
     mediaManager = new MediaStorageManager({ dshHome: tmpDir, db });
@@ -100,7 +98,6 @@ describe('契约测试: 黑话系统装配与运行时接线闭环 (Slang Assemb
   it('契约 1: setupSnapshotHub 配合 setupSlangService 正确注册 kujira:slang (order 45)，非 Kujira 会话 Fail-Closed 隔离、单聊 kujira-user-<hash16> 放行', async () => {
     const service = setupSlangService(mockCtx, {
       db,
-      storagePath: testFilePath,
       dshHome: tmpDir,
       registerGlobalTools: false,
       registerPromptContext: false,
