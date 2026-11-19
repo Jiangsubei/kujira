@@ -53,13 +53,13 @@ DeepSeek Harness (DSH) × QQ 官方 Bot 接入插件 —— 既是随叫随到�
 - **黑话学习系统**：基于 SQLite 存储的词库，全局常驻 L1 索引动态注入，支持查梗、收录新梗与满额拒绝/LRU淘汰策略。
 - **表情包资产闭环**：默认常驻装配，提供查表情、发表情、收录好图与满额管控（默认拒绝新增，支持 LRU 淘汰）全生命周期工具链。
 - **纯两字中文斜杠命令与权限分层**：开箱支持 `/状态`、`/模型`、`/思考`、`/停止`、`/新建`、`/会话`、`/用量`、`/压缩`、`/权限`、`/帮助` 10 大指令；`/模型` 与 `/思考` 统一支持 `-默认` 设定新建会话默认值；配置 `admins` 后自动对 `/权限` 及 `-默认` 全局配置启用管理员门控。
-- **WebUI 7 大 Tab 设置面板**：集成于 DSH 设置界面，涵盖 29 项核心参数，全部支持 volatile 动态热更新（含管理员审批、隐私工具热隔离与冷场搭话黑白名单），废弃字段全自动物理自愈过滤。
+- **WebUI 7 大 Tab 设置面板**：集成于 DSH 设置界面，涵盖 28 项核心参数，全部支持 volatile 动态热更新（含管理员审批、隐私工具热隔离与冷场搭话黑白名单），废弃字段全自动物理自愈过滤。
 
 ---
 
 ## ⚡ 极速上手
 
-整个部署流程仅需 **“装插件 → 官方后台拿凭据 → 填入即连”** 3 步，其余 29 项运行参数开箱即具备精心调校的默认值。
+整个部署流程仅需 **“装插件 → 官方后台拿凭据 → 填入即连”** 3 步，其余 28 项运行参数开箱即具备精心调校的默认值。
 
 ### 步骤 1：安装插件（双端二选一）
 
@@ -107,67 +107,68 @@ dsh plugin add kujira
 
 ---
 
-## ⚙️ 运行时配置全景 (29 项)
+## ⚙️ 运行时配置全景 (28 项)
 
 配置面板在 WebUI 中分为 7 个 Tab 分区，所有参数均支持动态热生效：
 
 ### 1. 常规 (Connection)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `AppID` | `string` | *(必填)* | QQ 开放平台机器人 AppID（只写保护，不入配置文件） |
-| `密钥 (AppSecret)` | `string` | *(必填)* | QQ 开放平台机器人密钥（只写保护，不入配置文件） |
-| `image_ttl_days` | `number` | `7` | 外来图片与媒体资源本地缓存保留天数 |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `AppID` | **Bot AppID** | `string` | *(必填)* | QQ 开放平台机器人 AppID（只写保护，不入配置文件） |
+| `密钥 (AppSecret)` | **Bot AppSecret** | `string` | *(必填)* | QQ 开放平台机器人通信密钥（只写保护，不入配置文件） |
+| `image_ttl_days` | **多媒体文件缓存天数** | `number` | `7` | 外来图片与媒体资源本地缓存保留天数 |
 
 ### 2. 回复节奏 (Reply)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `new_message_behavior` | `'steer' \| 'queue'` | `'steer'` | 运行中收到新消息的行为模式（`steer` 及时插话 vs `queue` 加入队列） |
-| `proactive_attitude` | `'enthusiastic' \| 'balanced' \| 'aloof'` | `'balanced'` | 互动偏好分段（`enthusiastic` 热情 / `balanced` 均衡 / `aloof` 冷淡） |
-| `aggregation_enabled` | `boolean` | `false` | 消息聚合回复总开关（连续消息按周期窗口合并回复，需手动开启） |
-| `aggregation_min_seconds` | `number` | `10` | 聚合等待最小时长（秒，硬底线） |
-| `aggregation_max_seconds` | `number` | `60` | 聚合等待最大时长（秒） |
-| `instant_reply_enabled` | `boolean` | `false` | 允许在连续热聊时概率秒回（突破聚合下限） |
-| `idle_reply_enabled` | `boolean` | `false` | 冷场主动搭话总开关（长时间无新消息时主动发起话题，名单过滤见「更多配置」） |
-| `idle_reply_min_mins` | `number` | `30` | 潜水主动搭话最小沉默时长（分钟） |
-| `idle_reply_max_mins` | `number` | `120` | 潜水主动搭话最大沉默时长（分钟） |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `new_message_behavior` | **新消息行为** | `'steer' \| 'queue'` | `'steer'` | 运行中收到新消息的行为模式（`steer` 及时插话 vs `queue` 加入队列） |
+| `proactive_attitude` | **互动偏好** | `'enthusiastic' \| 'balanced' \| 'aloof'` | `'balanced'` | 互动偏好分段（热情 / 均衡 / 冷淡） |
+| `aggregation_enabled` | **连续消息聚合** | `boolean` | `false` | 消息聚合回复总开关（连续消息按周期窗口合并回复，需手动开启） |
+| `aggregation_min_seconds` | **聚合最小时长** | `number` | `10` | 聚合等待最小时长（秒，硬底线） |
+| `aggregation_max_seconds` | **聚合最大时长** | `number` | `60` | 聚合等待最大时长（秒） |
+| `instant_reply_enabled` | **概率秒回** | `boolean` | `false` | 允许在连续热聊时概率秒回（突破聚合下限） |
+| `idle_reply_enabled` | **冷场主动搭话** | `boolean` | `false` | 冷场主动搭话总开关（长时间无新消息时主动发起话题，名单过滤见「更多配置」） |
+| `idle_reply_min_mins` | **冷场最小时长** | `number` | `30` | 冷场主动搭话最小沉默时长（分钟） |
+| `idle_reply_max_mins` | **冷场最大时长** | `number` | `120` | 冷场主动搭话最大沉默时长（分钟） |
 
 ### 3. 人格与准则 (Persona & Behavior)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `persona` | `string` | *(内置)* | 助手的人格设定（注入 System Prompt 动态段） |
-| `behavior` | `string` | *(内置)* | 行为约束准则（注入 System Prompt 动态段） |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `persona` | **助手人设** | `string` | *(内置)* | 助手的人设设定（注入 System Prompt 动态段） |
+| `behavior` | **行为准则** | `string` | *(内置)* | 行为约束准则（注入 System Prompt 动态段） |
 
 ### 4. 记忆 (Memory)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `memory_storage_dir` | `string` | `".dsh/kujira/memory"` | 双层记忆 Markdown 文件存储根目录 |
-| `user_profile_budget_chars` | `number` | `2200` | 单个用户画像文件的写入字符上限 |
-| `session_memory_budget_chars` | `number` | `2200` | 单个会话规则文件的写入字符上限 |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `memory_storage_dir` | **记忆存储目录** | `string` | `".dsh/kujira/memory"` | 双层记忆 Markdown 文件存储根目录 |
+| `user_profile_budget_chars` | **用户画像字符预算上限** | `number` | `2200` | 单个用户画像文件的写入字符上限 |
+| `session_memory_budget_chars` | **会话规则字符预算上限** | `number` | `2200` | 单个会话规则文件的写入字符上限 |
 
 ### 5. 表情包 (Face)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `face_store_max` | `number` | `100` | 本地表情库存储容量上限（张） |
-| `face_store_dir` | `string` | `".dsh/kujira/faces"` | 本地表情库文件存储目录 |
-| `face_evict_policy` | `'reject' \| 'evict_lru'` | `'reject'` | 库容满额策略（`reject` 拒绝 / `evict_lru` 淘汰最久未用） |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `face_store_max` | **表情库容量上限** | `number` | `100` | 本地表情库存储容量上限（张） |
+| `face_store_dir` | **表情库存储目录** | `string` | `".dsh/kujira/faces"` | 本地表情库文件存储目录 |
+| `face_evict_policy` | **满额时行为** | `'reject' \| 'evict_lru'` | `'reject'` | 满额策略（`reject` 拒绝新增 / `evict_lru` 淘汰最久未用） |
 
 ### 6. 黑话学习 (Slang)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `slang_max_entries` | `number` | `300` | 黑话知识库条数上限 |
-| `slang_evict_policy` | `'reject' \| 'evict_lru'` | `'reject'` | 黑话满额策略（`reject` 拒绝 / `evict_lru` 淘汰查阅最少词条） |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `slang_max_entries` | **黑话条数容量上限** | `number` | `300` | 黑话知识库条数上限 |
+| `slang_evict_policy` | **满额时行为** | `'reject' \| 'evict_lru'` | `'reject'` | 满额策略（`reject` 拒绝新增 / `evict_lru` 淘汰最少查阅） |
 
 ### 7. 更多配置 (More)
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `admins` | `string[]` | `[]` | 管理员名单（存内部脱敏 `peer`）；为空按 1 对 1 开放，非空时仅管理员可审批与执行 `/权限`、`/模型 -默认`、`/思考 -默认` |
-| `privacy_tools_enabled` | `boolean` | `false` | 隔离可能泄露隐私的工具总开关（Shell/文件/目录/环境/技能，保留发文件与识图），保存即对存活会话热生效 |
-| `privacy_tools_list_mode` | `'whitelist' \| 'blacklist'` | `'whitelist'` | 隐私工具隔离名单模式（`whitelist` 白名单豁免 / `blacklist` 黑名单精准隔离） |
-| `privacy_tools_whitelist` | `string[]` | `[]` | 隐私工具白名单用户 `peer` 列表（白名单模式下放行；空表时开启开关即全员隔离） |
-| `privacy_tools_blacklist` | `string[]` | `[]` | 隐私工具黑名单用户 `peer` 列表（黑名单模式下仅隔离名单内用户） |
-| `idle_reply_list_mode` | `'blacklist' \| 'whitelist'` | `'blacklist'` | 冷场主动搭话名单过滤模式（`blacklist` 黑名单排除 / `whitelist` 白名单仅允许） |
-| `idle_reply_blacklist` | `string[]` | `[]` | 冷场主动搭话黑名单用户 `peer` 列表（黑名单模式排除） |
-| `idle_reply_whitelist` | `string[]` | `[]` | 冷场主动搭话白名单用户 `peer` 列表（白名单模式仅允许） |
+| 参数 (代码键名) | WebUI 显示名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `admins` | **管理员名单** | `string[]` | `[]` | 管理员名单（存内部脱敏 `peer`）；为空按 1 对 1 开放，非空时仅管理员可审批与执行 `/权限`、`/模型 -默认`、`/思考 -默认` |
+| `privacy_tools_enabled` | **隔离可能泄露隐私的工具** | `boolean` | `false` | 隔离可能泄露隐私的工具总开关（Shell/文件/目录/环境/技能，保留发文件与识图），保存即对存活会话热生效 |
+| `privacy_tools_list_mode` | **隔离名单模式** | `'whitelist' \| 'blacklist'` | `'whitelist'` | 隐私工具隔离名单模式（白名单模式豁免 / 黑名单模式精准隔离） |
+| `privacy_tools_whitelist` | **白名单用户** | `string[]` | `[]` | 隐私工具白名单用户 `peer` 列表（白名单模式下放行；空表时开启开关即全员隔离） |
+| `privacy_tools_blacklist` | **黑名单用户** | `string[]` | `[]` | 隐私工具黑名单用户 `peer` 列表（黑名单模式下仅隔离名单内用户） |
+| - | **冷场主动搭话名单** | 开关状态 | - | 外层平铺开关，开启后展开下方模式与好友黑白名单 |
+| `idle_reply_list_mode` | **搭话名单模式** | `'blacklist' \| 'whitelist'` | `'blacklist'` | 冷场主动搭话名单过滤模式（黑名单模式排除 / 白名单模式仅允许） |
+| `idle_reply_blacklist` | **黑名单用户** | `string[]` | `[]` | 冷场主动搭话黑名单用户 `peer` 列表（黑名单模式排除） |
+| `idle_reply_whitelist` | **白名单用户** | `string[]` | `[]` | 冷场主动搭话白名单用户 `peer` 列表（白名单模式仅允许） |
 
 ---
 
@@ -216,7 +217,7 @@ pnpm test          # 完整构建测试（pnpm build + vitest run）
 - [文档中心索引 (docs/README.md)](docs/README.md)：专题文档总览与快速导航入口。
 - [快速上手指南 (docs/getting-started.md)](docs/getting-started.md)：详细环境准备、QQ 开放平台操作图解、双端安装与验证排查。
 - [系统架构与设计哲学 (docs/architecture.md)](docs/architecture.md)：仿生动态时序引擎数学模型、正向网关、静默出站体系深度解析。
-- [运行时配置全景参考 (docs/configuration.md)](docs/configuration.md)：29 项核心配置详尽字典、管理员权限与隐私工具热隔离、调优配方与自愈机制。
+- [运行时配置全景参考 (docs/configuration.md)](docs/configuration.md)：28 项核心配置详尽字典、管理员权限与隐私工具热隔离、调优配方与自愈机制。
 - [Agent 工具集与斜杠命令手册 (docs/tools-and-commands.md)](docs/tools-and-commands.md)：16 大专属工具 Lossless JSON 契约与 10 大命令。
 - [常见问题排查与实测手册 (docs/troubleshooting.md)](docs/troubleshooting.md)：实测避坑（40054005 跨天去重、40034024 ID混淆、流式 50015001、2 分钟撤回）、探针使用指南。
 

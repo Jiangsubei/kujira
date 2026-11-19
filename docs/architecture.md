@@ -65,7 +65,7 @@ kujira 作为 DeepSeek Harness (DSH) 的 Cordis 插件运行，在腾讯 QQ 开�
 
 1. **凭据与配置装配**：
    - 接入 DSH 官方 `ctx.credentials`，安全加载 `appId` 与 `appSecret`（支持从环境变量 `QQ_BOT_APP_ID` / `QQ_BOT_SECRET` 或 `$DSH_HOME/.credentials.yaml` 读取）；
-   - 合并 29 项核心配置（含管理员名单、隐私工具热隔离与冷场搭话黑白名单），挂载过时配置物理自愈过滤器（全自动剥离历史废弃字段）。
+   - 合并 28 项核心配置（含管理员名单、隐私工具热隔离与冷场搭话黑白名单），挂载过时配置物理自愈过滤器（全自动剥离历史废弃字段）。
 2. **底层存储就绪**：
    - 初始化 SQLite 数据库（`MessageDatabase`，管理消息记录、`peer_openid_map` 映射、黑话词库与被动回复锚点）；
    - 初始化媒体存储管理器（`MediaStorageManager`），挂载外来图片/语音的 TTL 定时清理机制。
@@ -81,7 +81,7 @@ kujira 作为 DeepSeek Harness (DSH) 的 Cordis 插件运行，在腾讯 QQ 开�
    - 挂载 `InboundReplySlots`，维护持久化入站锚点与单调递增 `msg_seq` 槽位，彻底杜绝 `40054005` 跨天去重拒绝，保障流式接口规避无锚点 `50015001` 异常，并在锚点失效时平滑降级普通主动消息。
 6. **WebUI 设置卡片与 REST 路由**：
    - 注册 `/plugins/kujira/config`、`/plugins/kujira/peers` 等 REST 路由，全面接入宿主 `connection` 服务鉴权（Fail-Closed 策略）；
-   - 凭据提交执行只写保护，禁止明文回显；已互动用户接口仅返回脱敏短 OpenID 与最近消息摘要；支持 29 项核心配置项 volatile 动态热更新。
+   - 凭据提交执行只写保护，禁止明文回显；已互动用户接口仅返回脱敏短 OpenID 与最近消息摘要；支持 28 项核心配置项 volatile 动态热更新。
 
 ---
 
